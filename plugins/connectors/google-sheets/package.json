@@ -1,0 +1,16 @@
+{
+  "name": "@dagflux/connector-google-sheets",
+  "version": "1.0.0",
+  "description": "Google Sheets connector plugin for DagFlux with OAuth2.0 authentication",
+  "main": "index.js",
+  "dagflux": {
+    "id": "google-sheets",
+    "displayName": "Google Sheets",
+    "type": "connector",
+    "authType": "oauth2"
+  },
+  "dependencies": {
+    "googleapis": "^134.0.0",
+    "axios": "^1.6.0"
+  }
+}
