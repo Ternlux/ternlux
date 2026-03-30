@@ -1,0 +1,18 @@
+{
+  "name": "@dagflux/connector-mssql",
+  "version": "1.0.0",
+  "description": "Microsoft SQL Server connector for DagFlux",
+  "main": "index.js",
+  "dagflux": {
+    "type": "connector",
+    "id": "mssql",
+    "displayName": "SQL Server",
+    "icon": "./icon.svg",
+    "minAppVersion": "1.0.0"
+  },
+  "dependencies": {
+    "mssql": "^9.0.0"
+  },
+  "author": "DagFlux",
+  "license": "MIT"
+}
