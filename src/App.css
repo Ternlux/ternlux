@@ -1,0 +1,95 @@
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #e8e8e8;
+}
+
+/* Nav bar */
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding-left: 100px;
+  padding-right: 20px;
+  height: 48px;
+  z-index: 1001;
+
+  background: #ffffff;
+  border-bottom: 1px solid #e0e0e0;
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.app-nav-brand {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1a1a1a;
+  letter-spacing: 0.5px;
+  -webkit-app-region: drag;
+}
+
+.app-nav-tabs {
+  display: flex;
+  gap: 4px;
+  -webkit-app-region: no-drag;
+}
+
+.app-nav-tab {
+  /* padding: 5px 16px; */
+  min-width: 200px;
+  height: 35px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #888;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.app-nav-tab:hover {
+  background: #f0f0f0;
+  color: #333;
+}
+
+.app-nav-tab.active {
+  background: #e8e8e8;
+  color: #1a1a1a;
+}
+
+.app-nav-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+.app-nav-settings-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.app-nav-settings-btn:hover {
+  background: #f0f0f0;
+}
+
+/* Content area */
+.app-content {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
