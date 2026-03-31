@@ -1,0 +1,19 @@
+{
+  "name": "@dagflux/connector-postgres",
+  "version": "1.0.0",
+  "description": "PostgreSQL database connector for DagFlux",
+  "main": "index.js",
+  "dagflux": {
+    "type": "connector",
+    "id": "postgres",
+    "displayName": "PostgreSQL",
+    "icon": "./icon.svg",
+    "minAppVersion": "1.0.0"
+  },
+  "dependencies": {
+    "pg": "^8.7.1",
+    "pg-cursor": "^2.10.3"
+  },
+  "author": "DagFlux",
+  "license": "MIT"
+}
