@@ -1,0 +1,19 @@
+{
+  "name": "@dagflux/connector-onedrive",
+  "version": "1.0.0",
+  "description": "OneDrive storage connector for DagFlux",
+  "main": "index.js",
+  "dagflux": {
+    "type": "connector",
+    "id": "onedrive",
+    "displayName": "OneDrive",
+    "icon": "./icon.svg",
+    "minAppVersion": "1.0.0"
+  },
+  "dependencies": {
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "isomorphic-fetch": "^3.0.0"
+  },
+  "author": "DagFlux",
+  "license": "MIT"
+}
