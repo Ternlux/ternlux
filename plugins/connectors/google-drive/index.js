@@ -1,0 +1,532 @@
+/**
+ * Google Drive Storage Connector Plugin for DagFlux
+ * Handles all Google Drive storage operations
+ */
+
+const { google } = require('googleapis');
+const { Readable } = require('stream');
+
+// Google Drive client cache
+const driveClients = new Map();
+
+/**
+ * Get or create Google Drive client with OAuth2 credentials
+ */
+function getOAuthClient(config, connectionId) {
+  const key = connectionId || JSON.stringify(config);
+
+  if (!driveClients.has(key)) {
+    const oauth2Client = new google.auth.OAuth2(
+      config.clientId,
+      config.clientSecret,
+      config.redirectUri || 'http://localhost:3000/oauth/callback'
+    );
+
+    // Set credentials if tokens exist
+    if (config.accessToken) {
+      oauth2Client.setCredentials({
+        access_token: config.accessToken,
+        refresh_token: config.refreshToken,
+        scope: config.scope,
+        token_type: 'Bearer',
+        expiry_date: config.expiryDate
+      });
+    }
+
+    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+    driveClients.set(key, drive);
+  }
+
+  return driveClients.get(key);
+}
+
+/**
+ * Legacy get client for backwards compatibility
+ */
+function getClient(config, connectionId) {
+  // If OAuth credentials exist, use OAuth client
+  if (config.clientId || config.accessToken) {
+    return getOAuthClient(config, connectionId);
+  }
+
+  // Fallback to legacy credentials
+  const key = connectionId || JSON.stringify(config);
+
+  if (!driveClients.has(key)) {
+    const auth = new google.auth.OAuth2();
+
+    if (config.credentials) {
+      const creds = typeof config.credentials === 'string'
+        ? JSON.parse(config.credentials)
+        : config.credentials;
+      auth.setCredentials(creds);
+    }
+
+    const drive = google.drive({ version: 'v3', auth });
+    driveClients.set(key, drive);
+  }
+
+  return driveClients.get(key);
+}
+
+/**
+ * Refresh access token if expired
+ */
+async function refreshAccessTokenIfNeeded(oauth2Client) {
+  try {
+    const tokens = oauth2Client.credentials;
+
+    // Check if token is expired or about to expire (within 5 minutes)
+    if (tokens.expiry_date && tokens.expiry_date < Date.now() + 5 * 60 * 1000) {
+      console.log('[Google Drive] Refreshing access token...');
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      oauth2Client.setCredentials(credentials);
+      return credentials;
+    }
+
+    return tokens;
+  } catch (error) {
+    console.error('[Google Drive] Token refresh error:', error);
+    throw error;
+  }
+}
+
+module.exports = {
+  type: 'connector',
+  id: 'google-drive',
+  name: 'Google Drive',
+  icon: './icon.svg',
+  storageType: 'cloud-storage',
+  dbCategory: 'CloudStorage',
+  authType: 'oauth2',
+
+  /**
+   * Generate OAuth2 authorization URL
+   */
+  getAuthorizationUrl: (config) => {
+    try {
+      const oauth2Client = new google.auth.OAuth2(
+        config.clientId,
+        config.clientSecret,
+        config.redirectUri || 'http://localhost:3000/oauth/callback'
+      );
+
+      const scopes = [
+        'https://www.googleapis.com/auth/drive.file', // Access to files created/opened by app
+        'https://www.googleapis.com/auth/drive.readonly', // Read-only access to all files
+        'https://www.googleapis.com/auth/drive.metadata.readonly' // Read-only metadata (non-restricted)
+      ];
+
+      const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: scopes,
+        prompt: 'consent',
+        state: config.state
+      });
+
+      return {
+        success: true,
+        authUrl,
+        scopes
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.message
+      };
+    }
+  },
+
+  /**
+   * Exchange authorization code for tokens
+   */
+  exchangeCodeForTokens: async (config, code) => {
+    try {
+      const oauth2Client = new google.auth.OAuth2(
+        config.clientId,
+        config.clientSecret,
+        config.redirectUri || 'http://localhost:3000/oauth/callback'
+      );
+      // console.log('oauth2Client: ', oauth2Client)
+      const { tokens } = await oauth2Client.getToken(code);
+
+      return {
+        success: true,
+        tokens: {
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token,
+          expiryDate: tokens.expiry_date,
+          tokenType: tokens.token_type,
+          scope: tokens.scope
+        }
+      };
+    } catch (error) {
+      console.error('[Google Drive] Token exchange error:', error);
+      return {
+        success: false,
+        message: error.message
+      };
+    }
+  },
+
+  /**
+   * Test Google Drive connection
+   */
+  testConnection: async (config, connectionId = null) => {
+    try {
+      const drive = getClient(config, connectionId);
+
+      // Get about info to verify credentials
+      await drive.about.get({ fields: 'user' });
+
+      return { success: true, message: 'Connection successful' };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * List containers (returns root and shared drives)
+   */
+  getContainers: async (config, connectionId = null) => {
+    try {
+      const drive = getClient(config, connectionId);
+      const containers = [
+        {
+          name: 'My Drive',
+          id: 'root',
+          description: 'Personal Google Drive'
+        }
+      ];
+
+      // Try to get shared drives
+      try {
+        const sharedDrives = await drive.drives.list({
+          pageSize: 100
+        });
+
+        if (sharedDrives.data.drives) {
+          sharedDrives.data.drives.forEach(d => {
+            containers.push({
+              name: d.name,
+              id: d.id,
+              description: 'Shared Drive'
+            });
+          });
+        }
+      } catch (e) {
+        // Shared drives may not be available
+      }
+
+      return {
+        success: true,
+        containers
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * List objects in a folder
+   */
+  listObjects: async (config, connectionId, containerName, folderId = 'root', pageSize = 1000) => {
+    try {
+      const drive = getClient(config, connectionId);
+
+      const query = folderId === 'root' || !folderId
+        ? `'root' in parents and trashed = false`
+        : `'${folderId}' in parents and trashed = false`;
+
+      const response = await drive.files.list({
+        q: query,
+        pageSize: Math.min(pageSize, 1000),
+        fields: 'nextPageToken, files(id, name, mimeType, size, modifiedTime, createdTime, owners)',
+        orderBy: 'name'
+      });
+
+      return {
+        success: true,
+        objects: response.data.files.map(file => ({
+          name: file.name,
+          id: file.id,
+          objectKey: file.id, // Use ID for downloading
+          mimeType: file.mimeType,
+          size: file.size ? parseInt(file.size) : 0,
+          isFolder: file.mimeType === 'application/vnd.google-apps.folder',
+          lastModified: file.modifiedTime,
+          created: file.createdTime
+        })),
+        nextPageToken: response.data.nextPageToken
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Download object
+   */
+  downloadObject: async (config, connectionId, containerName, fileId) => {
+    try {
+      const drive = getClient(config, connectionId);
+      // Get file metadata first
+      const metadata = await drive.files.get({
+        fileId,
+        fields: 'name, mimeType, size'
+      });
+      console.log('fileId: ', metadata, fileId)
+
+      // Download file
+      const response = await drive.files.get(
+        { fileId, alt: 'media' },
+        { responseType: 'arraybuffer' }
+      );
+
+      return {
+        success: true,
+        data: Buffer.from(response.data),
+        name: metadata.data.name,
+        mimeType: metadata.data.mimeType,
+        size: metadata.data.size
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Export Google Workspace file (Sheets, Docs, etc.)
+   */
+  exportObject: async (config, connectionId, fileId, mimeType) => {
+    try {
+      const drive = getClient(config, connectionId);
+
+      // Get file metadata first
+      const metadata = await drive.files.get({
+        fileId,
+        fields: 'name, mimeType'
+      });
+
+      // Export the file
+      const response = await drive.files.export(
+        { fileId, mimeType },
+        { responseType: 'arraybuffer' }
+      );
+
+      return {
+        success: true,
+        data: Buffer.from(response.data),
+        name: metadata.data.name,
+        mimeType: mimeType,
+        originalMimeType: metadata.data.mimeType
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Upload object
+   */
+  uploadObject: async (config, connectionId, containerName, fileName, data, contentType) => {
+    try {
+      const drive = getClient(config, connectionId);
+
+      // Default to root folder if containerName is not a valid folder ID
+      const folderId = containerName === 'root' || !containerName ? 'root' : containerName;
+
+      const fileMetadata = {
+        name: fileName,
+        parents: [folderId]
+      };
+
+      // Convert Buffer to readable stream if needed
+      const bodyStream = Buffer.isBuffer(data) ? Readable.from(data) : data;
+
+      const media = {
+        mimeType: contentType || 'application/octet-stream',
+        body: bodyStream
+      };
+
+      const response = await drive.files.create({
+        requestBody: fileMetadata,
+        media: media,
+        fields: 'id, name'
+      });
+
+      return {
+        success: true,
+        message: `Successfully uploaded ${fileName}`,
+        fileId: response.data.id
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Delete object
+   */
+  deleteObject: async (config, connectionId, containerName, fileId) => {
+    try {
+      const drive = getClient(config, connectionId);
+
+      await drive.files.delete({ fileId });
+
+      return {
+        success: true,
+        message: `Successfully deleted file ${fileId}`
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Get object metadata
+   */
+  getObjectMetadata: async (config, connectionId, containerName, fileId) => {
+    try {
+      const drive = getClient(config, connectionId);
+
+      const response = await drive.files.get({
+        fileId,
+        fields: 'id, name, mimeType, size, modifiedTime, createdTime, owners, parents'
+      });
+
+      return {
+        success: true,
+        metadata: {
+          id: response.data.id,
+          name: response.data.name,
+          mimeType: response.data.mimeType,
+          size: response.data.size ? parseInt(response.data.size) : 0,
+          isFolder: response.data.mimeType === 'application/vnd.google-apps.folder',
+          lastModified: response.data.modifiedTime,
+          created: response.data.createdTime,
+          parents: response.data.parents
+        }
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Get credentials for Google Picker
+   * Returns access token and optional API key for frontend Picker integration
+   */
+  getPickerCredentials: async (config, connectionId) => {
+    try {
+      // Create OAuth2 client directly (don't use getOAuthClient which returns Drive client)
+      const oauth2Client = new google.auth.OAuth2(
+        config.clientId,
+        config.clientSecret,
+        config.redirectUri || 'http://localhost:3000/oauth/callback'
+      );
+
+      // Set credentials if tokens exist
+      if (config.accessToken) {
+        oauth2Client.setCredentials({
+          access_token: config.accessToken,
+          refresh_token: config.refreshToken,
+          scope: config.scope,
+          token_type: 'Bearer',
+          expiry_date: config.expiryDate
+        });
+      }
+
+      // Refresh token if needed
+      await refreshAccessTokenIfNeeded(oauth2Client);
+
+      const credentials = oauth2Client.credentials;
+
+      return {
+        success: true,
+        accessToken: credentials.access_token,
+        apiKey: config.apiKey || null, // API key is optional when using OAuth
+        clientId: config.clientId
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: error.message
+      };
+    }
+  },
+
+  /**
+   * Close connection (cleanup client)
+   */
+  closeConnection: async (connectionId) => {
+    if (driveClients.has(connectionId)) {
+      driveClients.delete(connectionId);
+    }
+  },
+
+  /**
+   * Configuration schema for UI generation
+   */
+  configSchema: {
+    fields: [
+      {
+        name: 'clientId',
+        type: 'string',
+        label: 'OAuth Client ID',
+        placeholder: 'xxxxx.apps.googleusercontent.com',
+        required: true,
+        sensitive: true,
+        helpText: 'Get this from Google Cloud Console'
+      },
+      {
+        name: 'clientSecret',
+        type: 'password',
+        label: 'OAuth Client Secret',
+        required: true,
+        sensitive: true,
+        helpText: 'Get this from Google Cloud Console'
+      },
+      // {
+      //   name: 'apiKey',
+      //   type: 'string',
+      //   label: 'Google API Key',
+      //   placeholder: 'AIza...',
+      //   required: true,
+      //   sensitive: true,
+      //   helpText: 'Required for Google Picker file selection. Get from Google Cloud Console: Go to APIs & Services > Credentials > Create Credentials > API Key. Enable Google Picker API for your project.'
+      // },
+      {
+        name: 'redirectUri',
+        type: 'string',
+        label: 'Redirect URI',
+        placeholder: 'http://localhost:3000/oauth/callback',
+        default: 'http://localhost:3000/oauth/callback',
+        required: false,
+        sensitive: false,
+        helpText: 'Must match the redirect URI in your Google Cloud Console'
+      },
+      {
+        name: 'accessToken',
+        type: 'hidden',
+        label: 'Access Token',
+        required: false,
+        sensitive: true
+      },
+      {
+        name: 'refreshToken',
+        type: 'hidden',
+        label: 'Refresh Token',
+        required: false,
+        sensitive: true
+      },
+      {
+        name: 'expiryDate',
+        type: 'hidden',
+        label: 'Token Expiry Date',
+        required: false,
+        sensitive: false
+      }
+    ]
+  }
+};
