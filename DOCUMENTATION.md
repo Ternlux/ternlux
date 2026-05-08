@@ -359,6 +359,597 @@ AI: Generates:
 
 ---
 
+### 5. Branch Node
+
+**Purpose:** Validate data and create conditional routing based on validation results.
+
+**Features:**
+- **Multiple Input Sources** - Validate data from one or more sources
+- **AI-Generated Validation Plans** - Describe validation logic in natural language
+- **Step-Based Execution** - Break complex validation into multiple steps
+- **JavaScript Validation Functions** - Custom logic with full data access
+- **Dual Output Routes:**
+  - **Valid/True** - Records that pass validation
+  - **Invalid/False** - Records that fail validation
+- **Skill Integration** - Use advanced validation plugins
+
+**Validation Workflow:**
+1. Connect source nodes to the Branch node
+2. Describe validation criteria in natural language
+3. AI generates a validation plan with steps
+4. Review the validation function
+5. Execute workflow - data routes based on validation result
+
+**Supported Operations:**
+
+**Simple Validations:**
+- "Check if all records have non-null email addresses"
+- "Validate that all amounts are positive"
+- "Ensure all dates are in the future"
+
+**Complex Validations:**
+- "Check if high-value orders (>$1000) represent more than 10% of total orders"
+- "Validate that the number of active users matches subscription count"
+- "Ensure inventory levels match across systems"
+
+**Multi-Source Validations:**
+- "Compare totals between source A and source B, pass if they match"
+- "Verify that all customer IDs in orders exist in customers table"
+- "Check if data freshness is within acceptable range"
+
+**Validation Plan Structure:**
+```javascript
+{
+  "steps": [
+    {
+      "stepNumber": 1,
+      "description": "Count records where amount > 1000",
+      "sourceNode": "orders",
+      "columns": ["amount"],
+      "operation": "filter"
+    },
+    {
+      "stepNumber": 2,
+      "description": "Get total count of all orders",
+      "sourceNode": "orders",
+      "columns": ["*"],
+      "operation": "aggregate"
+    }
+  ],
+  "explanation": "Validates that high-value orders exceed 10% threshold",
+  "validationFunction": "function(stepResults) {
+    const highValue = stepResults[1].count;
+    const total = stepResults[2].count;
+    return (highValue / total) > 0.1;
+  }",
+  "outputRoutes": {
+    "true": "valid",
+    "false": "invalid"
+  }
+}
+```
+
+**Example Use Cases:**
+- Data quality gates before loading to production
+- Business rule validation (e.g., inventory thresholds)
+- Reconciliation checks across systems
+- Conditional workflow routing based on data characteristics
+
+---
+
+## Validation and Error Handling
+
+### Input Validation
+
+DagFlux implements comprehensive validation at multiple levels to ensure data integrity and prevent errors before execution.
+
+#### Connection Validation
+
+**Database Connections:**
+- **Credential Verification** - Tests connection before saving
+- **Timeout Handling** - 30-second timeout for connection tests
+- **SSL/TLS Validation** - Verifies secure connections when required
+- **Network Accessibility** - Checks if host is reachable
+- **Permission Verification** - Validates user has required database permissions
+
+**Cloud Storage Connections:**
+- **API Key Validation** - Verifies authentication tokens
+- **Bucket/Container Accessibility** - Tests read/write permissions
+- **Region Verification** - Ensures correct endpoint configuration
+- **Quota Checks** - Validates storage limits
+
+**Error Messages:**
+```javascript
+// Connection failure examples
+"Connection failed: Host 'db.example.com' is not reachable"
+"Authentication failed: Invalid credentials for user 'admin'"
+"Permission denied: User lacks SELECT permission on database 'production'"
+"SSL connection required but not configured"
+```
+
+#### Schema Validation
+
+**Automatic Type Detection:**
+- **SQL Databases:**
+  - INTEGER, BIGINT, DECIMAL, FLOAT
+  - VARCHAR, TEXT, CHAR
+  - DATE, TIMESTAMP, DATETIME
+  - BOOLEAN, JSON, ARRAY
+- **NoSQL Databases:**
+  - String, Number, Boolean
+  - Object, Array
+  - Date, ObjectId
+  - Binary, Null
+
+**Type Compatibility Checks:**
+```javascript
+// Cross-database type mapping validation
+PostgreSQL JSONB → MongoDB Object ✓
+BigQuery TIMESTAMP → MySQL DATETIME ✓
+MongoDB ObjectId → PostgreSQL VARCHAR(24) ✓
+MySQL ENUM → PostgreSQL VARCHAR + CHECK constraint ✓
+```
+
+**Schema Mismatch Handling:**
+- **Column Count Differences** - Warns when source and target don't match
+- **Type Incompatibilities** - Suggests type conversions
+- **Missing Columns** - Prompts user to map or create columns
+- **Constraint Violations** - Validates PRIMARY KEY, UNIQUE, NOT NULL
+
+#### Query Validation
+
+**SQL Validation:**
+- **Syntax Checking** - Pre-validates SQL before execution
+- **Reserved Word Detection** - Automatically quotes identifiers
+- **Injection Prevention** - Parameterized queries for user input
+- **Database-Specific Syntax** - Validates against target database dialect
+
+**NoSQL Validation:**
+- **MongoDB Aggregation Pipeline** - Validates stage syntax
+- **NeDB Query Objects** - Validates query structure
+- **Collection Existence** - Checks collection before querying
+
+**Common SQL Errors Caught:**
+```sql
+-- Missing semicolon (auto-added)
+SELECT * FROM users
+
+-- Unquoted reserved words (auto-quoted)
+SELECT order FROM orders → SELECT "order" FROM orders
+
+-- Invalid column reference (detected before execution)
+SELECT customer_name FROM orders WHERE invalid_column > 100
+Error: Column 'invalid_column' does not exist in table 'orders'
+
+-- Type mismatch in WHERE clause
+SELECT * FROM users WHERE age = 'twenty-five'
+Warning: Comparing NUMBER column 'age' with STRING value
+```
+
+#### Data Validation
+
+**Row-Level Validation:**
+- **NULL Checks** - Validates NOT NULL constraints
+- **Unique Constraints** - Detects duplicate values
+- **Foreign Key Validation** - Verifies referential integrity
+- **Range Checks** - Validates numeric boundaries
+- **Pattern Matching** - Validates string formats (email, phone, etc.)
+
+**Batch Validation:**
+- **Record Count Verification** - Ensures expected row counts
+- **Checksum Validation** - Verifies data integrity after transfer
+- **Sampling Validation** - Random sample checks for large datasets
+
+**Branch Node Validation:**
+- **Step Dependency Validation** - Ensures steps reference valid sources
+- **Function Syntax Validation** - Validates JavaScript before execution
+- **Return Type Validation** - Ensures function returns boolean
+- **Step Result Validation** - Verifies step outputs match expected structure
+
+---
+
+### Error Handling Mechanisms
+
+#### Execution-Time Error Handling
+
+**Transaction Management:**
+```javascript
+// SQL databases - automatic rollback on error
+BEGIN TRANSACTION;
+  INSERT INTO customers (name, email) VALUES ('John Doe', 'john@example.com');
+  -- Error occurs here
+  UPDATE orders SET customer_id = LAST_INSERT_ID();
+ROLLBACK; // Automatic rollback on error
+
+// Success case
+COMMIT;
+```
+
+**Retry Logic:**
+- **Network Failures** - 3 retries with exponential backoff
+- **Deadlock Detection** - Automatic retry for database deadlocks
+- **Timeout Errors** - Retry with increased timeout
+- **Rate Limiting** - Exponential backoff for API rate limits
+
+**Graceful Degradation:**
+```javascript
+// Example: Partial success in batch operations
+Result: {
+  success: true,
+  totalRecords: 10000,
+  successfulRecords: 9847,
+  failedRecords: 153,
+  errors: [
+    {
+      row: 234,
+      error: "Duplicate key violation on email 'user@example.com'"
+    },
+    {
+      row: 1056,
+      error: "NULL value in NOT NULL column 'required_field'"
+    }
+  ],
+  message: "Partial success: 98.47% of records inserted"
+}
+```
+
+#### AI-Powered Error Recovery
+
+**Automatic Error Detection:**
+- **Syntax Errors** - AI detects and suggests corrections
+- **Type Mismatches** - AI generates type conversion logic
+- **Missing Columns** - AI suggests ALTER TABLE statements
+- **Performance Issues** - AI recommends indexes and optimizations
+
+**Error Recovery Flow:**
+```javascript
+// 1. Initial transformation fails
+User: "Calculate average order value per customer"
+Generated SQL: SELECT customer_id, AVG(total) FROM orders GROUP BY customer_id
+Error: Column 'total' does not exist
+
+// 2. AI analyzes error and fixes automatically
+AI: "Detected missing column. Found similar column 'order_total'. Regenerating query..."
+Fixed SQL: SELECT customer_id, AVG(order_total) as avg_value FROM orders GROUP BY customer_id
+Result: Success ✓
+
+// 3. AI explains the fix
+AI: "Fixed: Changed 'total' to 'order_total' based on table schema."
+```
+
+**Common Auto-Fixes:**
+
+**Missing Columns:**
+```sql
+-- Original (fails)
+SELECT customer_name FROM users
+
+-- AI Fix
+SELECT name as customer_name FROM users
+-- Explanation: "Column 'customer_name' not found. Using 'name' instead."
+```
+
+**Type Conversions:**
+```sql
+-- Original (fails)
+SELECT * FROM orders WHERE created_at > '2024-01-01'
+
+-- AI Fix (PostgreSQL)
+SELECT * FROM orders WHERE created_at > '2024-01-01'::timestamp
+
+-- AI Fix (MySQL)
+SELECT * FROM orders WHERE created_at > STR_TO_DATE('2024-01-01', '%Y-%m-%d')
+```
+
+**Reserved Word Conflicts:**
+```sql
+-- Original (fails)
+SELECT order, user FROM transactions
+
+-- AI Fix
+SELECT "order", "user" FROM transactions
+```
+
+#### Error Categorization
+
+**Critical Errors (Stop Execution):**
+- Connection failures
+- Authentication errors
+- Permission denied
+- Table/collection does not exist
+- Syntax errors in user-provided SQL
+- Out of memory errors
+
+**Warning Errors (Log and Continue):**
+- Partial batch failures
+- Type conversion warnings
+- Performance warnings (slow queries)
+- Deprecation warnings
+
+**Recoverable Errors (Retry):**
+- Network timeouts
+- Database deadlocks
+- Rate limit exceeded
+- Connection pool exhausted
+- Temporary cloud storage unavailability
+
+---
+
+### Error Messages and User Feedback
+
+#### Structured Error Messages
+
+**Format:**
+```
+[ERROR TYPE] Operation failed: [WHAT WENT WRONG]
+
+Details:
+- [SPECIFIC DETAILS]
+- [CONTEXT INFORMATION]
+
+Suggestion: [HOW TO FIX]
+
+Technical Details:
+- Database: [DB TYPE]
+- Query: [QUERY OR OPERATION]
+- Error Code: [CODE]
+```
+
+**Example Error Messages:**
+
+**Connection Error:**
+```
+[CONNECTION FAILED] Unable to connect to PostgreSQL database
+
+Details:
+- Host: production-db.example.com
+- Port: 5432
+- Database: analytics
+- User: etl_user
+
+Suggestion: Check that the database is running and accessible from this network.
+Try: psql -h production-db.example.com -U etl_user -d analytics
+
+Technical Details:
+- Error Code: ECONNREFUSED
+- Timeout: 30000ms
+```
+
+**Schema Error:**
+```
+[SCHEMA MISMATCH] Column type incompatibility detected
+
+Details:
+- Source: customers.age (INTEGER)
+- Target: users.age (VARCHAR)
+- Operation: Data migration
+
+Suggestion: Add type conversion in transformer node:
+"Convert age column to string format"
+
+Or modify target schema:
+ALTER TABLE users MODIFY COLUMN age INTEGER;
+```
+
+**Validation Error:**
+```
+[VALIDATION FAILED] Branch node validation returned FALSE
+
+Details:
+- Validation: "Check if inventory levels are sufficient"
+- Step 1 Result: Current inventory = 450 units
+- Step 2 Result: Required inventory = 1000 units
+- Validation Result: 450 < 1000 → FALSE
+
+Routing: Data sent to 'invalid' output path
+
+Suggestion: This is expected behavior for validation branches.
+Connect the 'invalid' output to handle failed validation cases.
+```
+
+**Data Quality Error:**
+```
+[DATA QUALITY] Detected 45 rows with validation issues
+
+Details:
+- NULL values in required column 'email': 23 rows
+- Duplicate primary keys: 12 rows
+- Invalid date format: 10 rows
+
+Suggestion: Use transformer node to clean data:
+"Remove rows with NULL emails and fix date formats"
+
+Or use branch node to route invalid data separately.
+```
+
+#### Progress and Status Updates
+
+**Real-Time Feedback:**
+```
+[EXECUTING] Transformer Node: "Calculate customer lifetime value"
+├─ Loading source data... ✓ (2.3s)
+├─ Generating SQL... ✓ (0.8s)
+├─ Executing transformation... ⏳ (Processing 125,000 rows)
+│  ├─ Batch 1/5 complete (25,000 rows) ✓
+│  ├─ Batch 2/5 complete (25,000 rows) ✓
+│  ├─ Batch 3/5 complete (25,000 rows) ✓
+│  ├─ Batch 4/5 complete (25,000 rows) ✓
+│  └─ Batch 5/5 complete (25,000 rows) ✓
+└─ Success: Processed 125,000 rows in 8.4s
+```
+
+**Error During Execution:**
+```
+[EXECUTING] Join Node: "Combine customers with orders"
+├─ Loading customers table... ✓ (1.2s, 50,000 rows)
+├─ Loading orders table... ✓ (3.4s, 200,000 rows)
+├─ Executing join... ✗ (Error at 5.2s)
+│
+└─ [ERROR] JOIN FAILED: Memory limit exceeded
+
+Details:
+- Attempted to join 50,000 × 200,000 rows in memory
+- Required memory: ~2.4GB
+- Available memory: 1.8GB
+
+Suggestion: Use chunked processing for large joins:
+1. Enable "Chunked Processing" in join settings
+2. Or reduce data size with filters before joining
+3. Or execute join in database instead of locally
+
+Would you like me to:
+[Retry with Chunked Processing] [Filter Data First] [Use Database Join]
+```
+
+---
+
+### Best Practices for Error Handling
+
+#### 1. Pre-Execution Validation
+```
+✓ Always test connections before creating workflows
+✓ Preview data samples before transformations
+✓ Validate schema compatibility before cross-database operations
+✓ Use branch nodes for data quality gates
+```
+
+#### 2. Graceful Error Recovery
+```
+✓ Use try-catch patterns in custom JavaScript functions
+✓ Enable automatic retry for network operations
+✓ Implement fallback logic for critical workflows
+✓ Log errors for debugging and auditing
+```
+
+#### 3. Data Validation Strategies
+```
+✓ Add branch nodes before critical operations
+✓ Validate foreign key relationships before joins
+✓ Check for NULL values in required fields
+✓ Use transformer nodes to clean data proactively
+```
+
+#### 4. Performance Optimization
+```
+✓ Use LIMIT in development to test with small datasets
+✓ Enable chunked processing for large datasets (>100k rows)
+✓ Add filters early in workflow to reduce data volume
+✓ Use database-native joins instead of local joins when possible
+```
+
+#### 5. Monitoring and Alerting
+```
+✓ Enable Slack/Discord notifications for workflow failures
+✓ Review execution logs regularly
+✓ Set up data quality checks with branch nodes
+✓ Monitor execution times to detect performance degradation
+```
+
+---
+
+### Common Errors and Solutions
+
+#### Database Connection Errors
+
+**Error:** "Connection timeout after 30 seconds"
+```
+Causes:
+- Database is not running
+- Firewall blocking connection
+- Incorrect host/port configuration
+- Network connectivity issues
+
+Solutions:
+1. Verify database is running: systemctl status postgresql
+2. Check firewall rules: sudo ufw status
+3. Test connectivity: telnet db.example.com 5432
+4. Verify credentials in connection settings
+```
+
+**Error:** "Authentication failed for user"
+```
+Causes:
+- Incorrect password
+- User doesn't exist
+- User lacks database permissions
+
+Solutions:
+1. Verify credentials are correct
+2. Check user exists: SELECT * FROM pg_user WHERE usename = 'username';
+3. Grant permissions: GRANT SELECT, INSERT ON DATABASE mydb TO username;
+```
+
+#### Query Execution Errors
+
+**Error:** "Column 'X' does not exist"
+```
+Solutions:
+1. Check table schema to find correct column name
+2. Use AI to regenerate query with correct columns
+3. Add column to table if it's missing
+4. Update transformer to use existing columns
+```
+
+**Error:** "Duplicate key violation"
+```
+Solutions:
+1. Add deduplication in transformer: "Remove duplicate records by ID"
+2. Use UPDATE instead of INSERT for existing records
+3. Add WHERE NOT EXISTS clause to INSERT
+4. Drop and recreate target table
+```
+
+**Error:** "Data type mismatch"
+```
+Solutions:
+1. Add type conversion in transformer: "Convert column X to INTEGER"
+2. Modify target table schema to match source
+3. Use CAST in SQL: CAST(column AS INTEGER)
+```
+
+#### Memory and Performance Errors
+
+**Error:** "Out of memory during join operation"
+```
+Solutions:
+1. Enable chunked processing in join settings
+2. Add filters to reduce dataset size before join
+3. Execute join in database instead of locally
+4. Increase Node.js memory limit: node --max-old-space-size=4096
+```
+
+**Error:** "Query timeout after 300 seconds"
+```
+Solutions:
+1. Add indexes to join columns
+2. Reduce dataset with WHERE filters
+3. Use LIMIT during development
+4. Optimize query with AI assistance
+5. Increase timeout in database settings
+```
+
+#### Validation Errors
+
+**Error:** "Branch validation function syntax error"
+```
+Solutions:
+1. Verify function returns boolean: return true or false
+2. Check JavaScript syntax is valid
+3. Ensure stepResults parameter is used correctly
+4. Test function with sample data
+```
+
+**Error:** "Branch step failed: source node not configured"
+```
+Solutions:
+1. Ensure all source nodes are properly configured
+2. Verify connections are tested and active
+3. Check that source tables/collections exist
+4. Reconfigure source nodes if needed
+```
+
+---
+
 ## Platform Benefits
 
 ### 1. **Unified Data Access**
