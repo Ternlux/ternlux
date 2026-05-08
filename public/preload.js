@@ -105,6 +105,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   importToNeDB: (params) =>
     ipcRenderer.invoke('import-to-nedb', params),
 
+  listLanceDBTables: (dbPath) =>
+    ipcRenderer.invoke('list-lancedb-tables', dbPath),
+
   /**
    * Direct database connections (runs in main process via native drivers).
    * No backend server required.
@@ -160,7 +163,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       }),
 
     /** SQL transformation (for PostgreSQL, MySQL, MSSQL, SQLite, CSV/Excel files). */
-    transformSQL: (dbType, config, connectionId, ddl, sql, previewSql, storageLocation, operationMode, targetTableName, sourceLocalPath = null, insertSql = null) =>
+    transformSQL: (dbType, config, connectionId, ddl, sql, previewSql, storageLocation, operationMode, targetSchema, targetTableName, sourceLocalPath = null, insertSql = null) =>
       ipcRenderer.invoke('dbconn:transform-sql', {
         dbType,
         config,
@@ -170,6 +173,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         previewSql,
         storageLocation,
         operationMode,
+        targetSchema,
         targetTableName,
         sourceLocalPath,
         insertSql
@@ -182,6 +186,38 @@ contextBridge.exposeInMainWorld('electronAPI', {
         joinConfig,
         operationMode
       }),
+
+    /**
+     * Execute branch validation plan.
+     * params: {
+     *   sources: Array<{ sourceNodeId, connection, tableName }>,
+     *   steps:   Array<{ stepNumber, sourceNodeId, sql?, nosqlOperation?, selectedColumns? }>,
+     *   validationFunction: string (JS function expression),
+     *   outputRoutes: { true: string, false: string }
+     * }
+     * returns: { success, result:boolean, route, stepResults }
+     */
+    executeBranch: (params) =>
+      ipcRenderer.invoke('dbconn:execute-branch', params),
+
+    /**
+     * Execute a REST API fetch function and materialise the response into NeDB.
+     * params: {
+     *   apiConnectionId: string,
+     *   apiConnectionConfig: object,     // public config (no secrets)
+     *   apiFetchCode: string,            // async JS function expression with
+     *                                    // {{PLACEHOLDER}} tokens
+     *   nedbCollection: string,
+     *   operationMode?: 'new_table' | 'append'
+     * }
+     * returns: { success, rowCount, collection, localPath, sampleRow, error? }
+     *
+     * Secrets are decrypted and substituted into the code string in the main
+     * process, then the function is evaluated and invoked. The resolved code
+     * is never returned across this IPC.
+     */
+    executeRestApiFetch: (params) =>
+      ipcRenderer.invoke('rest-api:execute-fetch', params),
 
     /** Execute output operation (export to file or insert to connection). */
     executeOutput: (sourceConnection, sourceTableSchema, outputSettings) =>
@@ -259,6 +295,106 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /** Uninstall an installed plugin. Returns { success, message }. */
     uninstall: (pluginId) =>
       ipcRenderer.invoke('plugins:uninstall', { pluginId }),
+  },
+
+  /**
+   * AI provider operations. The renderer never sees decrypted API keys —
+   * everything is dispatched through these handlers in the main process.
+   */
+  ai: {
+    /**
+     * Call the configured/requested AI provider with a prompt.
+     * @param {Object} args - { prompt, options }
+     * @param {string} args.prompt
+     * @param {Object} [args.options] - { provider?, model?, maxTokens?, systemPrompt?, chatHistory? }
+     * @returns {Promise<{success: boolean, text?: string, message?: string}>}
+     */
+    call: ({ prompt, options = {} } = {}) =>
+      ipcRenderer.invoke('ai:call', { prompt, options }),
+
+    /** List providers that have a usable API key configured. */
+    listProviders: () =>
+      ipcRenderer.invoke('ai:listProviders'),
+  },
+
+  /**
+   * Agentic chat assistant — one step at a time. The renderer drives the
+   * loop, passing the running `scratchpad` back on each call until `done`.
+   * Cancellation = stop calling step().
+   *
+   * @param {Object} args
+   * @param {string} args.message           The user's original question.
+   * @param {Array}  [args.history]         Prior cross-turn chat: [{ role, text }]
+   * @param {Array}  [args.scratchpad]      Steps taken so far for this question.
+   * @param {Object} [args.activeContext]   { kind, id, name, summary }
+   * @param {string} [args.provider]
+   * @returns {Promise<{
+   *   success: boolean,
+   *   done: boolean,
+   *   thought: string,
+   *   actions: Array<{ tool, args, ok, error?, result? }>,
+   *   finalAnswer: string|null,
+   *   step: object,
+   * } | { success:false, message:string }>}
+   */
+  chat: {
+    step: ({ message, history = [], scratchpad = [], activeContext = null, provider = null } = {}) =>
+      ipcRenderer.invoke('chat:step', { message, history, scratchpad, activeContext, provider }),
+  },
+
+  /**
+   * Anonymous usage analytics. The renderer pushes the user's opt-in choice;
+   * the main process gates all outbound events on this flag.
+   */
+  analytics: {
+    setOptIn: (optIn) =>
+      ipcRenderer.invoke('analytics:set-opt-in', { optIn: !!optIn }),
+  },
+
+  /**
+   * Terms & Conditions acceptance, persisted to userData via the main process
+   * so it survives across launches.
+   */
+  terms: {
+    get: () => ipcRenderer.invoke('terms:get'),
+    save: (record) => ipcRenderer.invoke('terms:save', record),
+  },
+
+  /**
+   * Skills Plugin operations
+   */
+  skills: {
+    /** List installed skill plugins. Returns { success, skills: [{id, name, category, version, ...}] }. */
+    listInstalled: () =>
+      ipcRenderer.invoke('skills:listInstalled'),
+
+    /** Get skills by category (transformer/join). Returns { success, skills: [...] }. */
+    getByCategory: (category) =>
+      ipcRenderer.invoke('skills:getByCategory', category),
+
+    /** Get skill descriptions for AI context. Returns { success, descriptions: [...] }. */
+    getDescriptions: (category = null, context = {}) =>
+      ipcRenderer.invoke('skills:getDescriptions', category, context),
+
+    /** Analyze a skill request. Returns { success, action, followUpQuestion, questionsNeeded, skillParams, ... }. */
+    analyze: ({ skillId, params }) =>
+      ipcRenderer.invoke('skills:analyze', { skillId, params }),
+
+    /** Build skill prompt for AI. Returns { success, prompt, context }. */
+    buildPrompt: ({ skillId, params }) =>
+      ipcRenderer.invoke('skills:buildPrompt', { skillId, params }),
+
+    /** Process AI response through skill. Returns { success, action, pythonCode, explanation, followUpQuestion, directAnswer, ... }. */
+    processResponse: ({ skillId, aiResponse, operationType, currentState, availableConnections }) =>
+      ipcRenderer.invoke('skills:processResponse', { skillId, aiResponse, operationType, currentState, availableConnections }),
+
+    /** Execute a skill. Returns { success, data, recordCount, ... }. */
+    execute: ({ skillId, params }) =>
+      ipcRenderer.invoke('skills:execute', { skillId, params }),
+
+    /** Query vector database for preview. Returns { success, data, recordCount, isJson, storageType }. */
+    queryVectorPreview: (params) =>
+      ipcRenderer.invoke('skills:queryVectorPreview', params),
   },
 
   /**
@@ -356,5 +492,64 @@ contextBridge.exposeInMainWorld('electronAPI', {
      */
     cancelServer: (port = 3000) =>
       ipcRenderer.invoke('oauth:cancel-server', { port }),
+  },
+
+  /**
+   * Workflow execution.
+   * Execute workflows and track execution history.
+   */
+  workflow: {
+    /**
+     * Execute a workflow by processing all nodes in topological order.
+     * @param {object} params - { workflowId, workflowName, nodes, edges }
+     * Returns { success, executionId, message, results }
+     */
+    executeWorkflow: (params) =>
+      ipcRenderer.invoke('workflow:execute', params),
+  },
+
+  /**
+   * Start trigger management for workflow automation.
+   * Register and manage CRON jobs and file watchers.
+   */
+  startTriggers: {
+    /**
+     * Register a CRON job for time-based workflow triggers.
+     * @param {object} params - { nodeId, workflowId, cronExpression, description }
+     * Returns { success, message, cronExpression, nextRun }
+     */
+    registerCron: (params) =>
+      ipcRenderer.invoke('start-trigger:register-cron', params),
+
+    /**
+     * Unregister a CRON job.
+     * @param {object} params - { nodeId, workflowId }
+     * Returns { success, message }
+     */
+    unregisterCron: (params) =>
+      ipcRenderer.invoke('start-trigger:unregister-cron', params),
+
+    /**
+     * Register a file watcher for file/directory change triggers.
+     * @param {object} params - { nodeId, workflowId, path, events, pattern }
+     * Returns { success, message, path, events }
+     */
+    registerFileWatch: (params) =>
+      ipcRenderer.invoke('start-trigger:register-file-watch', params),
+
+    /**
+     * Unregister a file watcher.
+     * @param {object} params - { nodeId, workflowId }
+     * Returns { success, message }
+     */
+    unregisterFileWatch: (params) =>
+      ipcRenderer.invoke('start-trigger:unregister-file-watch', params),
+
+    /**
+     * Get all active triggers (CRON jobs and file watchers).
+     * Returns { success, triggers: { cron, file } }
+     */
+    getActiveTriggers: () =>
+      ipcRenderer.invoke('start-trigger:get-active'),
   },
 });

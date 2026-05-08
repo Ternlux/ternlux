@@ -1,38 +1,83 @@
-const { app, BrowserWindow, shell, ipcMain, safeStorage } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const axios = require('axios');
 const Datastore = require('@seald-io/nedb');
 const pluginManager = require('./pluginManager');
-const {transformNeDB, saveToLocalNeDB} = require('./transfomers/NeDB')
-const Sqlite = require('./transfomers/Sqlite');
-const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, executeLocalSQLiteJoin } = require('./joins/joinExecutionHelpers');
-const { executeOutput } = require('./outputs/outputExecutionHelpers');
+const aiProviders = require('./aiProviders');
+const analytics = require('./analytics');
+
+// Patch ipcMain.handle FIRST so every IPC handler registered below is
+// automatically wrapped with anonymous analytics tracking (channel name,
+// duration, success). Opt-in is OFF until the renderer pushes the user's
+// choice via `analytics:set-opt-in`.
+analytics.patchIpcMain(ipcMain);
+
+// Vector libs live at host level (public/lib) so they're available even when
+// the vector-db-executor plugin isn't installed. They're imported once here
+// and shared with every skill via the helpers bundle, so no skill ever has
+// to require across plugin directories.
+const vectorEmbeddings = require('./lib/embeddings');
+const vectorLanceDB    = require('./lib/lancedb');
+const localNeDB        = require('./lib/nedb');
+const localSQLite      = require('./lib/sqlite');
+const { executeOutput } = require('./NodeExecution/outputExecutionHelpers');
+const { addExecutionLog, executeNode } = require('./NodeExecution/workflowExecutionHelpers');
+const nodeExecution = require('./NodeExecution/NodeExecution');
+const apiFetch = require('./NodeExecution/ApiFetch');
 const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, importCsvToSqlite } = require('./imports/importHelpers');
+const SqliteConnectionPool = require('./SqliteConnectionPool');
+const { registerCronJob, unregisterCronJob, getActiveCronJobs, stopAllCronJobs } = require('./triggers/cronTriggers');
+const { registerFileWatcher, unregisterFileWatcher, getActiveFileWatchers, stopAllFileWatchers } = require('./triggers/fileWatchTriggers');
+const { registerAllWorkflowTriggers } = require('./triggers/registerAllTriggers');
+const chatAssistant = require('./chat/chatAssistant');
+
 // Ensure the same userData directory is used in both dev and production,
 // so a key saved during development persists when the packaged app is launched.
 app.setName('DagFlux');
 
 // Single SQLite database path for all local transformations
 let appSqliteDbPath = null;
+let sqlitePool = null;
+
+// Per-path NeDB Datastore cache. NeDB's loadDatabase rewrites `<file>.db~`
+// and renames it to `<file>.db`; running two Datastore instances concurrently
+// on the same path races that rename and one fails with ENOENT. Sharing a
+// single instance per path serializes operations through NeDB's executor.
+const nedbInstanceCache = new Map();
+async function getOrLoadNedb(filePath) {
+  let entry = nedbInstanceCache.get(filePath);
+  if (!entry) {
+    const db = new Datastore({ filename: filePath, autoload: false });
+    const loaded = new Promise((resolve, reject) => {
+      db.loadDatabase((err) => (err ? reject(err) : resolve(db)));
+    });
+    entry = { db, loaded };
+    nedbInstanceCache.set(filePath, entry);
+    try {
+      await loaded;
+    } catch (err) {
+      nedbInstanceCache.delete(filePath);
+      throw err;
+    }
+  } else {
+    await entry.loaded;
+  }
+  return entry.db;
+}
 
 /**
- * Initialize the single SQLite database for the app
- * All local SQL transformations will create tables in this database
+ * Initialize the SQLite connection pool
+ * All local SQL transformations will use this persistent connection
  */
-function initializeAppDatabase() {
-  const sqlite3 = require('sqlite3').verbose();
+async function initializeAppDatabase() {
   appSqliteDbPath = path.join(app.getPath('userData'), 'app-data.db');
 
-  // Ensure the database file exists
-  const db = new sqlite3.Database(appSqliteDbPath, (err) => {
-    if (err) {
-      console.error('Failed to initialize app database:', err);
-    } else {
-      console.log('App SQLite database initialized at:', appSqliteDbPath);
-    }
-  });
+  // Create and initialize the connection pool
+  sqlitePool = new SqliteConnectionPool(appSqliteDbPath);
+  await sqlitePool.initialize();
 
-  db.close();
+  console.log('App SQLite connection pool initialized at:', appSqliteDbPath);
   return appSqliteDbPath;
 }
 
@@ -40,6 +85,48 @@ function initializeAppDatabase() {
 // Written only after the app is ready so app.getPath() is safe to call.
 function getConfigPath() {
   return path.join(app.getPath('userData'), 'llm-config.dat');
+}
+
+/**
+ * Load all API keys from encrypted storage
+ * @returns {Object|null} - Object with provider keys { claude, gemini, chatgpt, openai, huggingface } or null
+ */
+function loadApiKeys() {
+  try {
+    const configPath = getConfigPath();
+    if (!fs.existsSync(configPath)) return null;
+    if (!safeStorage.isEncryptionAvailable()) return null;
+
+    const b64 = fs.readFileSync(configPath, 'utf8');
+    const buf = Buffer.from(b64, 'base64');
+    const payload = safeStorage.decryptString(buf);
+    return JSON.parse(payload);
+  } catch (err) {
+    console.error('[loadApiKeys]', err);
+    return null;
+  }
+}
+
+/**
+ * Check if an API key exists for a specific provider
+ * @param {string} provider - Provider name (openai, huggingface, claude, gemini, chatgpt)
+ * @returns {boolean}
+ */
+function hasApiKeyForProvider(provider) {
+  const allKeys = loadApiKeys();
+  if (!allKeys) return false;
+
+  // Normalize provider name
+  const providerMap = {
+    'chatgpt': 'chatgpt',
+    'gemini': 'gemini',
+    'claude': 'claude',
+    'openai': 'chatgpt', // OpenAI uses chatgpt key
+    'huggingface': 'huggingface'
+  };
+
+  const normalizedProvider = providerMap[provider.toLowerCase()] || provider.toLowerCase();
+  return !!(allKeys[normalizedProvider]);
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +205,36 @@ ipcMain.handle('api-key:clear', () => {
     return { success: true };
   } catch (err) {
     console.error('[api-key:clear]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+// Terms & Conditions acceptance is persisted to a file in userData so it
+// survives across launches reliably — renderer localStorage was unreliable
+// here because the productName/package name mismatch can shift the storage
+// origin between dev and packaged runs.
+function getTermsConfigPath() {
+  return path.join(app.getPath('userData'), 'terms-acceptance.json');
+}
+
+ipcMain.handle('terms:get', () => {
+  try {
+    const p = getTermsConfigPath();
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (err) {
+    console.error('[terms:get]', err);
+    return null;
+  }
+});
+
+ipcMain.handle('terms:save', (_event, record = {}) => {
+  try {
+    const p = getTermsConfigPath();
+    fs.writeFileSync(p, JSON.stringify(record), 'utf8');
+    return { success: true };
+  } catch (err) {
+    console.error('[terms:save]', err);
     return { success: false, error: err.message };
   }
 });
@@ -425,34 +542,32 @@ ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 10
         }
       });
     } else {
-      // Read NeDB file
-      const localDb = new Datastore({ filename: filePath });
+      // Read NeDB file via shared per-path Datastore (avoids rename race).
+      let localDb;
+      try {
+        localDb = await getOrLoadNedb(filePath);
+      } catch (loadErr) {
+        return {
+          success: false,
+          message: `Failed to load local collection: ${loadErr.message}`
+        };
+      }
 
       return new Promise((resolve) => {
-        localDb.loadDatabase((loadErr) => {
-          if (loadErr) {
+        localDb.find({}).limit(limit).exec((err, docs) => {
+          if (err) {
             resolve({
               success: false,
-              message: `Failed to load local collection: ${loadErr.message}`
+              message: `Failed to read documents: ${err.message}`
             });
-            return;
+          } else {
+            resolve({
+              success: true,
+              rows: docs,
+              rowCount: docs.length,
+              json: true // NeDB/MongoDB data is JSON
+            });
           }
-
-          localDb.find({}).limit(limit).exec((err, docs) => {
-            if (err) {
-              resolve({
-                success: false,
-                message: `Failed to read documents: ${err.message}`
-              });
-            } else {
-              resolve({
-                success: true,
-                rows: docs,
-                rowCount: docs.length,
-                json: true // NeDB/MongoDB data is JSON
-              });
-            }
-          });
         });
       });
     }
@@ -572,9 +687,8 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
  * import-to-sqlite — Import CSV/Excel/Parquet/Avro file to internal SQLite database
  * Returns { success, dbPath, tableName, rowCount, message }
  */
-ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileType }) => {
+ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileType, sheets = [] }) => {
   try {
-    const sqlite3 = require('sqlite3').verbose();
     const path = require('path');
 
     // Use the app-wide SQLite database
@@ -582,6 +696,13 @@ ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileTyp
       return {
         success: false,
         message: 'App database not initialized'
+      };
+    }
+
+    if (!sqlitePool) {
+      return {
+        success: false,
+        message: 'SQLite connection pool not initialized'
       };
     }
 
@@ -597,7 +718,6 @@ ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileTyp
     }
 
     const dbPath = appSqliteDbPath;
-    const db = new sqlite3.Database(dbPath);
 
     // Determine file type from extension if not provided
     const ext = path.extname(filePath).toLowerCase();
@@ -607,15 +727,19 @@ ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileTyp
       'spreadsheet'
     );
 
-    // Route to appropriate parser based on file type
-    if (detectedFileType === 'parquet') {
-      return await importParquetToSqlite(filePath, sanitizedTableName, db, dbPath);
-    } else if (detectedFileType === 'avro') {
-      return await importAvroToSqlite(filePath, sanitizedTableName, db, dbPath);
-    } else {
-      // Default: CSV/Excel import
-      return await importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath);
-    }
+    // Use connection pool for import
+    return await sqlitePool.executeWrite(async (db) => {
+      // Route to appropriate parser based on file type
+      if (detectedFileType === 'parquet') {
+        return await importParquetToSqlite(filePath, sanitizedTableName, db, dbPath);
+      } else if (detectedFileType === 'avro') {
+        return await importAvroToSqlite(filePath, sanitizedTableName, db, dbPath);
+      } else {
+        // Default: CSV/Excel import
+        // sheets parameter: empty array = import all sheets, specific sheets = import only those
+        return await importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets);
+      }
+    });
   } catch (error) {
     console.error('Import error:', error);
     return {
@@ -689,6 +813,45 @@ ipcMain.handle('import-to-nedb', async (_event, { filePath, collectionName }) =>
   } catch (err) {
     console.error('Import to NeDB error:', err);
     return { success: false, message: err.message };
+  }
+});
+
+/**
+ * list-lancedb-tables — List all tables in a LanceDB database directory
+ * Returns { success, tables: string[], message }
+ */
+ipcMain.handle('list-lancedb-tables', async (_event, dbPath) => {
+  try {
+    if (!dbPath || !fs.existsSync(dbPath)) {
+      return {
+        success: false,
+        message: 'LanceDB directory not found',
+        tables: []
+      };
+    }
+
+    // Get vector-db-executor skill via pluginManager
+    const vectorSkill = pluginManager.getSkill('vector-db-executor');
+    if (!vectorSkill) {
+      return {
+        success: false,
+        message: 'Vector database executor skill not found. Please install the vector-db-executor skill.',
+        tables: []
+      };
+    }
+
+    // Call the skill's method to list tables
+    const helpers = await buildSkillHelpers();
+    const result = await vectorSkill.listLanceDBTables({ dbPath, helpers });
+
+    return result;
+  } catch (err) {
+    console.error('List LanceDB tables error:', err);
+    return {
+      success: false,
+      message: err.message,
+      tables: []
+    };
   }
 });
 
@@ -942,87 +1105,78 @@ ipcMain.handle('google-sheets:import-to-sqlite', async (_event, { config, connec
     const placeholders = columns.map(() => '?').join(', ');
     const insertSql = `INSERT INTO "${sanitizedTableName}" (${quotedColumns}) VALUES (${placeholders})`;
 
-    // Step 7: Use Sqlite.js to insert data into app-data.db
-    const { databaseToLocal } = require('./transfomers/Sqlite');
+    // Step 7: Use connection pool to insert data into app-data.db
+    if (!sqlitePool) {
+      return {
+        success: false,
+        message: 'SQLite connection pool not initialized'
+      };
+    }
 
-    // Create a fake SQL query (not used since we already have the data)
-    const fakeQuery = `SELECT * FROM "${sanitizedTableName}"`;
-
-    // Use databaseToLocal with in-memory data
-    const sqlite3 = require('sqlite3').verbose();
-    const db = new sqlite3.Database(appSqliteDbPath);
-
-    return new Promise((resolve) => {
-      db.serialize(() => {
-        // Drop table if exists
+    return await sqlitePool.executeWrite(async (db) => {
+      // Drop table if exists
+      await new Promise((resolve, reject) => {
         db.run(`DROP TABLE IF EXISTS "${sanitizedTableName}"`, (dropErr) => {
-          if (dropErr) {
-            db.close();
-            return resolve({
-              success: false,
-              message: `Failed to drop existing table: ${dropErr.message}`
+          if (dropErr) reject(new Error(`Failed to drop existing table: ${dropErr.message}`));
+          else resolve();
+        });
+      });
+
+      // Create table
+      await new Promise((resolve, reject) => {
+        db.run(ddl, (createErr) => {
+          if (createErr) reject(new Error(`Failed to create table: ${createErr.message}`));
+          else resolve();
+        });
+      });
+
+      // Insert data in chunks
+      const CHUNK_SIZE = 1000;
+      let processedRows = 0;
+
+      const processChunk = async (startIndex) => {
+        const endIndex = Math.min(startIndex + CHUNK_SIZE, rows.length);
+        const chunk = rows.slice(startIndex, endIndex);
+
+        await new Promise((resolve, reject) => {
+          const stmt = db.prepare(insertSql);
+
+          for (const row of chunk) {
+            const values = columns.map(col => row[col]);
+            stmt.run(values, (runErr) => {
+              if (runErr) {
+                console.error('[Google Sheets Import] Insert error:', runErr);
+              }
             });
           }
 
-          // Create table
-          db.run(ddl, (createErr) => {
-            if (createErr) {
-              db.close();
-              return resolve({
-                success: false,
-                message: `Failed to create table: ${createErr.message}`
-              });
+          stmt.finalize((finalizeErr) => {
+            if (finalizeErr) {
+              console.error('[Google Sheets Import] Finalize error:', finalizeErr);
+              reject(finalizeErr);
+            } else {
+              processedRows += chunk.length;
+              resolve();
             }
-
-            // Insert data in chunks
-            const CHUNK_SIZE = 1000;
-            let processedRows = 0;
-
-            const processChunk = (startIndex) => {
-              const endIndex = Math.min(startIndex + CHUNK_SIZE, rows.length);
-              const chunk = rows.slice(startIndex, endIndex);
-
-              const stmt = db.prepare(insertSql);
-
-              for (const row of chunk) {
-                const values = columns.map(col => row[col]);
-                stmt.run(values, (runErr) => {
-                  if (runErr) {
-                    console.error('[Google Sheets Import] Insert error:', runErr);
-                  }
-                });
-              }
-
-              stmt.finalize((finalizeErr) => {
-                if (finalizeErr) {
-                  console.error('[Google Sheets Import] Finalize error:', finalizeErr);
-                }
-
-                processedRows += chunk.length;
-
-                if (endIndex < rows.length) {
-                  // Process next chunk
-                  setImmediate(() => processChunk(endIndex));
-                } else {
-                  // All chunks processed
-                  db.close(() => {
-                    resolve({
-                      success: true,
-                      localPath: appSqliteDbPath,
-                      tableName: sanitizedTableName,
-                      rowCount: processedRows,
-                      message: `Imported ${processedRows} rows from Google Sheet`
-                    });
-                  });
-                }
-              });
-            };
-
-            // Start processing chunks
-            processChunk(0);
           });
         });
-      });
+
+        if (endIndex < rows.length) {
+          // Process next chunk
+          await processChunk(endIndex);
+        }
+      };
+
+      // Start processing chunks
+      await processChunk(0);
+
+      return {
+        success: true,
+        localPath: appSqliteDbPath,
+        tableName: sanitizedTableName,
+        rowCount: processedRows,
+        message: `Imported ${processedRows} rows from Google Sheet`
+      };
     });
   } catch (err) {
     console.error('[Google Sheets Import] Error:', err);
@@ -1104,7 +1258,7 @@ ipcMain.handle('dbconn:generate-transform-prompt', async (_event, {
           console.log('sourceSchema || targetSchema: ', sourceSchema, targetSchema)
           let sourceSchemaClean = operationMode === 'in_place' ? (sourceSchema || targetSchema) : (targetSchema)
           sourceSchemaClean = sourceSchemaClean ? sourceSchemaClean : targetTableName.split('.').length > 1 ? targetTableName.split('.')[0] : null;
-          console.log('sourceSchemaClean: ', sourceSchemaClean)
+          // console.log('sourceSchemaClean: ', sourceSchemaClean)
           // Execute prompt function in main process with provided parameters
           // For in-place mode, use source table/schema; for new-table mode, use target table/schema
           const prompt = promptFn(
@@ -1484,7 +1638,7 @@ ipcMain.handle('plugins:uninstall', async (_event, { pluginId }) => {
     }
 
     // Unload plugin first
-    pluginManager.unloadPlugin(pluginId);
+    pluginManager.unloadConnector(pluginId);
 
     // Remove plugin directory
     fs.rmSync(pluginDir, { recursive: true, force: true });
@@ -1500,6 +1654,461 @@ ipcMain.handle('plugins:uninstall', async (_event, { pluginId }) => {
     return {
       success: false,
       message: `Uninstallation failed: ${error.message}`
+    };
+  }
+});
+
+
+/**
+ * Skills Plugin Handlers
+ */
+
+/**
+ * skills:listInstalled — list all installed skill plugins
+ * Returns { success, skills: [...] }
+ */
+ipcMain.handle('skills:listInstalled', async () => {
+  try {
+    const skills = pluginManager.listSkills();
+    return { success: true, skills };
+  } catch (err) {
+    return { success: false, message: err.message, skills: [] };
+  }
+});
+
+/**
+ * skills:getByCategory — get skills filtered by category
+ * Returns { success, skills: [...] }
+ */
+ipcMain.handle('skills:getByCategory', async (_event, category) => {
+  try {
+    const skills = pluginManager.getSkillsByCategory(category);
+    return { success: true, skills };
+  } catch (err) {
+    return { success: false, message: err.message, skills: [] };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AI provider IPC — the renderer never sees decrypted keys; everything goes
+// through these handlers, which delegate to public/aiProviders.js.
+// ---------------------------------------------------------------------------
+
+/**
+ * ai:call — invoke the configured/requested AI provider with the prompt.
+ * Returns { success, text } or { success: false, message }.
+ */
+ipcMain.handle('ai:call', async (_event, { prompt, options = {} } = {}) => {
+  try {
+    const apiKeys = loadApiKeys();
+    if (!apiKeys) {
+      return { success: false, message: 'No API keys configured. Set one up in settings.' };
+    }
+    const text = await aiProviders.callAIWithKeys(prompt, { ...options, apiKeys });
+    return { success: true, text };
+  } catch (err) {
+    console.error('[ai:call]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * ai:listProviders — providers that have a usable key configured.
+ * Returns { success, providers: ['openai', ...] }.
+ */
+ipcMain.handle('ai:listProviders', async () => {
+  const apiKeys = loadApiKeys() || {};
+  return { success: true, providers: aiProviders.listAvailableProviders(apiKeys) };
+});
+
+/**
+ * chat:step — one turn of the agentic chat assistant. The renderer drives
+ * the loop: each call performs ONE AI turn, executes whatever tools the
+ * model asked for (possibly several in a single turn), and returns the
+ * step result. The renderer issues another `chat:step` (with the previous
+ * step appended to `scratchpad`) until `done: true`. Cancel = stop calling.
+ * See public/chat/chatAssistant.js for the tool catalogue.
+ */
+ipcMain.handle('chat:step', async (_event, {
+  message,
+  history = [],
+  scratchpad = [],
+  activeContext = null,
+  provider = null,
+} = {}) => {
+  try {
+    const helpers = await buildSkillHelpers();
+    return await chatAssistant.runStep({
+      message,
+      history,
+      scratchpad,
+      activeContext,
+      provider,
+      getDb,
+      helpers,
+    });
+  } catch (err) {
+    console.error('[chat:step]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Analytics opt-in control. The renderer pushes the current value at startup
+// (App.js) and whenever the user toggles it (PrivacySettings / Terms).
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('analytics:set-opt-in', async (_event, { optIn } = {}) => {
+  try {
+    analytics.setOptIn(!!optIn);
+    return { success: true, optIn: analytics.getOptIn() };
+  } catch (err) {
+    return { success: false, message: err.message };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Skill helpers — a single bundle of injectables given to skills via params,
+// so a skill never has to require anything outside its own directory or
+// node_modules.
+// ---------------------------------------------------------------------------
+
+/**
+ * Look up a saved connection by name or id from a connections array.
+ */
+function findConnection(connections, ref) {
+  if (!ref) return null;
+  return (
+    connections.find((c) => (c.id || c._id) === ref) ||
+    connections.find((c) => c.name === ref) ||
+    null
+  );
+}
+
+async function loadConnectionsFromDb() {
+  try {
+    const db = getDb('connections');
+    return await db.findAsync({});
+  } catch (e) {
+    console.warn('[skill helpers] Could not load connections:', e.message);
+    return [];
+  }
+}
+
+/**
+ * Build the helper bundle injected into every skill IPC call. The skill (and
+ * any AI-generated function it runs) only needs these helpers — never an
+ * import that reaches across plugin folders or into the renderer source.
+ */
+/**
+ * @param {string|null} [defaultDbPath] - Optional fallback for local file
+ *   connections (nedb / sqlite / lancedb). When a runQuery / getTables /
+ *   getColumns call passes its own `dbPath`, that wins. When neither is
+ *   provided, the call is treated as a saved-connection lookup.
+ */
+async function buildSkillHelpers(defaultDbPath = null) {
+  const apiKeys = loadApiKeys() || {};
+  const connections = await loadConnectionsFromDb();
+
+  const LOCAL_DB_TYPES = new Set(['nedb', 'sqlite', 'lancedb']);
+  const localLib = (dbType) => {
+    if (dbType === 'nedb')    return localNeDB;
+    if (dbType === 'sqlite')  return localSQLite;
+    if (dbType === 'lancedb') return vectorLanceDB;
+    return null;
+  };
+
+  /**
+   * Decide whether a call should be served by a local lib (returns
+   * { dbType, dbPath, lib }) or by a saved-connection lookup (returns null).
+   *
+   * Routing rule: local iff a dbPath is available (per-call or default) AND
+   * `connection` identifies one of the local dbTypes — either a string name
+   * matching nedb/sqlite/lancedb, or an object that carries a matching
+   * `dbType`.
+   */
+  const resolveLocal = (connection, perCallDbPath) => {
+    const dbPath = perCallDbPath || defaultDbPath;
+    if (!dbPath) return null;
+    let dbType = null;
+    if (typeof connection === 'string' && LOCAL_DB_TYPES.has(connection)) {
+      dbType = connection;
+    } else if (connection && typeof connection === 'object' && LOCAL_DB_TYPES.has(connection.dbType)) {
+      dbType = connection.dbType;
+    }
+    if (!dbType) return null;
+    return { dbType, dbPath, lib: localLib(dbType) };
+  };
+
+  const requireConnection = (ref) => {
+    const conn = findConnection(connections, ref);
+    if (!conn) {
+      const names = connections.map((c) => c.name).join(', ');
+      throw new Error(`Connection not found: ${ref}. Available: ${names || 'none'}`);
+    }
+    return conn;
+  };
+
+  const requireConnector = (conn) => {
+    const connector = pluginManager.getConnector(conn.dbType);
+    if (!connector) throw new Error(`No connector registered for dbType: ${conn.dbType}`);
+    return connector;
+  };
+
+  /**
+   * runQuery(connection, query, dbPath = null)
+   *  - dbPath is non-null → local file (nedb / sqlite / lancedb), connection
+   *    is the dbType string ('nedb' | 'sqlite' | 'lancedb')
+   *  - dbPath is null     → saved connection looked up by name/id
+   *
+   * Replaces the old separate sqliteQuery / nedbReadFile / nedbWriteFile /
+   * writeLanceDB helpers — every store is reachable through this one entry.
+   */
+  async function runQuery(connection, query, dbPath = null) {
+    const local = resolveLocal(connection, dbPath);
+    if (local) {
+      const queryObj = (query && typeof query === 'object') ? query : { query };
+      return local.lib.runQuery({ ...queryObj, dbPath: local.dbPath });
+    }
+    const conn = requireConnection(connection);
+    const connector = requireConnector(conn);
+    const id = conn.id || conn._id;
+    const fullConfig = await getFullConfig(id, conn.dbConfig || {});
+    const queryObj = typeof query === 'string'
+      ? { query, limit: 1000000 }
+      : { limit: 1000000, ...query };
+    const result = await connector.runQuery(fullConfig, id, queryObj);
+    if (result && result.success === false) throw new Error(result.message || 'runQuery failed');
+    return result.rows || result.data || [];
+  }
+
+  async function getTables(connection, dbPath = null) {
+    const local = resolveLocal(connection, dbPath);
+    if (local) return local.lib.getTables({ dbPath: local.dbPath });
+    const conn = requireConnection(connection);
+    const connector = requireConnector(conn);
+    const id = conn.id || conn._id;
+    const fullConfig = await getFullConfig(id, conn.dbConfig || {});
+    const result = await connector.getTables(fullConfig, id);
+    return result.tables || [];
+  }
+
+  async function getColumns(connection, table, schema = null, dbPath = null) {
+    const local = resolveLocal(connection, dbPath);
+    if (local) return local.lib.getColumns({ dbPath: local.dbPath, table });
+    const conn = requireConnection(connection);
+    const connector = requireConnector(conn);
+    const id = conn.id || conn._id;
+    const fullConfig = await getFullConfig(id, conn.dbConfig || {});
+    const result = await connector.getColumns(fullConfig, id, schema, table);
+    return result.columns || [];
+  }
+
+  /** Call AI from inside a skill or from generated code. Routes through aiProviders. */
+  async function callAI(prompt, options = {}) {
+    return aiProviders.callAIWithKeys(prompt, { ...options, apiKeys });
+  }
+
+  /** Generate embeddings using the shared vector-embeddings library. */
+  async function vectorize(texts, options = {}) {
+    if (!Array.isArray(texts) || texts.length === 0) return [];
+    const provider = options.provider || (apiKeys.chatgpt || apiKeys.openai ? 'openai' : 'huggingface');
+    const apiKey = provider === 'openai'
+      ? (apiKeys.chatgpt || apiKeys.openai)
+      : apiKeys.huggingface;
+    if (!apiKey) throw new Error(`No API key configured for embedding provider "${provider}"`);
+    const model = options.model || (provider === 'openai'
+      ? 'text-embedding-3-small'
+      : 'sentence-transformers/all-MiniLM-L6-v2');
+    const data = texts.map((t, idx) => ({ __idx: idx, text: typeof t === 'string' ? t : String(t) }));
+    const result = await vectorEmbeddings.generateEmbeddings({ data, columnToEmbed: 'text', provider, model, apiKey });
+    return result.map((r) => r.vector);
+  }
+
+  return {
+    apiKeys,                                   // raw map (read-only use; do NOT echo to renderer)
+    aiProviders: aiProviders.listAvailableProviders(apiKeys),
+    embeddingProviders: [
+      ...(apiKeys.chatgpt || apiKeys.openai ? ['openai'] : []),
+      ...(apiKeys.huggingface ? ['huggingface'] : [])
+    ],
+    connections,                               // [{ _id/id, name, dbType, dbCategory, dbConfig, ... }]
+    getConnection: requireConnection,
+    callAI,
+    runQuery,
+    getTables,
+    getColumns,
+    vectorize,
+    axios,
+    // Full vector-lib modules — exposed so skills like vector-db-executor can
+    // use every export (estimateOpenAICost, listTables, ...) without having
+    // to require across plugin directories.
+    embeddings: vectorEmbeddings,
+    lancedb: vectorLanceDB,
+    appSqliteDbPath,
+    sqlitePool,
+    pluginManager,
+    getFullConfig
+  };
+}
+
+/**
+ * skills:getDescriptions — get skill descriptions for AI context
+ * Returns { success, descriptions: [...] }
+ */
+ipcMain.handle('skills:getDescriptions', async (_event, category = null, context = {}) => {
+  try {
+    const descriptions = pluginManager.getSkillDescriptions(category, context);
+    return { success: true, descriptions };
+  } catch (err) {
+    return { success: false, message: err.message, descriptions: [] };
+  }
+});
+
+/**
+ * skills:analyze — analyze a skill request and get follow-up questions or confirmation
+ * Returns { success, action, followUpQuestion, questionsNeeded, skillParams, ... }
+ */
+ipcMain.handle('skills:analyze', async (_event, { skillId, params }) => {
+  try {
+    const result = await pluginManager.analyzeSkillRequest(skillId, params);
+    return { success: true, ...result };
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+      error: err.message
+    };
+  }
+});
+
+/**
+ * skills:buildPrompt — build skill prompt for AI
+ * Returns { success, prompt, context }
+ */
+ipcMain.handle('skills:buildPrompt', async (_event, { skillId, params }) => {
+  try {
+    params.helpers = await buildSkillHelpers();
+
+    // Backward compatibility for vector-db-executor (kept until it migrates to helpers).
+    if (skillId === 'vector-db-executor') {
+      params.apiKeys = params.helpers.apiKeys;
+      params.vectorConnectors = pluginManager.listConnectors()
+        .filter((c) => c.dbCategory === 'Vector')
+        .map((c) => ({ id: c.id, name: c.name }));
+      params.pluginManager = pluginManager;
+      params.getFullConfig = getFullConfig;
+    }
+
+    const result = await pluginManager.buildSkillPrompt(skillId, params);
+    return { success: true, ...result };
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+      error: err.message
+    };
+  }
+});
+
+/**
+ * skills:processResponse — process AI response through skill
+ * Returns { success, action, pythonCode, explanation, followUpQuestion, directAnswer, ... }
+ */
+ipcMain.handle('skills:processResponse', async (_event, { skillId, aiResponse, operationType, currentState = {}, availableConnections = [] }) => {
+  try {
+    const helpers = await buildSkillHelpers();
+    const connections = availableConnections && availableConnections.length > 0
+      ? availableConnections
+      : helpers.connections;
+    const result = await pluginManager.processSkillResponse(
+      skillId,
+      aiResponse,
+      operationType,
+      currentState,
+      connections,
+      helpers
+    );
+    return { success: true, ...result };
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+      error: err.message,
+      action: 'ask_questions',
+      followUpQuestion: `Error processing response: ${err.message}`
+    };
+  }
+});
+
+/**
+ * skills:execute — execute a skill with given parameters
+ * Returns { success, data, recordCount, ... }
+ */
+ipcMain.handle('skills:execute', async (_event, { skillId, params }) => {
+  try {
+    const helpers = await buildSkillHelpers();
+
+    // Backward compatibility for vector-db-executor (kept until it migrates to helpers).
+    let embeddingApiKey = params.embeddingApiKey;
+    if (skillId === 'vector-db-executor' && !embeddingApiKey && params.embeddingProvider) {
+      const apiKeys = helpers.apiKeys;
+      if (params.embeddingProvider === 'openai') embeddingApiKey = apiKeys.chatgpt;
+      else if (params.embeddingProvider === 'huggingface') embeddingApiKey = apiKeys.huggingface;
+    }
+
+    const enhancedParams = {
+      ...params,
+      helpers,
+      // Legacy keys still consumed by vector-db-executor; new skills should
+      // read everything from `helpers`.
+      embeddingApiKey: embeddingApiKey || params.embeddingApiKey,
+      pluginManager,
+      getFullConfig,
+      appSqliteDbPath,
+      sqlitePool
+    };
+
+    const result = await pluginManager.executeSkill(skillId, enhancedParams);
+    return result;
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+      error: err.message
+    };
+  }
+});
+
+/**
+ * skills:queryVectorPreview — get preview data from vector database
+ * Returns { success, data, recordCount, isJson, storageType }
+ */
+ipcMain.handle('skills:queryVectorPreview', async (_event, params) => {
+  try {
+    const helpers = await buildSkillHelpers();
+    const enhancedParams = {
+      ...params,
+      helpers,
+      pluginManager,
+      getFullConfig
+    };
+
+    const skill = pluginManager.getSkill('vector-db-executor');
+    if (!skill || typeof skill.queryVectorPreview !== 'function') {
+      return {
+        success: false,
+        message: 'Vector preview not available'
+      };
+    }
+
+    const result = await skill.queryVectorPreview(enhancedParams);
+    return result;
+  } catch (err) {
+    return {
+      success: false,
+      message: err.message,
+      error: err.message
     };
   }
 });
@@ -1657,7 +2266,7 @@ ipcMain.handle('cloud-storage:get-picker-credentials', async (_event, { connecti
 });
 
 // Import file from cloud storage to local SQLite/NeDB
-ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fileType, sheetName, containerName, connectionName }) => {
+ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fileType, sheetName, sheets = [], containerName, connectionName }) => {
   try {
     const tmpDir = path.join(app.getPath('temp'), 'dagflux-cloud-imports');
     if (!fs.existsSync(tmpDir)) {
@@ -1680,7 +2289,11 @@ ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fil
       .replace(/[^a-zA-Z0-9_]/g, '_')
       .substring(0, 32); // Limit prefix length
 
-    console.log('[Cloud Import] File:', baseFileName, 'Container:', containerName, 'Prefix:', sanitizedContainerName)
+    // Support both old sheetName (string) and new sheets (array) parameters
+    // If sheetName is provided (backward compatibility), convert to sheets array
+    const sheetsToImport = sheets.length > 0 ? sheets : (sheetName ? [sheetName] : []);
+
+    console.log('[Cloud Import] File:', baseFileName, 'Container:', containerName, 'Prefix:', sanitizedContainerName, 'Sheets:', sheetsToImport)
     if (ext === '.json') {
       // Import to NeDB with container prefix
       const baseCollectionName = path.basename(baseFileName, ext).replace(/[^a-zA-Z0-9_]/g, '_');
@@ -1743,85 +2356,36 @@ ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fil
         dbPath: appSqliteDbPath
       });
 
-      // If it's Excel with a specific sheet, we need to handle it differently
-      if ((ext === '.xlsx' || ext === '.xls') && sheetName) {
-        // Use XLSX to extract specific sheet to CSV first
-        const XLSX = require('xlsx');
-        const workbook = XLSX.readFile(tmpFilePath);
-        const worksheet = workbook.Sheets[sheetName];
-        const csvData = XLSX.utils.sheet_to_csv(worksheet);
-
-        // Write CSV to temp file
-        const csvTmpPath = tmpFilePath.replace(ext, '.csv');
-        fs.writeFileSync(csvTmpPath, csvData);
-
-        // Add sheet name to table name
-        const sanitizedSheetName = String(sheetName)
-          .replace(/[^a-zA-Z0-9_]/g, '_')
-          .replace(/^[0-9]/, '_$&')
-          .substring(0, 64);
-        const tableNameWithSheet = `${tableName}_${sanitizedSheetName}`;
-
-        // Import CSV to SQLite with sheet name included
-        result = await new Promise((resolve) => {
-          const sqlite3 = require('sqlite3').verbose();
-          const db = new sqlite3.Database(appSqliteDbPath);
-
-          importCsvToSqlite(csvTmpPath, tableNameWithSheet, db, appSqliteDbPath)
-            .then(importResult => {
-              db.close();
-              resolve({
-                ...importResult,
-                localPath: appSqliteDbPath,
-                dbType: 'sqlite',
-                sheetName: sheetName // Include original sheet name
-                // Use tables from importResult (it returns the correct table name with sheet suffix)
-              });
-            })
-            .catch(err => {
-              db.close();
-              resolve({ success: false, message: err.message });
-            });
-        });
-
-        // Clean up CSV temp file
-        if (fs.existsSync(csvTmpPath)) {
-          fs.unlinkSync(csvTmpPath);
-        }
+      // Standard import using connection pool
+      if (!sqlitePool) {
+        result = { success: false, message: 'SQLite connection pool not initialized' };
       } else {
-        // Standard import
-        result = await new Promise((resolve) => {
-          const sqlite3 = require('sqlite3').verbose();
-          const db = new sqlite3.Database(appSqliteDbPath);
+        console.log('[Cloud Import] extension:', ext, 'sheets:', sheetsToImport);
 
+        result = await sqlitePool.executeWrite(async (db) => {
+          try {
+            let importResult;
+            if (ext === '.csv') {
+              importResult = await importCsvToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
+            } else if (ext === '.parquet') {
+              importResult = await importParquetToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
+            } else if (ext === '.avro') {
+              importResult = await importAvroToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
+            } else {
+              // Pass sheets array to importSpreadsheetToSqlite
+              // Empty array = import all sheets, specific sheets = import only those
+              importResult = await importSpreadsheetToSqlite(tmpFilePath, tableName, db, appSqliteDbPath, sheetsToImport);
+            }
 
-          console.log('[Cloud Import] extension:', ext);
-
-          let importPromise;
-          if (ext === '.csv') {
-            importPromise = importCsvToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
-          } else if (ext === '.parquet') {
-            importPromise = importParquetToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
-          } else if (ext === '.avro') {
-            importPromise = importAvroToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
-          } else {
-            importPromise = importSpreadsheetToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
+            return {
+              ...importResult,
+              localPath: appSqliteDbPath,
+              dbType: 'sqlite',
+              sheets: sheetsToImport.length > 0 ? sheetsToImport : undefined // Include selected sheets info
+            };
+          } catch (err) {
+            return { success: false, message: err.message };
           }
-
-          importPromise
-            .then(importResult => {
-              db.close();
-              resolve({
-                ...importResult,
-                localPath: appSqliteDbPath,
-                dbType: 'sqlite',
-                tables: [tableName]
-              });
-            })
-            .catch(err => {
-              db.close();
-              resolve({ success: false, message: err.message });
-            });
         });
       }
     }
@@ -1841,683 +2405,34 @@ ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fil
   }
 });
 
-// Handle NeDB (local file) transformations
-// ipcMain.handle('dbconn:transform-nedb', async (_event, {
-//   sourceLocalPath,
-//   targetCollection,
-//   operationType,
-//   nosqlOperation,
-//   transformFunction,
-//   operationMode
-// }) => {
-//   try {
-//     if (!sourceLocalPath || !fs.existsSync(sourceLocalPath)) {
-//       return { success: false, message: 'Source NeDB file not found' };
-//     }
-
-//     // Load source NeDB database
-//     const sourceDb = new Datastore({ filename: sourceLocalPath });
-
-//     return new Promise((resolve) => {
-//       sourceDb.loadDatabase((loadErr) => {
-//         if (loadErr) {
-//           resolve({
-//             success: false,
-//             message: `Failed to load source database: ${loadErr.message}`
-//           });
-//           return;
-//         }
-
-//         let transformFn = null;
-//         if (transformFunction) {
-//           try {
-//             transformFn = eval(`(${transformFunction})`);
-//           } catch (err) {
-//             resolve({
-//               success: false,
-//               message: `Failed to parse transform function: ${err.message}`
-//             });
-//             return;
-//           }
-//         }
-
-//         // Handle different operation types
-//         if (operationType === 'filter' || operationType === 'javascript') {
-//           // Parse filter
-//           const filter = nosqlOperation ? JSON.parse(nosqlOperation) : {};
-
-//           sourceDb.find(filter, async (err, docs) => {
-//             if (err) {
-//               resolve({
-//                 success: false,
-//                 message: `Query failed: ${err.message}`
-//               });
-//               return;
-//             }
-
-//             let transformedDocs = docs;
-
-//             // Apply transformation function if provided
-//             if (transformFn) {
-//               transformedDocs = docs
-//                 .map(doc => transformFn(doc))
-//                 .filter(doc => doc !== null && doc !== undefined);
-//             }
-
-//             // Save to target collection
-//             const targetPath = path.join(app.getPath('userData'), 'local-collections', `${targetCollection}.db`);
-//             const targetDir = path.dirname(targetPath);
-
-//             if (!fs.existsSync(targetDir)) {
-//               fs.mkdirSync(targetDir, { recursive: true });
-//             }
-
-//             // Delete existing file if in new_table mode
-//             if (operationMode === 'new_table' && fs.existsSync(targetPath)) {
-//               fs.unlinkSync(targetPath);
-//             }
-
-//             const targetDb = new Datastore({ filename: targetPath });
-//             targetDb.loadDatabase((targetLoadErr) => {
-//               if (targetLoadErr) {
-//                 resolve({
-//                   success: false,
-//                   message: `Failed to create target database: ${targetLoadErr.message}`
-//                 });
-//                 return;
-//               }
-
-//               targetDb.insert(transformedDocs, (insertErr, newDocs) => {
-//                 if (insertErr) {
-//                   resolve({
-//                     success: false,
-//                     message: `Failed to insert documents: ${insertErr.message}`
-//                   });
-//                 } else {
-//                   resolve({
-//                     success: true,
-//                     message: `Transformation completed. ${newDocs.length} documents saved to "${targetCollection}"`,
-//                     documentsProcessed: docs.length,
-//                     documentsInserted: newDocs.length,
-//                     localPath: targetPath
-//                   });
-//                 }
-//               });
-//             });
-//           });
-//         } else if (operationType === 'delete') {
-//           // Delete operation
-//           const filter = JSON.parse(nosqlOperation);
-
-//           if (operationMode === 'in_place') {
-//             sourceDb.remove(filter, { multi: true }, (err, numRemoved) => {
-//               if (err) {
-//                 resolve({
-//                   success: false,
-//                   message: `Delete failed: ${err.message}`
-//                 });
-//               } else {
-//                 resolve({
-//                   success: true,
-//                   message: `Deleted ${numRemoved} documents`,
-//                   documentsProcessed: numRemoved
-//                 });
-//               }
-//             });
-//           } else {
-//             resolve({
-//               success: false,
-//               message: 'Delete operation only supports in_place mode for NeDB'
-//             });
-//           }
-//         } else if (operationType === 'update') {
-//           // Update operation
-//           const updateOp = JSON.parse(nosqlOperation);
-
-//           if (operationMode === 'in_place') {
-//             sourceDb.update(
-//               updateOp.filter,
-//               updateOp.update,
-//               { multi: true },
-//               (err, numUpdated) => {
-//                 if (err) {
-//                   resolve({
-//                     success: false,
-//                     message: `Update failed: ${err.message}`
-//                   });
-//                 } else {
-//                   resolve({
-//                     success: true,
-//                     message: `Updated ${numUpdated} documents`,
-//                     documentsProcessed: numUpdated
-//                   });
-//                 }
-//               }
-//             );
-//           } else {
-//             resolve({
-//               success: false,
-//               message: 'Update operation only supports in_place mode for NeDB'
-//             });
-//           }
-//         } else {
-//           resolve({
-//             success: false,
-//             message: `Unsupported operation type: ${operationType}. NeDB supports filter, javascript, delete, and update.`
-//           });
-//         }
-//       });
-//     });
-//   } catch (error) {
-//     return {
-//       success: false,
-//       message: `Transformation failed: ${error.message}`,
-//       error: error.stack
-//     };
-//   }
-// });
-
-
 
 // Unified NoSQL transformation handler (routes to appropriate plugin or native NeDB)
-ipcMain.handle('dbconn:transform-nosql', async (_event, {
-  dbType,
-  config,
-  connectionId,
-  sourceLocalPath,
-  sourceCollection,
-  targetCollection,
-  operationType,
-  nosqlOperation,
-  transformFunction,
-  storageLocation,
-  operationMode
-}) => {
-  try {
-    if (dbType === 'nedb') {
-      // Use native NeDB transformation (local file operations)
-      return await transformNeDB({
-        sourceLocalPath,
-        targetCollection,
-        operationType,
-        nosqlOperation,
-        transformFunction,
-        operationMode
-      });
-
-    } else if (pluginManager.hasConnector(dbType)) {
-      // Use NoSQL plugin for transformation (MongoDB, etc.)
-      const fullConfig = await getFullConfig(connectionId, config);
-
-      const plugin = pluginManager.getConnector(dbType);
-      if (!plugin || !plugin.transformData) {
-        return {
-          success: false,
-          message: `${dbType} plugin not found or does not support transformations`
-        };
-      }
-
-      const result = await plugin.transformData(fullConfig, connectionId, {
-        sourceCollection,
-        targetCollection,
-        operationType,
-        nosqlOperation,
-        transformFunction,
-        storageLocation,
-        operationMode
-      });
-
-      // If plugin indicates local storage is needed, save to local NeDB
-      if (result.needsLocalStorage && result.transformedDocs) {
-        return await saveToLocalNeDB(
-          targetCollection,
-          result.transformedDocs,
-          operationMode,
-          result.totalProcessed
-        );
-      }
-
-      return result;
-
-    } else {
-      return {
-        success: false,
-        message: `Unsupported database type: ${dbType}. Only 'mongodb' and 'nedb' are supported.`
-      };
-    }
-
-  } catch (error) {
-    return {
-      success: false,
-      message: `Transformation failed: ${error.message}`,
-      error: error.stack
-    };
-  }
+ipcMain.handle('dbconn:transform-nosql', async (_event, params) => {
+  return await nodeExecution.handleTransformNoSQL(params);
 });
 
 // SQL transformation handler (for PostgreSQL, MySQL, MSSQL, SQLite, CSV, Excel)
-ipcMain.handle('dbconn:transform-sql', async (_event, {
-  dbType,
-  config,
-  connectionId,
-  ddl,
-  sql,
-  previewSql,
-  storageLocation,
-  operationMode,
-  targetTableName,
-  sourceLocalPath = null,
-  insertSql = null
-}) => {
-  try {
-    // LOCAL SQL
-    if(dbType === 'sqlite'){
-      if (operationMode === 'in_place') {
-        // For SQLite in-place operations, execute DDL (ALTER TABLE) and/or UPDATE/DELETE on the app database
-        return Sqlite.inPlaceLocalUpdate(appSqliteDbPath, ddl, sql, targetTableName)
-      } else {
-        // For SQLite new table operations, create table and execute INSERT
-        return Sqlite.createLocalTable(appSqliteDbPath, ddl, sql, targetTableName)
-      }
-    } else {
-      // DATABASE TYPES
-      if (operationMode === 'in_place') {
-        // Execute DDL (ALTER TABLE) and/or UPDATE/DELETE directly on the database
-        const fullConfig = await getFullConfig(connectionId, config);
+ipcMain.handle('dbconn:transform-sql', async (_event, params) => {
+  console.log('params: ', params)
+  return await nodeExecution.handleTransformSQL(params);
+});
 
-        if (!pluginManager.hasConnector(dbType)) {
-          return {
-            success: false,
-            message: `Database type ${dbType} is not supported`
-          };
-        }
+ipcMain.handle('dbconn:execute-join', async (_event, params) => {
+  return await nodeExecution.handleExecuteJoin(params);
+});
 
-        const plugin = pluginManager.getConnector(dbType);
-        let ddlRowCount = 0;
-        let sqlRowCount = 0;
-        let messages = [];
-
-        // Execute DDL first if it exists (ALTER TABLE operations)
-        if (ddl) {
-          const ddlResult = await plugin.runQuery(fullConfig, connectionId, { query: ddl });
-          if (!ddlResult.success) {
-            return {
-              success: false,
-              message: `DDL execution failed: ${ddlResult.message}`
-            };
-          }
-          ddlRowCount = ddlResult.rowCount || 0;
-          messages.push(`DDL executed successfully`);
-        }
-
-        // Execute SQL (UPDATE/DELETE) if it exists
-        if (sql) {
-          const sqlResult = await plugin.runQuery(fullConfig, connectionId, { query: sql });
-          if (!sqlResult.success) {
-            return {
-              success: false,
-              message: `SQL execution failed: ${sqlResult.message}`
-            };
-          }
-          sqlRowCount = sqlResult.rowCount || 0;
-          messages.push(`${sqlRowCount} rows modified`);
-        }
-
-        return {
-          success: true,
-          message: messages.length > 0 ? messages.join('. ') : 'Operation completed successfully',
-          rowCount: sqlRowCount // For UPDATE/DELETE row count
-        };
-      }else if(storageLocation === 'database'){
-      // Execute DDL + INSERT directly in the database
-        // This works for all SQL databases with plugin connectors
-        const fullConfig = await getFullConfig(connectionId, config);
-
-        if (!pluginManager.hasConnector(dbType)) {
-          return {
-            success: false,
-            message: `Database type ${dbType} is not supported. No plugin connector available.`
-          };
-        }
-
-        const plugin = pluginManager.getConnector(dbType);
-
-        // Drop existing table if it exists
-        if (targetTableName) {
-          const dropQuery = `DROP TABLE IF EXISTS ${targetTableName}`;
-          await plugin.runQuery(fullConfig, connectionId, { query: dropQuery });
-        }
-
-        // Execute DDL
-        const ddlResult = await plugin.runQuery(fullConfig, connectionId, { query: ddl });
-        if (!ddlResult.success) {
-          return {
-            success: false,
-            message: `DDL execution failed: ${ddlResult.message}`
-          };
-        }
-
-        // Execute INSERT
-        const sqlResult = await plugin.runQuery(fullConfig, connectionId, { query: sql });
-        if (!sqlResult.success) {
-          return {
-            success: false,
-            message: `SQL execution failed: ${sqlResult.message}`
-          };
-        }
-
-        // Success - return result
-        return {
-          success: true,
-          message: `Table created and ${sqlResult.rowCount || 0} rows inserted`,
-          rowCount: sqlResult.rowCount || 0
-        };
-
-      } else if (storageLocation === 'local') {
-        // Pull data from remote database and save to local SQLite app database
-        // This works for all SQL databases (PostgreSQL, MySQL, MSSQL)
-        const fullConfig = await getFullConfig(connectionId, config);
-
-        if (!pluginManager.hasConnector(dbType)) {
-          return {
-            success: false,
-            message: `Database type ${dbType} is not supported. Cannot pull data to local storage.`
-          };
-        }
-
-        const plugin = pluginManager.getConnector(dbType);
-        return Sqlite.databaseToLocal(fullConfig, plugin, connectionId, sql, ddl, insertSql, targetTableName, appSqliteDbPath)
-      }
-      
-
-    }
-  
-    // Unknown storage location
-    return {
-      success: false,
-      message: `Invalid settings location: ${storageLocation}. Must be 'database' or 'local'.`
-    };
-    
-
-  } catch (error) {
-    console.error('[dbconn:transform-sql]', error);
-    return {
-      success: false,
-      message: `Transformation failed: ${error.message}`,
-      error: error.stack
-    };
-  }
+ipcMain.handle('dbconn:execute-branch', async (_event, params) => {
+  return await nodeExecution.handleExecuteBranch(params);
 });
 
 /**
- * Execute Join Operation
- * Handles joining multiple data sources with SQL or NoSQL destinations
+ * IPC: 'rest-api:execute-fetch'
+ * Runs a REST API fetch plan authored on a DataSource node and materialises the
+ * response into NeDB. Decrypts credentials in the main process only; never
+ * returns resolved URL/headers/body to the renderer.
  */
-ipcMain.handle('dbconn:execute-join', async (_event, {
-  destinationConnection,
-  joinConfig,
-  operationMode = 'new_table'
-}) => {
-  try {
-    const CHUNK_SIZE = 1000;
-    const isNoSQL = ['mongodb', 'nedb'].includes(destinationConnection.dbType);
-    const isLocalStorage = ['sqlite', 'nedb'].includes(destinationConnection.dbType);
-    const targetTableName = joinConfig.targetTableName || joinConfig.targetCollection;
-
-    console.log(`[Join] Starting ${isNoSQL ? 'NoSQL' : 'SQL'} join operation`);
-    console.log(`[Join] Destination: ${destinationConnection.dbType}, Mode: ${operationMode}`);
-
-    if (isNoSQL) {
-      // ===== NoSQL JOIN: Load data into memory, run JavaScript function, insert to destination =====
-
-      const sourcesConfig = joinConfig.sourcesConfig || [];
-      const javascriptFunction = joinConfig.transformFunction || joinConfig.javascriptFunction;
-      const sourceDataArrays = [];
-
-      // Step 1: Load all source data into memory
-      console.log(`[NoSQL Join] Loading ${sourcesConfig.length} sources into memory...`);
-
-      for (let i = 0; i < sourcesConfig.length; i++) {
-        const sourceConfig = sourcesConfig[i];
-        const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
-
-        if (!sourceConnection) {
-          throw new Error(`Source connection not found for ${sourceConfig.sourceNodeId}`);
-        }
-
-        const sourceData = await loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig);
-
-        console.log(`[NoSQL Join] Loaded ${sourceData.length} rows from source ${i + 1}`);
-        sourceDataArrays.push(sourceData);
-      }
-
-      // Step 2: Execute JavaScript join function
-      console.log(`[NoSQL Join] Executing join function...`);
-      const joinFunction = eval(`(${javascriptFunction})`);
-      const joinedResults = joinFunction(...sourceDataArrays);
-
-      console.log(`Join_produced:`, destinationConnection);
-
-      // Step 3: Insert into destination
-      if (isLocalStorage) {
-        // Save to local NeDB
-        const result = await saveToLocalNeDB(
-          targetTableName,
-          joinedResults,
-          operationMode,
-          joinedResults.length
-        );
-        return result;
-      } else {
-        // Insert into remote NoSQL database
-        if (!pluginManager.hasConnector(destinationConnection.dbType)) {
-          return {
-            success: false,
-            message: `Database type ${destinationConnection.dbType} is not supported`
-          };
-        }
-
-        const fullConfig = await getFullConfig(destinationConnection.id, destinationConnection.dbConfig || {});
-        const plugin = pluginManager.getConnector(destinationConnection.dbType);
-
-        if (operationMode === 'new_table') {
-          // Drop existing collection
-          try {
-            await plugin.runQuery(fullConfig, destinationConnection.id, {
-              operation: 'drop',
-              collection: targetTableName
-            });
-          } catch (err) {
-            // Collection might not exist
-          }
-        }
-
-        // Insert documents
-        const insertResult = await plugin.runQuery(fullConfig, destinationConnection.id, {
-          operation: 'insertMany',
-          collection: targetTableName,
-          documents: joinedResults
-        });
-
-        return {
-          success: true,
-          message: `Successfully inserted ${joinedResults.length} documents into ${targetTableName}`,
-          documentsInserted: joinedResults.length
-        };
-      }
-
-    } else {
-      // ===== SQL JOIN: Create temp tables, load data, execute join SQL =====
-
-      const sourcesConfig = joinConfig.sourcesConfig || [];
-      const targetDdl = joinConfig.targetDdl || joinConfig.ddl;
-      const joinSql = joinConfig.joinSql || joinConfig.sql;
-      const tempTablesToCleanup = [];
-
-      // Check if destination is local SQLite
-      const isLocalSQLite = destinationConnection.dbType === 'sqlite';
-      // console.log('sourcesConfig: ', joinSql, targetDdl, sourcesConfig)
-      if (isLocalSQLite) {
-        // ===== LOCAL SQLITE JOIN =====
-        return await executeLocalSQLiteJoin(
-          appSqliteDbPath,
-          sourcesConfig,
-          targetDdl,
-          joinSql,
-          targetTableName,
-          operationMode,
-          pluginManager,
-          getFullConfig
-        );
-      }
-
-      // ===== REMOTE DATABASE JOIN =====
-
-      // Get destination connection
-      if (!pluginManager.hasConnector(destinationConnection.dbType)) {
-        return {
-          success: false,
-          message: `Database type ${destinationConnection.dbType} is not supported`
-        };
-      }
-
-      const destFullConfig = await getFullConfig(destinationConnection.id, destinationConnection.dbConfig || {});
-      const destPlugin = pluginManager.getConnector(destinationConnection.dbType);
-
-
-      // Step 1: Create temp tables and load source data
-      for (let i = 0; i < sourcesConfig.length; i++) {
-        const sourceConfig = sourcesConfig[i];
-
-        // Skip sources that don't need temp tables (already in destination)
-        if (!sourceConfig.ddl || !sourceConfig.tempTableName) {
-          console.log(`exists: `, sourceConfig);
-          continue;
-        }
-        console.log(`SOURCE_CONFIG: `, sourceConfig);
-
-        const tempTableName = sourceConfig.tempTableName;
-        tempTablesToCleanup.push(tempTableName);
-
-        console.log(`TEMP_TABLE: ${tempTableName}`);
-
-        // Drop temp table if exists (from previous failed runs)
-        try {
-          // For temp tables, use the name as provided in the config (already properly formatted in DDL)
-          // Don't add additional quoting/schema qualification as it may already be included
-          await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${tempTableName}`});
-        } catch (err) {
-          // Ignore errors if table doesn't exist
-          console.log(`Ignoring drop table error for ${tempTableName}: ${err.message}`);
-        }
-
-        // Create temp table
-        await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: sourceConfig.ddl});
-
-        // Load data from source
-        const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
-        const isNoSQLSource = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
-
-        // Get selectedColumns from sourceConfig
-        const selectedColumns = sourceConfig.selectedColumns;
-        if (!selectedColumns || selectedColumns.length === 0) {
-          throw new Error(`No selectedColumns found for source ${sourceConfig.sourceNodeId}`);
-        }
-
-        let totalInserted = 0;
-
-        if (isNoSQLSource) {
-          // NoSQL source: Load all data into memory, then batch insert
-          // console.log(`[SQL Join] Loading NoSQL source ${i + 1}...`);
-
-          const sourceData = await loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig);
-          totalInserted = await insertDataToTempTable(
-            destPlugin,
-            destFullConfig,
-            destinationConnection.id,
-            tempTableName,
-            selectedColumns,
-            sourceData,
-            CHUNK_SIZE
-          );
-
-          console.log(`SQL_LOADED: ${totalInserted}/${sourceData.length}`);
-
-        } else {
-          // SQL source: Stream data in chunks
-          // console.log(`[SQL Join] Loading SQL source ${i + 1}...`);
-
-          totalInserted = await loadSQLSourceInChunks(
-            sourceConnection,
-            sourceConfig.sql,
-            CHUNK_SIZE,
-            pluginManager,
-            getFullConfig,
-            async (rows) => {
-              await insertDataToTempTable(
-                destPlugin,
-                destFullConfig,
-                destinationConnection.id,
-                tempTableName,
-                selectedColumns,
-                rows,
-                rows.length // Don't re-chunk, already chunked by loadSQLSourceInChunks
-              );
-            }
-          );
-
-          console.log(`[SQL Join] Loaded ${totalInserted} rows from SQL source`);
-        }
-
-        console.log(`[SQL Join] Finished loading source ${i + 1}: ${totalInserted} total rows`);
-      }
-
-      // Step 2: Create target table if needed
-      if (operationMode === 'new_table' && targetDdl) {
-        console.log(`join_new_table ${targetTableName}...`);
-
-        // Drop target table if exists (for clean re-runs)
-        try {
-          await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${targetTableName}`});
-        } catch (err) {
-          console.log('destPlugin_drop_table_error: ', err)
-          // Ignore errors if table doesn't exist
-        }
-
-        await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: targetDdl});
-      }
-
-      // Step 3: Execute join query
-      console.log(`join_execute_main_query: `, joinSql);
-      const joinResult = await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: joinSql});
-      const rowsAffected = joinResult.rowCount || joinResult.affectedRows || 0;
-
-      // Step 4: Clean up temp tables
-      console.log(`join_drop_temp_table: `, tempTablesToCleanup);
-      for (const tempTable of tempTablesToCleanup) {
-        try {
-          await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${tempTable}`});
-        } catch (err) {
-          console.error(`Failed to cleanup ${tempTable}:`, err);
-        }
-      }
-
-      return {
-        success: true,
-        message: `Join completed successfully. ${rowsAffected} rows inserted into ${targetTableName}`,
-        rowsAffected,
-        targetTableName
-      };
-    }
-
-  } catch (error) {
-    console.error('Join execution error:', error);
-    return {
-      success: false,
-      message: `Join execution failed: ${error.message}`,
-      error: error.stack
-    };
-  }
+ipcMain.handle('rest-api:execute-fetch', async (_event, params) => {
+  return await apiFetch.handleExecuteApiFetch(params);
 });
 
 /**
@@ -2525,14 +2440,541 @@ ipcMain.handle('dbconn:execute-join', async (_event, {
  * Handles exporting data to local files or database connections
  */
 ipcMain.handle('dbconn:execute-output', async (_event, sourceConnection, sourceTableSchema, outputSettings) => {
+  const skillHelpers = await buildSkillHelpers();
   return await executeOutput(
     sourceConnection,
     sourceTableSchema,
     outputSettings,
     pluginManager,
     getFullConfig,
-    getDb
+    getDb,
+    skillHelpers
   );
+});
+
+// ---------------------------------------------------------------------------
+// Workflow Execution
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute an entire workflow using executionSteps from the workflow
+ * Logs each step to the executions collection
+ */
+ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, nodes, edges, executionSteps }) => {
+  const executionsDb = getDb('executions');
+  const startTime = new Date().toISOString();
+
+  // Generate unique execution ID
+  const executionId = `exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+  // Create initial execution record
+  const executionRecord = {
+    executionId,
+    workflowId,
+    workflowName,
+    status: 'running',
+    startTime,
+    endTime: null,
+    duration: null,
+    nodeExecutions: [],
+    logs: [],
+    results: {
+      totalRecordsProcessed: 0,
+      summary: ''
+    },
+    trigger: {
+      type: 'manual',
+      user: 'local'
+    },
+    username: 'local'
+  };
+
+  try {
+    await executionsDb.insertAsync(executionRecord);
+
+    // Build a map of node IDs to nodes
+    const nodeMap = new Map();
+    nodes.forEach(node => nodeMap.set(node.id, node));
+
+    // Use executionSteps if provided, otherwise extract node IDs from nodes array
+    const stepsToExecute = executionSteps && executionSteps.length > 0
+      ? executionSteps.sort((a, b) => a.order - b.order)
+      : nodes.map((node, index) => ({ nodeId: node.id, order: index }));
+
+    const executionOrder = stepsToExecute.map(step => step.nodeId);
+
+    console.log(`[Workflow Execution] Starting execution ${executionId}`);
+    console.log(`[Workflow Execution] Execution order:`, executionOrder);
+
+    // Add log entry
+    await addExecutionLog(executionsDb, executionId, 'info', `Starting workflow execution: ${workflowName}`);
+
+    let totalRecordsProcessed = 0;
+    const nodeResults = new Map();
+
+    // Prepare helpers object for node execution
+    const helpers = {
+      pluginManager,
+      getFullConfig,
+      getDb,
+      appSqliteDbPath,
+      sqlitePool,
+      buildSkillHelpers          // available for output / vector skill calls
+    };
+
+    // Execute each node in order from executionSteps
+    for (const step of stepsToExecute) {
+      const nodeId = step.nodeId;
+      const node = nodeMap.get(nodeId);
+
+      if (!node) {
+        console.warn(`[Workflow Execution] Node ${nodeId} not found in node map`);
+        continue;
+      }
+
+      const nodeStartTime = Date.now();
+      const nodeLabel = step.customName || step.nodeLabel || node.data?.label || node.id;
+
+      await addExecutionLog(executionsDb, executionId, 'info', `Executing node: ${nodeLabel} (${node.type})`);
+
+      try {
+        // Execute the node using the helper function
+        const nodeResult = await executeNode(node, nodeMap, edges, helpers);
+
+        const nodeDuration = Date.now() - nodeStartTime;
+
+        // Store node result
+        nodeResults.set(nodeId, nodeResult);
+
+        // Update node execution record
+        const nodeExecution = {
+          nodeId,
+          nodeName: nodeLabel,
+          nodeType: node.type,
+          status: nodeResult?.success ? 'completed' : 'failed',
+          startTime: new Date(nodeStartTime).toISOString(),
+          duration: nodeDuration,
+          error: nodeResult?.success ? null : { message: nodeResult?.message || 'Unknown error' },
+          metrics: {
+            recordsProcessed: nodeResult?.recordsProcessed || 0,
+            recordsSuccess: nodeResult?.recordsProcessed || 0,
+            recordsFailed: 0
+          }
+        };
+
+        executionRecord.nodeExecutions.push(nodeExecution);
+
+        if (nodeResult?.success) {
+          totalRecordsProcessed += nodeResult?.recordsProcessed || 0;
+          await addExecutionLog(executionsDb, executionId, 'info', `Node ${nodeLabel} completed successfully`);
+        } else {
+          await addExecutionLog(executionsDb, executionId, 'error', `Node ${nodeLabel} failed: ${nodeResult?.message || 'Unknown error'}`, nodeId);
+          throw new Error(`Node ${nodeLabel} failed: ${nodeResult?.message || 'Unknown error'}`);
+        }
+
+      } catch (nodeError) {
+        console.error(`[Workflow Execution] Error executing node ${nodeId}:`, nodeError);
+
+        const nodeDuration = Date.now() - nodeStartTime;
+
+        executionRecord.nodeExecutions.push({
+          nodeId,
+          nodeName: nodeLabel,
+          nodeType: node.type,
+          status: 'failed',
+          startTime: new Date(nodeStartTime).toISOString(),
+          duration: nodeDuration,
+          error: { message: nodeError.message },
+          metrics: {
+            recordsProcessed: 0,
+            recordsSuccess: 0,
+            recordsFailed: 0
+          }
+        });
+
+        await addExecutionLog(executionsDb, executionId, 'error', `Node execution failed: ${nodeError.message}`, nodeId);
+        throw nodeError;
+      }
+    }
+
+    // Workflow completed successfully
+    const endTime = new Date().toISOString();
+    const duration = Date.now() - new Date(startTime).getTime();
+
+    executionRecord.status = 'completed';
+    executionRecord.endTime = endTime;
+    executionRecord.duration = duration;
+    executionRecord.results.totalRecordsProcessed = totalRecordsProcessed;
+    executionRecord.results.summary = `Successfully executed ${executionOrder.length} nodes`;
+    executionRecord.executionOrder = executionOrder;
+
+    await executionsDb.updateAsync(
+      { executionId },
+      { $set: executionRecord },
+      {}
+    );
+
+    await addExecutionLog(executionsDb, executionId, 'info', `Workflow execution completed successfully`);
+
+    console.log(`[Workflow Execution] Execution ${executionId} completed successfully`);
+
+    return {
+      success: true,
+      executionId,
+      message: 'Workflow executed successfully',
+      results: executionRecord.results
+    };
+
+  } catch (error) {
+    console.error(`[Workflow Execution] Execution ${executionId} failed:`, error);
+
+    const endTime = new Date().toISOString();
+    const duration = Date.now() - new Date(startTime).getTime();
+
+    executionRecord.status = 'failed';
+    executionRecord.endTime = endTime;
+    executionRecord.duration = duration;
+    executionRecord.error = {
+      message: error.message,
+      stack: error.stack
+    };
+
+    await executionsDb.updateAsync(
+      { executionId },
+      { $set: executionRecord },
+      {}
+    );
+
+    await addExecutionLog(executionsDb, executionId, 'error', `Workflow execution failed: ${error.message}`);
+
+    return {
+      success: false,
+      executionId,
+      message: error.message,
+      error: error.message
+    };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Start Trigger Management (CRON and File Watchers)
+// ---------------------------------------------------------------------------
+
+// Track active workflow executions to prevent concurrent runs
+const activeWorkflowExecutions = new Map();
+
+/**
+ * Execute a workflow from a trigger (CRON or file watcher)
+ * @param {String} workflowId - Workflow ID to execute
+ * @param {String} nodeId - Trigger node ID
+ * @param {Object} triggerInfo - Information about the trigger
+ * @returns {Promise<Object>} Execution result
+ */
+async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
+  try {
+    console.log('activeWorkflowExecutions: ', activeWorkflowExecutions)
+    // Check if workflow is already executing
+    if (activeWorkflowExecutions.has(workflowId)) {
+      console.log(`[Trigger] Workflow ${workflowId} is already executing, skipping trigger`);
+      return {
+        success: false,
+        message: 'Workflow is already executing',
+        skipped: true
+      };
+    }
+
+    // Mark workflow as executing
+    activeWorkflowExecutions.set(workflowId, {
+      startTime: new Date().toISOString(),
+      nodeId: nodeId,
+      trigger: triggerInfo
+    });
+
+    // Load workflow from database
+    const workflowsDb = getDb('workflows');
+    const workflow = await workflowsDb.findOneAsync({ id: workflowId });
+
+    // console.log('workflow: ', workflow)
+    if (!workflow) {
+      console.error(`[Trigger] Workflow ${workflowId} not found`);
+      activeWorkflowExecutions.delete(workflowId);
+      return { success: false, message: 'Workflow not found' };
+    }
+
+    console.log(`[Trigger] Executing workflow: ${workflow.name}`);
+
+
+    const notificationOptions = {
+      title: 'DagFlux',
+      body: `Workflow "${workflow.name}" is now running...`,
+    };
+
+    if (Notification.isSupported()) {
+      new Notification(notificationOptions).show();
+    }
+
+    // Execute workflow
+    const executionsDb = getDb('executions');
+    const startTime = new Date().toISOString();
+    const executionId = `exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Create execution record
+    const executionRecord = {
+      executionId,
+      workflowId,
+      workflowName: workflow.name,
+      status: 'running',
+      startTime,
+      endTime: null,
+      duration: null,
+      nodeExecutions: [],
+      logs: [],
+      results: {
+        totalRecordsProcessed: 0,
+        summary: ''
+      },
+      trigger: {
+        ...triggerInfo,
+        nodeId: nodeId
+      },
+      username: 'system'
+    };
+
+    await executionsDb.insertAsync(executionRecord);
+
+    // Build node map
+    const nodeMap = new Map();
+    workflow.nodes.forEach(node => nodeMap.set(node.id, node));
+
+    // Get execution steps
+    const stepsToExecute = workflow.executionSteps && workflow.executionSteps.length > 0
+      ? workflow.executionSteps.sort((a, b) => a.order - b.order)
+      : workflow.nodes.map((node, index) => ({ nodeId: node.id, order: index }));
+
+    await addExecutionLog(
+      executionsDb,
+      executionId,
+      'info',
+      `Starting workflow execution: ${workflow.name} (triggered by ${triggerInfo.type}: ${triggerInfo.description})`
+    );
+
+    // Prepare helpers
+    const helpers = {
+      pluginManager,
+      getFullConfig,
+      getDb,
+      appSqliteDbPath,
+      sqlitePool,
+      buildSkillHelpers          // available for output / vector skill calls
+    };
+
+    let totalRecordsProcessed = 0;
+
+    // Execute each node
+    for (const step of stepsToExecute) {
+      const node = nodeMap.get(step.nodeId);
+      if (!node) continue;
+
+      const nodeStartTime = Date.now();
+      const nodeLabel = step.customName || step.nodeLabel || node.data?.label || node.id;
+
+      await addExecutionLog(
+        executionsDb,
+        executionId,
+        'info',
+        `Executing node: ${nodeLabel} (${node.type})`
+      );
+
+      try {
+        const nodeResult = await executeNode(node, nodeMap, workflow.edges, helpers);
+        const nodeDuration = Date.now() - nodeStartTime;
+
+        const nodeExec = {
+          nodeId: node.id,
+          nodeName: nodeLabel,
+          nodeType: node.type,
+          status: nodeResult?.success ? 'completed' : 'failed',
+          startTime: new Date(nodeStartTime).toISOString(),
+          duration: nodeDuration,
+          error: nodeResult?.success ? null : { message: nodeResult?.message || 'Unknown error' },
+          metrics: {
+            recordsProcessed: nodeResult?.recordsProcessed || 0,
+            recordsSuccess: nodeResult?.recordsProcessed || 0,
+            recordsFailed: 0
+          }
+        };
+
+        await executionsDb.updateAsync(
+          { executionId },
+          { $push: { nodeExecutions: nodeExec } }
+        );
+
+        if (!nodeResult?.success) {
+          throw new Error(nodeResult?.message || 'Node execution failed');
+        }
+
+        totalRecordsProcessed += nodeResult?.recordsProcessed || 0;
+      } catch (error) {
+        await addExecutionLog(
+          executionsDb,
+          executionId,
+          'error',
+          `Node execution failed: ${error.message}`
+        );
+
+        // Mark as failed
+        const endTime = new Date().toISOString();
+        const duration = new Date(endTime) - new Date(startTime);
+
+        await executionsDb.updateAsync(
+          { executionId },
+          {
+            $set: {
+              status: 'failed',
+              endTime,
+              duration,
+              'results.totalRecordsProcessed': totalRecordsProcessed,
+              'results.summary': `Workflow failed: ${error.message}`
+            }
+          }
+        );
+
+
+        if (Notification.isSupported()) {
+          new Notification({
+            title: 'DagFlux - Workflow Failed',
+            body: `Workflow "${workflow.name}" failed: ${error.message}`,
+          }).show();
+        }
+
+        throw error;
+      }
+    }
+
+    // Mark as completed
+    const endTime = new Date().toISOString();
+    const duration = new Date(endTime) - new Date(startTime);
+
+    await executionsDb.updateAsync(
+      { executionId },
+      {
+        $set: {
+          status: 'completed',
+          endTime,
+          duration,
+          'results.totalRecordsProcessed': totalRecordsProcessed,
+          'results.summary': `Workflow completed successfully. Processed ${totalRecordsProcessed} records.`
+        }
+      }
+    );
+
+    await addExecutionLog(
+      executionsDb,
+      executionId,
+      'info',
+      `Workflow execution completed: ${workflow.name}`
+    );
+
+    console.log(`[Trigger] Workflow ${workflowId} executed successfully`);
+
+
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'DagFlux - Workflow Completed',
+        body: `Workflow "${workflow.name}" executed successfully!`,
+      }).show();
+    }
+    console.log('activeWorkflowExecutionsdelete: ', activeWorkflowExecutions)
+
+    // Remove from active executions
+    activeWorkflowExecutions.delete(workflowId);
+
+    return {
+      success: true,
+      executionId,
+      message: 'Workflow executed successfully',
+      recordsProcessed: totalRecordsProcessed
+    };
+  } catch (error) {
+    console.error(`[Trigger] Failed to execute workflow ${workflowId}:`, error);
+
+    // Remove from active executions
+    activeWorkflowExecutions.delete(workflowId);
+
+    // Get workflow name if available
+    let workflowName = 'Unknown Workflow';
+    try {
+      const workflowsDb = getDb('workflows');
+      const workflow = await workflowsDb.findOneAsync({ _id: workflowId });
+
+      if (workflow) {
+        workflowName = workflow.name;
+      }
+    } catch (err) {
+      // Ignore error, use default name
+    }
+
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'DagFlux - Workflow Error',
+        body: `Workflow "${workflowName}" encountered an error: ${error.message}`,
+      }).show();
+    }
+
+    return {
+      success: false,
+      message: error.message
+    };
+  }
+}
+
+/**
+ * Register a CRON job for time-based workflow triggers
+ */
+ipcMain.handle('start-trigger:register-cron', async (_event, params) => {
+  return await registerCronJob(params, executeWorkflowFromTrigger);
+});
+
+/**
+ * Unregister a CRON job
+ */
+ipcMain.handle('start-trigger:unregister-cron', async (_event, params) => {
+  return await unregisterCronJob(params);
+});
+
+/**
+ * Register a file watcher for file/directory change triggers
+ */
+ipcMain.handle('start-trigger:register-file-watch', async (_event, params) => {
+  return await registerFileWatcher(params, executeWorkflowFromTrigger);
+});
+
+/**
+ * Unregister a file watcher
+ */
+ipcMain.handle('start-trigger:unregister-file-watch', async (_event, params) => {
+  return await unregisterFileWatcher(params);
+});
+
+/**
+ * Get all active triggers (CRON jobs and file watchers)
+ */
+ipcMain.handle('start-trigger:get-active', async () => {
+  try {
+    return {
+      success: true,
+      triggers: {
+        cron: getActiveCronJobs(),
+        file: getActiveFileWatchers()
+      }
+    };
+  } catch (error) {
+    console.error('[Triggers] Get active error:', error);
+    return {
+      success: false,
+      message: error.message
+    };
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -2550,7 +2992,7 @@ function createWindow() {
       nodeIntegration: false,
       preload: path.join(__dirname, 'preload.js'),
     },
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    titleBarStyle: 'default',
     title: 'DagFlux',
     show: false,
   });
@@ -2572,12 +3014,20 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
-  // Initialize single SQLite database for the app
-  initializeAppDatabase();
+app.whenReady().then(async () => {
+  // Initialize SQLite connection pool
+  await initializeAppDatabase();
+
+  // Initialize node execution module with dependencies (skill helpers
+  // builder is passed so vector-DB join hooks can access embedding libs).
+  nodeExecution.initialize(appSqliteDbPath, getFullConfig, sqlitePool, buildSkillHelpers);
+  apiFetch.initialize(getFullConfig);
 
   // Load connector plugins
   pluginManager.loadPlugins();
+
+  // Register all workflow triggers (CRON jobs and file watchers)
+  await registerAllWorkflowTriggers(getDb, executeWorkflowFromTrigger);
 
   createWindow();
 
@@ -2588,4 +3038,26 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+// Gracefully close SQLite connection pool and stop all triggers on app quit
+app.on('before-quit', async (event) => {
+  event.preventDefault();
+
+  // Stop all CRON jobs
+  console.log('[Electron] Stopping all CRON jobs...');
+  stopAllCronJobs();
+
+  // Stop all file watchers
+  console.log('[Electron] Stopping all file watchers...');
+  await stopAllFileWatchers();
+
+  // Close SQLite connection pool
+  if (sqlitePool) {
+    console.log('[Electron] Closing SQLite connection pool...');
+    await sqlitePool.close();
+    sqlitePool = null;
+  }
+
+  app.exit(0);
 });
