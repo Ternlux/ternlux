@@ -1,0 +1,1104 @@
+/**
+ * Workflow Execution Helpers
+ * Handles execution of different node types in a workflow
+ */
+
+const path = require('path');
+const fs = require('fs');
+const { handleTransformNoSQL, handleTransformSQL, handleExecuteJoin, handleExecuteBranch } = require('./NodeExecution');
+const { handleExecuteApiFetch } = require('./ApiFetch');
+const { executeOutput } = require('./outputExecutionHelpers');
+const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, importCsvToSqlite } = require('../imports/importHelpers');
+
+/**
+ * Helper function to add a log entry to an execution
+ */
+async function addExecutionLog(executionsDb, executionId, level, message, nodeId = null) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    nodeId
+  };
+
+  await executionsDb.updateAsync(
+    { executionId },
+    { $push: { logs: logEntry } },
+    {}
+  );
+}
+
+/**
+ * Get source local path for NeDB or local SQLite operations
+ */
+function getSourceLocalPath(targetNode, nodeMap, edges) {
+  const sourceEdge = edges.find(e => e.target === targetNode.id);
+  if (!sourceEdge) return null;
+
+  const sourceNode = nodeMap.get(sourceEdge.source);
+  if (!sourceNode?.data?.config) return null;
+
+  const sourceConfig = sourceNode.data.config;
+
+  return sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath;
+}
+
+  /**
+   * Helper function to get original file path from connection
+   * @param {String} sourceConnectionId - Connection ID
+   * @param {String} dbType - Database type (sqlite or nedb)
+   * @returns {Promise<String|null>} Original file path or null
+   */
+  const getOriginalFilePath = async (sourceConnectionId, dbType, getDb) => {
+    if (!sourceConnectionId) {
+      return null;
+    }
+
+    // Only applicable for local file types
+    if (!['sqlite', 'nedb'].includes(dbType)) {
+      return null;
+    }
+
+    try {
+      // Get connections database
+      const connectionsDb = await getDb('connections');
+
+      // Find the connection record
+      const connection = await connectionsDb.findOneAsync({ id: sourceConnectionId });
+      console.log('connection: ', connection, sourceConnectionId, dbType)
+      if (!connection) {
+        console.warn(`[executeDataSourceNode] Connection not found: ${sourceConnectionId}`);
+        return null;
+      }
+
+      // Get localPath from connection
+      const localPath = connection?.fileInfo?.sourceFilePath || connection?.fileInfo?.filePath;
+
+      if (localPath) {
+        console.log(`[executeDataSourceNode] Found original file path for ${dbType}: ${localPath}`);
+        return localPath;
+      }
+
+      console.warn(`[executeDataSourceNode] No local path found in connection ${sourceConnectionId}`);
+      return null;
+    } catch (error) {
+      console.error(`[executeDataSourceNode] Error getting file path from connection:`, error);
+      return null;
+    }
+  };
+
+/**
+ * Execute a Data Source node
+ * Imports local files or Google Sheets
+ */
+async function executeDataSourceNode(node, helpers) {
+  const { pluginManager, getFullConfig, getDb, appSqliteDbPath, sqlitePool } = helpers;
+
+  console.log(`[Workflow Execution] Executing Data Source node: ${node.id}`);
+
+  // Data source nodes can have local file imports or cloud data sources
+  const config = node.data?.config;
+  // console.log('node: ', node)
+
+  if (!config) {
+    return {
+      success: false,
+      message: 'Data source configuration not found',
+      recordsProcessed: 0
+    };
+  }
+
+
+  const sourceConnectionId = config.sourceConnectionId;
+  console.log('config: ', config)
+  // REST API source: re-execute the saved fetch function and re-populate the
+  // local NeDB collection the downstream nodes already point at.
+  if (config.sourceConnectionType === 'api' && config.apiFetchCode) {
+    try {
+      console.log('[Workflow Execution] REST API source — re-running fetch function');
+      const collection = config.sourceCollection ||
+        String(node.id).replace(/[^a-z0-9]+/gi, '_').toLowerCase() ||
+        'api_response';
+
+      const fetchResult = await handleExecuteApiFetch({
+        apiConnectionId: config.sourceApiConnectionId,
+        apiConnectionConfig: config.apiConnectionPublicConfig || {},
+        apiFetchCode: config.apiFetchCode,
+        nedbCollection: collection,
+        operationMode: 'new_table',
+      });
+
+      if (!fetchResult.success) {
+        return {
+          success: false,
+          message: `REST API fetch failed: ${fetchResult.error || 'unknown error'}`,
+          recordsProcessed: 0,
+        };
+      }
+
+      return {
+        success: true,
+        message: `REST API fetch completed: ${fetchResult.rowCount || 0} rows into ${collection}`,
+        recordsProcessed: fetchResult.rowCount || 0,
+      };
+    } catch (err) {
+      console.error('[Workflow Execution] REST API source error:', err);
+      return { success: false, message: err.message || 'REST API source failed', recordsProcessed: 0 };
+    }
+  }
+
+  // Check if it's a cloud storage file that needs to be re-downloaded and imported
+  if (config.cloudSource) {
+    try {
+      console.log('[Workflow Execution] Cloud storage file detected, downloading and importing...');
+
+      const { connectionId, dbType, containerName, objectKey, objectName, sheetName } = config.cloudSource;
+
+      // Get the cloud storage connection config
+      const cloudConnection = await getFullConfig(connectionId);
+      if (!cloudConnection) {
+        return {
+          success: false,
+          message: `Cloud storage connection not found: ${connectionId}`,
+          recordsProcessed: 0
+        };
+      }
+
+      // Get the connector plugin
+      const plugin = pluginManager.getConnector(dbType);
+      if (!plugin || !plugin.downloadObject) {
+        return {
+          success: false,
+          message: `Cloud storage connector not available for: ${dbType}`,
+          recordsProcessed: 0
+        };
+      }
+
+      // Download the file from cloud storage
+      console.log(`[Workflow Execution] Downloading from ${dbType}: ${containerName}/${objectKey}`);
+      // console.log('cloudConnection: ', cloudConnection)
+      const downloadResult = await plugin.downloadObject(
+        cloudConnection,
+        connectionId,
+        containerName,
+        objectKey
+      );
+
+      if (!downloadResult.success) {
+        return {
+          success: false,
+          message: `Failed to download file: ${downloadResult.message}`,
+          recordsProcessed: 0
+        };
+      }
+
+      
+      const fileExt = path.extname(objectName).toLowerCase();
+
+      let fileType;
+      if (['.csv'].includes(fileExt)) {
+        fileType = 'spreadsheet';
+      } else if (['.xlsx', '.xls'].includes(fileExt)) {
+        fileType = 'spreadsheet';
+      } else if (['.json'].includes(fileExt)) {
+        fileType = 'json';
+      } else if (['.parquet'].includes(fileExt)) {
+        fileType = 'parquet';
+      } else if (['.avro'].includes(fileExt)) {
+        fileType = 'avro';
+      }
+
+      if (!fileType) {
+        return {
+          success: false,
+          message: `Unsupported file type: ${fileExt}`,
+          recordsProcessed: 0
+        };
+      }
+
+      // Import the file to local storage
+      const tableName = config.sourceTableName || config.sourceCollection || config.sourceTableSchema?.tableName;
+      
+      if (fileType === 'spreadsheet' || fileType === 'parquet' || fileType === 'avro') {
+        // Import to SQLite
+        if (!sqlitePool) {
+          throw new Error('SQLite connection pool not available');
+        }
+
+        // Prepare sheets array for Excel files
+        // If sheetName is specified in cloudSource, only import that sheet
+        const sheets = sheetName ? [sheetName] : [];
+
+        const importResult = await sqlitePool.executeWrite(async (db) => {
+          if (fileType === 'parquet') {
+            // Save buffer to temp file for parquet parser
+            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
+            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
+            const result = await importParquetToSqlite(tempPath, tableName, db, appSqliteDbPath);
+            fs.unlinkSync(tempPath);
+            return result;
+          } else if (fileType === 'avro') {
+            // Save buffer to temp file for avro parser
+            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
+            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
+            const result = await importAvroToSqlite(tempPath, tableName, db, appSqliteDbPath);
+            fs.unlinkSync(tempPath);
+            return result;
+          } else if (['.xlsx', '.xls'].includes(fileExt)) {
+            // Save buffer to temp file for spreadsheet parser
+            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
+            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
+            const connectionName = sheetName ? tableName.replace(`_${sheetName}`, '') : tableName;
+            console.log('tableName, sheets: ', connectionName, tableName, sheets)
+            // Pass sheets array: empty = import all sheets, specific = import only those
+            const result = await importSpreadsheetToSqlite(tempPath, connectionName, db, appSqliteDbPath, sheets);
+            fs.unlinkSync(tempPath);
+            return result;
+          } else if (fileExt === '.csv') {
+            // Save buffer to temp file for CSV parser
+            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
+            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
+            const result = await importCsvToSqlite(tempPath, tableName, db, appSqliteDbPath);
+            fs.unlinkSync(tempPath);
+            return result;
+          }
+        });
+
+        if (importResult.success) {
+          return {
+            success: true,
+            message: `Successfully imported ${importResult.rowCount || 0} rows from cloud storage`,
+            recordsProcessed: importResult.rowCount || 0
+          };
+        } else {
+          return {
+            success: false,
+            message: importResult.message || 'Cloud storage import failed',
+            recordsProcessed: 0
+          };
+        }
+      } else if (fileType === 'json') {
+        // Import to NeDB
+        const collectionName = config.sourceCollection || config.sourceTableSchema?.tableName;
+        const dbPath = config.sourceLocalPath;
+
+        // Parse JSON
+        const jsonContent = Buffer.from(downloadResult.data).toString('utf8');
+        let documents;
+        try {
+          const parsed = JSON.parse(jsonContent);
+          documents = Array.isArray(parsed) ? parsed : [parsed];
+        } catch (parseErr) {
+          return {
+            success: false,
+            message: `Invalid JSON format: ${parseErr.message}`,
+            recordsProcessed: 0
+          };
+        }
+
+        if (documents.length === 0) {
+          return {
+            success: false,
+            message: 'No documents found in JSON file',
+            recordsProcessed: 0
+          };
+        }
+
+        // Create NeDB datastore
+        const Datastore = require('@seald-io/nedb');
+        const db = new Datastore({ filename: dbPath, autoload: true });
+
+        // Remove all existing documents first
+        await new Promise((resolve) => {
+          db.remove({}, { multi: true }, (err, numRemoved) => {
+            if (err) {
+              console.warn(`[Workflow Execution] Could not clear NeDB collection:`, err);
+            } else {
+              console.log(`[Workflow Execution] Cleared ${numRemoved} existing documents from collection`);
+            }
+            resolve();
+          });
+        });
+
+        db.persistence.compactDatafile();
+
+        // Insert documents
+        const insertResult = await new Promise((resolve) => {
+          db.insert(documents, (err, newDocs) => {
+            if (err) {
+              resolve({
+                success: false,
+                message: `Failed to insert documents: ${err.message}`
+              });
+            } else {
+              resolve({
+                success: true,
+                docCount: newDocs.length
+              });
+            }
+          });
+        });
+
+        if (insertResult.success) {
+          return {
+            success: true,
+            message: `Successfully imported ${insertResult.docCount} documents from cloud storage`,
+            recordsProcessed: insertResult.docCount
+          };
+        } else {
+          return {
+            success: false,
+            message: insertResult.message,
+            recordsProcessed: 0
+          };
+        }
+      }
+    } catch (error) {
+      console.error('[Workflow Execution] Cloud storage import error:', error);
+      return {
+        success: false,
+        message: error.message,
+        recordsProcessed: 0
+      };
+    }
+  }
+
+  const filePath = await getOriginalFilePath(sourceConnectionId, config.sourceDbType, getDb)
+  console.log("sourceFilePath: ", filePath)
+  // Check if it's a local file import
+  if (config.sourceLocalPath && config.sourceDbType === 'sqlite') {
+    try {
+      if (!sqlitePool) {
+        throw new Error('SQLite connection pool not available');
+      }
+
+      const tableName = config.tableName || config.sourceTableSchema?.tableName;
+
+      if (!tableName) {
+        return {
+          success: false,
+          message: 'Table name not found in configuration',
+          recordsProcessed: 0
+        };
+      }
+
+      const fileExt = path.extname(filePath).toLowerCase();
+
+      // Execute import using connection pool
+      const importResult = await sqlitePool.executeWrite(async (db) => {
+        // Determine import type based on file extension
+        // Note: Drop table logic is already handled within each import function
+        if (fileExt === '.parquet') {
+          return await importParquetToSqlite(filePath, tableName, db, appSqliteDbPath);
+        } else if (fileExt === '.avro') {
+          return await importAvroToSqlite(filePath, tableName, db, appSqliteDbPath);
+        } else if (['.xlsx', '.xls'].includes(fileExt)) {
+          // Pass empty array to import all sheets (default behavior for local files)
+          return await importSpreadsheetToSqlite(filePath, tableName, db, appSqliteDbPath, []);
+        } else if (fileExt === '.csv') {
+          return await importCsvToSqlite(filePath, tableName, db, appSqliteDbPath);
+        } else {
+          return {
+            success: false,
+            message: `Unsupported file type: ${fileExt}`
+          };
+        }
+      });
+
+      if (importResult.success) {
+        return {
+          success: true,
+          message: `Successfully imported ${importResult.rowCount || 0} rows from ${path.basename(filePath)}`,
+          recordsProcessed: importResult.rowCount || 0
+        };
+      } else {
+        return {
+          success: false,
+          message: importResult.message || 'Import failed',
+          recordsProcessed: 0
+        };
+      }
+    } catch (error) {
+      console.error('[Workflow Execution] Data source import error:', error);
+      return {
+        success: false,
+        message: error.message,
+        recordsProcessed: 0
+      };
+    }
+  }
+
+  // Check if it's a NeDB JSON file import
+  if (config.sourceLocalPath && config.sourceDbType === 'nedb') {
+    try {
+      const collectionName = config.sourceCollection || config.sourceTableSchema?.tableName || path.basename(filePath, '.json');
+      const fileExt = path.extname(filePath).toLowerCase();
+
+      // Only support JSON files for NeDB
+      if (fileExt !== '.json') {
+        return {
+          success: false,
+          message: `Unsupported file type for NeDB: ${fileExt}. Only .json files are supported.`,
+          recordsProcessed: 0
+        };
+      }
+
+      // Use the existing NeDB database path from sourceLocalPath
+      const dbPath = config.sourceLocalPath;
+      console.log('[Workflow Execution] Using NeDB database at:', dbPath);
+      console.log('[Workflow Execution] Reading source file:', filePath);
+
+      // Read JSON file
+      const jsonContent = fs.readFileSync(filePath, 'utf8');
+      let documents;
+
+      try {
+        const parsed = JSON.parse(jsonContent);
+        // Handle both array of documents and single document
+        documents = Array.isArray(parsed) ? parsed : [parsed];
+      } catch (parseErr) {
+        return {
+          success: false,
+          message: `Invalid JSON format: ${parseErr.message}`,
+          recordsProcessed: 0
+        };
+      }
+
+      if (documents.length === 0) {
+        return {
+          success: false,
+          message: 'No documents found in JSON file',
+          recordsProcessed: 0
+        };
+      }
+
+      // Create NeDB datastore using the existing database path
+      const Datastore = require('@seald-io/nedb');
+      const db = new Datastore({ filename: dbPath, autoload: true });
+
+      // Remove all existing documents first (drop collection)
+      await new Promise((resolve, reject) => {
+        db.remove({}, { multi: true }, (err, numRemoved) => {
+          if (err) {
+            console.warn(`[Workflow Execution] Could not clear NeDB collection ${collectionName}:`, err);
+          } else {
+            console.log(`[Workflow Execution] Cleared ${numRemoved} existing documents from collection: ${collectionName}`);
+          }
+          resolve();
+        });
+      });
+
+      // Compact the database to reclaim space
+      db.persistence.compactDatafile();
+
+      // Insert documents
+      const insertResult = await new Promise((resolve, reject) => {
+        db.insert(documents, (err, newDocs) => {
+          if (err) {
+            resolve({
+              success: false,
+              message: `Failed to insert documents: ${err.message}`
+            });
+          } else {
+            resolve({
+              success: true,
+              dbPath,
+              collectionName,
+              docCount: newDocs.length
+            });
+          }
+        });
+      });
+
+      if (insertResult.success) {
+        return {
+          success: true,
+          message: `Successfully imported ${insertResult.docCount} documents to NeDB collection '${collectionName}'`,
+          recordsProcessed: insertResult.docCount
+        };
+      } else {
+        return {
+          success: false,
+          message: insertResult.message,
+          recordsProcessed: 0
+        };
+      }
+    } catch (error) {
+      console.error('[Workflow Execution] NeDB import error:', error);
+      return {
+        success: false,
+        message: error.message,
+        recordsProcessed: 0
+      };
+    }
+  }
+
+  // Check if it's a Google Sheets import
+  if (config.dbType === 'google-sheets' && config.spreadsheetId) {
+    try {
+      const plugin = pluginManager.getConnector('google-sheets');
+      if (!plugin) {
+        return {
+          success: false,
+          message: 'Google Sheets plugin not found',
+          recordsProcessed: 0
+        };
+      }
+
+      const connectionId = config.connectionId;
+      const fullConfig = await getFullConfig(connectionId);
+
+      if (!fullConfig) {
+        return {
+          success: false,
+          message: 'Google Sheets connection not found',
+          recordsProcessed: 0
+        };
+      }
+
+      // Import Google Sheet to SQLite using connection pool
+      if (!sqlitePool) {
+        throw new Error('SQLite connection pool not available');
+      }
+
+      const tableName = config.tableName || config.sourceTableSchema?.tableName || 'imported_sheet';
+
+      // Use the plugin's import function with connection pool
+      const importResult = await sqlitePool.executeWrite(async (db) => {
+        // Note: Drop table logic is handled within the plugin's importToSqlite function
+        return await plugin.importToSqlite(
+          fullConfig.dbConfig,
+          connectionId,
+          config.spreadsheetId,
+          config.sheetName,
+          tableName,
+          db,
+          appSqliteDbPath
+        );
+      });
+
+      if (importResult.success) {
+        return {
+          success: true,
+          message: `Successfully imported ${importResult.rowCount || 0} rows from Google Sheets`,
+          recordsProcessed: importResult.rowCount || 0
+        };
+      } else {
+        return {
+          success: false,
+          message: importResult.message || 'Google Sheets import failed',
+          recordsProcessed: 0
+        };
+      }
+    } catch (error) {
+      console.error('[Workflow Execution] Google Sheets import error:', error);
+      return {
+        success: false,
+        message: error.message,
+        recordsProcessed: 0
+      };
+    }
+  }
+
+  // For other data sources, just validate that the configuration exists
+  return {
+    success: true,
+    message: 'Data source validated',
+    recordsProcessed: config.recordCount || 0
+  };
+}
+
+/**
+ * Execute a Transformer node
+ * Calls the transformation handlers directly
+ */
+async function executeTransformerNode(node, nodeMap, edges, helpers) {
+  console.log(`[Workflow Execution] Executing Transformer node: ${node.id}`);
+
+  const config = node.data?.config;
+  // console.log('config: ', config)
+  if (!config) {
+    return {
+      success: false,
+      message: 'Transformation configuration not found',
+      recordsProcessed: 0
+    };
+  }
+
+  // Find source node
+  const sourceEdge = edges.find(e => e.target === node.id);
+  if (!sourceEdge) {
+    return {
+      success: false,
+      message: 'No source connection found for transformer',
+      recordsProcessed: 0
+    };
+  }
+
+  const sourceNode = nodeMap.get(sourceEdge.source);
+  if (!sourceNode) {
+    return {
+      success: false,
+      message: 'Source node not found',
+      recordsProcessed: 0
+    };
+  }
+
+  try {
+    // Check if this transformation uses a skill
+    if (config.usesSkill && config.skillId) {
+      console.log(`[Workflow Execution] Executing skill transformation: ${config.skillId}`);
+
+      // Get source connection info
+      const rawSourceConfig = sourceNode.data?.config || {};
+      let sourceConnection = rawSourceConfig.connection || rawSourceConfig;
+      // Datasource node configs store fields with a `source*` prefix
+      // (sourceDbType, sourceLocalPath, sourceConnectionId, ...) while skills
+      // read the canonical un-prefixed names. Map both shapes so the skill
+      // sees a uniform sourceConnection regardless of which node produced it.
+      sourceConnection = {
+        ...sourceConnection,
+        id: sourceConnection.id || sourceConnection.sourceConnectionId,
+        name: sourceConnection.name || sourceConnection.sourceConnectionName,
+        dbType: sourceConnection.dbType || sourceConnection.sourceDbType,
+        dbConfig: sourceConnection.dbConfig || sourceConnection.sourceDbConfig,
+        dbCategory: sourceConnection.dbCategory || sourceConnection.sourceDbCategory,
+        connectionType: sourceConnection.connectionType || sourceConnection.sourceConnectionType,
+        localPath: sourceConnection.localPath
+          || sourceConnection.sourceLocalPath
+          || sourceConnection.targetLocalPath
+      };
+      const sourceTableSchema = sourceNode.data?.config?.targetTableSchema || sourceNode.data?.config?.sourceTableSchema;
+
+      // Determine operation type
+      const isNoSQL = ['mongodb', 'nedb'].includes(sourceConnection?.dbType);
+      const operationType = isNoSQL ? 'nosql' : 'sql';
+
+      // Get source schema
+      const sourceSchema = sourceNode.data?.config?.targetSchema || sourceNode.data?.config?.sourceSchema;
+      const sourceNodeConfig = sourceNode.data?.config;
+
+      // For LanceDB, ensure localPath is included in sourceConnection
+      if (sourceConnection?.dbType === 'lancedb') {
+        sourceConnection = {
+          ...sourceConnection,
+          localPath: sourceConnection.localPath ||
+                     sourceNodeConfig?.targetLocalPath ||
+                     sourceNodeConfig?.sourceLocalPath ||
+                     sourceNodeConfig?.targetDbConfig?.dbPath
+        };
+      }
+
+      // Build the same helpers bundle the IPC layer would inject so skills
+      // (javascript-executor, vector-db-executor, ...) receive params.helpers.
+      const skillHelpers = typeof helpers.buildSkillHelpers === 'function'
+        ? await helpers.buildSkillHelpers()
+        : null;
+
+      // Mirror the `skills:execute` IPC shim: vector-db-executor still reads
+      // embeddingApiKey from top-level params, but stored configs don't carry
+      // the key. Resolve it from the same apiKeys bundle the chat path uses.
+      let resolvedEmbeddingKey = config.embeddingApiKey;
+      if (config.skillId === 'vector-db-executor' && !resolvedEmbeddingKey && config.embeddingProvider && skillHelpers?.apiKeys) {
+        if (config.embeddingProvider === 'openai') {
+          resolvedEmbeddingKey = skillHelpers.apiKeys.chatgpt;
+        } else if (config.embeddingProvider === 'huggingface') {
+          resolvedEmbeddingKey = skillHelpers.apiKeys.huggingface;
+        }
+      }
+
+      // Execute the skill
+      const skillResult = await helpers.pluginManager.executeSkill(config.skillId, {
+        helpers: skillHelpers,
+        // Source information
+        sourceConnection: sourceConnection,
+        sourceTableSchema: {
+          tableName: sourceTableSchema?.tableName,
+          originalTableName: sourceTableSchema?.tableName,
+          indexName: sourceTableSchema?.indexName || sourceConnection?.indexName,
+          columns: sourceTableSchema?.columns,
+          sampleData: sourceTableSchema?.sampleData,
+          sheetName: sourceTableSchema?.sheetName,
+          schema: sourceSchema,
+          namespace: sourceTableSchema?.namespace || sourceSchema,
+          localPath: sourceTableSchema?.localPath || sourceNodeConfig?.targetLocalPath || sourceNodeConfig?.sourceLocalPath
+        },
+
+        // Operation type and settings
+        operationType,
+        storageLocation: config.transformationSettings?.storageLocation || config.storageLocation,
+        operationMode: config.transformationSettings?.operationMode || config.operationMode,
+
+        // Target information
+        targetLocalPath: config.targetLocalPath || sourceNodeConfig?.targetLocalPath || sourceNodeConfig?.sourceLocalPath,
+        targetTable: config.targetTableName || config.targetCollection,
+        targetConnectionId: config.targetConnectionId,
+        targetConnectionName: sourceConnection?.name,
+
+        // Vector DB specific parameters
+        vectorDbType: config.targetDbType || config.skillExecution?.vectorDbType,
+        operation: config.skillExecution?.operation,
+        namespace: config.namespace || sourceTableSchema?.namespace || sourceSchema,
+        indexName: config.indexName || sourceTableSchema?.indexName || sourceConnection?.indexName,
+
+        // Embedding parameters
+        embeddingProvider: config.embeddingProvider,
+        embeddingModel: config.embeddingModel,
+        embeddingApiKey: resolvedEmbeddingKey,
+        columnToEmbed: config.columnToEmbed,
+
+        // Query parameters
+        queryText: config.queryText,
+        queryVector: config.queryVector,
+        topK: config.topK,
+        filter: config.filter,
+        useEmbeddingSearch: config.useEmbeddingSearch,
+        searchQuery: config.searchQuery,
+
+        // Transformation function parameters
+        transformFunction: config.transformFunction,
+        initialState: config.initialState,
+
+        // Pinecone/LanceDB specific configs
+        pineconeConfig: config.pineconeConfig,
+        lancedbConfig: config.lancedbConfig,
+
+        // Node context
+        nodeId: node.id,
+        sourceNodeId: sourceNode?.id,
+        sourceNodeLabel: sourceNode?.data?.label,
+        sourceNodeConfig: sourceNodeConfig,
+        sourceConnectionName: sourceConnection?.name,
+        sourceConnectionType: sourceConnection?.connectionType,
+
+        // System dependencies
+        pluginManager: helpers.pluginManager,
+        getFullConfig: helpers.getFullConfig,
+        appSqliteDbPath: helpers.appSqliteDbPath,
+        sqlitePool: helpers.sqlitePool,
+
+        // Spread any additional skill params last (allows overrides)
+        ...config.skillParams
+      });
+
+      if (!skillResult.success) {
+        return {
+          success: false,
+          message: skillResult.error || skillResult.message || 'Skill execution failed',
+          recordsProcessed: 0
+        };
+      }
+
+      return {
+        success: true,
+        message: skillResult.message || 'Skill transformation completed',
+        recordsProcessed: skillResult.recordCount || 0
+      };
+    }
+
+    const dbType = config.targetDbType || config.dbType;
+
+    if (!dbType) {
+      return {
+        success: false,
+        message: 'Database type not configured',
+        recordsProcessed: 0
+      };
+    }
+
+    // Get source local path if needed (for NeDB or local SQLite operations)
+    const isNeDB = dbType === 'nedb';
+    const isLocalStorage = config.transformationSettings?.storageLocation === 'local';
+    const isInPlace = config.transformationSettings?.operationMode === 'in_place';
+    const sourceLocalPath = (isNeDB || isLocalStorage || isInPlace) ? getSourceLocalPath(node, nodeMap, edges) : null;
+
+    // NoSQL transformations (MongoDB, NeDB)
+    if (['mongodb', 'nedb'].includes(dbType)) {
+      const result = await handleTransformNoSQL({
+        dbType,
+        config: config.targetDbConfig || config.dbConfig,
+        connectionId: config.targetConnectionId || config.connectionId,
+        sourceLocalPath: sourceLocalPath,
+        sourceCollection: config.sourceCollection,
+        targetCollection: config.targetCollection,
+        operationType: config.operationType,
+        nosqlOperation: config.nosqlOperation,
+        transformFunction: config.transformFunction,
+        storageLocation: config.transformationSettings?.storageLocation,
+        operationMode: config.transformationSettings?.operationMode
+      });
+
+      return {
+        success: result.success,
+        message: result.message || (result.success ? 'NoSQL transformation completed' : 'NoSQL transformation failed'),
+        recordsProcessed: result.recordCount || result.modifiedCount || 0
+      };
+    }
+
+    // SQL transformations (PostgreSQL, MySQL, MSSQL, SQLite, etc.)
+    const result = await handleTransformSQL({
+      dbType,
+      config: config.targetDbConfig || config.dbConfig,
+      connectionId: config.targetConnectionId || config.connectionId,
+      ddl: config.targetDdl,
+      sql: config.targetSql,
+      previewSql: config.targetPreviewSql,
+      storageLocation: config.transformationSettings?.storageLocation,
+      operationMode: config.transformationSettings?.operationMode,
+      targetSchema: config.targetSchema || config.sourceSchema || config.schema,
+      targetTableName: config.targetTableName || config.targetCollection,
+      sourceLocalPath: sourceLocalPath,
+      insertSql: config.targetInsertSql
+    });
+
+    return {
+      success: result.success,
+      message: result.message || (result.success ? 'SQL transformation completed' : 'SQL transformation failed'),
+      recordsProcessed: result.rowCount || result.recordCount || 0
+    };
+  } catch (error) {
+    console.error('[Workflow Execution] Transformer error:', error);
+    return {
+      success: false,
+      message: error.message,
+      recordsProcessed: 0
+    };
+  }
+}
+
+/**
+ * Execute a Join node
+ * Calls the join handler directly
+ */
+async function executeJoinNode(node, nodeMap, edges, helpers) {
+  const { getFullConfig } = helpers;
+
+  console.log(`[Workflow Execution] Executing Join node: ${node.id}`);
+
+  const config = node.data?.config;
+
+  if (!config) {
+    return {
+      success: false,
+      message: 'Join configuration not found',
+      recordsProcessed: 0
+    };
+  }
+
+  // Find source nodes
+  const sourceEdges = edges.filter(e => e.target === node.id);
+  if (sourceEdges.length < 2) {
+    return {
+      success: false,
+      message: 'Join requires at least 2 source connections',
+      recordsProcessed: 0
+    };
+  }
+
+  // Check if join is configured
+  if (!config.joinConfig) {
+    return {
+      success: false,
+      message: 'Join configuration not found',
+      recordsProcessed: 0
+    };
+  }
+
+  try {
+    // Build destination connection from config
+    const destinationConnection = {
+      id: config.targetConnectionId || config.connectionId,
+      dbType: config.targetDbType,
+      dbConfig: config.targetDbConfig || {}
+    };
+
+    // Build join config
+    const joinConfig = {
+      sourcesConfig: config.sourcesConfig,
+      joinSql: config.joinSql,
+      targetDdl: config.targetDdl,
+      transformFunction: config.transformFunction,
+      targetTableName: config.targetTableName,
+      targetCollection: config.targetCollection
+    };
+
+    // Call the join handler directly
+    const result = await handleExecuteJoin({
+      destinationConnection,
+      joinConfig,
+      operationMode: config.joinSettings?.operationMode || 'new_table'
+    });
+
+    return {
+      success: result.success,
+      message: result.message || (result.success ? 'Join executed successfully' : 'Join execution failed'),
+      recordsProcessed: result.rowCount || result.recordCount || result.documentsInserted || 0
+    };
+  } catch (error) {
+    console.error('[Workflow Execution] Join error:', error);
+    return {
+      success: false,
+      message: error.message,
+      recordsProcessed: 0
+    };
+  }
+}
+
+
+
+/**
+ * Execute an Output node
+ * Calls the output handler directly
+ */
+async function executeOutputNode(node, nodeMap, edges, helpers) {
+  const { getFullConfig, pluginManager } = helpers;
+
+  console.log(`[Workflow Execution] Executing Output node: ${node.id}`);
+
+  const config = node.data?.config;
+
+  if (!config) {
+    return {
+      success: false,
+      message: 'Output configuration not found',
+      recordsProcessed: 0
+    };
+  }
+
+  // Find source node
+  const sourceEdge = edges.find(e => e.target === node.id);
+  if (!sourceEdge) {
+    return {
+      success: false,
+      message: 'No source connection found for output',
+      recordsProcessed: 0
+    };
+  }
+
+  const sourceNode = nodeMap.get(sourceEdge.source);
+  if (!sourceNode) {
+    return {
+      success: false,
+      message: 'Source node not found',
+      recordsProcessed: 0
+    };
+  }
+
+  // Check if output is configured
+  if (!config.outputSettings) {
+    return {
+      success: false,
+      message: 'Output settings not configured',
+      recordsProcessed: 0
+    };
+  }
+
+  try {
+
+
+    const sourceConfig = sourceNode.data?.config
+    const sourceConnectionId = sourceConfig?.sourceConnectionId || sourceConfig?.targetConnectionId;
+    
+
+    const connection = {
+      id: sourceConfig.sourceConnectionId || sourceConfig.targetConnectionId,
+      name: sourceConfig.sourceConnectionName || sourceConfig.targetConnectionName,
+      connectionType: sourceConfig.sourceConnectionType || sourceConfig.targetConnectionType,
+      dbType: sourceConfig.sourceDbType || sourceConfig.targetDbType,
+      dbConfig: sourceConfig.sourceDbConfig || sourceConfig.targetDbConfig,
+      localPath:  sourceConfig.sourceLocalPath || sourceConfig.targetLocalPath,
+      dbCategory:  sourceConfig.sourceDbCategory || sourceConfig.targetDbCategory,
+      indexName: sourceConfig.sourceIndexName || sourceConfig.targetIndexName // For Pinecone
+    };
+
+    const sourceConnection = await getFullConfig(sourceConnectionId, connection);
+    
+    // console.log('sourceConnectionId: ', sourceNode, sourceConnection)
+
+    if (!sourceConnection) {
+      return {
+        success: false,
+        message: 'Source connection not found',
+        recordsProcessed: 0
+      };
+    }
+
+    // Call the output handler directly
+    // Note: getDb is not available in workflow execution context, passing null
+    const skillHelpers = typeof helpers.buildSkillHelpers === 'function'
+      ? await helpers.buildSkillHelpers()
+      : null;
+    const result = await executeOutput(
+      sourceConnection,
+      config.sourceTableSchema,
+      config.outputSettings,
+      pluginManager,
+      getFullConfig,
+      null,
+      skillHelpers
+    );
+
+    return {
+      success: result.success,
+      message: result.message || (result.success ? 'Output executed successfully' : 'Output execution failed'),
+      recordsProcessed: result.rowCount || result.recordCount || 0
+    };
+  } catch (error) {
+    console.error('[Workflow Execution] Output error:', error);
+    return {
+      success: false,
+      message: error.message,
+      recordsProcessed: 0
+    };
+  }
+}
+
+/**
+ * Execute a single workflow node
+ * @param {object} node - The node to execute
+ * @param {Map} nodeMap - Map of node IDs to node objects
+ * @param {Array} edges - Array of workflow edges
+ * @param {object} helpers - Helper functions and dependencies
+ * @returns {Promise<object>} - Result of node execution
+ */
+async function executeNode(node, nodeMap, edges, helpers) {
+  let nodeResult = null;
+  // console.log('node: ', node)
+  switch (node.type) {
+    case 'dataSource':
+      nodeResult = await executeDataSourceNode(node, helpers);
+      break;
+
+    case 'transformer':
+      nodeResult = await executeTransformerNode(node, nodeMap, edges, helpers);
+      break;
+
+    case 'join':
+      nodeResult = await executeJoinNode(node, nodeMap, edges, helpers);
+      break;
+
+    case 'output':
+      nodeResult = await executeOutputNode(node, nodeMap, edges, helpers);
+      break;
+
+    case 'start':
+      // Start nodes don't need execution
+      nodeResult = { success: true, message: 'Start node' };
+      break;
+
+    default:
+      console.log(`[Workflow Execution] Skipping node type: ${node.type}`);
+      nodeResult = { success: true, message: `Skipped ${node.type} node` };
+  }
+
+  return nodeResult;
+}
+
+module.exports = {
+  addExecutionLog,
+  executeNode,
+  executeDataSourceNode,
+  executeTransformerNode,
+  executeJoinNode,
+  executeOutputNode
+};
