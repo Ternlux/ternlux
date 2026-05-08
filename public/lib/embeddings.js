@@ -1,0 +1,230 @@
+/**
+ * Embedding generation library for vector database operations
+ * Supports OpenAI and HuggingFace embedding providers
+ */
+
+const { OpenAI } = require('openai');
+const { HfInference } = require('@huggingface/inference');
+
+/**
+ * Generate embeddings for an array of data rows
+ * @param {Object} params - Parameters
+ * @param {Array} params.data - Array of data rows
+ * @param {String} params.columnToEmbed - Column name to extract text from
+ * @param {String} params.provider - 'openai' or 'huggingface'
+ * @param {String} params.model - Model name/ID
+ * @param {String} params.apiKey - API key for the provider
+ * @returns {Promise<Array>} Array of data rows with added 'vector' field
+ */
+async function generateEmbeddings({ data, columnToEmbed, provider, model, apiKey }) {
+  console.log('generateEmbeddings: ', { data, columnToEmbed, provider, model })
+  if (!data || data.length === 0) {
+    throw new Error('No data provided for embedding generation');
+  }
+
+  if (!columnToEmbed) {
+    throw new Error('columnToEmbed is required');
+  }
+
+  if (!provider) {
+    throw new Error('Embedding provider is required (openai or huggingface)');
+  }
+
+  if (!apiKey) {
+    throw new Error('API key is required for embedding generation');
+  }
+
+  // Extract and validate texts from specified column
+  const validRows = [];
+  const texts = [];
+
+  for (const row of data) {
+    const text = row[columnToEmbed];
+    if (text != null && typeof text === 'string' && text.trim().length > 0) {
+      validRows.push(row);
+      texts.push(text.trim());
+    }
+  }
+
+  if (texts.length === 0) {
+    throw new Error(`No valid text found in column: ${columnToEmbed}`);
+  }
+
+  console.log(`Generating embeddings for ${texts.length} texts using ${provider} (${model})...`);
+
+  let embeddings;
+
+  if (provider === 'openai') {
+    embeddings = await generateOpenAIEmbeddings(texts, model, apiKey);
+  } else if (provider === 'huggingface') {
+    embeddings = await generateHuggingFaceEmbeddings(texts, model, apiKey);
+  } else {
+    throw new Error(`Unknown embedding provider: ${provider}. Supported: openai, huggingface`);
+  }
+
+  // Validate embeddings
+  if (!embeddings || embeddings.length !== texts.length) {
+    throw new Error('Embedding generation failed: received invalid embeddings');
+  }
+
+  // Merge embeddings back with original data
+  const result = validRows.map((row, idx) => ({
+    ...row,
+    vector: embeddings[idx],
+    _embedded_column: columnToEmbed,
+    _embedding_provider: provider,
+    _embedding_model: model,
+    _embedded_at: new Date().toISOString()
+  }));
+
+  console.log(`Successfully generated ${result.length} embeddings (dimension: ${embeddings[0]?.length || 'unknown'})`);
+
+  return result;
+}
+
+/**
+ * Generate OpenAI embeddings
+ * @param {Array<String>} texts - Array of texts to embed
+ * @param {String} model - OpenAI model name
+ * @param {String} apiKey - OpenAI API key
+ * @returns {Promise<Array<Array<Number>>>} Array of embedding vectors
+ */
+async function generateOpenAIEmbeddings(texts, model = 'text-embedding-3-small', apiKey) {
+  const openai = new OpenAI({ apiKey });
+
+  // OpenAI supports batching up to 2048 inputs per request
+  const BATCH_SIZE = 100;
+  const allEmbeddings = [];
+
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const batch = texts.slice(i, i + BATCH_SIZE);
+
+    console.log(`Processing OpenAI batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(texts.length / BATCH_SIZE)}...`);
+
+    try {
+      const response = await openai.embeddings.create({
+        model,
+        input: batch,
+        encoding_format: 'float'
+      });
+
+      const batchEmbeddings = response.data.map(item => item.embedding);
+      allEmbeddings.push(...batchEmbeddings);
+    } catch (error) {
+      throw new Error(`OpenAI embedding generation failed: ${error.message}`);
+    }
+  }
+
+  return allEmbeddings;
+}
+
+/**
+ * Generate HuggingFace embeddings
+ * @param {Array<String>} texts - Array of texts to embed
+ * @param {String} model - HuggingFace model name
+ * @param {String} apiKey - HuggingFace API key
+ * @returns {Promise<Array<Array<Number>>>} Array of embedding vectors
+ */
+async function generateHuggingFaceEmbeddings(texts, model = 'sentence-transformers/all-MiniLM-L6-v2', apiKey) {
+  const hf = new HfInference(apiKey);
+
+  const allEmbeddings = [];
+
+  // HuggingFace Inference API processes texts individually or in small batches
+  // depending on the model
+  for (let i = 0; i < texts.length; i++) {
+    const text = texts[i];
+
+    if ((i + 1) % 10 === 0 || i === texts.length - 1) {
+      console.log(`Processing HuggingFace embedding ${i + 1}/${texts.length}...`);
+    }
+
+    try {
+      const embedding = await hf.featureExtraction({
+        model,
+        inputs: text
+      });
+
+      // Normalize the embedding to array of numbers
+      let embeddingArray;
+      if (Array.isArray(embedding)) {
+        // Some models return nested arrays
+        embeddingArray = Array.isArray(embedding[0]) ? embedding[0] : embedding;
+      } else {
+        throw new Error('Unexpected embedding format from HuggingFace');
+      }
+
+      allEmbeddings.push(embeddingArray);
+    } catch (error) {
+      throw new Error(`HuggingFace embedding generation failed: ${error.message}`);
+    }
+  }
+
+  return allEmbeddings;
+}
+
+/**
+ * Estimate embedding cost for OpenAI
+ * @param {Array<String>} texts - Texts to estimate cost for
+ * @param {String} model - OpenAI model name
+ * @returns {Object} { tokens, estimatedCost }
+ */
+function estimateOpenAICost(texts, model = 'text-embedding-3-small') {
+  // Rough estimation: ~1 token per 4 characters
+  const estimatedTokens = texts.reduce((sum, text) =>
+    sum + Math.ceil(text.length / 4), 0
+  );
+
+  // Pricing as of 2024 (per 1M tokens)
+  const pricing = {
+    'text-embedding-3-small': 0.00002,  // $0.02 per 1M tokens
+    'text-embedding-3-large': 0.00013,  // $0.13 per 1M tokens
+    'text-embedding-ada-002': 0.0001   // $0.10 per 1M tokens
+  };
+
+  const pricePerToken = pricing[model] || pricing['text-embedding-3-small'];
+  const estimatedCost = estimatedTokens * pricePerToken;
+
+  return {
+    tokens: estimatedTokens,
+    estimatedCost: estimatedCost
+  };
+}
+
+/**
+ * Get embedding dimension for a model
+ * @param {String} provider - 'openai' or 'huggingface'
+ * @param {String} model - Model name
+ * @returns {Number|null} Dimension or null if unknown
+ */
+function getEmbeddingDimension(provider, model) {
+  if (provider === 'openai') {
+    const dimensions = {
+      'text-embedding-3-small': 1536,
+      'text-embedding-3-large': 3072,
+      'text-embedding-ada-002': 1536
+    };
+    return dimensions[model] || null;
+  }
+
+  if (provider === 'huggingface') {
+    const dimensions = {
+      'sentence-transformers/all-MiniLM-L6-v2': 384,
+      'sentence-transformers/all-mpnet-base-v2': 768,
+      'BAAI/bge-small-en-v1.5': 384,
+      'BAAI/bge-base-en-v1.5': 768,
+      'BAAI/bge-large-en-v1.5': 1024
+    };
+    return dimensions[model] || null;
+  }
+
+  return null;
+}
+
+module.exports = {
+  generateEmbeddings,
+  generateOpenAIEmbeddings,
+  generateHuggingFaceEmbeddings,
+  estimateOpenAICost,
+  getEmbeddingDimension
+};
