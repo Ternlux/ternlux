@@ -224,13 +224,17 @@ async function executeLocalSQLiteJoin(
   targetTableName,
   operationMode,
   pluginManager,
-  getFullConfig
+  getFullConfig,
+  sqlitePool
 ) {
-  const sqlite3 = require('sqlite3').verbose();
-  const db = new sqlite3.Database(appSqliteDbPath);
+  if (!sqlitePool) {
+    throw new Error('[executeLocalSQLiteJoin] sqlitePool is required');
+  }
+
   const tempTablesToCleanup = [];
 
-  try {
+  return sqlitePool.executeWrite(async (db) => {
+    try {
     // Step 1: Create and populate temp tables for sources
     for (let i = 0; i < sourcesConfig.length; i++) {
       const sourceConfig = sourcesConfig[i];
@@ -263,7 +267,10 @@ async function executeLocalSQLiteJoin(
       const isNoSQLSource = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
       let sourceData = [];
 
-      if (isNoSQLSource) {
+      if (Array.isArray(sourceConfig._preloadedRows)) {
+        // Caller (e.g. vector source pre-resolved by skill) supplied rows.
+        sourceData = sourceConfig._preloadedRows;
+      } else if (isNoSQLSource) {
         sourceData = await loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig);
       } else {
         const sourcePlugin = pluginManager.getConnector(sourceConnection.dbType);
@@ -364,27 +371,26 @@ async function executeLocalSQLiteJoin(
       targetTableName
     };
 
-  } catch (error) {
-    console.error('[Local SQLite Join] Error:', error);
-    return {
-      success: false,
-      message: `Local SQLite join failed: ${error.message}`,
-      error: error.stack
-    };
-  } finally {
-    // Step 4: Clean up temp tables (Placed in finally to ensure cleanup even if an error occurs)
-    for (const tempTable of tempTablesToCleanup) {
-      await new Promise((res) => {
-        db.run(`DROP TABLE IF EXISTS ${tempTable}`, (err) => {
-          if (err) console.error(`Failed to cleanup ${tempTable}: ${err.message}`);
-          res();
+    } catch (error) {
+      console.error('[Local SQLite Join] Error:', error);
+      return {
+        success: false,
+        message: `Local SQLite join failed: ${error.message}`,
+        error: error.stack
+      };
+    } finally {
+      // Step 4: Clean up temp tables (Placed in finally to ensure cleanup even if an error occurs)
+      for (const tempTable of tempTablesToCleanup) {
+        await new Promise((res) => {
+          db.run(`DROP TABLE IF EXISTS ${tempTable}`, (err) => {
+            if (err) console.error(`Failed to cleanup ${tempTable}: ${err.message}`);
+            res();
+          });
         });
-      });
+      }
+      // Connection pool handles db connection, no need to close
     }
-
-    // Always close the db connection gracefully
-    db.close();
-  }
+  });
 }
 
 module.exports = {
