@@ -121,7 +121,7 @@ async function importParquetToSqlite(filePath, sanitizedTableName, db, dbPath) {
         return inferColumnType(columnData);
       });
 
-      console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
+      // console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
 
       const tableNameForFile = sanitizedTableName;
 
@@ -271,7 +271,7 @@ async function importAvroToSqlite(filePath, sanitizedTableName, db, dbPath) {
           return inferColumnType(columnData);
         });
 
-        console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
+        // console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
 
         const tableNameForFile = sanitizedTableName;
 
@@ -368,7 +368,7 @@ async function importAvroToSqlite(filePath, sanitizedTableName, db, dbPath) {
 /**
  * Import CSV/Excel (spreadsheet) file to SQLite
  */
-async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath) {
+async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets = []) {
   return new Promise((resolve) => {
     try {
       // Read the Excel/CSV file
@@ -379,11 +379,19 @@ async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPat
       const tables = [];
 
       // Filter out empty sheets
-      const sheetsToProcess = workbook.SheetNames.filter(sheetName => {
+      let sheetsToProcess = workbook.SheetNames.filter(sheetName => {
         const ws = workbook.Sheets[sheetName];
         const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: false });
         return rawRows.length > 0;
       });
+
+      // If specific sheets are requested, filter to only those sheets
+      if (sheets && sheets.length > 0) {
+        sheetsToProcess = sheetsToProcess.filter(sheetName => sheets.includes(sheetName));
+        console.log(`[importSpreadsheetToSqlite] Importing only selected sheets:`, sheets);
+      } else {
+        console.log(`[importSpreadsheetToSqlite] Importing all sheets:`, sheetsToProcess);
+      }
 
       if (sheetsToProcess.length === 0) {
         resolve({
@@ -474,7 +482,7 @@ async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPat
             }
           }
 
-          console.log(`[importSpreadsheetToSqlite] Sheet "${sheetName}" - Deduplicated headers:`, headers);
+          // console.log(`[importSpreadsheetToSqlite] Sheet "${sheetName}" - Deduplicated headers:`, headers);
 
           // Get data rows for type inference
           const dataRows = rawRows.slice(1);
@@ -485,7 +493,7 @@ async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPat
             return inferColumnType(columnData, 10000);
           });
 
-          console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
+          // console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
 
           // Sanitize sheet name for SQLite table naming
           const sanitizedSheetName = String(sheetName)
@@ -497,7 +505,7 @@ async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPat
           const tableNameForSheet = `${sanitizedTableName}_${sanitizedSheetName}`;
 
           tables.push(tableNameForSheet);
-
+          console.log("tableNameForSheet: ", tableNameForSheet)
           // Drop existing table if it exists (re-importing data)
           db.run(`DROP TABLE IF EXISTS "${tableNameForSheet}"`, (dropErr) => {
             if (dropErr) {
@@ -682,7 +690,7 @@ async function importCsvToSqlite(filePath, sanitizedTableName, db, dbPath) {
         return inferColumnType(columnData, 10000);
       });
 
-      console.log('[CSV Import] Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
+      // console.log('[CSV Import] Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
 
       // Use the sanitized table name directly (no sheet suffix for CSV)
       const tableNameForFile = sanitizedTableName;
