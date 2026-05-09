@@ -1,0 +1,18 @@
+{
+  "name": "@dagflux/skill-python-executor",
+  "version": "1.0.0",
+  "description": "Execute Python code for complex data transformations in DagFlux",
+  "main": "index.js",
+  "keywords": [
+    "dagflux",
+    "plugin",
+    "skill",
+    "python",
+    "transformation",
+    "pandas",
+    "numpy"
+  ],
+  "author": "DagFlux",
+  "license": "MIT",
+  "dependencies": {}
+}
