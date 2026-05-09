@@ -10,7 +10,9 @@
     "authType": "oauth2"
   },
   "dependencies": {
-    "googleapis": "^134.0.0",
-    "axios": "^1.6.0"
+    "@googleapis/drive": "^8.0.0",
+    "@googleapis/sheets": "^5.0.0",
+    "axios": "^1.6.0",
+    "google-auth-library": "^9.0.0"
   }
 }
