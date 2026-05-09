@@ -8,12 +8,49 @@ require('isomorphic-fetch');
 
 // OneDrive client cache
 const onedriveClients = new Map();
+const tokenRefreshCallbacks = new Map();
 
 /**
- * Get or create OneDrive client
+ * Check if token is expired or about to expire (within 5 minutes)
  */
-function getClient(config, connectionId) {
+function isTokenExpired(expiryDate) {
+  if (!expiryDate) return true;
+  const now = Date.now();
+  const bufferTime = 5 * 60 * 1000; // 5 minutes
+  return now >= (expiryDate - bufferTime);
+}
+
+/**
+ * Get or create OneDrive client with automatic token refresh
+ */
+async function getClient(config, connectionId) {
   const key = connectionId || JSON.stringify(config);
+
+  // Check if token needs refresh
+  if (isTokenExpired(config.expiryDate)) {
+    console.log('[OneDrive] Token expired or about to expire, refreshing...');
+
+    const module = require('./index.js');
+    const refreshResult = await module.refreshAccessToken(config);
+
+    if (refreshResult.success) {
+      console.log('[OneDrive] Token refreshed successfully');
+      // Update config with new tokens
+      Object.assign(config, refreshResult.tokens);
+
+      // Trigger callback to update connection in database if registered
+      if (tokenRefreshCallbacks.has(connectionId)) {
+        const callback = tokenRefreshCallbacks.get(connectionId);
+        await callback(refreshResult.tokens);
+      }
+
+      // Clear cached client to force recreation with new token
+      onedriveClients.delete(key);
+    } else {
+      console.error('[OneDrive] Token refresh failed:', refreshResult.message);
+      throw new Error('Token refresh failed: ' + refreshResult.message);
+    }
+  }
 
   if (!onedriveClients.has(key)) {
     const client = Client.init({
@@ -26,6 +63,14 @@ function getClient(config, connectionId) {
   }
 
   return onedriveClients.get(key);
+}
+
+/**
+ * Register a callback to be called when token is refreshed
+ * This allows the main app to update the connection config
+ */
+function registerTokenRefreshCallback(connectionId, callback) {
+  tokenRefreshCallbacks.set(connectionId, callback);
 }
 
 module.exports = {
@@ -113,11 +158,61 @@ module.exports = {
   },
 
   /**
+   * Refresh access token using refresh token
+   */
+  refreshAccessToken: async (config) => {
+    try {
+      const axios = require('axios');
+      const tenantId = config.tenantId || 'common';
+
+      if (!config.refreshToken) {
+        return {
+          success: false,
+          message: 'No refresh token available'
+        };
+      }
+
+      const params = new URLSearchParams();
+      params.append('client_id', config.clientId);
+      params.append('client_secret', config.clientSecret);
+      params.append('refresh_token', config.refreshToken);
+      params.append('grant_type', 'refresh_token');
+
+      const response = await axios.post(
+        `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+        params,
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+
+      return {
+        success: true,
+        tokens: {
+          accessToken: response.data.access_token,
+          refreshToken: response.data.refresh_token || config.refreshToken,
+          expiryDate: Date.now() + (response.data.expires_in * 1000),
+          tokenType: response.data.token_type,
+          scope: response.data.scope
+        }
+      };
+    } catch (error) {
+      console.error('[OneDrive] Token refresh error:', error);
+      return {
+        success: false,
+        message: error.response?.data?.error_description || error.message
+      };
+    }
+  },
+
+  /**
    * Test OneDrive connection
    */
   testConnection: async (config, connectionId = null) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       // Get user info to verify credentials
       await client.api('/me').get();
@@ -133,11 +228,11 @@ module.exports = {
    */
   getContainers: async (config, connectionId = null) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       // Get available drives
       const response = await client.api('/me/drives').get();
-
+      console.log('response: ', response)
       return {
         success: true,
         containers: response.value.map(drive => ({
@@ -148,6 +243,7 @@ module.exports = {
         }))
       };
     } catch (error) {
+      console.log('getContainerserror: ', error)
       return { success: false, message: error.message };
     }
   },
@@ -157,24 +253,39 @@ module.exports = {
    */
   listObjects: async (config, connectionId, containerName, folderId = 'root', top = 1000) => {
     try {
-      const client = getClient(config, connectionId);
-
-      // Build the API path
-      const path = folderId === 'root'
-        ? '/me/drive/root/children'
-        : `/me/drive/items/${folderId}/children`;
-
+      const client = await getClient(config, connectionId);
+  
+      // 1. Determine the Base Path (Specific Drive vs. Default Drive)
+      // containerName here is the drive.id from your getContainers output
+      const basePath = containerName 
+        ? `/drives/${containerName}` 
+        : '/me/drive';
+  
+      // 2. Determine the Item Path
+      // If folderId is 'root', null, or empty, use the /root shorthand
+      const isRoot = !folderId || folderId === 'root';
+      const itemPath = isRoot 
+        ? '/root' 
+        : `/items/${folderId}`;
+  
+      // 3. Combine them
+      const path = `${basePath}${itemPath}/children`;
+      
+      console.log('[OneDrive] List objects path:', path);
+  
       const response = await client
         .api(path)
         .top(Math.min(top, 1000))
         .get();
-
+      
+      console.log('response: ', response)
+      
       return {
         success: true,
         objects: response.value.map(item => ({
           name: item.name,
           id: item.id,
-          objectKey: item.id, // Use ID for downloading
+          objectKey: item.id, 
           size: item.size || 0,
           isFolder: !!item.folder,
           lastModified: item.lastModifiedDateTime,
@@ -184,6 +295,7 @@ module.exports = {
         nextLink: response['@odata.nextLink']
       };
     } catch (error) {
+      console.error('[OneDrive] List objects error:', error);
       return { success: false, message: error.message };
     }
   },
@@ -191,12 +303,26 @@ module.exports = {
   /**
    * Download object
    */
-  downloadObject: async (config, connectionId, containerName, itemId) => {
+  downloadObject: async (config, connectionId, driveId, itemId) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
-      // Get download URL
-      const item = await client.api(`/me/drive/items/${itemId}`).get();
+      // Build API paths using drive ID
+      let itemPath, contentPath;
+      if (!driveId || driveId === 'root') {
+        // Use default drive
+        itemPath = `/me/drive/items/${itemId}`;
+        contentPath = `/me/drive/items/${itemId}/content`;
+      } else {
+        // Use specific drive ID
+        itemPath = `/drives/${driveId}/items/${itemId}`;
+        contentPath = `/drives/${driveId}/items/${itemId}/content`;
+      }
+
+      console.log('[OneDrive] Download item path:', itemPath);
+
+      // Get item metadata
+      const item = await client.api(itemPath).get();
 
       if (item.folder) {
         return { success: false, message: 'Cannot download a folder' };
@@ -204,7 +330,7 @@ module.exports = {
 
       // Download content
       const response = await client
-        .api(`/me/drive/items/${itemId}/content`)
+        .api(contentPath)
         .getStream();
 
       // Convert stream to buffer
@@ -214,6 +340,8 @@ module.exports = {
       }
       const buffer = Buffer.concat(chunks);
 
+      console.log('[OneDrive] Download complete:', item.name, buffer.length, 'bytes');
+
       return {
         success: true,
         data: buffer,
@@ -222,6 +350,7 @@ module.exports = {
         mimeType: item.file?.mimeType
       };
     } catch (error) {
+      console.error('[OneDrive] Download error:', error);
       return { success: false, message: error.message };
     }
   },
@@ -229,25 +358,38 @@ module.exports = {
   /**
    * Upload object
    */
-  uploadObject: async (config, connectionId, containerName, fileName, data, contentType) => {
+  uploadObject: async (config, connectionId, containerName, objectName, data, contentType) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
-      // Upload to root by default, or specific folder if containerName is a folder ID
-      const path = containerName === 'root' || !containerName
-        ? `/me/drive/root:/${fileName}:/content`
-        : `/me/drive/items/${containerName}:/${fileName}:/content`;
+      // containerName is the drive ID from getContainers (e.g., '1d5b40836ef4a3ea')
+      // objectName is the full path (e.g., 'folder/file.json' or 'file.json')
+
+      let path;
+
+      if (!containerName || containerName === 'root') {
+        // Use default drive
+        path = `/me/drive/root:/${objectName}:/content`;
+      } else {
+        // Use specific drive ID
+        path = `/drives/${containerName}/root:/${objectName}:/content`;
+      }
+
+      console.log('[OneDrive] Upload path:', path);
 
       const response = await client
         .api(path)
         .putStream(data);
 
+      console.log('[OneDrive] Upload response:', response.id);
+
       return {
         success: true,
-        message: `Successfully uploaded ${fileName}`,
+        message: `Successfully uploaded ${objectName}`,
         itemId: response.id
       };
     } catch (error) {
+      console.error('[OneDrive] Upload error:', error);
       return { success: false, message: error.message };
     }
   },
@@ -255,17 +397,30 @@ module.exports = {
   /**
    * Delete object
    */
-  deleteObject: async (config, connectionId, containerName, itemId) => {
+  deleteObject: async (config, connectionId, driveId, itemId) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
-      await client.api(`/me/drive/items/${itemId}`).delete();
+      // Build API path using drive ID
+      let path;
+      if (!driveId || driveId === 'root') {
+        // Use default drive
+        path = `/me/drive/items/${itemId}`;
+      } else {
+        // Use specific drive ID
+        path = `/drives/${driveId}/items/${itemId}`;
+      }
+
+      console.log('[OneDrive] Delete item path:', path);
+
+      await client.api(path).delete();
 
       return {
         success: true,
         message: `Successfully deleted item ${itemId}`
       };
     } catch (error) {
+      console.error('[OneDrive] Delete error:', error);
       return { success: false, message: error.message };
     }
   },
@@ -273,11 +428,23 @@ module.exports = {
   /**
    * Get object metadata
    */
-  getObjectMetadata: async (config, connectionId, containerName, itemId) => {
+  getObjectMetadata: async (config, connectionId, driveId, itemId) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
-      const item = await client.api(`/me/drive/items/${itemId}`).get();
+      // Build API path using drive ID
+      let path;
+      if (!driveId || driveId === 'root') {
+        // Use default drive
+        path = `/me/drive/items/${itemId}`;
+      } else {
+        // Use specific drive ID
+        path = `/drives/${driveId}/items/${itemId}`;
+      }
+
+      console.log('[OneDrive] Get metadata path:', path);
+
+      const item = await client.api(path).get();
 
       return {
         success: true,
@@ -293,6 +460,7 @@ module.exports = {
         }
       };
     } catch (error) {
+      console.error('[OneDrive] Get metadata error:', error);
       return { success: false, message: error.message };
     }
   },
@@ -304,6 +472,16 @@ module.exports = {
     if (onedriveClients.has(connectionId)) {
       onedriveClients.delete(connectionId);
     }
+    if (tokenRefreshCallbacks.has(connectionId)) {
+      tokenRefreshCallbacks.delete(connectionId);
+    }
+  },
+
+  /**
+   * Register token refresh callback
+   */
+  registerTokenRefreshCallback: (connectionId, callback) => {
+    return registerTokenRefreshCallback(connectionId, callback);
   },
 
   /**
