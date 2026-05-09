@@ -8,12 +8,49 @@ require('isomorphic-fetch');
 
 // SharePoint client cache
 const sharepointClients = new Map();
+const tokenRefreshCallbacks = new Map();
 
 /**
- * Get or create SharePoint client
+ * Check if token is expired or about to expire (within 5 minutes)
  */
-function getClient(config, connectionId) {
+function isTokenExpired(expiryDate) {
+  if (!expiryDate) return true;
+  const now = Date.now();
+  const bufferTime = 5 * 60 * 1000; // 5 minutes
+  return now >= (expiryDate - bufferTime);
+}
+
+/**
+ * Get or create SharePoint client with automatic token refresh
+ */
+async function getClient(config, connectionId) {
   const key = connectionId || JSON.stringify(config);
+
+  // Check if token needs refresh
+  if (isTokenExpired(config.expiryDate)) {
+    console.log('[SharePoint] Token expired or about to expire, refreshing...');
+
+    const module = require('./index.js');
+    const refreshResult = await module.refreshAccessToken(config);
+
+    if (refreshResult.success) {
+      console.log('[SharePoint] Token refreshed successfully');
+      // Update config with new tokens
+      Object.assign(config, refreshResult.tokens);
+
+      // Trigger callback to update connection in database if registered
+      if (tokenRefreshCallbacks.has(connectionId)) {
+        const callback = tokenRefreshCallbacks.get(connectionId);
+        await callback(refreshResult.tokens);
+      }
+
+      // Clear cached client to force recreation with new token
+      sharepointClients.delete(key);
+    } else {
+      console.error('[SharePoint] Token refresh failed:', refreshResult.message);
+      throw new Error('Token refresh failed: ' + refreshResult.message);
+    }
+  }
 
   if (!sharepointClients.has(key)) {
     const client = Client.init({
@@ -26,6 +63,14 @@ function getClient(config, connectionId) {
   }
 
   return sharepointClients.get(key);
+}
+
+/**
+ * Register a callback to be called when token is refreshed
+ * This allows the main app to update the connection config
+ */
+function registerTokenRefreshCallback(connectionId, callback) {
+  tokenRefreshCallbacks.set(connectionId, callback);
 }
 
 module.exports = {
@@ -113,11 +158,61 @@ module.exports = {
   },
 
   /**
+   * Refresh access token using refresh token
+   */
+  refreshAccessToken: async (config) => {
+    try {
+      const axios = require('axios');
+      const tenantId = config.tenantId || 'common';
+
+      if (!config.refreshToken) {
+        return {
+          success: false,
+          message: 'No refresh token available'
+        };
+      }
+
+      const params = new URLSearchParams();
+      params.append('client_id', config.clientId);
+      params.append('client_secret', config.clientSecret);
+      params.append('refresh_token', config.refreshToken);
+      params.append('grant_type', 'refresh_token');
+
+      const response = await axios.post(
+        `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+        params,
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+
+      return {
+        success: true,
+        tokens: {
+          accessToken: response.data.access_token,
+          refreshToken: response.data.refresh_token || config.refreshToken,
+          expiryDate: Date.now() + (response.data.expires_in * 1000),
+          tokenType: response.data.token_type,
+          scope: response.data.scope
+        }
+      };
+    } catch (error) {
+      console.error('[SharePoint] Token refresh error:', error);
+      return {
+        success: false,
+        message: error.response?.data?.error_description || error.message
+      };
+    }
+  },
+
+  /**
    * Test SharePoint connection
    */
   testConnection: async (config, connectionId = null) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       if (config.siteId) {
         // Test specific site
@@ -138,7 +233,7 @@ module.exports = {
    */
   getContainers: async (config, connectionId = null) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       let siteId = config.siteId;
 
@@ -171,7 +266,7 @@ module.exports = {
    */
   listObjects: async (config, connectionId, driveId, folderId = 'root', top = 1000) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       let siteId = config.siteId;
 
@@ -215,7 +310,7 @@ module.exports = {
    */
   downloadObject: async (config, connectionId, driveId, itemId) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       let siteId = config.siteId;
 
@@ -261,7 +356,7 @@ module.exports = {
    */
   uploadObject: async (config, connectionId, driveId, fileName, data, contentType) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       let siteId = config.siteId;
 
@@ -293,7 +388,7 @@ module.exports = {
    */
   deleteObject: async (config, connectionId, driveId, itemId) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       let siteId = config.siteId;
 
@@ -319,7 +414,7 @@ module.exports = {
    */
   getObjectMetadata: async (config, connectionId, driveId, itemId) => {
     try {
-      const client = getClient(config, connectionId);
+      const client = await getClient(config, connectionId);
 
       let siteId = config.siteId;
 
@@ -356,6 +451,16 @@ module.exports = {
     if (sharepointClients.has(connectionId)) {
       sharepointClients.delete(connectionId);
     }
+    if (tokenRefreshCallbacks.has(connectionId)) {
+      tokenRefreshCallbacks.delete(connectionId);
+    }
+  },
+
+  /**
+   * Register token refresh callback
+   */
+  registerTokenRefreshCallback: (connectionId, callback) => {
+    return registerTokenRefreshCallback(connectionId, callback);
   },
 
   /**
