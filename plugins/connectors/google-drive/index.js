@@ -3,11 +3,13 @@
  * Handles all Google Drive storage operations
  */
 
-const { google } = require('googleapis');
+const { OAuth2Client } = require('google-auth-library');
+const { drive: driveApi } = require('@googleapis/drive');
 const { Readable } = require('stream');
 
 // Google Drive client cache
 const driveClients = new Map();
+const tokenRefreshCallbacks = new Map();
 
 /**
  * Get or create Google Drive client with OAuth2 credentials
@@ -16,7 +18,7 @@ function getOAuthClient(config, connectionId) {
   const key = connectionId || JSON.stringify(config);
 
   if (!driveClients.has(key)) {
-    const oauth2Client = new google.auth.OAuth2(
+    const oauth2Client = new OAuth2Client(
       config.clientId,
       config.clientSecret,
       config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -33,7 +35,7 @@ function getOAuthClient(config, connectionId) {
       });
     }
 
-    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+    const drive = driveApi({ version: 'v3', auth: oauth2Client });
     driveClients.set(key, drive);
   }
 
@@ -53,7 +55,7 @@ function getClient(config, connectionId) {
   const key = connectionId || JSON.stringify(config);
 
   if (!driveClients.has(key)) {
-    const auth = new google.auth.OAuth2();
+    const auth = new OAuth2Client();
 
     if (config.credentials) {
       const creds = typeof config.credentials === 'string'
@@ -62,7 +64,7 @@ function getClient(config, connectionId) {
       auth.setCredentials(creds);
     }
 
-    const drive = google.drive({ version: 'v3', auth });
+    const drive = driveApi({ version: 'v3', auth });
     driveClients.set(key, drive);
   }
 
@@ -72,7 +74,7 @@ function getClient(config, connectionId) {
 /**
  * Refresh access token if expired
  */
-async function refreshAccessTokenIfNeeded(oauth2Client) {
+async function refreshAccessTokenIfNeeded(oauth2Client, connectionId) {
   try {
     const tokens = oauth2Client.credentials;
 
@@ -81,6 +83,19 @@ async function refreshAccessTokenIfNeeded(oauth2Client) {
       console.log('[Google Drive] Refreshing access token...');
       const { credentials } = await oauth2Client.refreshAccessToken();
       oauth2Client.setCredentials(credentials);
+
+      // Trigger callback to update connection in database if registered
+      if (connectionId && tokenRefreshCallbacks.has(connectionId)) {
+        const callback = tokenRefreshCallbacks.get(connectionId);
+        await callback({
+          accessToken: credentials.access_token,
+          refreshToken: credentials.refresh_token,
+          expiryDate: credentials.expiry_date,
+          tokenType: credentials.token_type,
+          scope: credentials.scope
+        });
+      }
+
       return credentials;
     }
 
@@ -89,6 +104,14 @@ async function refreshAccessTokenIfNeeded(oauth2Client) {
     console.error('[Google Drive] Token refresh error:', error);
     throw error;
   }
+}
+
+/**
+ * Register a callback to be called when token is refreshed
+ * This allows the main app to update the connection config
+ */
+function registerTokenRefreshCallback(connectionId, callback) {
+  tokenRefreshCallbacks.set(connectionId, callback);
 }
 
 module.exports = {
@@ -105,7 +128,7 @@ module.exports = {
    */
   getAuthorizationUrl: (config) => {
     try {
-      const oauth2Client = new google.auth.OAuth2(
+      const oauth2Client = new OAuth2Client(
         config.clientId,
         config.clientSecret,
         config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -142,7 +165,7 @@ module.exports = {
    */
   exchangeCodeForTokens: async (config, code) => {
     try {
-      const oauth2Client = new google.auth.OAuth2(
+      const oauth2Client = new OAuth2Client(
         config.clientId,
         config.clientSecret,
         config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -162,6 +185,49 @@ module.exports = {
       };
     } catch (error) {
       console.error('[Google Drive] Token exchange error:', error);
+      return {
+        success: false,
+        message: error.message
+      };
+    }
+  },
+
+  /**
+   * Refresh access token using refresh token
+   */
+  refreshAccessToken: async (config) => {
+    try {
+      if (!config.refreshToken) {
+        return {
+          success: false,
+          message: 'No refresh token available'
+        };
+      }
+
+      const oauth2Client = new OAuth2Client(
+        config.clientId,
+        config.clientSecret,
+        config.redirectUri || 'http://localhost:3000/oauth/callback'
+      );
+
+      oauth2Client.setCredentials({
+        refresh_token: config.refreshToken
+      });
+
+      const { credentials } = await oauth2Client.refreshAccessToken();
+
+      return {
+        success: true,
+        tokens: {
+          accessToken: credentials.access_token,
+          refreshToken: credentials.refresh_token || config.refreshToken,
+          expiryDate: credentials.expiry_date,
+          tokenType: credentials.token_type,
+          scope: credentials.scope
+        }
+      };
+    } catch (error) {
+      console.error('[Google Drive] Token refresh error:', error);
       return {
         success: false,
         message: error.message
@@ -275,7 +341,7 @@ module.exports = {
         fileId,
         fields: 'name, mimeType, size'
       });
-      console.log('fileId: ', metadata, fileId)
+      // console.log('fileId: ', metadata, fileId)
 
       // Download file
       const response = await drive.files.get(
@@ -420,7 +486,7 @@ module.exports = {
   getPickerCredentials: async (config, connectionId) => {
     try {
       // Create OAuth2 client directly (don't use getOAuthClient which returns Drive client)
-      const oauth2Client = new google.auth.OAuth2(
+      const oauth2Client = new OAuth2Client(
         config.clientId,
         config.clientSecret,
         config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -438,7 +504,7 @@ module.exports = {
       }
 
       // Refresh token if needed
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
       const credentials = oauth2Client.credentials;
 
@@ -463,6 +529,16 @@ module.exports = {
     if (driveClients.has(connectionId)) {
       driveClients.delete(connectionId);
     }
+    if (tokenRefreshCallbacks.has(connectionId)) {
+      tokenRefreshCallbacks.delete(connectionId);
+    }
+  },
+
+  /**
+   * Register token refresh callback
+   */
+  registerTokenRefreshCallback: (connectionId, callback) => {
+    return registerTokenRefreshCallback(connectionId, callback);
   },
 
   /**
