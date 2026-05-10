@@ -29,7 +29,6 @@ import {
 } from 'chart.js';
 import { Bar, Line, Pie } from 'react-chartjs-2';
 import { Boxdataset } from '../ui_components/boxdataset';
-import { minWidth } from '@mui/system';
 
 // Register Chart.js components
 ChartJS.register(

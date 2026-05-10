@@ -6,16 +6,19 @@ import {
     Avatar,
     Fade,
     IconButton,
-    Collapse
+    Collapse,
+    Tooltip
 } from '@mui/material';
 import {
     SmartToy as BotIcon,
-    Code as CodeIcon
+    Code as CodeIcon,
+    OpenInFull as OpenInFullIcon
 } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import DataVisualization from './DataVisualization';
 import MultiStepProgress from './MultiStepProgress';
 import StepResultHeader from './StepResultHeader';
+import CodeEditorPopup from './CodeEditorPopup';
 
 // Helper function to parse markdown bold syntax and newlines into React elements
 const parseMarkdownBold = (text) => {
@@ -78,21 +81,46 @@ const getImageLink = (age, income) => {
     return `/segmentation/${age}_${incomeValue}.jpeg`;
 };
 
-// Code Editor Component
+// Inline read-only code preview
 const CodeEditor = ({ code, language = 'sql', height = 300 }) => {
     return (
         <Box
             sx={{
-                border: '1px solid #333',
+                border: '1px solid #e2e6eb',
                 borderRadius: 1,
-                overflow: 'hidden'
+                overflow: 'hidden',
+                bgcolor: '#fff',
             }}
         >
             <Editor
                 height={height}
                 defaultLanguage={language}
                 value={code}
-                theme="vs-dark"
+                beforeMount={(monaco) => {
+                    monaco.editor.defineTheme('dagflux-light', {
+                        base: 'vs',
+                        inherit: true,
+                        rules: [],
+                        colors: {
+                            'editor.background': '#ffffff',
+                            'editor.foreground': '#111827',
+                            'editorLineNumber.foreground': '#9ca3af',
+                            'editorLineNumber.activeForeground': '#5a6678',
+                            'editor.selectionBackground': '#dbeafe',
+                            'editor.inactiveSelectionBackground': '#eef1f6',
+                            'editor.lineHighlightBackground': '#f7f9fc',
+                            'editorCursor.foreground': '#2563eb',
+                            'editorIndentGuide.background': '#eef1f6',
+                            'editorIndentGuide.activeBackground': '#cdd2db',
+                            'editorWhitespace.foreground': '#e2e6eb',
+                            'editorGutter.background': '#ffffff',
+                            'scrollbarSlider.background': '#e2e6eb88',
+                            'scrollbarSlider.hoverBackground': '#cdd2dbcc',
+                            'scrollbarSlider.activeBackground': '#5a667888',
+                        },
+                    });
+                }}
+                theme="dagflux-light"
                 options={{
                     readOnly: true,
                     minimap: { enabled: false },
@@ -113,6 +141,80 @@ const CodeEditor = ({ code, language = 'sql', height = 300 }) => {
     );
 };
 
+// Per-section: collapsible inline preview + "Open in full editor" affordance.
+const CodeSection = ({
+    field,
+    label,
+    code,
+    language = 'sql',
+    color = 'primary',
+    bgTint,
+    message,
+    onCodeSave,
+}) => {
+    const [open, setOpen] = useState(false);
+    const [popupOpen, setPopupOpen] = useState(false);
+
+    const lineCount = (code || '').split('\n').length;
+    const height = Math.min(language === 'javascript' || language === 'python' ? 400 : 300, (lineCount + 1) * 19 + 20);
+
+    const tint = bgTint ?? 'rgba(25, 118, 210, 0.08)';
+    const tintHover = tint.replace('0.08', '0.12');
+
+    const handleSave = (newCode) => {
+        if (!onCodeSave) return;
+        onCodeSave(field, newCode, message);
+    };
+
+    return (
+        <Box sx={{ mt: 2 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                <IconButton
+                    size="small"
+                    onClick={() => setOpen(prev => !prev)}
+                    sx={{
+                        color,
+                        bgcolor: tint,
+                        '&:hover': { bgcolor: tintHover }
+                    }}
+                >
+                    <CodeIcon fontSize="small" />
+                </IconButton>
+                <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary', flex: 1 }}>
+                    {open ? `Hide ${label}` : `View ${label}`}
+                </Typography>
+                <Tooltip title="Open in full editor">
+                    <IconButton
+                        size="small"
+                        onClick={() => setPopupOpen(true)}
+                        sx={{
+                            color: 'text.secondary',
+                            '&:hover': { color: 'text.primary', bgcolor: 'rgba(0,0,0,0.04)' }
+                        }}
+                    >
+                        <OpenInFullIcon sx={{ fontSize: 14 }} />
+                    </IconButton>
+                </Tooltip>
+            </Box>
+            <Collapse in={open}>
+                <CodeEditor
+                    code={code}
+                    language={language}
+                    height={height}
+                />
+            </Collapse>
+            <CodeEditorPopup
+                open={popupOpen}
+                onClose={() => setPopupOpen(false)}
+                title={label}
+                code={code}
+                language={language}
+                onSave={handleSave}
+            />
+        </Box>
+    );
+};
+
 const ChatMessage = ({
     message,
     index,
@@ -120,108 +222,93 @@ const ChatMessage = ({
     isFullscreen,
     multiStepData,
     formatTimestamp,
-    onSaveToMain
+    onSaveToMain,
+    // ── code-popup wiring ──
+    onCodeSave,
 }) => {
-    // console.log('message: ', message)
     const isUser = message.sender === 'user';
     const showAvatar = !isUser && (index === 0 || messages[index - 1]?.sender !== 'bot');
-    const [showSql, setShowSql] = useState(false);
-    const [showDdl, setShowDdl] = useState(false);
-    const [shownosqlOperation, setShownosqlOperation] = useState(false);
-    const [showTransformFunction, setShowTransformFunction] = useState(false);
-    const [showSourcesConfig, setShowSourcesConfig] = useState(false);
-    const [showTargetDdl, setShowTargetDdl] = useState(false);
-    const [showJoinSql, setShowJoinSql] = useState(false);
-    const [showJoinColumns, setShowJoinColumns] = useState(false);
-    const [showSelectedColumns, setShowSelectedColumns] = useState(false);
-    const [showJavascriptFunction, setShowJavascriptFunction] = useState(false);
+    const TEXT_COLLAPSE_CHAR_THRESHOLD = 240;
+    const TEXT_COLLAPSE_LINE_THRESHOLD = 5;
+    const messageText = message.text || '';
+    const isLongMessage = !isUser && (
+        messageText.length > TEXT_COLLAPSE_CHAR_THRESHOLD ||
+        messageText.split('\n').length > TEXT_COLLAPSE_LINE_THRESHOLD
+    );
+    const [isTextExpanded, setIsTextExpanded] = useState(!isLongMessage);
+    const collapsedText = useMemo(() => {
+        if (!isLongMessage || isTextExpanded) return messageText;
+        const lines = messageText.split('\n');
+        const truncatedByLines = lines.slice(0, TEXT_COLLAPSE_LINE_THRESHOLD).join('\n');
+        const truncated = truncatedByLines.length > TEXT_COLLAPSE_CHAR_THRESHOLD
+            ? truncatedByLines.slice(0, TEXT_COLLAPSE_CHAR_THRESHOLD).trimEnd() + '…'
+            : truncatedByLines + (lines.length > TEXT_COLLAPSE_LINE_THRESHOLD ? '…' : '');
+        return truncated;
+    }, [messageText, isLongMessage, isTextExpanded]);
 
-    const toggleSqlView = () => {
-        setShowSql(prev => !prev);
-    };
-
-    const toggleDdlView = () => {
-        setShowDdl(prev => !prev);
-    };
-
-    const togglenosqlOperationView = () => {
-        setShownosqlOperation(prev => !prev);
-    };
-
-    const toggleTransformFunctionView = () => {
-        setShowTransformFunction(prev => !prev);
-    };
-
-    const toggleSourcesConfigView = () => {
-        setShowSourcesConfig(prev => !prev);
-    };
-
-    const toggleTargetDdlView = () => {
-        setShowTargetDdl(prev => !prev);
-    };
-
-    const toggleJoinSqlView = () => {
-        setShowJoinSql(prev => !prev);
-    };
-
-    const toggleJoinColumnsView = () => {
-        setShowJoinColumns(prev => !prev);
-    };
-
-    const toggleSelectedColumnsView = () => {
-        setShowSelectedColumns(prev => !prev);
-    };
-
-    const toggleJavascriptFunctionView = () => {
-        setShowJavascriptFunction(prev => !prev);
-    };
-    
-    const nosqlOperation = useMemo(() => {
-        if(!message?.metadata?.nosqlOperation) return;
-        // console.log('message?.metadata?.nosqlOperation: ', message?.metadata?.nosqlOperation, typeof message.metadata.nosqlOperation)
-        let jsonValue = message.metadata.nosqlOperation.trim()
-        try{
-            if(typeof message.metadata.nosqlOperation === 'string')
-            jsonValue = JSON.parse(message.metadata.nosqlOperation)
-        }catch(e){
-            console.log('failed to turn into json')
-            return jsonValue
+    const nosqlOperationDisplay = useMemo(() => {
+        if (!message?.metadata?.nosqlOperation) return null;
+        const raw = message.metadata.nosqlOperation;
+        if (typeof raw === 'string') {
+            try {
+                return JSON.stringify(JSON.parse(raw), null, 2);
+            } catch (e) {
+                return raw;
+            }
         }
-        return  JSON.stringify(message.metadata.nosqlOperation, null, 2)                             
-    }, [message?.metadata?.nosqlOperation])
+        return JSON.stringify(raw, null, 2);
+    }, [message?.metadata?.nosqlOperation]);
+
+    const MONO = "'JetBrains Mono', monospace";
+    const SANS = "'Inter',-apple-system,sans-serif";
+    const ACCENT = '#2563eb';
+    const BORDER = '#e2e6eb';
+    const TEXT = '#111827';
+    const MUTED = '#5a6678';
+
+    // Shared props passed to every CodeSection
+    const sectionProps = {
+        message,
+        onCodeSave,
+    };
+
     return (
-        <Fade in={true} key={message.id} timeout={300}>
+        <Fade in={true} key={message.id} timeout={200}>
             <Box
                 sx={{
                     display: 'flex',
-                    mb: 2,
+                    mb: 1.75,
                     justifyContent: isUser ? 'flex-end' : 'flex-start',
-                    px: isFullscreen ? 3 : 2
+                    px: isFullscreen ? 3 : 2,
+                    fontFamily: SANS,
                 }}
             >
                 {/* Bot avatar */}
                 {!isUser && showAvatar && (
-                    <Avatar 
-                        sx={{ 
-                            width: 32, 
-                            height: 32, 
-                            mr: 2,
-                            bgcolor: 'primary.main',
-                            alignSelf: 'flex-end'
+                    <Avatar
+                        sx={{
+                            width: 26,
+                            height: 26,
+                            mr: 1.25,
+                            bgcolor: '#eef1f6',
+                            border: `1px solid ${BORDER}`,
+                            alignSelf: 'flex-end',
+                            borderRadius: 1,
                         }}
+                        variant="rounded"
                     >
-                        <BotIcon fontSize="small" />
+                        <BotIcon sx={{ fontSize: 14, color: MUTED }} />
                     </Avatar>
                 )}
-                
+
                 {/* Spacer for non-avatar messages */}
-                {!isUser && !showAvatar && <Box sx={{ width: 48 }} />}
-                
+                {!isUser && !showAvatar && <Box sx={{ width: 38 }} />}
+
                 {/* Message content */}
                 <Box
                     sx={{
-                        maxWidth: isFullscreen ? '70%' : '85%',
-                        minWidth: 120,
+                        maxWidth: isFullscreen ? '65%' : '82%',
+                        minWidth: 80,
                         position: 'relative'
                     }}
                 >
@@ -229,14 +316,15 @@ const ChatMessage = ({
                     <Paper
                         elevation={0}
                         sx={{
-                            p: 2,
-                            bgcolor: isUser ? 'primary.main' : 'grey.100',
-                            color: isUser ? 'primary.contrastText' : 'text.primary',
-                            borderRadius: 4,
-                            borderTopLeftRadius: !isUser && showAvatar ? 1 : 4,
-                            borderTopRightRadius: isUser ? 1 : 4,
-                            borderBottomLeftRadius: 4,
-                            borderBottomRightRadius: 4,
+                            px: 1.75,
+                            py: 1.25,
+                            bgcolor: isUser ? ACCENT : '#fff',
+                            color: isUser ? '#fff' : TEXT,
+                            border: isUser ? 'none' : `1px solid ${BORDER}`,
+                            borderRadius: 1.5,
+                            borderTopLeftRadius: !isUser && showAvatar ? 0.25 : 1.5,
+                            borderTopRightRadius: isUser ? 0.25 : 1.5,
+                            boxShadow: isUser ? 'none' : '0 1px 3px rgba(0,0,0,0.05)',
                             position: 'relative',
                             wordBreak: 'break-word'
                         }}
@@ -245,17 +333,17 @@ const ChatMessage = ({
                         {message.metadata?.type === 'step_result' && (
                             <StepResultHeader metadata={message.metadata} />
                         )}
-                        
+
                         {/* Multi-step Progress Display */}
                         {(message.metadata?.type === 'multi_step_plan' && message.metadata?.plan) ? (
                             <Box sx={{ mt: 2 }}>
-                                <MultiStepProgress 
+                                <MultiStepProgress
                                     data={{
                                         goal: message.metadata.plan.goal,
                                         steps: message.metadata.plan.steps,
                                         stepResults: multiStepData?.stepResults,
                                         status: multiStepData?.status
-                                    }} 
+                                    }}
                                 />
                             </Box>
                         ) : (
@@ -291,327 +379,216 @@ const ChatMessage = ({
                                     <Typography
                                         variant="body1"
                                         sx={{
-                                            fontSize: '0.95rem',
-                                            lineHeight: 1.4,
+                                            fontSize: 12,
+                                            lineHeight: 1.65,
                                             whiteSpace: 'pre-wrap',
                                             wordWrap: 'break-word',
-                                            color: isUser ? 'white' : 'inherit'
+                                            color: isUser ? '#fff' : 'inherit',
                                         }}
                                     >
-                                        {parseMarkdownBold(message.text)}
+                                        {message.text}
+                                        {/* {parseMarkdownBold(isLongMessage ? collapsedText : message.text)} */}
                                     </Typography>
+                                    {/* {isLongMessage && (
+                                        <Box
+                                            component="button"
+                                            type="button"
+                                            onClick={() => setIsTextExpanded(prev => !prev)}
+                                            sx={{
+                                                mt: 0.5,
+                                                px: 0,
+                                                py: 0,
+                                                background: 'none',
+                                                border: 'none',
+                                                cursor: 'pointer',
+                                                color: ACCENT,
+                                                fontFamily: SANS,
+                                                fontSize: 11,
+                                                fontWeight: 600,
+                                                textAlign: 'left',
+                                                '&:hover': { textDecoration: 'underline' },
+                                            }}
+                                        >
+                                            {isTextExpanded ? 'Show less' : 'Show more'}
+                                        </Box>
+                                    )} */}
                                 </Box>
                             </Box>
                         )}
 
-                        {/* DDL Code Display */}
-                        {message.metadata?.ddl && !isUser && (
+                        {/* Code sections (collapsible inline + popup-expandable) */}
+                        {!isUser && message.metadata?.ddl && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="ddl"
+                                label="DDL (CREATE TABLE)"
+                                code={message.metadata.ddl}
+                                language="sql"
+                                color="success.main"
+                                bgTint="rgba(46, 125, 50, 0.08)"
+                            />
+                        )}
+
+                        {!isUser && message.metadata?.sql && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="sql"
+                                label="SQL (INSERT)"
+                                code={message.metadata.sql}
+                                language="sql"
+                                color="primary.main"
+                                bgTint="rgba(25, 118, 210, 0.08)"
+                            />
+                        )}
+
+                        {!isUser && message.metadata?.operationType && message.metadata?.nosqlOperation && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="nosqlOperation"
+                                label={`Operation ${message.metadata.operationType === 'javascript' ? 'Filter' : message.metadata.operationType}`}
+                                code={nosqlOperationDisplay || ''}
+                                language="json"
+                                color="success.main"
+                                bgTint="rgba(46, 125, 50, 0.08)"
+                            />
+                        )}
+
+                        {!isUser && message.metadata?.transformFunction && (
                             <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleDdlView}
-                                        sx={{
-                                            color: 'success.main',
-                                            bgcolor: 'rgba(46, 125, 50, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(46, 125, 50, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showDdl ? 'Hide DDL (CREATE TABLE)' : 'View DDL (CREATE TABLE)'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showDdl}>
-                                    <CodeEditor
-                                        code={message.metadata.ddl}
-                                        language="sql"
-                                        height={Math.min(300, (message.metadata.ddl.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
+                                {/* Search/Filter Info for Vector Transformations */}
+                                {(message.metadata?.useEmbeddingSearch !== undefined || message.metadata?.filter !== undefined) && (
+                                    <Box sx={{ mb: 2, p: 1.5, bgcolor: 'rgba(25, 118, 210, 0.08)', borderRadius: 1 }}>
+                                        <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary', display: 'block', mb: 0.5 }}>
+                                            Filter Method:
+                                        </Typography>
+                                        {message.metadata.useEmbeddingSearch ? (
+                                            <Box>
+                                                {message.metadata.searchQuery && (
+                                                    <Typography variant="body2" sx={{ mt: 0.5, color: 'text.secondary', fontStyle: 'italic' }}>
+                                                        Query: "{message.metadata.searchQuery}"
+                                                    </Typography>
+                                                )}
+                                            </Box>
+                                        ) : (
+                                            <Box>
+                                                {message.metadata.filter && (
+                                                    <Typography variant="body2" sx={{ mt: 0.5, fontFamily: 'monospace', color: 'text.secondary' }}>
+                                                        {typeof message.metadata.filter === 'string'
+                                                            ? message.metadata.filter
+                                                            : JSON.stringify(message.metadata.filter)}
+                                                    </Typography>
+                                                )}
+                                            </Box>
+                                        )}
+                                    </Box>
+                                )}
+
+                                {/* Initial State Display */}
+                                {message.metadata?.initialState && Object.keys(message.metadata.initialState).length > 0 && (
+                                    <Box sx={{ mb: 2, p: 1.5, bgcolor: 'rgba(156, 39, 176, 0.08)', borderRadius: 1 }}>
+                                        <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary', display: 'block', mb: 0.5 }}>
+                                            Initial State:
+                                        </Typography>
+                                        <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.secondary' }}>
+                                            {JSON.stringify(message.metadata.initialState, null, 2)}
+                                        </Typography>
+                                    </Box>
+                                )}
+
+                                <CodeSection
+                                    {...sectionProps}
+                                    field="transformFunction"
+                                    label="Transform Function"
+                                    code={message.metadata.transformFunction}
+                                    language="javascript"
+                                    color="warning.main"
+                                    bgTint="rgba(237, 108, 2, 0.08)"
+                                />
                             </Box>
                         )}
 
-                        {/* SQL Code Display */}
-                        {message.metadata?.sql && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleSqlView}
-                                        sx={{
-                                            color: 'primary.main',
-                                            bgcolor: 'rgba(25, 118, 210, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(25, 118, 210, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showSql ? 'Hide SQL (INSERT)' : 'View SQL (INSERT)'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showSql}>
-                                    <CodeEditor
-                                        code={message.metadata.sql}
-                                        language="sql"
-                                        height={Math.min(300, (message.metadata.sql.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.sourcesConfig && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="sourcesConfig"
+                                label="Sources Configuration"
+                                code={JSON.stringify(message.metadata.sourcesConfig, null, 2)}
+                                language="json"
+                                color="info.main"
+                                bgTint="rgba(2, 136, 209, 0.08)"
+                            />
                         )}
 
-                        {/* MongoDB Operation Display */}
-                        {message.metadata?.operationType && message.metadata?.nosqlOperation && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={togglenosqlOperationView}
-                                        sx={{
-                                            color: 'success.main',
-                                            bgcolor: 'rgba(46, 125, 50, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(46, 125, 50, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {shownosqlOperation ? `Hide Operation ${message.metadata.operationType === 'javascript'?  'Filter' : message.metadata.operationType}` : `View Operation ${message.metadata.operationType === 'javascript'?  'Filter' : message.metadata.operationType}`}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={shownosqlOperation}>
-                                    <CodeEditor
-                                        code={nosqlOperation}
-                                        language="json"
-                                        height={Math.min(300, (nosqlOperation?.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.targetDdl && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="targetDdl"
+                                label="Target DDL"
+                                code={message.metadata.targetDdl}
+                                language="sql"
+                                color="success.main"
+                                bgTint="rgba(46, 125, 50, 0.08)"
+                            />
                         )}
 
-                        {/* Transform Function Display */}
-                        {message.metadata?.transformFunction && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleTransformFunctionView}
-                                        sx={{
-                                            color: 'warning.main',
-                                            bgcolor: 'rgba(237, 108, 2, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(237, 108, 2, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showTransformFunction ? 'Hide Transform Function' : 'View Transform Function'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showTransformFunction}>
-                                    <CodeEditor
-                                        code={message.metadata.transformFunction}
-                                        language="javascript"
-                                        height={Math.min(400, (message.metadata.transformFunction.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.joinSql && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="joinSql"
+                                label="Join SQL"
+                                code={message.metadata.joinSql}
+                                language="sql"
+                                color="primary.main"
+                                bgTint="rgba(25, 118, 210, 0.08)"
+                            />
                         )}
 
-                        {/* Sources Config Display */}
-                        {message.metadata?.sourcesConfig && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleSourcesConfigView}
-                                        sx={{
-                                            color: 'info.main',
-                                            bgcolor: 'rgba(2, 136, 209, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(2, 136, 209, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showSourcesConfig ? 'Hide Sources Configuration' : 'View Sources Configuration'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showSourcesConfig}>
-                                    <CodeEditor
-                                        code={JSON.stringify(message.metadata.sourcesConfig, null, 2)}
-                                        language="json"
-                                        height={Math.min(400, (JSON.stringify(message.metadata.sourcesConfig, null, 2).split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.joinColumns && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="joinColumns"
+                                label="Join Columns"
+                                code={JSON.stringify(message.metadata.joinColumns, null, 2)}
+                                language="json"
+                                color="secondary.main"
+                                bgTint="rgba(156, 39, 176, 0.08)"
+                            />
                         )}
 
-                        {/* Target DDL Display */}
-                        {message.metadata?.targetDdl && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleTargetDdlView}
-                                        sx={{
-                                            color: 'success.main',
-                                            bgcolor: 'rgba(46, 125, 50, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(46, 125, 50, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showTargetDdl ? 'Hide Target DDL' : 'View Target DDL'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showTargetDdl}>
-                                    <CodeEditor
-                                        code={message.metadata.targetDdl}
-                                        language="sql"
-                                        height={Math.min(300, (message.metadata.targetDdl.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.selectedColumns && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="selectedColumns"
+                                label="Selected Columns"
+                                code={JSON.stringify(message.metadata.selectedColumns, null, 2)}
+                                language="json"
+                                color="warning.main"
+                                bgTint="rgba(237, 108, 2, 0.08)"
+                            />
                         )}
 
-                        {/* Join SQL Display */}
-                        {message.metadata?.joinSql && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleJoinSqlView}
-                                        sx={{
-                                            color: 'primary.main',
-                                            bgcolor: 'rgba(25, 118, 210, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(25, 118, 210, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showJoinSql ? 'Hide Join SQL' : 'View Join SQL'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showJoinSql}>
-                                    <CodeEditor
-                                        code={message.metadata.joinSql}
-                                        language="sql"
-                                        height={Math.min(400, (message.metadata.joinSql.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.javascriptFunction && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="javascriptFunction"
+                                label="JavaScript Function"
+                                code={message.metadata.javascriptFunction}
+                                language="javascript"
+                                color="error.main"
+                                bgTint="rgba(211, 47, 47, 0.08)"
+                            />
                         )}
 
-                        {/* Join Columns Display */}
-                        {message.metadata?.joinColumns && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleJoinColumnsView}
-                                        sx={{
-                                            color: 'secondary.main',
-                                            bgcolor: 'rgba(156, 39, 176, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(156, 39, 176, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showJoinColumns ? 'Hide Join Columns' : 'View Join Columns'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showJoinColumns}>
-                                    <CodeEditor
-                                        code={JSON.stringify(message.metadata.joinColumns, null, 2)}
-                                        language="json"
-                                        height={Math.min(300, (JSON.stringify(message.metadata.joinColumns, null, 2).split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
-                        )}
-
-                        {/* Selected Columns Display */}
-                        {message.metadata?.selectedColumns && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleSelectedColumnsView}
-                                        sx={{
-                                            color: 'warning.main',
-                                            bgcolor: 'rgba(237, 108, 2, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(237, 108, 2, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showSelectedColumns ? 'Hide Selected Columns' : 'View Selected Columns'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showSelectedColumns}>
-                                    <CodeEditor
-                                        code={JSON.stringify(message.metadata.selectedColumns, null, 2)}
-                                        language="json"
-                                        height={Math.min(300, (JSON.stringify(message.metadata.selectedColumns, null, 2).split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
-                        )}
-
-                        {/* JavaScript Join Function Display */}
-                        {message.metadata?.javascriptFunction && !isUser && (
-                            <Box sx={{ mt: 2 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                                    <IconButton
-                                        size="small"
-                                        onClick={toggleJavascriptFunctionView}
-                                        sx={{
-                                            color: 'error.main',
-                                            bgcolor: 'rgba(211, 47, 47, 0.08)',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(211, 47, 47, 0.12)'
-                                            }
-                                        }}
-                                    >
-                                        <CodeIcon fontSize="small" />
-                                    </IconButton>
-                                    <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
-                                        {showJavascriptFunction ? 'Hide JavaScript Join Function' : 'View JavaScript Join Function'}
-                                    </Typography>
-                                </Box>
-                                <Collapse in={showJavascriptFunction}>
-                                    <CodeEditor
-                                        code={message.metadata.javascriptFunction}
-                                        language="javascript"
-                                        height={Math.min(400, (message.metadata.javascriptFunction.split('\n').length + 1) * 19 + 20)}
-                                    />
-                                </Collapse>
-                            </Box>
+                        {!isUser && message.metadata?.pythonCode && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="pythonCode"
+                                label="Python Code"
+                                code={message.metadata.pythonCode}
+                                language="python"
+                                color="#ff9800"
+                                bgTint="rgba(255, 152, 0, 0.08)"
+                            />
                         )}
 
                         {/* Visualization */}
@@ -623,26 +600,27 @@ const ChatMessage = ({
                                 />
                             </Box>
                         )}
-                        
-                        {/* Timestamp */}
-                        <Typography 
-                            variant="caption" 
-                            sx={{ 
-                                display: 'block', 
-                                mt: 1, 
-                                opacity: 0.7,
-                                fontSize: '0.75rem'
-                            }}
-                        >
-                            {formatTimestamp(message.timestamp)}
-                        </Typography>
+
                     </Paper>
+                    {/* Timestamp — outside the bubble to match redesign */}
+                    <Typography
+                        sx={{
+                            display: 'block',
+                            mt: 0.5,
+                            fontSize: 9,
+                            color: '#9ca3af',
+                            fontFamily: MONO,
+                            textAlign: isUser ? 'right' : 'left',
+                        }}
+                    >
+                        {formatTimestamp(message.timestamp)}
+                    </Typography>
                 </Box>
-                
+
                 {/* User avatar space (invisible) */}
-                {isUser && <Box sx={{ width: 48 }} />}
+                {isUser && <Box sx={{ width: 38 }} />}
             </Box>
-            
+
         </Fade>
     );
 };
