@@ -2,15 +2,22 @@ import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { PlayCircleOutlined, ClockCircleOutlined, ThunderboltOutlined } from '@ant-design/icons';
 
+const ACCENT = '#2563eb';
+const MONO = "'JetBrains Mono', monospace";
+const TEXT = '#111827';
+const MUTED = '#5a6678';
+const BORDER = '#e2e6eb';
+const GREEN = '#059669';
+
 const StartNode = ({ data, selected }) => {
   const getTriggerIcon = () => {
     switch (data.config?.triggerType) {
       case 'schedule':
-        return <ClockCircleOutlined style={{ fontSize: '14px', color: 'white' }} />;
+        return <ClockCircleOutlined style={{ fontSize: '12px', color: ACCENT }} />;
       case 'webhook':
-        return <ThunderboltOutlined style={{ fontSize: '14px', color: 'white' }} />;
+        return <ThunderboltOutlined style={{ fontSize: '12px', color: ACCENT }} />;
       default:
-        return <PlayCircleOutlined style={{ fontSize: '14px', color: 'white' }} />;
+        return <PlayCircleOutlined style={{ fontSize: '12px', color: ACCENT }} />;
     }
   };
 
@@ -22,7 +29,7 @@ const StartNode = ({ data, selected }) => {
       case 'webhook':
         return 'Webhook';
       case 'manual':
-        return 'Manual';
+        return 'Manual Trigger';
       default:
         return 'Start';
     }
@@ -35,68 +42,103 @@ const StartNode = ({ data, selected }) => {
         if (config.scheduleType === 'interval' && config.interval) {
           return `Every ${config.interval}${config.intervalUnit?.charAt(0) || 'm'}`;
         } else if (config.scheduleType === 'daily') {
-          return 'Daily';
+          return 'Daily schedule';
         } else if (config.scheduleType === 'weekly') {
-          return 'Weekly';
+          return 'Weekly schedule';
         } else if (config.scheduleType === 'monthly') {
-          return 'Monthly';
+          return 'Monthly schedule';
         } else if (config.scheduleType === 'cron') {
-          return 'Custom';
+          return 'Custom cron';
         }
-        return 'Configure';
+        return 'Configure schedule';
       case 'webhook':
-        return 'API Trigger';
+        return 'HTTP trigger';
       case 'manual':
-        return 'Manual';
+        return 'Runs on demand. No schedule configured.';
       default:
-        return 'Configure';
+        return 'Configure trigger';
     }
   };
 
+  const isConfigured = !!(data.config?.triggerType);
+
   return (
-    <div className={`react-flow__node-start ${selected ? 'selected' : ''}`}>
-      <div style={{ 
-        padding: '8px 10px', 
-        display: 'flex', 
-        alignItems: 'center', 
-        gap: '6px',
-        width: '240px',
-        background: 'linear-gradient(135deg, #1890ff 0%, #40a9ff 100%)',
-        color: 'white',
-        borderRadius: '6px',
-        position: 'relative'
+    <div
+      style={{
+        width: 264,
+        background: '#fff',
+        border: `1px solid ${selected ? ACCENT : BORDER}`,
+        borderLeft: `3px solid ${ACCENT}`,
+        borderRadius: 6,
+        boxShadow: selected
+          ? `0 0 0 3px ${ACCENT}1a, 0 4px 16px rgba(0,0,0,0.12)`
+          : '0 1px 4px rgba(0,0,0,0.07)',
+        position: 'relative',
+        userSelect: 'none',
+        fontFamily: "'Inter',-apple-system,sans-serif",
+      }}
+    >
+      {/* Header */}
+      <div style={{
+        padding: '7px 10px',
+        borderBottom: '1px solid #f0f2f5',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7,
       }}>
         {getTriggerIcon()}
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: '500', fontSize: '12px' }}>
-            {getTriggerLabel()}
-          </div>
-          <div style={{ fontSize: '10px', opacity: 0.9 }}>
-            {getTriggerDescription()}
-          </div>
-        </div>
-        
-        {/* Start indicator */}
+        <span style={{
+          fontSize: 9,
+          fontFamily: MONO,
+          fontWeight: 700,
+          letterSpacing: '0.1em',
+          color: ACCENT,
+          textTransform: 'uppercase',
+        }}>
+          START
+        </span>
         <div style={{
-          position: 'absolute',
-          top: '-4px',
-          left: '-4px',
-          width: '8px',
-          height: '8px',
+          marginLeft: 'auto',
+          width: 6,
+          height: 6,
           borderRadius: '50%',
-          background: '#52c41a',
-          border: '1px solid white'
+          background: isConfigured ? GREEN : BORDER,
         }} />
       </div>
-      
+
+      {/* Body */}
+      <div style={{ padding: '8px 10px' }}>
+        <div style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: TEXT,
+          marginBottom: 4,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}>
+          {getTriggerLabel()}
+        </div>
+        <div style={{
+          fontSize: 11,
+          color: MUTED,
+          lineHeight: 1.5,
+        }}>
+          {getTriggerDescription()}
+        </div>
+      </div>
+
+      {/* Right handle */}
       <Handle
         type="source"
         position={Position.Right}
         style={{
-          background: '#1890ff',
+          background: ACCENT,
           border: '2px solid #fff',
-          width: '8px',
-          height: '8px'
+          width: 10,
+          height: 10,
+          right: -6,
+          boxShadow: `0 0 0 1px ${ACCENT}44`,
         }}
       />
     </div>

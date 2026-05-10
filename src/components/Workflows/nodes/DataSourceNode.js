@@ -1,6 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { DatabaseOutlined } from '@ant-design/icons';
+import { ExpandableCodes, extractLatestCodes, getLatestUserQuestion } from './nodeCardShared';
 import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
 import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
 import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
@@ -11,7 +12,13 @@ import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg
 import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
 import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
 
-// Helper to get database icon component
+const COLOR = '#0891b2';
+const MONO = "'JetBrains Mono', monospace";
+const TEXT = '#111827';
+const MUTED = '#5a6678';
+const BORDER = '#e2e6eb';
+const GREEN = '#059669';
+
 const getDbIcon = (dbType) => {
   const iconMap = {
     postgres: PostgresIcon,
@@ -28,21 +35,11 @@ const getDbIcon = (dbType) => {
 };
 
 const DataSourceNode = ({ data, selected }) => {
-  // console.log('DataSourceNode; ', data.config)
-  // Check if the data source is configured
-  // For CSV files, only connectionId is required (no table/dataset needed)
   const isConfigured = data.config?.sourceConnectionId &&
     (data.config?.sourceType === 'csv' || data.config?.table || data.config?.dataset || data.config?.sourceType);
 
-  // Determine colors based on configuration status (keep border color logic)
-  const borderColor = isConfigured ? '#52c41a' : '#d9d9d9';
-  const iconColor = isConfigured ? '#52c41a' : '#999';
-  const textColor = isConfigured ? '#333' : '#999';
-
-  // Get database-specific icon
   const DbIconComponent = data.config?.dbType ? getDbIcon(data.config.dbType) : null;
 
-  // Get display info
   const getDisplayName = () => {
     if (data.config?.sourceConnectionName) {
       return data.config.sourceConnectionName;
@@ -54,15 +51,16 @@ const DataSourceNode = ({ data, selected }) => {
     if (!isConfigured) return 'Click to configure data source';
 
     const config = data.config;
-    if (config.sourceExplanation || config.sourceSqlExplanation) {
-      const explanation = config.sourceExplanation || config.sourceSqlExplanation;
+    // Prefer AI-written explanations over user questions so the card
+    // describes what the node *does*, not what was asked.
+    const explanation =
+      config.apiFetchExplanation ||
+      config.sourceExplanation ||
+      config.sourceSqlExplanation ||
+      config.sourceQueryDescription ||
+      getLatestUserQuestion(config.chat);
+    if (explanation) {
       return explanation.length > 100 ? explanation.slice(0, 100) + '...' : explanation;
-    }
-
-    if (config.sourceQueryDescription) {
-      return config.sourceQueryDescription.length > 100
-        ? config.sourceQueryDescription.slice(0, 100) + '...'
-        : config.sourceQueryDescription;
     }
 
     if (config.sourceTable) {
@@ -76,87 +74,108 @@ const DataSourceNode = ({ data, selected }) => {
     return 'Data source configured';
   };
 
+  const latestCodes = extractLatestCodes(data.config?.chat);
+
   return (
-    <div className={`react-flow__node-dataSource ${selected ? 'selected' : ''}`}
-         style={{
-           borderLeft: `4px solid ${borderColor}`,
-           borderTop: `1px solid #e8e8e8`,
-           borderRight: `1px solid #e8e8e8`,
-           borderBottom: `2px solid #d0d0d0`,
-           backgroundColor: '#fefce8',
-           boxShadow: selected ? '0 4px 12px rgba(0,0,0,0.15)' : '0 2px 6px rgba(0,0,0,0.1)',
-           borderRadius: '2px',
-           minWidth: '220px',
-           maxWidth: '280px',
-           opacity: isConfigured ? 1 : 0.8,
-         }}>
-      {/* Target handle for incoming connections from start node */}
+    <div
+      style={{
+        width: 264,
+        background: '#fff',
+        border: `1px solid ${selected ? COLOR : BORDER}`,
+        borderLeft: `3px solid ${COLOR}`,
+        borderRadius: 6,
+        boxShadow: selected
+          ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
+          : '0 1px 4px rgba(0,0,0,0.07)',
+        position: 'relative',
+        userSelect: 'none',
+        fontFamily: "'Inter',-apple-system,sans-serif",
+        opacity: isConfigured ? 1 : 0.9,
+      }}
+    >
       <Handle
         type="target"
         position={Position.Left}
         style={{
-          background: borderColor,
+          background: COLOR,
           border: '2px solid #fff',
-          width: '10px',
-          height: '10px',
-          left: '-5px',
+          width: 10,
+          height: 10,
+          left: -6,
+          boxShadow: `0 0 0 1px ${COLOR}44`,
         }}
       />
 
-      {/* Header with icon and name */}
+      {/* Header */}
       <div style={{
-        padding: '10px 12px',
-        borderBottom: '1px solid #f0f0f0',
+        padding: '7px 10px',
+        borderBottom: '1px solid #f0f2f5',
         display: 'flex',
         alignItems: 'center',
-        gap: '8px',
-        backgroundColor: 'rgba(255,255,255,0.5)',
+        gap: 7,
       }}>
         {DbIconComponent ? (
-          <DbIconComponent style={{ width: '18px', height: '18px', fill: iconColor }} />
+          <DbIconComponent style={{ width: 12, height: 12, fill: COLOR }} />
         ) : (
-          <DatabaseOutlined style={{ fontSize: '18px', color: iconColor }} />
+          <DatabaseOutlined style={{ fontSize: 12, color: COLOR }} />
         )}
+        <span style={{
+          fontSize: 9,
+          fontFamily: MONO,
+          fontWeight: 700,
+          letterSpacing: '0.1em',
+          color: COLOR,
+          textTransform: 'uppercase',
+        }}>
+          DATA SOURCE
+        </span>
         <div style={{
-          fontWeight: '600',
-          fontSize: '13px',
-          color: textColor,
-          flex: 1,
+          marginLeft: 'auto',
+          width: 6,
+          height: 6,
+          borderRadius: '50%',
+          background: isConfigured ? GREEN : BORDER,
+        }} />
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: '8px 10px' }}>
+        <div style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: TEXT,
+          marginBottom: 4,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
         }}>
           {getDisplayName()}
         </div>
+        <div style={{
+          fontSize: 11,
+          color: MUTED,
+          lineHeight: 1.5,
+          display: '-webkit-box',
+          WebkitLineClamp: 3,
+          WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+        }}>
+          {getSummary()}
+        </div>
       </div>
 
-      {/* Summary description */}
-      <div style={{
-        padding: '12px',
-        fontSize: '12px',
-        lineHeight: '1.5',
-        color: isConfigured ? '#555' : '#999',
-        fontStyle: isConfigured ? 'normal' : 'italic',
-        minHeight: '60px',
-        maxHeight: '90px',
-        overflow: 'hidden',
-        display: '-webkit-box',
-        WebkitLineClamp: 4,
-        WebkitBoxOrient: 'vertical',
-      }}>
-        {getSummary()}
-      </div>
+      <ExpandableCodes codes={latestCodes} />
 
-      {/* Source handle for outgoing connections to other nodes */}
       <Handle
         type="source"
         position={Position.Right}
         style={{
-          background: borderColor,
+          background: COLOR,
           border: '2px solid #fff',
-          width: '10px',
-          height: '10px',
-          right: '-5px',
+          width: 10,
+          height: 10,
+          right: -6,
+          boxShadow: `0 0 0 1px ${COLOR}44`,
         }}
       />
     </div>
