@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Form, Input, InputNumber, Switch, Button, Space, message, Alert } from 'antd';
+import { Form, Input, InputNumber, Switch, Button, Space, message, Alert, Select } from 'antd';
 import { LinkOutlined, CheckCircleOutlined } from '@ant-design/icons';
 
 /**
@@ -72,6 +72,7 @@ const DynamicConnectionForm = ({
         description: values.description || `Connection to ${plugin.name}`,
         connectionType: 'database',
         dbType: plugin.id,
+        dbCategory: plugin.dbCategory || null,
         dbConfig: { ...values },
       };
       // console.log('connectionData: ', connectionData)
@@ -272,6 +273,42 @@ const DynamicConnectionForm = ({
           </Form.Item>
         );
 
+      case 'select':
+        return (
+          <Form.Item
+            key={field.name}
+            name={field.name}
+            label={field.label}
+            rules={rules}
+            tooltip={field.helpText}
+          >
+            <Select
+              placeholder={field.placeholder}
+              options={(field.options || []).map(opt =>
+                typeof opt === 'string'
+                  ? { value: opt, label: opt }
+                  : { value: opt.value, label: opt.label ?? String(opt.value) }
+              )}
+            />
+          </Form.Item>
+        );
+
+      case 'textarea':
+        return (
+          <Form.Item
+            key={field.name}
+            name={field.name}
+            label={field.label}
+            rules={rules}
+            tooltip={field.helpText}
+          >
+            <Input.TextArea
+              placeholder={field.placeholder}
+              rows={field.rows || 3}
+            />
+          </Form.Item>
+        );
+
       case 'string':
       default:
         return (
@@ -289,6 +326,21 @@ const DynamicConnectionForm = ({
         );
     }
   };
+
+  // Resolve fields visible given current form values. Supports
+  //   visibleWhen: { fieldName: 'expectedValue' | [values...] }
+  // All listed fields must match for the row to show. Fields without
+  // `visibleWhen` are always visible.
+  const watchedValues = Form.useWatch([], form) || {};
+  const isFieldVisible = (field) => {
+    if (!field.visibleWhen) return true;
+    return Object.entries(field.visibleWhen).every(([k, expected]) => {
+      const actual = watchedValues[k];
+      if (Array.isArray(expected)) return expected.includes(actual);
+      return actual === expected;
+    });
+  };
+  const visibleFields = (plugin.configSchema?.fields || []).filter(isFieldVisible);
 
   return (
     <div style={{ padding: '20px 0' }}>
@@ -319,8 +371,8 @@ const DynamicConnectionForm = ({
           />
         </Form.Item>
 
-        {/* Dynamic fields from plugin configSchema */}
-        {plugin.configSchema?.fields?.map(renderField)}
+        {/* Dynamic fields from plugin configSchema (respecting visibleWhen) */}
+        {visibleFields.map(renderField)}
 
         {/* OAuth2.0 Authorization */}
         {plugin.authType === 'oauth2' && (
