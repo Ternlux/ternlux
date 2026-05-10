@@ -256,6 +256,16 @@ export const executionsDb = {
   },
 
   /**
+   * Update an execution by its executionId.
+   * @param {string} executionId
+   * @param {object} data - Fields to merge
+   * @returns {Promise<object>} NeDB update result
+   */
+  async update(executionId, data) {
+    return dbUpdate('executions', { executionId }, { $set: data });
+  },
+
+  /**
    * Delete an execution by executionId.
    * @param {string} executionId
    * @returns {Promise<number>}
