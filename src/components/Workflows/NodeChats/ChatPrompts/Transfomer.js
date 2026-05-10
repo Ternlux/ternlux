@@ -285,7 +285,7 @@ const prompts = {
 
         Provide working SQLite SQL.`,
 
-        transformationRequest: (userRequest, sourceTablesInfo, dbyType, isSourceLocal = false) => `You are an intelligent data transformation assistant. Analyze the user's request and determine the best course of action.
+        transformationRequest: (userRequest, sourceTablesInfo, dbyType, isSourceLocal = false, availableSkills = []) => `You are an intelligent data transformation assistant. Analyze the user's request and determine the best course of action.
 
         User's request: "${userRequest}"
 
@@ -294,6 +294,25 @@ const prompts = {
 
         Database type: ${dbyType}
         ${isSourceLocal ? 'Source data location: Local file (data is already stored locally)' : 'Source data location: Database (remote connection)'}
+
+        ${availableSkills.length > 0 ? `**Available Skills**:
+You have access to these special transformation skills that can be used instead of standard SQL/NoSQL transformations:
+
+${availableSkills.map(skill => `
+**${skill.name}** (${skill.id}):
+${skill.description.description}
+
+Capabilities:
+${skill.description.capabilities.map(cap => `- ${cap}`).join('\n')}
+
+Use when:
+- ${skill.description.description}
+
+${skill.prompts ? skill.prompts.systemContext : ''}
+`).join('\n')}
+
+**IMPORTANT**: If a skill is better suited for the transformation than standard SQL/NoSQL, you can specify "usesSkill": true and "skillId": "<skill-id>" in your response.
+` : ''}
 
         **Important**: You have access to the full chat history. Use it to understand:
         - If this is a follow-up request (refine/modify existing transformation)
@@ -352,6 +371,9 @@ const prompts = {
           "action": "answer_directly" | "generate_transformation" | "ask_questions",
           "directAnswer": "Your direct answer (only if action is answer_directly)",
           "tableName": "inferred custom_table_name if in users input",
+          "usesSkill": false | true,
+          "skillId": "skill-id-here (only if usesSkill is true)",
+          "skillExplanation": "Brief explanation of why this skill is being used (only if usesSkill is true)",
           "inferredSettings": {
             "operationMode": "new_table" | "in_place" | null${isSourceLocal ? '' : `,
             "storageLocation": "database" | "local" | null`}

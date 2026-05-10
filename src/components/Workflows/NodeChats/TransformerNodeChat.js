@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { getWorkflowAssistance } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
 import ChatPrompts from './ChatPrompts/Transfomer';
@@ -23,7 +23,6 @@ const TransformerNodeChat = ({
   onSave,
   onConfigUpdate,
   onPreviewConfigUpdate,
-  onExecute,
   executeTransformation,
   getSourceLocalPath,
   executingInd,
@@ -48,6 +47,10 @@ const TransformerNodeChat = ({
   const [saveState, setSaveState] = useState(false);
   const [disableInput, setDisableInput] = useState(false);
 
+  // Skills state
+  const [availableSkills, setAvailableSkills] = useState([]);
+  const [activeSkill, setActiveSkill] = useState(null); // { skillId, skillState: { code, params, etc. }, readyToExecute: bool }
+
   // Error state for failed transformations
   const [executionError, setExecutionError] = useState(null); // { error: string, transformation: object }
 
@@ -66,6 +69,32 @@ const TransformerNodeChat = ({
   // ─────────────────────────────────────────────────────────────────────────
   // Initialize
   // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Load available skills for transformer category
+   */
+  const loadAvailableSkills = async () => {
+    if (window.electronAPI?.skills?.getDescriptions) {
+      try {
+        // Determine operationType based on source connection dbCategory
+        const dbType = sourceConnection?.dbType;
+        const operationType = sourceConnection?.dbCategory ? sourceConnection.dbCategory.toLowerCase() : 'sql';
+
+        // Load transformer skills with context
+        const result = await window.electronAPI.skills.getDescriptions('transformer', {
+          operationType,
+          sourceSchema: sourceTableSchema
+        });
+
+        if (result.success) {
+          console.log('[TransformerNodeChat] Loaded skills:', result.descriptions);
+          setAvailableSkills(result.descriptions || []);
+        }
+      } catch (error) {
+        console.error('[TransformerNodeChat] Failed to load skills:', error);
+      }
+    }
+  };
 
   const initializationFunc = async () => {
     const source_name = await detectSourceNode();
@@ -134,6 +163,13 @@ const TransformerNodeChat = ({
       initializationFunc()
     }
   }, []);
+
+  // Load available skills when source connection and table schema are ready
+  useEffect(() => {
+    if (sourceConnection && sourceTableSchema) {
+      loadAvailableSkills();
+    }
+  }, [sourceConnection, sourceTableSchema]);
 
   // Sync chat state with initialChat prop when node changes
   useEffect(() => {
@@ -241,7 +277,9 @@ const TransformerNodeChat = ({
       connectionType: dataSource ? sourceConfig.sourceConnectionType : sourceConfig.targetConnectionType,
       dbType: dataSource ? sourceConfig.sourceDbType : sourceConfig.targetDbType,
       dbConfig: dataSource ? sourceConfig.sourceDbConfig : sourceConfig.targetDbConfig,
-      localPath: dataSource ?  sourceConfig.sourceLocalPath : sourceConfig.targetLocalPath
+      localPath: dataSource ?  sourceConfig.sourceLocalPath : sourceConfig.targetLocalPath,
+      dbCategory: dataSource ?  sourceConfig.sourceDbCategory : sourceConfig.targetDbCategory,
+      indexName: dataSource ? sourceConfig.sourceIndexName : sourceConfig.targetIndexName // For Pinecone
     };
 
     // Get schema from saved config (if available) or load from database
@@ -253,6 +291,9 @@ const TransformerNodeChat = ({
       schema = {
         sourceNodeLabel: source.data.label,
         tableName: sourceConfig.targetTableName || sourceConfig.sourceTableName || sourceConfig.targetCollection || sourceConfig.sourceCollection || savedSchema.tableName,
+        indexName: dataSource ? sourceConfig.sourceIndexName : sourceConfig.targetIndexName, // For Pinecone
+        namespace: dataSource ? sourceConfig.sourceNamespace : sourceConfig.targetNamespace, // For Pinecone
+        schema: dataSource ? sourceConfig.sourceSchema : sourceConfig.targetSchema, // Schema field (also used for namespace in some cases)
         columns: savedSchema.columns,
         sampleData: savedSchema.sampleData
       };
@@ -292,16 +333,20 @@ const TransformerNodeChat = ({
       console.warn('Database API not available');
       return null;
     }
-  
+
     try {
       const sourceConfig = source?.data?.config || {};
+      const nodeType = sourceConfig.nodeType;
+      const dataSource = nodeType === 'datasource';
       const isNoSQL = connection.dbType === 'mongodb' || connection.dbType === 'nedb';
-      
+
       let tableName = null;
       let tableSchema = null;
       let localPath = null;
       let queryConnection = connection;
-  
+      let indexName = null;
+      let namespace = null;
+
       if (isNoSQL) {
         // 1. Resolve NoSQL/NeDB identifiers
         // Try target first (for transformer chains), then source (for data sources)
@@ -325,13 +370,17 @@ const TransformerNodeChat = ({
                     sourceConfig.sourceTableName ||
                     sourceConfig.table ||
                     (source.id ? source.id.replace('-', '_').toLowerCase() : null);
+
+        // For vector databases (Pinecone), extract indexName and namespace
+        indexName = dataSource ? sourceConfig.sourceIndexName : sourceConfig.targetIndexName;
+        namespace = dataSource ? sourceConfig.sourceNamespace : sourceConfig.targetNamespace;
       }
-  
+
       if (!tableName && !localPath) {
         console.warn('Could not determine table name or local path from source config');
         return null;
       }
-  
+
       // 3. Call the unified utility function
       const schema = await loadTableSchema({
         connection: queryConnection,
@@ -340,7 +389,18 @@ const TransformerNodeChat = ({
         localPath,
         limit: 5 // Matching your original sample size
       });
-  
+
+      // 4. Add vector database fields if applicable
+      if (schema && indexName) {
+        schema.indexName = indexName;
+      }
+      if (schema && namespace) {
+        schema.namespace = namespace;
+      }
+      if (schema && tableSchema && !schema.schema) {
+        schema.schema = tableSchema;
+      }
+
       console.log('Loaded source schema:', schema);
       return schema;
   
@@ -358,8 +418,17 @@ const TransformerNodeChat = ({
     const userMsg = addUserMessage(text, ref, value, data);
 
     if (ref === 'transformationRequest' || ref === 'chatContinue') {
-      // All user requests go through the intelligent analysis
-      await startTransformationFlow(userMsg);
+      // Check if we're in skill mode
+      if (activeSkill) {
+        // Route to skill flow
+        await handleSkillFlow(userMsg);
+      } else {
+        // Normal transformation flow
+        await startTransformationFlow(userMsg);
+      }
+    } else if (ref === 'skillFollowUp') {
+      // Skill follow-up question response
+      await handleSkillFlow(userMsg);
     } else if (ref === 'operationMode') {
       await handleOperationModeResponse(value);
     } else if (ref === 'storageLocation') {
@@ -390,6 +459,21 @@ const TransformerNodeChat = ({
     setExecutionError(null); // Clear any previous error state
 
     try {
+      // Check if source is a vector database - route directly to vector skill
+      if (sourceConnection?.dbCategory === 'Vector') {
+        console.log('Vector database detected - routing to vector-db-executor skill');
+
+        const skillInfo = {
+          skillId: 'vector-db-executor',
+          skillState: { isSourceVector: true },
+          readyToExecute: false
+        };
+
+        setActiveSkill(skillInfo);
+        await handleSkillFlow(userMsg, skillInfo);
+        return;
+      }
+
       // Build chat history for AI context
       const chatHistory = chat.map(msg => ({
         sender: msg.sender,
@@ -400,11 +484,226 @@ const TransformerNodeChat = ({
       await analyzeTransformationRequest(userMsg.text, chatHistory);
     } catch (error) {
       console.error('Analysis error:', error);
-      addBotMessage('Failed to analyze your request. Please try again.', false);
+      addBotMessage(`Failed to analyze your request. Error: ${error}`, false);
       setAiLoading(false);
       setLoading(false);
     }
   };
+  // ─────────────────────────────────────────────────────────────────────────
+  // Skill Flow - Dedicated flow for skill interactions
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Handle all skill interactions through the skill's main function
+   * @param {Object} userMsg - User message object
+   * @param {Object} skillInfo - Optional skill info to use (for initial call when state hasn't updated yet)
+   */
+  const handleSkillFlow = async (userMsg, skillInfo = null) => {
+    const currentSkill = skillInfo || activeSkill;
+
+    if (!currentSkill || !currentSkill.skillId) {
+      console.error('[handleSkillFlow] No active skill');
+      addBotMessage('Error: No active skill found.', false);
+      setAiLoading(false);
+      setLoading(false);
+      return;
+    }
+
+    console.log('[handleSkillFlow] Processing request with skill:', currentSkill.skillId);
+
+    setAiLoading(true);
+    setLoading(true);
+
+    try {
+      // Build chat history
+      const chatHistory = chat.map(msg => ({
+        sender: msg.sender,
+        text: msg.text
+      }));
+
+      // Determine operationType
+      const dbType = sourceConnection?.dbType;
+      const operationType = ['mongodb', 'nedb'].includes(dbType) ? 'nosql' : 'sql';
+
+      // Step 1: Build the skill prompt
+      const promptResult = await window.electronAPI.skills.buildPrompt({
+        skillId: currentSkill.skillId,
+        params: {
+          userRequest: userMsg.text,
+          chatHistory,
+          sourceTableSchema: sourceTableSchema,
+          sourceConnection: sourceConnection,
+          operationType,
+          settings: transformationSettings,
+          currentState: currentSkill.skillState || {}
+        }
+      });
+      console.log('promptResult: ', promptResult)
+      if (!promptResult.success) {
+        addBotMessage(`Error building prompt: ${promptResult.message}`, false);
+        setAiLoading(false);
+        setLoading(false);
+        return;
+      }
+
+      let result;
+
+      if (promptResult.prompt) {
+        // Standard flow: skill returned a prompt to send to AI, then we hand
+        // the response back through processSkillResponse for validation.
+        const aiResponse = await getWorkflowAssistance(
+          `skill-${currentSkill.skillId}`,
+          promptResult.prompt,
+          promptResult.context,
+          chatHistory
+        );
+
+        result = await window.electronAPI.skills.processResponse({
+          skillId: currentSkill.skillId,
+          aiResponse,
+          operationType,
+          currentState: currentSkill.skillState || {},
+          availableConnections: promptResult.context?.availableConnections
+        });
+
+        if (!result.success) {
+          addBotMessage(`Error: ${result.message}`, false);
+          setAiLoading(false);
+          setLoading(false);
+          return;
+        }
+      } else {
+        // Pre-resolved flow: skill orchestrated its own AI calls and returned
+        // a fully-validated result (action + relevant fields) at the top
+        // level. Skip the AI roundtrip and processResponse entirely.
+        result = promptResult;
+      }
+
+
+      console.log('[handleSkillFlow] Skill response:', result);
+
+      // Handle different actions
+      switch (result.action) {
+        case 'unrelateSkill':
+          // Exit skill mode and go back to normal flow
+          addBotMessage(
+            result.explanation || 'This request is not related to the skill transformation. Switching back to standard transformation flow.',
+            false
+          );
+          setActiveSkill(null);
+          setAiLoading(false);
+          setLoading(false);
+
+          // Re-process the request through normal flow
+          await startTransformationFlow(userMsg);
+          break;
+
+        case 'answer_directly':
+          // Answer the user's question
+          setAiLoading(false);
+          setLoading(false);
+          addBotMessage(result.directAnswer || result.explanation, false);
+          addBotMessage(
+            'Continue refining your transformation, or execute when ready.',
+            true,
+            'text',
+            'chatContinue',
+            'Ask another question or refine the transformation...'
+          );
+          break;
+
+        case 'ask_questions':
+          // Ask follow-up questions
+          setAiLoading(false);
+          setLoading(false);
+
+          // Format questions from questionsNeeded object
+          let questionText = result.followUpQuestion || result.explanation || 'I need some additional information:';
+
+          if (result.questionsNeeded && typeof result.questionsNeeded === 'object') {
+            const questions = Object.entries(result.questionsNeeded)
+              .filter(([key, question]) => question && question.trim() !== '') // Filter out empty questions
+              .map(([key, question]) => `• ${question}`)
+              .join('\n\n');
+
+            if (questions) {
+              questionText = `I need some additional information:\n\n${questions}`;
+            }
+          }
+
+          addBotMessage(
+            questionText,
+            true,
+            'text',
+            'skillFollowUp',
+            'Provide additional details...'
+          );
+          break;
+
+        case 'execute':
+          // Ready to execute - show save button
+          setAiLoading(false);
+          setLoading(false);
+
+          // Update skill state with execution params
+          const updatedSkill = {
+            ...currentSkill,
+            skillState: {
+              ...currentSkill.skillState,
+              ...result // Store all execution params (pythonCode, etc.)
+            },
+            readyToExecute: true
+          };
+          setActiveSkill(updatedSkill);
+
+          // Prepare metadata to display code in chat
+          const skillMetadata = {
+            skillId: currentSkill.skillId,
+            ...result // Contains pythonCode or other skill-specific code
+          };
+
+          addBotMessage(
+            `✓ Transformation ready:\n${result.explanation || 'Ready to execute'}`,
+            false,
+            'text',
+            '',
+            '',
+            skillMetadata
+          );
+
+          // Re-enable chat input so users can refine before clicking Execute.
+          // chatContinue routes back through handleSkillFlow while activeSkill is set.
+          addBotMessage(
+            'Continue refining your transformation, or execute when ready.',
+            true,
+            'text',
+            'chatContinue',
+            'Ask another question or refine the transformation...'
+          );
+
+          // Set pending choices to show execute button
+          setPendingChoices([{
+            label: '▶ Execute & Save',
+            value: 'execute_skill',
+            variant: 'contained',
+            fullWidth: true
+          }]);
+          break;
+
+        default:
+          addBotMessage(`Unknown action: ${result.action}`, false);
+          setAiLoading(false);
+          setLoading(false);
+      }
+
+    } catch (error) {
+      console.error('[handleSkillFlow] Error:', error);
+      addBotMessage(`Error processing skill request: ${error.message}`, false);
+      setAiLoading(false);
+      setLoading(false);
+    }
+  };
+
   // console.log('sourceNode: ', sourceNode)
   const analyzeTransformationRequest = async (userRequest, chatHistory = []) => {
     var finalSettings = {};
@@ -412,7 +711,9 @@ const TransformerNodeChat = ({
     // Get properly quoted source table name with schema
     const sourceSchema = sourceNode?.data?.config?.targetSchema || sourceNode?.data?.config?.sourceSchema;
     const dbType = sourceConnection?.dbType;
-    const isNoSQL = ['mongodb', 'nedb'].includes(dbType);
+    const dbCategory = sourceConnection?.dbCategory;
+    const isNoSQL = dbCategory === 'NoSQL' || ['mongodb', 'nedb'].includes(dbType);
+    const isVectorDB = dbCategory === 'Vector';
 
     let sourceFullTableName = sourceTableSchema.tableName || 'unknown';
     if (!isNoSQL && dbType !== 'sqlite' && sourceSchema) {
@@ -439,7 +740,13 @@ Source: ${sourceTableSchema.sourceNodeLabel}
     // Determine if source is local (data stored in local file vs remote database)
     const isSourceLocal = isFileLocal()
 
-    const analysisPrompt = ChatPrompts.transfomer.transformationRequest(userRequest, sourceTableInfo, sourceConnection.dbType, isSourceLocal);
+    const analysisPrompt = ChatPrompts.transfomer.transformationRequest(
+      userRequest,
+      sourceTableInfo,
+      isVectorDB ? 'vector' : sourceConnection.dbType,
+      isSourceLocal,
+      availableSkills
+    );
 
     const response = await getWorkflowAssistance('transformer', analysisPrompt, {
       sourceTable: sourceTableSchema.tableName,
@@ -470,7 +777,43 @@ Source: ${sourceTableSchema.sourceNodeLabel}
     }
 
     console.log('Parsed analysis:', analysis);
-    
+
+    // Check if a skill was selected
+    if (analysis.usesSkill && analysis.skillId) {
+      console.log('[TransformerNodeChat] Skill selected:', analysis.skillId);
+
+      // Find the skill name from availableSkills
+      const selectedSkill = availableSkills.find(s => s.id === analysis.skillId);
+      const skillName = selectedSkill?.name || analysis.skillId;
+
+      // Create skill info object
+      const skillInfo = {
+        skillId: analysis.skillId,
+        skillState: analysis.skillParams || {},
+        readyToExecute: false
+      };
+
+      // Activate skill mode
+      setActiveSkill(skillInfo);
+
+      // Add bot message explaining skill will be used
+      addBotMessage(
+        `Activating ${skillName}:\n${analysis.skillExplanation || analysis.explanation || ''}`,
+        false
+      );
+
+      // Automatically start skill flow with the user's request
+      // Create a mock user message object for the skill flow
+      const userMsgForSkill = {
+        text: userRequest,
+        timestamp: new Date()
+      };
+
+      // Call skill flow directly, passing the skill info since state hasn't updated yet
+      await handleSkillFlow(userMsgForSkill, skillInfo);
+      return; // End processing - skill flow is handling it
+    }
+
     if(!analysis.inferredSettings.operationMode) delete analysis.inferredSettings.operationMode
     if(!analysis.inferredSettings.storageLocation) delete analysis.inferredSettings.storageLocation
 
@@ -902,7 +1245,183 @@ Source: ${sourceTableSchema.sourceNodeLabel}
   // ─────────────────────────────────────────────────────────────────────────
   // AI Transformation Generation
   // ─────────────────────────────────────────────────────────────────────────
-  
+
+  /**
+   * Handle execute skill button click
+   */
+  const handleExecuteSkill = async () => {
+    if (!activeSkill || !activeSkill.readyToExecute) {
+      addBotMessage('Skill is not ready to execute. Please complete the configuration first.', false);
+      return;
+    }
+
+    // Clear pending choices
+    setPendingChoices([]);
+
+    // Determine operationType
+    const dbType = sourceConnection?.dbType;
+    const operationType = ['mongodb', 'nedb'].includes(dbType) ? 'nosql' : 'sql';
+
+    // Execute the skill transformation
+    await executeSkillTransformation(activeSkill.skillId, {
+      ...activeSkill.skillState,
+      operationType
+    });
+  };
+
+  /**
+   * Execute a skill-based transformation
+   * @param {String} skillId - ID of the skill to execute
+   * @param {Object} skillParams - Parameters for skill execution
+   */
+  // console.log("sourceConnection: ", sourceConnection)
+  const executeSkillTransformation = async (skillId, skillParams) => {
+    console.log('[executeSkillTransformation] Starting:', skillId, skillParams);
+    setAiLoading(true);
+    setLoading(true);
+
+    try {
+      addBotMessage('Executing transformation with skill...', false);
+
+      // Determine operationType
+      const isNoSQL = ['mongodb', 'nedb'].includes(sourceConnection?.dbType);
+      const operationType = isNoSQL ? 'nosql' : 'sql';
+
+      // Get properly quoted source table name with schema
+      const sourceSchema = sourceNode?.data?.config?.targetSchema || sourceNode?.data?.config?.sourceSchema;
+      const dbType = sourceConnection?.dbType;
+      let quotedTableName = sourceTableSchema.tableName;
+
+      // Quote identifier for SQL databases with schema
+      if (!isNoSQL && sourceSchema && dbType !== 'sqlite') {
+        const quotedResult = await window.electronAPI.dbConnect.quoteIdentifier(
+          dbType,
+          sourceTableSchema.tableName,
+          sourceSchema,
+          sourceConnection?.dbConfig,
+          sourceConnection?.id
+        );
+        quotedTableName = quotedResult.quotedIdentifier;
+      } else if (sourceSchema) {
+        // For sqlite or if quoting fails, just append schema manually
+        quotedTableName = `${sourceSchema}.${sourceTableSchema.tableName}`;
+      }
+
+      console.log('[executeSkillTransformation] Using quoted table name:', quotedTableName);
+      const sourceNodeConfig = sourceNode?.data?.config;
+      
+
+      // Execute the skill - skill will pull data itself and return config
+      const result = await window.electronAPI.skills.execute({
+        skillId,
+        params: {
+          sourceConnection: {
+            id: sourceConnection.id,
+            dbType: sourceConnection.dbType,
+            dbConfig: sourceConnection.dbConfig,
+            localPath: sourceConnection.localPath,
+            connectionType: sourceConnection.connectionType,
+            dbCategory: sourceConnection.dbCategory,
+            indexName: sourceConnection.indexName // For Pinecone
+          },
+          sourceTableSchema: {
+            tableName: quotedTableName, // Use quoted table name
+            originalTableName: sourceTableSchema.tableName, // Keep original for reference
+            indexName: sourceTableSchema.indexName || sourceConnection.indexName, // For Pinecone
+            columns: sourceTableSchema.columns,
+            sampleData: sourceTableSchema.sampleData,
+            sheetName: sourceTableSchema.sheetName,
+            schema: sourceSchema,
+            namespace: sourceTableSchema.namespace || sourceSchema // For Pinecone namespace
+          },
+          operationType,
+          // Storage settings
+          targetLocalPath: sourceNodeConfig?.targetLocalPath,
+          storageLocation: transformationSettings.storageLocation,
+          operationMode: transformationSettings.operationMode,
+          // Node context for config building
+          nodeId: node.id,
+          sourceNodeId: sourceNode?.id,
+          sourceNodeLabel: sourceNode?.data?.label,
+          sourceNodeConfig: sourceNodeConfig,
+          sourceConnectionName: sourceConnection.name,
+          sourceConnectionType: sourceConnection.connectionType,
+          userRequest: skillParams.userRequest,
+          // Spread the nested skillParams if it exists, otherwise spread the whole object
+          ...(skillParams.skillParams || skillParams)
+        }
+      });
+
+      if (!result.success) {
+        addBotMessage(`Skill execution failed: ${result.error || result.message}`, false);
+        setAiLoading(false);
+        setLoading(false);
+        return;
+      }
+
+      // Skill returns config - use it directly
+      if (!result.config) {
+        addBotMessage(`Error: Skill did not return configuration`, false);
+        setAiLoading(false);
+        setLoading(false);
+        return;
+      }
+
+      // Show success messages
+      addBotMessage(
+        `✓ Transformation completed successfully!\n${result.message}\n\nTransformed ${result.recordCount} records.`,
+        false
+      );
+
+      if (result.localPath) {
+        addBotMessage(`📁 Data saved to: ${result.localPath}`, false);
+      }
+
+      // If skill indicates schema needs to be loaded, fetch it
+      let finalConfig = { ...result.config };
+      console.log('[executeSkillTransformation] Saving config from skill:', finalConfig);
+
+      if (result.config.needsSchemaLoad) {
+        try {
+          addBotMessage('Loading target table schema...', false);
+
+          const targetTableSchema = await loadTableSchema({
+            connection: {
+              dbType: result.config.targetDbType,
+              dbConfig: result.config.targetDbConfig || {}
+            },
+            tableName: result.config.targetTableName || result.config.targetCollection,
+            localPath: result.config.targetLocalPath
+          });
+
+          finalConfig.targetTableSchema = targetTableSchema;
+          delete finalConfig.needsSchemaLoad; // Remove the indicator flag
+
+          console.log('[executeSkillTransformation] Loaded target table schema:', targetTableSchema);
+        } catch (error) {
+          console.error('[executeSkillTransformation] Failed to load target schema:', error);
+          // Continue without schema - it's not critical
+        }
+      }
+      
+      // Save the configuration returned by the skill
+      
+      onSave(finalConfig, chat);
+
+      addBotMessage('✓ Configuration saved to node', false);
+
+      setAiLoading(false);
+      setLoading(false);
+
+    } catch (error) {
+      console.error('[executeSkillTransformation] Error:', error);
+      addBotMessage(`Error executing skill: ${error.message}`, false);
+      setAiLoading(false);
+      setLoading(false);
+    }
+  };
+
+  // console.log('sourceConnection: ', sourceConnection)
   const generateTransformation = async (settings) => {
     console.log('generateTransformation: ', settings)
     // return;
@@ -914,10 +1433,12 @@ Source: ${sourceTableSchema.sourceNodeLabel}
     const targetTableName = settings.tableName || node.id.replace('-', '_').toLowerCase();
     const isNoSQL = sourceConnection?.dbType === 'mongodb' || sourceConnection?.dbType === 'nedb';
     const dbType = sourceConnection?.dbType;
+    
+    let fullTableName = targetTableName
 
-    // Get properly quoted table name for SQL databases
-    let fullTableName = `${targetSchema}.${targetTableName}`;
     if (!isNoSQL && dbType !== 'sqlite') {
+      // Get properly quoted table name for SQL databases
+      let fullTableName = `${targetSchema}.${targetTableName}`;
       const quotedResult = await window.electronAPI.dbConnect.quoteIdentifier(
         dbType,
         targetTableName,
@@ -948,8 +1469,6 @@ Source: ${sourceTableSchema.sourceNodeLabel}
           sourceConnection?.id
         );
         sourceFullTableName = quotedSourceResult.quotedIdentifier;
-      } else if (sourceSchema && !isNoSQL) {
-        sourceFullTableName = `${sourceSchema}.${sourceTableSchema.tableName}`;
       }
 
       // Build source table information
@@ -1077,242 +1596,6 @@ Transformation Settings:
     } catch (error) {
       console.error('Transformation generation error:', error);
       addBotMessage('Failed to generate transformation. Please try again.', false);
-    } finally {
-      setAiLoading(false);
-      setLoading(false);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Fix Execution Error
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const handleFixError = async () => {
-    if (!executionError) return;
-
-    setAiLoading(true);
-    setLoading(true);
-    setExecutionError(null); // Clear error state
-    setPendingChoices([]); // Clear the fix button
-
-    const { error, transformation } = executionError;
-    const isNoSQL = sourceConnection?.dbType === 'mongodb' || sourceConnection?.dbType === 'nedb';
-    const dbType = sourceConnection?.dbType;
-
-    try {
-      // Build error context for LLM
-      const errorContext = `
-Previous transformation attempt FAILED with error:
-${error}
-
-Original transformation that failed:
-${isNoSQL ? `
-Operation Type: ${transformation.operationType}
-Operation: ${transformation.nosqlOperation}
-${transformation.transformFunction ? `Transform Function: ${transformation.transformFunction}` : ''}
-` : `
-DDL: ${transformation.ddl || 'N/A'}
-SQL: ${transformation.sql}
-`}
-`;
-
-      // Get properly quoted source table name with schema (for SQL databases)
-      const sourceSchema = sourceNode?.data?.config?.targetSchema || sourceNode?.data?.config?.sourceSchema;
-      let sourceFullTableName = sourceTableSchema.tableName;
-
-      if (!isNoSQL && dbType !== 'sqlite' && sourceSchema) {
-        const quotedSourceResult = await window.electronAPI.dbConnect.quoteIdentifier(
-          dbType,
-          sourceTableSchema.tableName,
-          sourceSchema,
-          sourceConnection?.dbConfig,
-          sourceConnection?.id
-        );
-        sourceFullTableName = quotedSourceResult.quotedIdentifier;
-      } else if (sourceSchema && !isNoSQL) {
-        sourceFullTableName = `${sourceSchema}.${sourceTableSchema.tableName}`;
-      }
-
-      // Build source table information
-      const sourceTableInfo = `
-Source: ${sourceTableSchema.sourceNodeLabel}
-- Table/Collection name: ${sourceFullTableName}
-- Columns/Fields: ${JSON.stringify(sourceTableSchema.columns || [])}
-- Sample data (first 5 rows/documents): ${JSON.stringify(sourceTableSchema.sampleData || [])}
-      `;
-
-      // Build transformation settings context
-      const settingsContext = `
-Transformation Settings:
-- Operation Mode: ${transformationSettings.operationMode === 'in_place' ? 'Source table (In-Place) Update/Delete' : 'Create New Table'}
-- Storage Location: ${transformationSettings.storageLocation === 'database' ? 'Database (store and process in database)' : 'Local (store and process locally)'}
-      `;
-
-      const targetTableName = transformationSettings.tableName || node.id.replace('-', '_').toLowerCase();
-      const targetSchema = sourceNode?.data?.config?.targetSchema || sourceNode?.data?.config?.sourceSchema;
-
-      // Get properly quoted table name for SQL databases
-      let fullTableName = `${targetSchema}.${targetTableName}`;
-      if (!isNoSQL && dbType !== 'sqlite') {
-        const quotedResult = await window.electronAPI.dbConnect.quoteIdentifier(
-          dbType,
-          targetTableName,
-          targetSchema,
-          sourceConnection?.dbConfig,
-          sourceConnection?.id
-        );
-        fullTableName = quotedResult.quotedIdentifier;
-      }
-
-      // Build fix prompt
-      let fixPrompt;
-      if (isNoSQL) {
-        // For local NoSQL (NeDB), use ChatPrompts. For remote NoSQL, fetch from plugin.
-        if (dbType === 'nedb') {
-          if (transformationSettings.operationMode === 'in_place') {
-            fixPrompt = ChatPrompts.transfomer.nedbTransformationInPlace(
-              transformationSettings,
-              sourceTableInfo,
-              settingsContext,
-              sourceTableSchema
-            );
-          } else {
-            fixPrompt = ChatPrompts.transfomer.nedbTransformationNewTable(
-              transformationSettings,
-              sourceTableInfo,
-              settingsContext,
-              sourceTableSchema,
-              targetTableName
-            );
-          }
-        } else {
-          // Generate prompt from plugin (e.g., MongoDB)
-          const sourceSchema = sourceConnection?.dbConfig?.database;
-          const sourceFullTableName = sourceTableSchema.tableName;
-
-          const promptResult = await window.electronAPI.dbConnect.generateTransformPrompt(
-            dbType,
-            transformationSettings.operationMode,
-            transformationSettings,
-            sourceTableInfo,
-            settingsContext,
-            sourceTableSchema,
-            targetTableName,
-            sourceConnection,
-            targetSchema,
-            fullTableName,
-            sourceSchema,
-            sourceFullTableName
-          );
-          if (promptResult.success) {
-            fixPrompt = promptResult.prompt;
-          } else {
-            throw new Error(`Failed to get transformation prompts for ${dbType}`);
-          }
-        }
-      } else {
-        // For SQL databases
-        if (dbType === 'sqlite' && transformationSettings.storageLocation === 'local') {
-          // Use SQLite prompts only for local SQLite files
-          if (transformationSettings.operationMode === 'in_place') {
-            fixPrompt = ChatPrompts.transfomer.sqliteTransformationInPlace(
-              transformationSettings,
-              sourceTableInfo,
-              settingsContext,
-              sourceTableSchema
-            );
-          } else {
-            fixPrompt = ChatPrompts.transfomer.sqliteTransformationNewTable(
-              transformationSettings,
-              sourceTableInfo,
-              settingsContext,
-              sourceTableSchema,
-              targetTableName
-            );
-          }
-        } else {
-          // Generate prompt from plugin for all other cases (database storage or remote DB to local)
-          // sourceFullTableName is already defined and quoted above (before sourceTableInfo)
-
-          const promptResult = await window.electronAPI.dbConnect.generateTransformPrompt(
-            dbType,
-            transformationSettings.operationMode,
-            transformationSettings,
-            sourceTableInfo,
-            settingsContext,
-            sourceTableSchema,
-            targetTableName,
-            sourceConnection,
-            targetSchema,
-            fullTableName,
-            sourceSchema,
-            sourceFullTableName
-          );
-          if (promptResult.success) {
-            fixPrompt = promptResult.prompt;
-          } else {
-            throw new Error(`Failed to generate transformation prompt for ${dbType}: ${promptResult.message}`);
-          }
-        }
-      }
-
-      // Prepend error context to the prompt
-      const fullPrompt = `${errorContext}\n\n Fix the transformation to resolve the error above.\n\n${fixPrompt}`;
-
-      // Build chat history
-      const chatHistory = chat.slice(0, -2).map(msg => ({
-        sender: msg.sender,
-        text: msg.text
-      }));
-
-      addBotMessage('Analyzing the error and generating a fix...', false);
-
-      const response = await getWorkflowAssistance('transformer', fullPrompt, {
-        sourceTable: sourceTableSchema.tableName,
-        sourceSchema: sourceTableSchema,
-        targetTable: fullTableName,
-        dbType: sourceConnection.dbType,
-        transformationSettings: transformationSettings,
-        error: error
-      }, chatHistory);
-
-      // Parse JSON response
-      let parsedResponse;
-      try {
-        parsedResponse = JSON.parse(response);
-      } catch (e) {
-        console.log('ERROR parsing fix response:', e);
-        parsedResponse = {
-          explanation: response,
-          ddl: '',
-          sql: ''
-        };
-      }
-
-      console.log('Fixed transformation:', parsedResponse);
-
-      // Apply the fixed transformation result
-      const success = await applyTransformationResult(
-        parsedResponse,
-        transformationSettings,
-        transformationSettings.userRequest,
-        false
-      );
-
-      if (success) {
-        addBotMessage(
-          'Error fixed! You can now try running the transformation again, or continue refining.',
-          true,
-          'text',
-          'chatContinue',
-          'Ask a follow-up question or request changes…'
-        );
-      }
-    } catch (error) {
-      console.error('Error fixing transformation:', error);
-      addBotMessage('Failed to fix the error. Please try refining your request manually.', false);
-      // Restore the error state so user can try again
-      setExecutionError(executionError);
     } finally {
       setAiLoading(false);
       setLoading(false);
@@ -1687,14 +1970,14 @@ Transformation Settings:
             : (sourceConnection.dbConfig?.schema);
         }
 
-        console.log('transformedSchema_input: ', {
-          connection: transformationSettings.storageLocation === 'local' && schemaLocalPath
-            ? { dbType: 'sqlite', dbConfig: {} } // Use SQLite connection for local
-            : sourceConnection,
-          tableName: targetTableName,
-          tableSchema: targetSchema,
-          localPath: schemaLocalPath
-        })
+        // console.log('transformedSchema_input: ', {
+        //   connection: transformationSettings.storageLocation === 'local' && schemaLocalPath
+        //     ? { dbType: 'sqlite', dbConfig: {} } // Use SQLite connection for local
+        //     : sourceConnection,
+        //   tableName: targetTableName,
+        //   tableSchema: targetSchema,
+        //   localPath: schemaLocalPath
+        // })
 
         transformedSchema = await loadTableSchema({
           connection: transformationSettings.storageLocation === 'local' && schemaLocalPath
@@ -1773,7 +2056,15 @@ Transformation Settings:
     }
 
     if (choice.value === 'fix_error') {
-      handleFixError();
+      const errorText = executionError?.error || 'an unknown error';
+      const message = `Fix this error: ${errorText}`;
+      setExecutionError(null);
+      handleUserResponse(message, 'chatContinue', message, null);
+      return;
+    }
+
+    if (choice.value === 'execute_skill') {
+      handleExecuteSkill();
       return;
     }
 
@@ -1797,6 +2088,45 @@ Transformation Settings:
     sender: m.sender,
     timestamp: m.timestamp || new Date(),
   }));
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Code popup wiring
+  // ─────────────────────────────────────────────────────────────────────────
+  const handleCodeSave = useCallback((field, value, message) => {
+    const updatedChat = chat.map(m =>
+      m.id === message?.id
+        ? { ...m, metadata: { ...m.metadata, [field]: value } }
+        : m
+    );
+    setChat(updatedChat);
+
+    if (!onConfigUpdate || !node?.id) return;
+
+    let update;
+    switch (field) {
+      case 'sql':
+        update = { targetSql: value };
+        break;
+      case 'ddl':
+        update = { targetDdl: value };
+        break;
+      case 'transformFunction':
+        update = { transformFunction: value };
+        break;
+      case 'nosqlOperation':
+        update = { nosqlOperation: value };
+        break;
+      case 'pythonCode':
+        update = { pythonCode: value };
+        break;
+      case 'javascriptFunction':
+        update = { javascriptFunction: value };
+        break;
+      default:
+        update = { [field]: value };
+    }
+    onConfigUpdate(node.id, { ...update, chat: updatedChat });
+  }, [onConfigUpdate, node?.id, chat]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Render
@@ -1830,6 +2160,7 @@ Transformation Settings:
         showRunButton={false}
         onRun={null}
         runButtonLoading={false}
+        onCodeSave={handleCodeSave}
       />
     </div>
   );
