@@ -75,25 +75,13 @@
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
 }
 
-/* Start Node Styles */
+/* Start Node Styles — handled inline by the node component now */
 .react-flow__node-start {
-  border: 2px solid #1890ff;
-  border-radius: 8px;
-  width: 240px;
-  background: white;
-  box-shadow: 0 2px 8px rgba(24, 144, 255, 0.2);
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
 }
-
-.react-flow__node-start.selected {
-  border-color: #40a9ff;
-  box-shadow: 0 4px 16px rgba(24, 144, 255, 0.3);
-}
-
-.react-flow__node-start:hover {
-  box-shadow: 0 4px 12px rgba(24, 144, 255, 0.25);
-}
-  /* transform: translateY(-2px); */
-/* } */
 
 .workflow-card-header {
   display: flex;
@@ -154,68 +142,59 @@
   width: 100%;
 }
 
+/* React Flow nodes are fully styled inline by their components.
+   Reset any default wrapper styling so the component owns the look. */
 .react-flow__node {
-  border-radius: 8px;
-  border: 2px solid #d9d9d9;
-  background: white;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
   font-size: 12px;
-  color: #333;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  color: #111827;
+  font-family: 'Inter', -apple-system, sans-serif;
 }
 
 .react-flow__node.selected {
-  border-color: #1890ff;
-  box-shadow: 0 0 0 3px rgba(24, 144, 255, 0.2);
+  box-shadow: none;
 }
 
-.react-flow__node-dataSource {
-  border-color: #52c41a;
-  background: linear-gradient(135deg, #f6ffed 0%, #d9f7be 100%);
-  transition: all 0.3s ease;
-}
-
-.react-flow__node-dataSource:not([style*="borderColor"]) {
-  /* Default styling when not configured */
-  border-color: #d9d9d9;
-  background: linear-gradient(135deg, #f9f9f9 0%, #f0f0f0 100%);
-}
-
-.react-flow__node-transformer {
-  border-color: #1890ff;
-  background: linear-gradient(135deg, #e6f7ff 0%, #bae7ff 100%);
-}
-
-.react-flow__node-join {
-  border-color: #fa8c16;
-  background: linear-gradient(135deg, #fff7e6 0%, #ffd591 100%);
-}
-
-.react-flow__node-output {
-  border-color: #722ed1;
-  width: auto;
-  background: linear-gradient(135deg, #f9f0ff 0%, #d3adf7 100%);
+.react-flow__node-dataSource,
+.react-flow__node-transformer,
+.react-flow__node-join,
+.react-flow__node-branch,
+.react-flow__node-output,
+.react-flow__node-start {
+  border: none;
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
 }
 
 .react-flow__handle {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   border: 2px solid #fff;
-  background: #1890ff;
+  background: #2563eb;
 }
 
 .react-flow__handle-connecting {
-  background: #ff4d4f;
+  background: #dc2626;
 }
 
 .react-flow__edge {
-  stroke: #d9d9d9;
-  stroke-width: 2;
+  stroke: #cdd2db;
+  stroke-width: 1.5;
 }
 
 .react-flow__edge.selected {
-  stroke: #1890ff;
+  stroke: #2563eb;
 }
+
+.react-flow__background {
+  background-color: #f7f9fc;
+}
+
 
 .react-flow__edge-path {
   stroke: inherit;
@@ -226,10 +205,11 @@
   position: fixed;
   top: 40px;
   right: 0;
-  width: 400px;
+  width: 420px;
   height: 100vh;
   background: white;
-  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.1);
+  border-left: 1px solid #e2e6eb;
+  box-shadow: -6px 0 24px rgba(0, 0, 0, 0.08);
   z-index: 1010;
   transform: translateX(100%);
   transition: transform 0.3s ease;
@@ -240,76 +220,33 @@
 }
 
 .workflow-sidebar-content {
-  padding: 24px;
+  padding: 16px;
   height: 100%;
   overflow-y: auto;
 }
 
 .workflow-toolbar {
   position: absolute;
-  top: 20px;
-  left: 20px;
+  top: 14px;
+  left: 14px;
   z-index: 100;
   display: flex;
   gap: 8px;
-  background: white;
-  padding: 12px;
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #e2e6eb;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: #5a6678;
+  backdrop-filter: blur(4px);
 }
 
 .node-types-panel {
   position: absolute;
-  top: 20px;
-  right: 20px;
+  top: 14px;
+  right: 14px;
   z-index: 100;
-  background: white;
-  padding: 16px;
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  min-width: 200px;
-}
-
-.draggable-node {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  margin: 4px 0;
-  border: 1px solid #d9d9d9;
-  border-radius: 6px;
-  cursor: grab;
-  transition: all 0.2s;
-  background: white;
-}
-
-.draggable-node:hover {
-  border-color: #1890ff;
-  box-shadow: 0 2px 8px rgba(24, 144, 255, 0.1);
-}
-
-.draggable-node:active {
-  cursor: grabbing;
-}
-
-.draggable-node.data-source {
-  border-color: #52c41a;
-  color: #52c41a;
-}
-
-.draggable-node.transformer {
-  border-color: #1890ff;
-  color: #1890ff;
-}
-
-.draggable-node.join {
-  border-color: #fa8c16;
-  color: #fa8c16;
-}
-
-.draggable-node.output {
-  border-color: #722ed1;
-  color: #722ed1;
 }
 
 /* Connection Styles */
@@ -480,6 +417,48 @@
   padding: 4px 8px;
   font-size: 10px;
   border-radius: 0 12px 0 12px;
+}
+
+/* Save button custom styling */
+.workflow-save-button.ant-btn-primary {
+  background-color: #059669 !important;
+  border-color: #059669 !important;
+  border-radius: 4px !important;
+  font-weight: 600 !important;
+}
+
+.workflow-save-button.ant-btn-primary:hover {
+  background-color: #047857 !important;
+  border-color: #047857 !important;
+}
+
+.workflow-save-button.ant-btn-primary:active,
+.workflow-save-button.ant-btn-primary:focus {
+  background-color: #065f46 !important;
+  border-color: #065f46 !important;
+}
+
+/* Subtle scrollbars to match redesign */
+.workflow-sidebar ::-webkit-scrollbar,
+.react-flow-wrapper ::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.workflow-sidebar ::-webkit-scrollbar-track,
+.react-flow-wrapper ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.workflow-sidebar ::-webkit-scrollbar-thumb,
+.react-flow-wrapper ::-webkit-scrollbar-thumb {
+  background: #cdd2db;
+  border-radius: 3px;
+}
+
+.workflow-sidebar ::-webkit-scrollbar-thumb:hover,
+.react-flow-wrapper ::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
 }
 
 .react-flow__panel a{

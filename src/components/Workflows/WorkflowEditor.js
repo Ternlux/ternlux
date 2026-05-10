@@ -12,7 +12,7 @@ import ReactFlow, {
   Panel,
 } from 'reactflow';
 import { Button, Space, Input, message, Typography, Modal, Spin, Dropdown, Menu } from 'antd';
-import { SaveOutlined, UndoOutlined, CloudUploadOutlined, SettingOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
+import { SaveOutlined, UndoOutlined, CloudUploadOutlined, SettingOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, ExportOutlined, MoreOutlined } from '@ant-design/icons';
 import 'reactflow/dist/style.css';
 
 import StartNode from './nodes/StartNode';
@@ -36,6 +36,17 @@ const nodeTypes = {
   transformer: TransformerNode,
   join: JoinNode,
   output: OutputNode,
+};
+
+// Strip non-structured-cloneable values (class instances like Apache Arrow
+// Vectors, functions, circular refs) before sending workflow data through
+// Electron IPC. Throws with a clearer message than the IPC bridge does.
+const toCloneable = (value, label = 'workflow') => {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (err) {
+    throw new Error(`Cannot serialize ${label} for save: ${err.message}`);
+  }
 };
 
 const initialNodes = [];
@@ -69,7 +80,7 @@ const isValidFile = (file) => {
   return true;
 };
 
-const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
+const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest }) => {
   const reactFlowWrapper = useRef(null);
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
@@ -89,6 +100,7 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
   const [triggerSidebarSave, setTriggerSidebarSave] = useState(false);
   const [currentWorkflowId, setCurrentWorkflowId] = useState(workflow?.id || null);
   const [editorLoading, setEditorLoading] = useState(!!workflow?.id);
+  const [saveAfterStepsEditor, setSaveAfterStepsEditor] = useState(false);
 
   // Database schema state (shared between chat and preview)
   const [dbTables, setDbTables] = useState([]); // Full table objects with schema info
@@ -98,6 +110,9 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
   // Context menu state
   const [contextMenu, setContextMenu] = useState(null);
   const [contextMenuNode, setContextMenuNode] = useState(null);
+
+  // Execution state
+  const [isExecuting, setIsExecuting] = useState(false);
 
   // Close context menu when clicking anywhere in the document
   useEffect(() => {
@@ -195,6 +210,22 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         }
       };
       fetchFullWorkflow();
+    } else if (workflow?.nodes) {
+      // Pre-loaded imported workflow (has nodes/edges but no saved id yet)
+      const workflowNodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
+      const workflowEdges = Array.isArray(workflow.edges) ? workflow.edges : [];
+      setWorkflowName(workflow.name || '');
+      setWorkflowDescription(workflow.description || '');
+      setNodes(workflowNodes);
+      setEdges(workflowEdges);
+      setExecutionSteps(workflow.executionSteps || []);
+      setCurrentWorkflowId(null);
+      setInitialWorkflowState({
+        name: workflow.name || '',
+        description: workflow.description || '',
+        nodes: workflowNodes,
+        edges: workflowEdges,
+      });
     } else {
       // Create new workflow with start node
       const startNode = {
@@ -467,6 +498,8 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         return 'Transformer';
       case 'join':
         return 'Join';
+      case 'branch':
+        return 'Branch';
       case 'output':
         return 'Output';
       default:
@@ -484,6 +517,8 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         return { operation: '', config: {} };
       case 'join':
         return { joinType: 'inner', condition: '' };
+      case 'branch':
+        return { steps: [], validationFunction: null };
       case 'output':
         return { destination: '', format: 'table' };
       default:
@@ -563,10 +598,10 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
     setContextMenu(null);
     setContextMenuNode(null);
   }, []);
-
+  // console.log('nodes: ', selectedNode)
   // Handle node configuration updates
   const onNodeConfigUpdate = useCallback((nodeId, config) => {
-    // console.log('config: ', config)
+    console.log('config: ', config)
     setNodes((nds) =>
       nds.map((node) => {
         if (node.id === nodeId) {
@@ -609,7 +644,6 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
   // Refresh DataPreview (called after execution completes)
   const handleDataPreviewRefresh = useCallback(() => {
     setDataPreviewRefreshTrigger(prev => prev + 1);
-    setDataPreviewRefreshTrigger(0);
   }, []);
 
   // Load database tables (called from DataSourceNodeChat)
@@ -730,6 +764,9 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         // Needs two input connections
         const inputConnections = allEdges.filter(edge => edge.target === node.id);
         return inputConnections.length >= 2;
+      case 'branch':
+        // Needs at least one input connection
+        return allEdges.some(edge => edge.target === node.id);
       case 'output':
         // Needs one input connection
         return allEdges.some(edge => edge.target === node.id);
@@ -744,6 +781,8 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         return 'Transformer node requires a source connection to configure';
       case 'join':
         return 'Join node requires two input connections to configure';
+      case 'branch':
+        return 'Branch node requires at least one input connection to configure';
       case 'output':
         return 'Output node requires an input connection to configure';
       default:
@@ -812,7 +851,7 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
     return true;
   };
 
-  const handleSave = async () => {
+  const handleSave = async (providedExecutionSteps = null) => {
     if (!validateWorkflow()) {
       return;
     }
@@ -822,7 +861,7 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
       // Extract final_dataset s3key from Data Export node's connected source
       const outputNode = nodes.find(node => node.type === 'output');
       let finalDatasetS3Key = null;
-      
+
       if (outputNode) {
         // Find the edge that connects to the output node
         const outputConnection = edges.find(edge => edge.target === outputNode.id);
@@ -843,8 +882,8 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         }
       }
 
-      // Use stored execution steps or auto-generate if none exist
-      let finalExecutionSteps = executionSteps;
+      // Use provided execution steps, stored execution steps, or auto-generate if none exist
+      let finalExecutionSteps = providedExecutionSteps || executionSteps;
       if (!finalExecutionSteps.length && nodes.length > 0) {
         // Auto-generate execution steps using shared utility function
         finalExecutionSteps = generateStepsFromNodes(nodes, edges);
@@ -853,17 +892,17 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
       const workflowData = {
         name: workflowName,
         description: workflowDescription,
-        nodes,
-        edges,
+        nodes: toCloneable(nodes, 'nodes'),
+        edges: toCloneable(edges, 'edges'),
         nodeCount: nodes.length,
         type: 'Custom',
-        final_dataset: finalDatasetS3Key,
+        final_dataset: toCloneable(finalDatasetS3Key, 'final_dataset'),
         executionSteps: finalExecutionSteps || []
       };
 
       // Let the parent component handle the API call to avoid duplication
       await onSave(workflowData);
-      
+
       // Update initial state to current state after successful save
       setInitialWorkflowState({
         name: workflowName,
@@ -872,19 +911,19 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
         edges
       });
       setHasUnsavedChanges(false);
-      
+
     } catch (error) {
       console.error('Error saving workflow:', error);
-      
+
       // Handle authentication errors
-      if (error.response?.status === 401 || error.response?.status === 204 || 
+      if (error.response?.status === 401 || error.response?.status === 204 ||
           (error.response?.status === 400)) {
         localStorage.removeItem('auth-token');
         message.error('Session expired. Please log in again.');
         window.location.href = '/login';
         return;
       }
-      
+
       message.error('Failed to save workflow');
     } finally {
       setSaving(false);
@@ -923,7 +962,7 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
       message.warning('Cannot save: Workflow must have at least one Data Source node');
       return;
     }
-
+    
     // Check if start node is connected to at least one data source
     const startNode = nodes.find(node => node.type === 'start');
     if (startNode) {
@@ -939,143 +978,63 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
     
     setSaving(true);
     try {
-      // Extract final_dataset s3key from Data Export node's connected source
+      // Extract final_dataset from Data Export node's connected source
       const outputNodeForSave = nodes.find(node => node.type === 'output');
       let finalDatasetS3Key = null;
-      
       if (outputNodeForSave) {
-        // Find the edge that connects to the output node
         const outputConnection = edges.find(edge => edge.target === outputNodeForSave.id);
         if (outputConnection) {
-          // Find the source node that connects to output
           const sourceNode = nodes.find(node => node.id === outputConnection.source);
-          if (sourceNode && sourceNode.data?.config) {
-            // Extract s3key based on source node type
-            if (sourceNode.type === 'join') {
-              finalDatasetS3Key = {...sourceNode.data.config, connectionName: sourceNode.id};
-            } else if (sourceNode.type === 'transformer') {
-              finalDatasetS3Key = {...sourceNode.data.config, connectionName: sourceNode.id};
+          if (sourceNode?.data?.config) {
+            if (sourceNode.type === 'join' || sourceNode.type === 'transformer') {
+              finalDatasetS3Key = { ...sourceNode.data.config, connectionName: sourceNode.id };
             } else if (sourceNode.type === 'dataSource') {
-              // For direct data source connections, use the connection's s3key
               finalDatasetS3Key = sourceNode.data.config;
             }
           }
         }
       }
 
-      // Use stored execution steps or auto-generate if none exist
       let finalExecutionSteps = executionSteps;
       if (!finalExecutionSteps.length && nodes.length > 0) {
-        // Auto-generate execution steps using shared utility function
         finalExecutionSteps = generateStepsFromNodes(nodes, edges);
       }
-
+      
       const workflowData = {
         name: workflowName,
         description: workflowDescription,
-        nodes,
-        edges,
+        nodes: toCloneable(nodes, 'nodes'),
+        edges: toCloneable(edges, 'edges'),
         nodeCount: nodes.length,
         type: 'Custom',
-        final_dataset: finalDatasetS3Key,
-        executionSteps: finalExecutionSteps || []
+        final_dataset: toCloneable(finalDatasetS3Key, 'final_dataset'),
+        executionSteps: finalExecutionSteps || [],
       };
 
-      const token = localStorage.getItem('auth-token');
-
-      if (token) {
-        // User is logged in - save to API
-        let apiUrl = '/workflow/workflow-action';
-
-        // Prepare the request based on whether it's a new or existing workflow
-        let requestData;
-        if (currentWorkflowId) {
-          requestData = {
-            action: 'update',
-            workflowId: currentWorkflowId,
-            ...workflowData
-          };
-        } else {
-          requestData = {
-            action: 'create',
-            ...workflowData
-          };
-        }
-
-        const response = await axios.post(apiUrl, requestData, {
-          headers: {
-            'auth-token': token
-          }
-        });
-
-        // Check if the response indicates success
-        if (!response.data.success) {
-          throw new Error(response.data.error || 'Failed to auto-save workflow');
-        }
-
-        // If this was a creation, store the returned workflow ID
-        if (!currentWorkflowId && response.data.data?.id) {
-          setCurrentWorkflowId(response.data.data.id);
-          console.log('Workflow created with ID:', response.data.data.id);
-        }
-      } else {
-        // User is not logged in - save to local database
-        const { workflowsDb } = await import('../../utils/localDb');
-
-        if (currentWorkflowId) {
-          // Update existing workflow locally
-          await workflowsDb.update(currentWorkflowId, workflowData);
-          console.log('Workflow updated locally with ID:', currentWorkflowId);
-        } else {
-          // Create new workflow locally
-          const savedWorkflow = await workflowsDb.save(workflowData);
-          setCurrentWorkflowId(savedWorkflow.id);
-          console.log('Workflow created locally with ID:', savedWorkflow.id);
-        }
+      const savedId = await onAutoSave(workflowData, currentWorkflowId);
+      if (savedId && !currentWorkflowId) {
+        setCurrentWorkflowId(savedId);
       }
 
-      // Update initial state to current state after successful save
-      setInitialWorkflowState({
-        name: workflowName,
-        description: workflowDescription,
-        nodes,
-        edges
-      });
+      setInitialWorkflowState({ name: workflowName, description: workflowDescription, nodes, edges });
       setHasUnsavedChanges(false);
-      
     } catch (error) {
-      console.error('Auto-save failed:', error);
-
-      // Handle authentication errors
-      if (error.response?.status === 401 || error.response?.status === 204) {
-        localStorage.removeItem('auth-token');
-        message.error('Cannot save: Session expired. Please log in again.');
-        window.location.href = '/login';
-        return;
-      }
-
-      // Handle specific error responses from the API
-      if (error.response?.data?.error) {
-        message.error(`Cannot save: ${error.response.data.error}`);
-      } else if (error.response?.status === 400) {
-        message.error('Cannot save: Invalid workflow data. Please check all fields.');
+      console.error('Auto-save failed:', error, );
+      if (error.message === 'Duplicate workflow name') {
+        // message already shown by WorkflowsTab
       } else if (error.response?.status === 404) {
         message.error('Cannot save: Workflow not found. It may have been deleted.');
-        setCurrentWorkflowId(null); // Reset to allow creating a new workflow
-      } else if (error.response?.status === 500) {
-        message.error('Cannot save: Server error. Please try again later.');
-      } else if (error.message === 'Network Error' || !error.response) {
-        message.error('Cannot save: Network error. Please check your internet connection.');
+        setCurrentWorkflowId(null);
+      } else if (error.message !== 'Network Error' && error.response) {
+        message.error(`Cannot save: ${error.response?.data?.error || error.message || 'Unknown error'}`);
       } else {
-        message.error(`Cannot save: ${error.message || 'Unknown error occurred'}`);
+        message.error('Cannot save: Network error. Please check your connection.');
       }
-
-      // Reset hasUnsavedChanges to prevent infinite retry loop
       setHasUnsavedChanges(false);
     } finally {
       setSaving(false);
     }
-  }, [workflowName, nodes, edges, executionSteps, workflowDescription, currentWorkflowId, saving]);
+  }, [workflowName, nodes, edges, executionSteps, workflowDescription, currentWorkflowId, saving, onAutoSave]);
 
   // Debounced auto-save (2 seconds delay)
   // Use ref to store the latest autoSave function
@@ -1203,19 +1162,158 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
 
 
   const handleOpenStepsEditor = () => {
+    setSaveAfterStepsEditor(false);
     setIsStepsEditorOpen(true);
+  };
+
+  const handleSaveWorkflow = () => {
+    if (!validateWorkflow()) {
+      return;
+    }
+    // Open steps editor first, then save after steps are saved
+    setSaveAfterStepsEditor(true);
+    setIsStepsEditorOpen(true);
+  };
+
+  const handleExportJSON = () => {
+    const workflowData = {
+      name: workflowName,
+      description: workflowDescription,
+      nodes,
+      edges,
+      nodeCount: nodes.length,
+      type: 'Custom',
+      executionSteps: executionSteps || [],
+      exportedAt: new Date().toISOString(),
+    };
+
+    const safeName = (workflowName || 'workflow').replace(/[^a-z0-9-_]+/gi, '_').toLowerCase();
+    const blob = new Blob([JSON.stringify(workflowData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${safeName}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    message.success('Workflow exported as JSON');
   };
 
   const handleStepsEditorClose = () => {
     setIsStepsEditorOpen(false);
+    setSaveAfterStepsEditor(false);
   };
 
-  const handleStepsEditorSave = (savedExecutionSteps) => {
+  const handleStepsEditorSave = async (savedExecutionSteps) => {
     // Update the workflow state to include execution steps
     setExecutionSteps(savedExecutionSteps);
     setHasUnsavedChanges(true);
-    
+
     console.log('Execution steps saved to workflow state:', savedExecutionSteps);
+
+    // If Save button was clicked, trigger autoSave instead of calling handleSave directly
+    if (saveAfterStepsEditor) {
+      setSaveAfterStepsEditor(false);
+      // Trigger immediate autoSave using the sidebar save mechanism
+      setTriggerSidebarSave(true);
+
+      // Show message that steps are updated (autoSave will handle the actual save)
+      message.success('Execution steps updated. Auto-saving workflow...');
+    }
+  };
+
+  /**
+   * Execute the entire workflow
+   * Iterates through nodes in order and executes each one
+   */
+  const handleExecuteWorkflow = async () => {
+    if (!nodes || nodes.length === 0) {
+      message.warning('No nodes to execute');
+      return;
+    }
+
+    if (!window.electronAPI?.workflow?.executeWorkflow) {
+      message.error('Workflow execution not available');
+      return;
+    }
+
+    setIsExecuting(true);
+
+    try {
+      // Use stored execution steps or auto-generate if none exist
+      let finalExecutionSteps = executionSteps;
+      if (!finalExecutionSteps || finalExecutionSteps.length === 0) {
+        finalExecutionSteps = generateStepsFromNodes(nodes, edges);
+      }
+
+      // Send notification that workflow is running
+      if (window.Notification && Notification.permission === 'granted') {
+        new Notification('DagFlux', {
+          body: `Workflow "${workflowName || 'Untitled Workflow'}" is now running...`,
+          // icon: '/image/dagflux.png'
+        });
+      } else if (window.Notification && Notification.permission !== 'denied') {
+        Notification.requestPermission().then(permission => {
+          if (permission === 'granted') {
+            new Notification('DagFlux', {
+              body: `Workflow "${workflowName || 'Untitled Workflow'}" is now running...`,
+              // icon: '/image/dagflux.png'
+            });
+          }
+        });
+      }
+
+      // Start execution
+      const result = await window.electronAPI.workflow.executeWorkflow({
+        workflowId: currentWorkflowId,
+        workflowName: workflowName || 'Untitled Workflow',
+        nodes,
+        edges,
+        executionSteps: finalExecutionSteps
+      });
+
+      if (result.success) {
+        message.success(`Workflow executed successfully! Execution ID: ${result.executionId}`);
+
+        // Send success notification
+        if (window.Notification && Notification.permission === 'granted') {
+          new Notification('DagFlux - Workflow Completed', {
+            body: `Workflow "${workflowName || 'Untitled Workflow'}" executed successfully!`,
+            // icon: '/image/dagflux.png'
+          });
+        }
+
+        // Refresh data preview if available
+        if (handleDataPreviewRefresh) {
+          handleDataPreviewRefresh();
+        }
+      } else {
+        message.error(`Workflow execution failed: ${result.message || 'Unknown error'}`);
+
+        // Send failure notification
+        if (window.Notification && Notification.permission === 'granted') {
+          new Notification('DagFlux - Workflow Failed', {
+            body: `Workflow "${workflowName || 'Untitled Workflow'}" failed: ${result.message || 'Unknown error'}`,
+            // icon: '/image/dagflux.png'
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Execute workflow error:', error);
+      message.error(`Execution error: ${error.message}`);
+
+      // Send error notification
+      if (window.Notification && Notification.permission === 'granted') {
+        new Notification('DagFlux - Workflow Error', {
+          body: `Workflow "${workflowName || 'Untitled Workflow'}" encountered an error: ${error.message}`,
+          // icon: '/image/dagflux.png'
+        });
+      }
+    } finally {
+      setIsExecuting(false);
+    }
   };
 
   if (editorLoading) {
@@ -1227,22 +1325,30 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
   }
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', fontFamily: "'Inter',-apple-system,sans-serif" }}>
       {/* Header */}
-      <div style={{ 
-        padding: '16px 24px', 
-        borderBottom: '1px solid #f0f0f0',
-        background: 'white',
+      <div style={{
+        padding: '10px 16px 10px 0px',
+        borderBottom: '1px solid #e2e6eb',
+        background: '#fff',
         display: 'flex',
         justifyContent: 'space-between',
-        alignItems: 'center'
+        alignItems: 'center',
+        gap: 12,
+        flexShrink: 0,
       }}>
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
           <Input
             placeholder="Enter workflow name"
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
-            style={{ marginBottom: '8px', fontSize: '16px', fontWeight: '500' }}
+            style={{
+              fontSize: 18,
+              fontWeight: 600,
+              color: '#111827',
+              padding: '2px 0px',
+              letterSpacing: '-0.01em',
+            }}
             bordered={false}
           />
           <Input.TextArea
@@ -1250,25 +1356,80 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
             value={workflowDescription}
             onChange={(e) => setWorkflowDescription(e.target.value)}
             rows={1}
-            style={{ fontSize: '14px' }}
+            style={{
+              fontSize: 11,
+              padding: 0,
+              marginTop: 6,
+              color: '#5a6678',
+              resize: 'none',
+            }}
             bordered={false}
           />
         </div>
-        <Space>
-          <Button 
-            icon={<SettingOutlined />}
-            onClick={handleOpenStepsEditor}
-            disabled={!nodes || nodes.length === 0}
-            title="Edit execution steps"
+        <Space size={6}>
+          <Button
+            type="primary"
+            icon={<PlayCircleOutlined />}
+            onClick={handleExecuteWorkflow}
+            disabled={!nodes || nodes.length === 0 || isExecuting}
+            loading={isExecuting}
+            title="Execute workflow"
+            size="small"
+            style={{
+              borderRadius: 4,
+              background: '#2563eb',
+              borderColor: '#2563eb',
+              fontSize: 12,
+              fontWeight: 600,
+            }}
           >
-            Edit Steps
+            Execute
           </Button>
-          {/* <Button onClick={handleCancel}>
-            Cancel
-          </Button> */}
+          <Button
+            type="primary"
+            icon={<SaveOutlined />}
+            onClick={handleSaveWorkflow}
+            disabled={!workflowName.trim() || saving}
+            loading={saving}
+            title="Save workflow"
+            size="small"
+            className="workflow-save-button"
+          >
+            Save
+          </Button>
+          <Dropdown
+            overlay={
+              <Menu>
+                <Menu.Item
+                  key="edit-steps"
+                  icon={<SettingOutlined />}
+                  disabled={!nodes || nodes.length === 0}
+                  onClick={handleOpenStepsEditor}
+                >
+                  Edit Steps
+                </Menu.Item>
+                <Menu.Item
+                  key="export-json"
+                  icon={<ExportOutlined />}
+                  disabled={!nodes || nodes.length === 0}
+                  onClick={handleExportJSON}
+                >
+                  Export JSON
+                </Menu.Item>
+              </Menu>
+            }
+            trigger={['click']}
+            placement="bottomRight"
+          >
+            <Button
+              size="small"
+              icon={<MoreOutlined />}
+              style={{ borderRadius: 4, borderColor: '#e2e6eb', color: '#5a6678' }}
+            />
+          </Dropdown>
           {saving && (
-            <span style={{ color: '#1890ff', fontSize: '12px' }}>
-              Auto-saving...
+            <span style={{ color: '#2563eb', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+              Auto-saving…
             </span>
           )}
         </Space>
@@ -1296,20 +1457,36 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
               attributionPosition="top-right"
             >
               <Controls />
-              <MiniMap />
-              <Background variant="dots" gap={12} size={1} />
-              
+              <MiniMap
+                style={{
+                  background: 'rgba(255,255,255,0.92)',
+                  border: '1px solid #e2e6eb',
+                  borderRadius: 5,
+                }}
+                maskColor="rgba(247,249,252,0.6)"
+                nodeColor={(n) => {
+                  const map = {
+                    start: '#2563eb',
+                    dataSource: '#0891b2',
+                    transformer: '#7c3aed',
+                    join: '#d97706',
+                    branch: '#059669',
+                    output: '#db2777',
+                  };
+                  return map[n.type] || '#cdd2db';
+                }}
+              />
+              <Background variant="dots" gap={16} size={1.4} color="#cdd2db" />
+
               {/* Node Types Panel */}
               <Panel position="top-right">
                 <NodeTypePanel />
               </Panel>
-              
+
               {/* Workflow Info */}
               <Panel position="top-left">
                 <div className="workflow-toolbar">
-                  <div style={{ fontSize: '12px', color: '#666' }}>
-                    Nodes: {nodes.length} | Connections: {edges.length}
-                  </div>
+                  {nodes.length} nodes · {edges.length} connections
                 </div>
               </Panel>
             </ReactFlow>
@@ -1326,46 +1503,48 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
               left: contextMenu.x,
               zIndex: 10000,
               backgroundColor: '#fff',
-              border: '1px solid #d9d9d9',
-              borderRadius: '6px',
-              boxShadow: '0 3px 6px -4px rgba(0,0,0,.12), 0 6px 16px 0 rgba(0,0,0,.08), 0 9px 28px 8px rgba(0,0,0,.05)',
-              minWidth: '150px',
+              border: '1px solid #e2e6eb',
+              borderRadius: 6,
+              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+              minWidth: 150,
               overflow: 'hidden',
+              fontFamily: "'Inter',-apple-system,sans-serif",
             }}
           >
             <div
               onClick={handleEditNode}
               style={{
-                padding: '8px 16px',
+                padding: '7px 12px',
                 cursor: 'pointer',
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px',
-                fontSize: '14px',
-                transition: 'background-color 0.2s',
+                gap: 8,
+                fontSize: 12,
+                color: '#111827',
+                transition: 'background-color 0.15s',
               }}
-              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f5f5f5'}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f7f9fc'}
               onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
             >
-              <EditOutlined style={{ fontSize: '14px', color: '#1890ff' }} />
+              <EditOutlined style={{ fontSize: 12, color: '#2563eb' }} />
               <span>Edit</span>
             </div>
             <div
               onClick={handleDeleteNode}
               style={{
-                padding: '8px 16px',
+                padding: '7px 12px',
                 cursor: 'pointer',
                 display: 'flex',
                 alignItems: 'center',
-                gap: '8px',
-                fontSize: '14px',
-                transition: 'background-color 0.2s',
+                gap: 8,
+                fontSize: 12,
+                transition: 'background-color 0.15s',
               }}
-              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#fff1f0'}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#fef2f2'}
               onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
             >
-              <DeleteOutlined style={{ fontSize: '14px', color: '#ff4d4f' }} />
-              <span style={{ color: '#ff4d4f' }}>Delete</span>
+              <DeleteOutlined style={{ fontSize: 12, color: '#dc2626' }} />
+              <span style={{ color: '#dc2626' }}>Delete</span>
             </div>
           </div>
         )}
@@ -1376,6 +1555,7 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
           node={selectedNode}
           nodes={nodes}
           edges={edges}
+          currentWorkflowId={currentWorkflowId}
           onClose={onCloseSidebar}
           onConfigUpdate={onNodeConfigUpdate}
           onPreviewConfigUpdate={onPreviewConfigUpdate}
@@ -1403,37 +1583,41 @@ const WorkflowEditor = ({ workflow, onSave, onCancel, onCloseRequest }) => {
             left: 0,
             right: 0,
             bottom: 0,
-            backgroundColor: 'rgba(24, 144, 255, 0.1)',
-            border: '3px dashed #1890ff',
+            backgroundColor: 'rgba(37, 99, 235, 0.08)',
+            border: '2px dashed #2563eb',
             zIndex: 1000,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            pointerEvents: 'none'
+            pointerEvents: 'none',
+            fontFamily: "'Inter',-apple-system,sans-serif",
           }}>
-            <div style={{ 
+            <div style={{
               textAlign: 'center',
-              backgroundColor: 'white',
-              padding: '32px',
-              borderRadius: '8px',
-              boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)'
+              backgroundColor: '#fff',
+              padding: 28,
+              border: '1px solid #e2e6eb',
+              borderRadius: 8,
+              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.12)'
             }}>
-              <CloudUploadOutlined style={{ 
-                fontSize: 64, 
-                color: '#1890ff', 
-                marginBottom: 16 
+              <CloudUploadOutlined style={{
+                fontSize: 48,
+                color: '#2563eb',
+                marginBottom: 12
               }} />
-              <div style={{ 
-                fontSize: 18, 
-                fontWeight: 'bold', 
-                color: '#1890ff',
-                marginBottom: 8
+              <div style={{
+                fontSize: 14,
+                fontWeight: 600,
+                color: '#111827',
+                marginBottom: 6,
+                letterSpacing: '-0.01em',
               }}>
                 Drop your Excel or CSV file here
               </div>
-              <div style={{ 
-                fontSize: 14, 
-                color: '#666' 
+              <div style={{
+                fontSize: 11,
+                color: '#5a6678',
+                fontFamily: "'JetBrains Mono', monospace",
               }}>
                 A new data source connection will be created
               </div>

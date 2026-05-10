@@ -81,6 +81,34 @@ const CloudStorageBrowser = ({
 
   const [outputFormat, setOutputFormat] = useState(getDefaultFormat());
 
+  // Helper function to get the correct container identifier based on dbType
+  const getContainerIdentifier = (container) => {
+    // OneDrive and SharePoint require ID first (drive ID/site ID)
+    // Other cloud storage (S3, Azure Blob, GCS) use name first
+    if (connection.dbType === 'onedrive' || connection.dbType === 'sharepoint') {
+      return container.id || container.name;
+    }
+    return container.name || container.id;
+  };
+
+  // Helper function to get the correct folder path/ID based on dbType
+  const getFolderPrefix = (pathArray) => {
+    if (!pathArray || pathArray.length === 0) {
+      return '';
+    }
+
+    // OneDrive and SharePoint use item IDs for folder navigation
+    if (connection.dbType === 'onedrive' || connection.dbType === 'sharepoint') {
+      // Return the ID of the last folder in the path
+      const lastFolder = pathArray[pathArray.length - 1];
+      return lastFolder.id || lastFolder.objectKey || '';
+    }
+
+    // S3, Azure Blob, GCS use folder names as prefixes
+    const folderPath = pathArray.map(p => p.name).join('/');
+    return folderPath ? folderPath + '/' : '';
+  };
+
   useEffect(() => {
     if (open && connection) {
       loadContainers();
@@ -96,9 +124,8 @@ const CloudStorageBrowser = ({
     if (!currentContainer) return;
 
     const debounceTimer = setTimeout(() => {
-      const folderPath = currentPath.map(p => p.name).join('/');
-      const prefix = folderPath ? folderPath + '/' : '';
-      loadObjects(currentContainer.name || currentContainer.id, prefix, true);
+      const prefix = getFolderPrefix(currentPath);
+      loadObjects(getContainerIdentifier(currentContainer), prefix, true);
     }, 500); // 500ms debounce
 
     return () => clearTimeout(debounceTimer);
@@ -180,13 +207,12 @@ const CloudStorageBrowser = ({
         return;
       }
 
-      const folderPath = currentPath.map(p => p.name).join('/');
-      const prefix = folderPath ? folderPath + '/' : '';
+      const prefix = getFolderPrefix(currentPath);
 
       const result = await window.electronAPI.cloudStorage.listObjects(
         connection.id,
         connection.dbType,
-        currentContainer.name || currentContainer.id,
+        getContainerIdentifier(currentContainer),
         prefix,
         pageSize,
         continuationToken,
@@ -212,15 +238,16 @@ const CloudStorageBrowser = ({
     setCurrentContainer(container);
     setCurrentPath([]);
     setSearchTerm(''); // Reset search when switching containers
-    loadObjects(container.name || container.id, '', true, '');
+    loadObjects(getContainerIdentifier(container), '', true, '');
   };
 
   const handleObjectClick = (object) => {
     if (object.isFolder) {
       // Navigate into folder
-      setCurrentPath([...currentPath, object]);
-      const folderPath = [...currentPath, object].map(p => p.name).join('/');
-      loadObjects(currentContainer.name || currentContainer.id, folderPath + '/', true);
+      const newPath = [...currentPath, object];
+      setCurrentPath(newPath);
+      const folderPrefix = getFolderPrefix(newPath);
+      loadObjects(getContainerIdentifier(currentContainer), folderPrefix, true);
     } else if (mode === 'import') {
       // Check if file type is supported before selecting
       if (checkFileType(object)) {
@@ -246,15 +273,15 @@ const CloudStorageBrowser = ({
       setCurrentPath([]);
       setSelectedFile(null);
       setFilePreview(null);
-      loadObjects(currentContainer.name || currentContainer.id, '', true);
+      loadObjects(getContainerIdentifier(currentContainer), '', true);
     } else if (index < currentPath.length) {
       // Navigate to specific folder
       const newPath = currentPath.slice(0, index);
       setCurrentPath(newPath);
-      const folderPath = newPath.map(p => p.name).join('/');
+      const folderPrefix = getFolderPrefix(newPath);
       setSelectedFile(null);
       setFilePreview(null);
-      loadObjects(currentContainer.name || currentContainer.id, folderPath ? folderPath + '/' : '', true);
+      loadObjects(getContainerIdentifier(currentContainer), folderPrefix, true);
     }
   };
 
@@ -328,7 +355,7 @@ const CloudStorageBrowser = ({
       const downloadResult = await window.electronAPI.cloudStorage.downloadObject(
         connection.id,
         connection.dbType,
-        currentContainer.name || currentContainer.id,
+        getContainerIdentifier(currentContainer),
         objectIdentifier
       );
 
@@ -396,12 +423,16 @@ const CloudStorageBrowser = ({
         return;
       }
 
+      // Convert sheetName to sheets array
+      // If sheetName is provided, only import that sheet; otherwise import all sheets
+      const sheets = sheetName ? [sheetName] : [];
+
       const result = await window.electronAPI.cloudStorage.importFile({
         data: fileData,
         fileName: fileName,
         fileType: fileType,
-        sheetName: sheetName,
-        containerName: currentContainer.name || currentContainer.id,
+        sheets: sheets,
+        containerName: getContainerIdentifier(currentContainer),
         connectionName: connection.name
       });
 
@@ -424,9 +455,12 @@ const CloudStorageBrowser = ({
           cloudSource: {
             connectionId: connection.id,
             connectionName: connection.name,
-            containerName: currentContainer.name || currentContainer.id,
+            dbType: connection.dbType,
+            containerName: getContainerIdentifier(currentContainer),
             objectName: selectedFile.name,
-            objectPath: [...currentPath, selectedFile].map(p => p.name).join('/')
+            objectKey: selectedFile.objectKey || selectedFile.name, // Use objectKey if available
+            objectPath: [...currentPath, selectedFile].map(p => p.name).join('/'),
+            sheetName: sheetName // Store sheet name for re-import
           }
         });
 
@@ -481,8 +515,8 @@ const CloudStorageBrowser = ({
     // Build the full path
     const folderPath = currentPath.map(p => p.name).join('/');
     const objectPath = folderPath ? `${folderPath}/${fileNameWithExtension}` : fileNameWithExtension;
-    // Use ID for cloud storage APIs (e.g., Google Drive "root"), fallback to name
-    const containerName = currentContainer.id || currentContainer.name;
+    // Use getContainerIdentifier to get the correct identifier based on dbType
+    const containerName = getContainerIdentifier(currentContainer);
 
     onFileSelect({
       containerName,
