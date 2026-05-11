@@ -25,8 +25,55 @@ export const loadTableSchema = async ({
     const isMongoDB = connection.dbType === 'mongodb';
     const isSQLite = connection.dbType === 'sqlite';
     const isGoogleSheets = connection.dbType === 'google-sheets';
+    const isVectorDB = connection.dbCategory === 'Vector'
+      || connection.dbType === 'lancedb'
+      || connection.dbType === 'pinecone';
 
-    // console.log('loadTableSchema: ', connection)
+    console.log('connection: ', connection)
+
+    // Handle vector databases (LanceDB, Pinecone) via the vector-db-executor skill.
+    // Must run before the localPath branch — LanceDB sets localPath but is not SQLite/NeDB.
+    if (isVectorDB) {
+      if (!window.electronAPI?.skills?.queryVectorPreview) {
+        console.error('Vector DB preview API not available');
+        return null;
+      }
+
+      const result = await window.electronAPI.skills.queryVectorPreview({
+        vectorDbType: connection.dbType,
+        tableName,
+        namespace: tableSchema || '',
+        dbConfig: connection.dbConfig || {},
+        connectionId: connection.id,
+        targetLocalPath: localPath
+      });
+      console.log('result: ', result)
+      if (!result.success || !result.data) {
+        console.error('Failed to query vector database for schema:', result.message);
+        return null;
+      }
+
+      const sampleData = result.data.slice(0, limit);
+      const columns = sampleData.length > 0
+        ? Object.keys(sampleData[0]).map(name => {
+            const value = sampleData[0][name];
+            let type = 'unknown';
+            if (typeof value === 'number') type = 'number';
+            else if (typeof value === 'boolean') type = 'boolean';
+            else if (Array.isArray(value)) type = 'array';
+            else if (typeof value === 'string' && /\[\d+ dims\]/.test(value)) type = 'vector';
+            else if (typeof value === 'string') type = 'string';
+            else if (value && typeof value === 'object') type = 'object';
+            return { name, type, nullable: true };
+          })
+        : [];
+
+      return {
+        tableName,
+        columns,
+        sampleData
+      };
+    }
 
     // Handle local files (NeDB for MongoDB, SQLite for SQL transformations)
     if (localPath && window.electronAPI?.db?.readLocalCollection) {

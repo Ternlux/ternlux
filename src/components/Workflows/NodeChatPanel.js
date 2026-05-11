@@ -4,9 +4,11 @@ import {
   CloseOutlined, DatabaseOutlined, SettingOutlined,
   MergeOutlined, ExportOutlined, PlayCircleOutlined,
   ReloadOutlined, CaretRightOutlined, LoadingOutlined,
+  BranchesOutlined,
 } from '@ant-design/icons';
 
 // Import node-specific chat components
+import StartNodeChat from './NodeChats/StartNodeChat';
 import DataSourceNodeChat from './NodeChats/DataSourceNodeChat';
 import TransformerNodeChat from './NodeChats/TransformerNodeChat';
 import JoinNodeChat from './NodeChats/JoinNodeChat';
@@ -16,20 +18,42 @@ import OutputNodeChat from './NodeChats/OutputNodeChat';
 // Constants & Utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NODE_ICON = {
-  start: <PlayCircleOutlined style={{ color: '#1890ff', fontSize: 16 }} />,
-  dataSource: <DatabaseOutlined style={{ color: '#52c41a', fontSize: 16 }} />,
-  transformer: <SettingOutlined style={{ color: '#1890ff', fontSize: 16 }} />,
-  join: <MergeOutlined style={{ color: '#fa8c16', fontSize: 16 }} />,
-  output: <ExportOutlined style={{ color: '#722ed1', fontSize: 16 }} />,
+const NODE_COLORS = {
+  start: '#2563eb',
+  dataSource: '#0891b2',
+  transformer: '#7c3aed',
+  join: '#d97706',
+  branch: '#059669',
+  output: '#db2777',
 };
+
+const NODE_LABELS = {
+  start: 'START',
+  dataSource: 'DATA SOURCE',
+  transformer: 'TRANSFORM',
+  join: 'JOIN',
+  branch: 'BRANCH',
+  output: 'OUTPUT',
+};
+
+const NODE_ICON = {
+  start: (color) => <PlayCircleOutlined style={{ color, fontSize: 14 }} />,
+  dataSource: (color) => <DatabaseOutlined style={{ color, fontSize: 14 }} />,
+  transformer: (color) => <SettingOutlined style={{ color, fontSize: 14 }} />,
+  join: (color) => <MergeOutlined style={{ color, fontSize: 14 }} />,
+  branch: (color) => <BranchesOutlined style={{ color, fontSize: 14 }} />,
+  output: (color) => <ExportOutlined style={{ color, fontSize: 14 }} />,
+};
+
+const MONO = "'JetBrains Mono', monospace";
+const SANS = "'Inter',-apple-system,sans-serif";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main NodeChatPanel Component
 // Routes to specific node type components
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, onPreviewConfigUpdate, onLoadDatabaseTables, onDataPreviewRefresh }) => {
+const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose, onConfigUpdate, onPreviewConfigUpdate, onLoadDatabaseTables, onDataPreviewRefresh }) => {
   const [resetKey, setResetKey] = useState(0);
   const [executing, setExecuting] = useState(false);
 
@@ -73,6 +97,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
     connectionId,
 
     // SQL params
+    targetSchema = null,
     ddl = null,
     sql = null,
     previewSql = null,
@@ -142,7 +167,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
     }
 
     // SQL transformation
-    if (!sql && !ddl) {
+    if (!sql && !ddl && !transformFunction) {
       const result = { success: false, error: 'No SQL to execute' };
       if (onError) onError(result);
       return result;
@@ -166,11 +191,12 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
         previewSql,
         storageLocation,
         operationMode,
+        targetSchema,
         targetTableName,
         sourceLocalPath,
         insertSql
       );
-
+      console.log('result: ', result)
       if (result.success && onDataPreviewRefresh) {
         onDataPreviewRefresh();
       }
@@ -271,6 +297,37 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
         if (config.emailAddress) summaryText += `\n**Email:** ${config.emailAddress}`;
         break;
 
+      case 'branch': {
+        const routeTrue = config.outputRoutes?.true || 'valid';
+        const routeFalse = config.outputRoutes?.false || 'invalid';
+        summaryText = 'Configuration saved!\n';
+        if (config.branchRequest) summaryText += `\n**Rule:** ${config.branchRequest}`;
+        if (config.explanation) summaryText += `\n${config.explanation}`;
+        summaryText += `\n\n**Routes:** true → ${routeTrue} · false → ${routeFalse}`;
+        if (Array.isArray(config.steps)) {
+          metadata = { branchSteps: config.steps, validationFunction: config.validationFunction };
+        }
+        break;
+      }
+
+      case 'start':
+        summaryText = 'Configuration saved!\n';
+        if (config.triggerType === 'manual') {
+          summaryText += '\n**Trigger:** Manual';
+        } else if (config.triggerType === 'time') {
+          summaryText += `\n**Trigger:** Time-based\n**Schedule:** ${config.description || 'Not configured'}`;
+        } else if (config.triggerType === 'file') {
+          summaryText += `\n**Trigger:** File Watch\n**Path:** ${config.fileWatchConfig?.path || 'Not configured'}`;
+          if (config.fileWatchConfig?.events) {
+            const eventNames = config.fileWatchConfig.events.map(e => {
+              const map = { add: 'File Added', change: 'File Changed', unlink: 'File Deleted', addDir: 'Directory Added', unlinkDir: 'Directory Deleted' };
+              return map[e];
+            });
+            summaryText += `\n**Events:** ${eventNames.join(', ')}`;
+          }
+        }
+        break;
+
       default:
         summaryText = 'Configuration saved!';
         break;
@@ -319,6 +376,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
         targetDdl: config.targetDdl,
         transformFunction: config.transformFunction,
         targetTableName: config.targetTableName,
+        targetSchema: config.targetSchema,
         targetCollection: config.targetCollection
       };
 
@@ -337,6 +395,60 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
       return;
     }
 
+    // Skill-based transformations bypass the SQL/NoSQL branches and dispatch
+    // through skills:execute so the skill (javascript-executor, python-executor,
+    // vector-db-executor) gets the helpers bundle that electron injects.
+    if (config.usesSkill && config.skillId) {
+      setExecuting(true);
+      try {
+        const skillResult = await window.electronAPI.skills.execute({
+          skillId: config.skillId,
+          params: {
+            sourceConnection: {
+              id: config.sourceConnectionId,
+              name: config.sourceConnectionName,
+              dbType: config.sourceDbType,
+              dbConfig: config.sourceDbConfig,
+              localPath: config.sourceLocalPath,
+              connectionType: config.sourceConnectionType,
+              dbCategory: config.sourceDbCategory,
+              indexName: config.sourceIndexName
+            },
+            sourceTableSchema: config.sourceTableSchema,
+            operationType: config.operationType,             // python-executor
+            transformFunction: config.transformFunction,     // javascript-executor / vector-db-executor
+            outputType: config.targetDbType,                 // javascript-executor: nedb | lancedb
+            targetLocalPath: config.targetLocalPath,
+            storageLocation: config.transformationSettings?.storageLocation || config.storageLocation,
+            operationMode: config.transformationSettings?.operationMode || config.operationMode,
+            nodeId: node.id,
+            sourceNodeId: config.sourceNodeId,
+            sourceNodeLabel: config.sourceNodeLabel,
+            sourceConnectionName: config.sourceConnectionName,
+            sourceConnectionType: config.sourceConnectionType,
+            userRequest: config.transformationRequest,
+            // vector-db-executor specific
+            vectorDbType: config.targetDbType,
+            targetConnectionId: config.targetConnectionId,
+            // python-executor specific
+            pythonCode: config.pythonCode
+          }
+        });
+        setExecuting(false);
+        if (skillResult?.success) {
+          antMessage.success(skillResult.message || 'Execution successful!');
+          if (onDataPreviewRefresh) onDataPreviewRefresh();
+        } else {
+          antMessage.error(skillResult?.error || skillResult?.message || 'Execution failed');
+        }
+      } catch (err) {
+        setExecuting(false);
+        console.error('Skill execute error:', err);
+        antMessage.error(err.message || 'Failed to execute skill');
+      }
+      return;
+    }
+
     // Handle transformer nodes
     const isNoSQL = config.dbType === 'mongodb' || config.dbType === 'nedb';
     const isNeDB = config.dbType === 'nedb';
@@ -348,14 +460,15 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
 
     const result = await executeTransformation({
       connectionConfig: {
-        dbType: config.dbType,
+        dbType: config.targetDbType,
         dbConfig: config.dbConfig
       },
-      connectionId: config.connectionId,
+      connectionId: config.targetConnectionId,
 
       // SQL params
-      ddl: config.ddl,
-      sql: config.sql,
+      targetSchema: config.targetSchema,
+      ddl: config.targetDdl,
+      sql: config.targetSql,
       previewSql: config.previewSql,
       targetTableName: config.targetTableName || config.targetCollection,
       insertSql: config.insertSql,
@@ -379,16 +492,6 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
   };
 
   const executingInd = async (execute) => setExecuting(execute)
-
-  const handleExecute = async (connectionConfig, ddl, sql, connectionId, nosqlConfig = null) => {
-    return executeTransformation({
-      connectionConfig,
-      connectionId,
-      ddl,
-      sql,
-      ...(nosqlConfig || {})
-    });
-  };
 
   /**
    * Execute Join Operation
@@ -486,6 +589,56 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
     }
   };
 
+  /**
+   * Execute Branch Validation
+   * Runs each plan step against its source, feeds the results into the
+   * validationFunction, and returns { success, result:boolean, route, stepResults }.
+   */
+  const executeBranch = async ({
+    sources,
+    steps,
+    validationFunction,
+    outputRoutes,
+    onSuccess = null,
+    onError = null,
+  }) => {
+    if (!window.electronAPI?.dbConnect?.executeBranch) {
+      const result = { success: false, error: 'Branch execution not available' };
+      if (onError) onError(result);
+      return result;
+    }
+
+    setExecuting(true);
+    try {
+      const result = await window.electronAPI.dbConnect.executeBranch({
+        sources,
+        steps,
+        validationFunction,
+        outputRoutes,
+      });
+
+      if (result.success && onDataPreviewRefresh) {
+        onDataPreviewRefresh();
+      }
+
+      setExecuting(false);
+
+      if (result.success && onSuccess) {
+        onSuccess(result);
+      } else if (!result.success && onError) {
+        onError(result);
+      }
+
+      return result;
+    } catch (error) {
+      console.error('Execute branch error:', error);
+      setExecuting(false);
+      const errorResult = { success: false, error: error.message || 'Failed to execute branch' };
+      if (onError) onError(errorResult);
+      return errorResult;
+    }
+  };
+
   // ─────────────────────────────────────────────────────────────────────────
   // Render child component based on node type
   // ─────────────────────────────────────────────────────────────────────────
@@ -502,7 +655,6 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
             onLoadDatabaseTables={onLoadDatabaseTables}
             onConfigUpdate={onConfigUpdate}
             onPreviewConfigUpdate={onPreviewConfigUpdate}
-            onExecute={handleExecute}
             executing={executing}
           />
         );
@@ -518,7 +670,6 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
             onSave={handleSave}
             onConfigUpdate={onConfigUpdate}
             onPreviewConfigUpdate={onPreviewConfigUpdate}
-            onExecute={handleExecute}
             executeTransformation={executeTransformation}
             getSourceLocalPath={getSourceLocalPath}
             executingInd={executingInd}
@@ -538,7 +689,6 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
             onLoadDatabaseTables={onLoadDatabaseTables}
             onConfigUpdate={onConfigUpdate}
             onPreviewConfigUpdate={onPreviewConfigUpdate}
-            onExecute={handleExecute}
             executeJoin={executeJoin}
             executingInd={executingInd}
             executing={executing}
@@ -554,6 +704,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
             edges={edges}
             initialChat={initialChat}
             onSave={handleSave}
+            onConfigUpdate={onConfigUpdate}
             executeOutput={executeOutput}
             executingInd={executingInd}
             executing={executing}
@@ -561,10 +712,21 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
         );
 
       case 'start':
+        return (
+          <StartNodeChat
+            key={`${node.id}-${resetKey}`}
+            currentWorkflowId={currentWorkflowId}
+            node={node}
+            initialChat={initialChat}
+            onSave={handleSave}
+            onConfigUpdate={onConfigUpdate}
+          />
+        );
+
       default:
         return (
           <div style={{ padding: 20, textAlign: 'center', color: '#888' }}>
-            This is the Start node — no configuration needed.
+            No configuration available for this node type.
           </div>
         );
     }
@@ -574,38 +736,55 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
   // Render
   // ─────────────────────────────────────────────────────────────────────────
 
+  const nodeColor = NODE_COLORS[node.type] || '#2563eb';
+  const nodeLabel = NODE_LABELS[node.type] || node.type.toUpperCase();
+  const iconFn = NODE_ICON[node.type] || (() => null);
+
   return (
     <div
       style={{
-        position: 'fixed', right: 0, top: 48, bottom: 0, width: 420, zIndex: 1010,
-        background: '#fff', boxShadow: '-4px 0 24px rgba(0,0,0,0.13)',
+        position: 'fixed', right: 0, top: 0, bottom: 0, width: 420, zIndex: 1010,
+        background: '#fff', borderLeft: '1px solid #e2e6eb',
+        boxShadow: '-6px 0 24px rgba(0,0,0,0.08)',
         display: 'flex', flexDirection: 'column',
+        fontFamily: SANS,
       }}
     >
       {/* Header */}
       <div
         style={{
-          padding: '14px 16px', borderBottom: '1px solid #f0f0f0',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          background: '#fafafa', flexShrink: 0,
+          padding: '12px 14px', borderBottom: '1px solid #e2e6eb',
+          display: 'flex', alignItems: 'center', gap: 10,
+          background: '#fff', flexShrink: 0,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          {NODE_ICON[node.type]}
-          <div>
-            <div style={{ fontWeight: 600, fontSize: 14, lineHeight: 1.3 }}>
-              Configure {node.data?.label || node.type}
-            </div>
-            <div style={{ fontSize: 11, color: '#888', marginTop: 1, textTransform: 'capitalize' }}>
-              {node.type} node
-            </div>
+        <div style={{
+          width: 28, height: 28, borderRadius: 5,
+          background: nodeColor + '18',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          flexShrink: 0,
+        }}>
+          {iconFn(nodeColor)}
+        </div>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{
+            fontSize: 9, fontFamily: MONO, fontWeight: 700,
+            letterSpacing: '0.1em', color: nodeColor, textTransform: 'uppercase',
+          }}>
+            {nodeLabel}
+          </div>
+          <div style={{
+            fontSize: 13, fontWeight: 600, color: '#111827', marginTop: 1,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {node.data?.label || `Configure ${node.type}`}
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {/* Show run button for dataSource, transformer, and join nodes with SQL/DDL */}
           {(
             (node.type === 'dataSource' && node.data?.config?.sql && node.data?.config?.ddl && node.data?.config?.connectionType === 'database') ||
-            (node.type === 'transformer' && node.data?.config?.sql || node.data?.config?.ddl || node.data?.config?.nosqlOperation) ||
+            (node.type === 'transformer' && node.data?.config?.targetSql || node.data?.config?.targetDdl || node.data?.config?.transformFunction || node.data?.config?.nosqlOperation) ||
             (node.type === 'join' && node.data?.config?.targetConnectionType)
           ) && (
             <Button
@@ -615,6 +794,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
               size="small"
               title="Execute SQL"
               disabled={executing}
+              style={{ color: nodeColor, fontSize: 11 }}
             >
               {executing && 'Running'}
             </Button>
@@ -625,8 +805,15 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate, on
             onClick={handleReset}
             size="small"
             title="Start over"
+            style={{ color: '#5a6678' }}
           />
-          <Button type="text" icon={<CloseOutlined />} onClick={onClose} size="small" />
+          <Button
+            type="text"
+            icon={<CloseOutlined />}
+            onClick={onClose}
+            size="small"
+            style={{ color: '#5a6678' }}
+          />
         </div>
       </div>
 

@@ -128,6 +128,7 @@ module.exports = {
   runQuery: async (config, connectionId, query, limit=100) => {
     try {
       const connection = await getConnection(config, connectionId);
+      query = query?.query ? query.query : query;
       const params = typeof query === 'string' ? JSON.parse(query) : query;
       const db = connection.db;
 

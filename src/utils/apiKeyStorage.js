@@ -69,7 +69,7 @@ export async function hasApiKeyForProvider(requestedProvider) {
       'chatgpt': 'chatgpt',
       'gemini': 'gemini',
       'claude': 'claude',
-      'openai': 'chatgpt' // openai maps to chatgpt in storage
+      'openai': 'chatgpt'
     };
     // console.log('requestedProvider: ', requestedProvider)
 

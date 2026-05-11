@@ -1,8 +1,6 @@
 
 import React from 'react';
 import {Loader_sidebar} from './loader_sidebar'
-import star from '../Images/star.png';
-import goldstar from '../Images/goldstar.png';
 import {Infoeach} from './infoeach';
 
 

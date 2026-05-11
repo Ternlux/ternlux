@@ -5,11 +5,13 @@ import {
   UserOutlined,
   RobotOutlined,
   CloseOutlined,
-  AppstoreAddOutlined
+  AppstoreAddOutlined,
+  SafetyOutlined
 } from '@ant-design/icons';
 import ProviderSettings from './ProviderSettings';
 import ApiKeySetup from '../ApiKeySetup/ApiKeySetup';
 import PluginMarketplace from './PluginMarketplace';
+import PrivacySettings from './PrivacySettings';
 import './Settings.css';
 
 const { Sider, Content } = Layout;
@@ -32,6 +34,11 @@ const Settings = ({ onClose }) => {
       key: 'plugins',
       icon: <AppstoreAddOutlined />,
       label: 'Plugins'
+    },
+    {
+      key: 'privacy',
+      icon: <SafetyOutlined />,
+      label: 'Privacy'
     }
   ];
 
@@ -49,6 +56,8 @@ const Settings = ({ onClose }) => {
         return <ApiKeySetup isSettingsMode={true} onComplete={handleApiKeyComplete} />;
       case 'plugins':
         return <PluginMarketplace />;
+      case 'privacy':
+        return <PrivacySettings />;
       default:
         return <ProviderSettings />;
     }

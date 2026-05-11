@@ -1,30 +1,28 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
-import { MailOutlined, ExportOutlined, RobotOutlined, BulbOutlined } from '@ant-design/icons';
+import { MailOutlined, ExportOutlined } from '@ant-design/icons';
+import { ExpandableCodes, extractLatestCodes } from './nodeCardShared';
+
+const COLOR = '#db2777';
+const MONO = "'JetBrains Mono', monospace";
+const TEXT = '#111827';
+const MUTED = '#5a6678';
+const BORDER = '#e2e6eb';
+const GREEN = '#059669';
 
 const OutputNode = ({ data, selected }) => {
-  // Check if the output is configured (new structure with outputSettings)
   const isConfigured = !!(data.config?.outputSettings?.outputType);
 
-  // Determine colors based on configuration status
-  const borderColor = isConfigured ? '#722ed1' : '#d9d9d9';
-  const iconColor = isConfigured ? '#722ed1' : '#999';
-  const textColor = isConfigured ? '#333' : '#999';
-
-  // Get display information
   const getDisplayName = () => {
     const outputSettings = data.config?.outputSettings;
-
     if (!outputSettings?.outputType) {
       return 'Output';
     }
 
     if (outputSettings.outputType === 'local') {
-      // Show format for local output
       const format = outputSettings.format?.toUpperCase() || 'FILE';
       return `Export to ${format}`;
     } else if (outputSettings.outputType === 'connection') {
-      // Show connection for database output
       return outputSettings.tableName || 'Database Export';
     }
 
@@ -34,17 +32,11 @@ const OutputNode = ({ data, selected }) => {
   const getOutputIcon = () => {
     const outputSettings = data.config?.outputSettings;
 
-    if (!outputSettings?.outputType) {
-      return <ExportOutlined style={{ fontSize: '18px', color: iconColor }} />;
+    if (outputSettings?.outputType === 'connection') {
+      return <MailOutlined style={{ fontSize: 12, color: COLOR }} />;
     }
 
-    if (outputSettings.outputType === 'local') {
-      return <ExportOutlined style={{ fontSize: '18px', color: iconColor }} />;
-    } else if (outputSettings.outputType === 'connection') {
-      return <MailOutlined style={{ fontSize: '18px', color: iconColor }} />;
-    }
-
-    return <ExportOutlined style={{ fontSize: '18px', color: iconColor }} />;
+    return <ExportOutlined style={{ fontSize: 12, color: COLOR }} />;
   };
 
   const getSummary = () => {
@@ -64,72 +56,93 @@ const OutputNode = ({ data, selected }) => {
     return 'Output configured';
   };
 
+  const latestCodes = extractLatestCodes(data.config?.chat);
+
   return (
-    <div className={`react-flow__node-output ${selected ? 'selected' : ''}`}
-         style={{
-           borderLeft: `4px solid ${borderColor}`,
-           borderTop: `1px solid #e8e8e8`,
-           borderRight: `1px solid #e8e8e8`,
-           borderBottom: `2px solid #d0d0d0`,
-           backgroundColor: '#f9f0ff',
-           boxShadow: selected ? '0 4px 12px rgba(0,0,0,0.15)' : '0 2px 6px rgba(0,0,0,0.1)',
-           borderRadius: '2px',
-           minWidth: '220px',
-           maxWidth: '280px',
-           opacity: isConfigured ? 1 : 0.8,
-         }}>
-      {/* Target handle for incoming connections */}
+    <div
+      style={{
+        width: 264,
+        background: '#fff',
+        border: `1px solid ${selected ? COLOR : BORDER}`,
+        borderLeft: `3px solid ${COLOR}`,
+        borderRadius: 6,
+        boxShadow: selected
+          ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
+          : '0 1px 4px rgba(0,0,0,0.07)',
+        position: 'relative',
+        userSelect: 'none',
+        fontFamily: "'Inter',-apple-system,sans-serif",
+        opacity: isConfigured ? 1 : 0.9,
+      }}
+    >
       <Handle
         type="target"
         position={Position.Left}
         style={{
-          background: borderColor,
+          background: COLOR,
           border: '2px solid #fff',
-          width: '10px',
-          height: '10px',
-          left: '-5px',
+          width: 10,
+          height: 10,
+          left: -6,
+          boxShadow: `0 0 0 1px ${COLOR}44`,
         }}
       />
 
-      {/* Header with icon and name */}
+      {/* Header */}
       <div style={{
-        padding: '10px 12px',
-        borderBottom: '1px solid #f0f0f0',
+        padding: '7px 10px',
+        borderBottom: '1px solid #f0f2f5',
         display: 'flex',
         alignItems: 'center',
-        gap: '8px',
-        backgroundColor: 'rgba(255,255,255,0.5)',
+        gap: 7,
       }}>
         {getOutputIcon()}
+        <span style={{
+          fontSize: 9,
+          fontFamily: MONO,
+          fontWeight: 700,
+          letterSpacing: '0.1em',
+          color: COLOR,
+          textTransform: 'uppercase',
+        }}>
+          OUTPUT
+        </span>
         <div style={{
-          fontWeight: '600',
-          fontSize: '13px',
-          color: textColor,
-          flex: 1,
+          marginLeft: 'auto',
+          width: 6,
+          height: 6,
+          borderRadius: '50%',
+          background: isConfigured ? GREEN : BORDER,
+        }} />
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: '8px 10px' }}>
+        <div style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: TEXT,
+          marginBottom: 4,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
         }}>
           {getDisplayName()}
         </div>
+        <div style={{
+          fontSize: 11,
+          color: MUTED,
+          lineHeight: 1.5,
+          display: '-webkit-box',
+          WebkitLineClamp: 3,
+          WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+        }}>
+          {getSummary()}
+        </div>
       </div>
 
-      {/* Summary description */}
-      <div style={{
-        padding: '12px',
-        fontSize: '12px',
-        lineHeight: '1.5',
-        color: isConfigured ? '#555' : '#999',
-        fontStyle: isConfigured ? 'normal' : 'italic',
-        minHeight: '60px',
-        maxHeight: '90px',
-        overflow: 'hidden',
-        display: '-webkit-box',
-        WebkitLineClamp: 4,
-        WebkitBoxOrient: 'vertical',
-      }}>
-        {getSummary()}
-      </div>
+      <ExpandableCodes codes={latestCodes} />
     </div>
   );
 };

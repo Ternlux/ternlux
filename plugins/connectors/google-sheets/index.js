@@ -3,11 +3,14 @@
  * OAuth2.0-based authentication for accessing Google Sheets
  */
 
-const { google } = require('googleapis');
+const { OAuth2Client } = require('google-auth-library');
+const { sheets: sheetsApi } = require('@googleapis/sheets');
+const { drive: driveApi } = require('@googleapis/drive');
 const axios = require('axios');
 
 // OAuth client cache
 const oauthClients = new Map();
+const tokenRefreshCallbacks = new Map();
 
 /**
  * Get or create OAuth2 client
@@ -16,7 +19,7 @@ function getOAuthClient(config, connectionId) {
   const key = connectionId || JSON.stringify(config);
 
   if (!oauthClients.has(key)) {
-    const oauth2Client = new google.auth.OAuth2(
+    const oauth2Client = new OAuth2Client(
       config.clientId,
       config.clientSecret,
       config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -42,7 +45,7 @@ function getOAuthClient(config, connectionId) {
 /**
  * Refresh access token if expired
  */
-async function refreshAccessTokenIfNeeded(oauth2Client) {
+async function refreshAccessTokenIfNeeded(oauth2Client, connectionId) {
   try {
     const tokens = oauth2Client.credentials;
 
@@ -51,6 +54,19 @@ async function refreshAccessTokenIfNeeded(oauth2Client) {
       console.log('[Google Sheets] Refreshing access token...');
       const { credentials } = await oauth2Client.refreshAccessToken();
       oauth2Client.setCredentials(credentials);
+
+      // Trigger callback to update connection in database if registered
+      if (connectionId && tokenRefreshCallbacks.has(connectionId)) {
+        const callback = tokenRefreshCallbacks.get(connectionId);
+        await callback({
+          accessToken: credentials.access_token,
+          refreshToken: credentials.refresh_token,
+          expiryDate: credentials.expiry_date,
+          tokenType: credentials.token_type,
+          scope: credentials.scope
+        });
+      }
+
       return credentials;
     }
 
@@ -59,6 +75,14 @@ async function refreshAccessTokenIfNeeded(oauth2Client) {
     console.error('[Google Sheets] Token refresh error:', error);
     throw error;
   }
+}
+
+/**
+ * Register a callback to be called when token is refreshed
+ * This allows the main app to update the connection config
+ */
+function registerTokenRefreshCallback(connectionId, callback) {
+  tokenRefreshCallbacks.set(connectionId, callback);
 }
 
 module.exports = {
@@ -74,7 +98,7 @@ module.exports = {
    */
   getAuthorizationUrl: (config) => {
     try {
-      const oauth2Client = new google.auth.OAuth2(
+      const oauth2Client = new OAuth2Client(
         config.clientId,
         config.clientSecret,
         config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -110,7 +134,7 @@ module.exports = {
    */
   exchangeCodeForTokens: async (config, code) => {
     try {
-      const oauth2Client = new google.auth.OAuth2(
+      const oauth2Client = new OAuth2Client(
         config.clientId,
         config.clientSecret,
         config.redirectUri || 'http://localhost:3000/oauth/callback'
@@ -138,6 +162,49 @@ module.exports = {
   },
 
   /**
+   * Refresh access token using refresh token
+   */
+  refreshAccessToken: async (config) => {
+    try {
+      if (!config.refreshToken) {
+        return {
+          success: false,
+          message: 'No refresh token available'
+        };
+      }
+
+      const oauth2Client = new OAuth2Client(
+        config.clientId,
+        config.clientSecret,
+        config.redirectUri || 'http://localhost:3000/oauth/callback'
+      );
+
+      oauth2Client.setCredentials({
+        refresh_token: config.refreshToken
+      });
+
+      const { credentials } = await oauth2Client.refreshAccessToken();
+
+      return {
+        success: true,
+        tokens: {
+          accessToken: credentials.access_token,
+          refreshToken: credentials.refresh_token || config.refreshToken,
+          expiryDate: credentials.expiry_date,
+          tokenType: credentials.token_type,
+          scope: credentials.scope
+        }
+      };
+    } catch (error) {
+      console.error('[Google Sheets] Token refresh error:', error);
+      return {
+        success: false,
+        message: error.message
+      };
+    }
+  },
+
+  /**
    * Test connection
    */
   testConnection: async (config, connectionId = null) => {
@@ -150,10 +217,10 @@ module.exports = {
       }
 
       const oauth2Client = getOAuthClient(config, connectionId);
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
       // Test by listing files
-      const drive = google.drive({ version: 'v3', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
       await drive.files.list({ pageSize: 1 });
 
       return {
@@ -175,9 +242,9 @@ module.exports = {
   getTables: async (config, connectionId = null) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
-      const newTokens = await refreshAccessTokenIfNeeded(oauth2Client);
+      const newTokens = await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
-      const drive = google.drive({ version: 'v3', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
 
       // Search for Google Sheets files
       const response = await drive.files.list({
@@ -220,9 +287,9 @@ module.exports = {
   getColumns: async (config, connectionId, schema, spreadsheetId) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
-      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
 
       // Get spreadsheet metadata to list all sheets
       const metadata = await sheets.spreadsheets.get({
@@ -280,9 +347,9 @@ module.exports = {
   getTableSchema: async (config, connectionId, spreadsheetId, sheetName = null, limit = 5) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
-      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
 
       // If no sheetName provided, get the first sheet
       let targetSheetName = sheetName;
@@ -402,9 +469,9 @@ module.exports = {
   runQuery: async (config, connectionId, query) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
-      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
 
       // Parse query - can be JSON string or object
       // Query object may contain fields for different database types
@@ -472,9 +539,9 @@ module.exports = {
   streamQuery: async (config, connectionId, query, onBatch, batchSize = 1000) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
-      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
 
       const queryObj = typeof query === 'string' ? JSON.parse(query) : query;
       const { spreadsheetId, range, sheetName } = queryObj;
@@ -529,6 +596,16 @@ module.exports = {
     if (oauthClients.has(connectionId)) {
       oauthClients.delete(connectionId);
     }
+    if (tokenRefreshCallbacks.has(connectionId)) {
+      tokenRefreshCallbacks.delete(connectionId);
+    }
+  },
+
+  /**
+   * Register token refresh callback
+   */
+  registerTokenRefreshCallback: (connectionId, callback) => {
+    return registerTokenRefreshCallback(connectionId, callback);
   },
 
   /**
@@ -538,9 +615,9 @@ module.exports = {
   uploadObject: async (config, connectionId, containerName, fileName, data, contentType) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
-      await refreshAccessTokenIfNeeded(oauth2Client);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
 
-      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
 
       // Parse data from Buffer if needed
       let jsonData;

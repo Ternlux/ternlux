@@ -99,6 +99,8 @@ module.exports = {
    */
   getColumns: async (config, connectionId, schema, table) => {
     try {
+      schema = schema || 'dbo';
+      console.log('config, connectionId, schema, table: ', config, connectionId, schema, table)
       const pool = await getPool(config, connectionId);
       const result = await pool.request()
         .input('schema', mssql.NVarChar, schema)
@@ -118,7 +120,7 @@ module.exports = {
           WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
           ORDER BY c.ORDINAL_POSITION
         `);
-
+      console.log('result: ', result)
       return {
         success: true,
         columns: result.recordset
@@ -526,6 +528,7 @@ module.exports = {
    */
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
+    if (identifier.startsWith("[")) return identifier;
 
     const quotedIdentifier = `[${identifier}]`;
 

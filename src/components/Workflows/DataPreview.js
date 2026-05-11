@@ -11,6 +11,7 @@ import {
   RightOutlined
 } from '@ant-design/icons';
 import axios from 'axios';
+import Editor from '@monaco-editor/react';
 
 const { Title, Text } = Typography;
 const { TabPane } = Tabs;
@@ -75,6 +76,44 @@ const DataPreview = ({
       // Handle SQLite/NeDB databases (including imported spreadsheets)
       // Check if this is a SQLite or NeDB connection first
       const dbType = connection.targetDbType || config.targetDbType || config.sourceDbType;
+      
+      // Handle vector databases (LanceDB, Pinecone)
+      if (dbType === 'lancedb' || dbType === 'pinecone') {
+        console.log('config: ', config)
+        // For Pinecone, use indexName; for LanceDB, use tableName
+        const tableName = dbType === 'pinecone'
+          ? (config.sourceIndexName || config.targetIndexName || config.targetTableName || config.sourceTableName)
+          : (config.targetTableName || config.sourceTableName);
+        const namespace = config.namespace || config.targetTableSchema?.schema || '';
+
+        if (!tableName) {
+          message.error('Vector database table/index name not found');
+          return null;
+        }
+
+        const result = await window.electronAPI.skills.queryVectorPreview({
+          vectorDbType: dbType,
+          tableName: tableName,
+          namespace: namespace,
+          dbConfig: config.targetDbConfig || config.sourceDbConfig,
+          connectionId: config.targetConnectionId || config.sourceConnectionId,
+          targetLocalPath: config.targetLocalPath || config.sourceLocalPath
+        });
+
+        if (!result.success) {
+          message.error(`Failed to query vector database: ${result.message}`);
+          return null;
+        }
+
+        return {
+          headers: [],
+          data: result.data || [],
+          metadata: { rowCount: result.recordCount || 0 },
+          isJson: true,
+          storageType: result.storageType || dbType
+        };
+      }
+
       if (dbType === 'sqlite' || dbType === 'nedb') {
         // Use sourceLocalPath for data source nodes, fallback to connection fileInfo
         const localPath = config.sourceLocalPath || connection.fileInfo?.filePath;
@@ -87,10 +126,10 @@ const DataPreview = ({
         // Determine storage type from connection dbType
         const storageType = dbType === 'sqlite' ? 'sqlite' : 'nedb';
         // Use sourcePreviewSql for SQLite if available
-        const sqlPreview = storageType === 'sqlite' ? config.sourcePreviewSql : null;
+        const sqlPreview = storageType === 'sqlite' ? config.targetPreviewSql || config.sourcePreviewSql : null;
         // Get table name for SQLite queries
         const tableName = storageType === 'sqlite' ? (config.targetTableName || config.sourceTableName || config.table) : null;
-
+        // console.log('sqlPreview: ', sqlPreview)
         const result = await window.electronAPI.db.readLocalCollection(localPath, 1000, storageType, sqlPreview, tableName);
         // console.log('result: ', result)
         if (!result.success) {
@@ -398,8 +437,10 @@ const DataPreview = ({
         }
       }
 
-      // Refetch transformed data if on transformed tab
-      if (forceRefresh && activeTab === 'transformed' && isTransformedTabEnabled()) {
+      // Always refetch transformed data after execution so the cached
+      // transformed tab reflects the new output, even if the user is
+      // currently viewing a different tab.
+      if (forceRefresh && isTransformedTabEnabled()) {
         fetchTransformedData();
       }
     }
@@ -669,17 +710,52 @@ const DataPreview = ({
     // Render JSON view for MongoDB data
     if (data.isJson) {
       return (
-        <div style={{ height: height - 150, overflow: 'auto', padding: '16px' }}>
-          <pre style={{
-            backgroundColor: '#f5f5f5',
-            padding: '16px',
-            borderRadius: '4px',
-            fontSize: '12px',
-            lineHeight: '1.6',
-            margin: 0
-          }}>
-            {JSON.stringify(data.data, null, 2)}
-          </pre>
+        <div style={{ height: height - 120, backgroundColor: '#fff' }}>
+          <Editor
+            height="100%"
+            language="json"
+            value={JSON.stringify(data.data, null, 2)}
+            beforeMount={(monaco) => {
+              monaco.editor.defineTheme('dagflux-light', {
+                base: 'vs',
+                inherit: true,
+                rules: [],
+                colors: {
+                  'editor.background': '#ffffff',
+                  'editor.foreground': '#111827',
+                  'editorLineNumber.foreground': '#9ca3af',
+                  'editorLineNumber.activeForeground': '#5a6678',
+                  'editor.selectionBackground': '#dbeafe',
+                  'editor.inactiveSelectionBackground': '#eef1f6',
+                  'editor.lineHighlightBackground': '#f7f9fc',
+                  'editorCursor.foreground': '#2563eb',
+                  'editorIndentGuide.background': '#eef1f6',
+                  'editorIndentGuide.activeBackground': '#cdd2db',
+                  'editorWhitespace.foreground': '#e2e6eb',
+                  'editorWidget.background': '#ffffff',
+                  'editorWidget.border': '#e2e6eb',
+                  'editorGutter.background': '#ffffff',
+                  'scrollbarSlider.background': '#e2e6eb88',
+                  'scrollbarSlider.hoverBackground': '#cdd2dbcc',
+                  'scrollbarSlider.activeBackground': '#5a667888',
+                  'minimap.background': '#f7f9fc',
+                },
+              });
+            }}
+            theme="dagflux-light"
+            options={{
+              readOnly: true,
+              minimap: { enabled: true },
+              fontSize: 13,
+              fontFamily: 'JetBrains Mono, Menlo, Consolas, monospace',
+              scrollBeyondLastLine: false,
+              automaticLayout: true,
+              wordWrap: 'on',
+              tabSize: 2,
+              renderWhitespace: 'selection',
+              padding: { top: 12, bottom: 12 },
+            }}
+          />
         </div>
       );
     }
@@ -716,7 +792,7 @@ const DataPreview = ({
         columns={columns}
         dataSource={dataSource}
         size="small"
-        scroll={{ x: true, y: height - 150 }}
+        scroll={{ x: true, y: height - 120 }}
         locale={{
           emptyText: dataSource.length === 0 && columns.length > 0
             ? 'Table is empty (no rows)'
@@ -800,6 +876,15 @@ const DataPreview = ({
     // For transformer/join nodes, check if they have executed transformation
     // Use target* prefixes since transformed data is the output
     if (selectedNode?.type === 'transformer' || selectedNode?.type === 'join') {
+      // For vector databases, check dbType and connectionId instead of SQL
+      const isVectorDb = nodeConfig?.targetDbType === 'lancedb' ||
+                         nodeConfig?.targetDbType === 'pinecone';
+
+      if (isVectorDb) {
+        return nodeConfig?.targetConnectionId && nodeConfig?.targetTableName;
+      }
+
+      // For SQL/NoSQL databases, check for SQL and connectionId
       return nodeConfig?.targetPreviewSql && nodeConfig?.targetConnectionId;
     }
 
@@ -832,8 +917,15 @@ const DataPreview = ({
 
     // Check if node is saved/processed
     const nodeConfig = selectedNode?.data?.config;
+
+    // Check if vector database
+    const isVectorDb = nodeConfig?.targetDbType === 'lancedb' ||
+                       nodeConfig?.targetDbType === 'pinecone';
+
     // Use target* prefixes for transformed data (output of transformation)
-    if (!nodeConfig?.targetPreviewSql || !nodeConfig?.targetConnectionId) {
+    // For vector databases, only check targetConnectionId (no SQL needed)
+    // For SQL/NoSQL databases, check both targetPreviewSql and targetConnectionId
+    if (!nodeConfig?.targetConnectionId || (!isVectorDb && !nodeConfig?.targetPreviewSql)) {
       message.warning('Node must be executed first to see transformed data');
       return;
     }
@@ -872,13 +964,16 @@ const DataPreview = ({
           }
         }
 
+        // console.log("connection: ", connection)
         // Create a config object with target* values for fetching transformed data
         const transformedConfig = {
           sourceDbType: nodeConfig.targetDbType,
           sourceLocalPath: nodeConfig.targetLocalPath,
           sourcePreviewSql: nodeConfig.targetPreviewSql,
           sourceTableName: nodeConfig.targetTableName,
-          sourceCollection: nodeConfig.targetCollection
+          sourceCollection: nodeConfig.targetCollection,
+          sourceConnectionId: nodeConfig.targetConnectionId,
+          sourceIndexName: nodeConfig.targetIndexName
         };
 
         // Fetch local data using the transformed table's configuration
@@ -1224,49 +1319,76 @@ const DataPreview = ({
     );
   };
 
-  // Export data to CSV
-  const handleExportCSV = () => {
-    try {
-      // Determine which data to export based on active tab
-      let dataToExport = null;
-      let exportName = '';
+  // Resolve which data is currently displayed and a base name for export filenames
+  const getCurrentExportData = () => {
+    let dataToExport = null;
+    let exportName = '';
 
-      if (activeTab === 'preview') {
-        // For preview tab, get the appropriate data based on node type
-        if (selectedNode?.type === 'dataSource') {
-          dataToExport = previewData;
-          exportName = selectedNode.data?.config?.sourceConnectionName || selectedNode.data?.config?.connectionName || 'preview';
-        } else if (selectedNode?.type === 'join' && connectedDataSources.length > 1) {
-          // For joins, export the currently active preview tab
-          const sourceIndex = parseInt(activePreviewTab);
-          const sourceConfig = connectedDataSources[sourceIndex]?.data?.config;
-          const connectionId = sourceConfig?.sourceConnectionId || sourceConfig?.connectionId;
-          const connectionSourceIdentifier = sourceConfig?.targetTableName || sourceConfig?.sourceTableName || sourceConfig?.targetCollection || sourceConfig.sourceCollection;
-          const cacheKey = connectionId + connectionSourceIdentifier;
-          dataToExport = previewDataBySource[cacheKey];
-          exportName = sourceConfig?.sourceConnectionName || sourceConfig?.connectionName || `join_preview_${activePreviewTab}`;
-        } else {
-          dataToExport = previewData;
-          exportName = 'preview';
-        }
-      } else if (activeTab === 'transformed') {
-        dataToExport = transformedData;
-        // Use target connection name for transformed data exports
-        exportName = selectedNode.data?.config?.targetConnectionName || 'transformed';
+    if (activeTab === 'preview') {
+      if (selectedNode?.type === 'dataSource') {
+        dataToExport = previewData;
+        exportName = selectedNode.data?.config?.sourceConnectionName || selectedNode.data?.config?.connectionName || 'preview';
+      } else if (selectedNode?.type === 'join' && connectedDataSources.length > 1) {
+        const sourceIndex = parseInt(activePreviewTab);
+        const sourceConfig = connectedDataSources[sourceIndex]?.data?.config;
+        const connectionId = sourceConfig?.targetConnectionId || sourceConfig?.sourceConnectionId || sourceConfig?.connectionId;
+        const connectionSourceIdentifier = sourceConfig?.targetTableName || sourceConfig?.sourceTableName ||
+                                           sourceConfig?.targetCollection || sourceConfig?.sourceCollection ||
+                                           sourceConfig?.sourceDataset || sourceConfig?.dataset || sourceConfig?.table;
+        const cacheKey = connectionId + connectionSourceIdentifier;
+        dataToExport = previewDataBySource[cacheKey] || previewData;
+        exportName = sourceConfig?.sourceConnectionName || sourceConfig?.connectionName || `join_preview_${activePreviewTab}`;
+      } else {
+        dataToExport = previewData;
+        exportName = 'preview';
       }
+    } else if (activeTab === 'transformed') {
+      dataToExport = transformedData;
+      exportName = selectedNode.data?.config?.targetConnectionName || 'transformed';
+    }
 
-      if (!dataToExport || !dataToExport.headers || !dataToExport.data) {
+    return { dataToExport, exportName };
+  };
+
+  const triggerDownload = (content, mimeType, filename) => {
+    const blob = new Blob([content], { type: mimeType });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Export current data as CSV or JSON depending on the data shape
+  const handleExport = () => {
+    try {
+      const { dataToExport, exportName } = getCurrentExportData();
+
+      if (!dataToExport || !dataToExport.data) {
         message.warning('No data available to export');
         return;
       }
 
-      // Create CSV header
-      const csvHeaders = dataToExport.headers.join(',');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
 
-      // Create CSV rows
+      if (dataToExport.isJson) {
+        const jsonContent = JSON.stringify(dataToExport.data, null, 2);
+        triggerDownload(jsonContent, 'application/json;charset=utf-8;', `${exportName}_${timestamp}.json`);
+        message.success('JSON exported successfully!');
+        return;
+      }
+
+      if (!dataToExport.headers) {
+        message.warning('No data available to export');
+        return;
+      }
+
+      const csvHeaders = dataToExport.headers.join(',');
       const csvRows = dataToExport.data.map(row => {
         return row.map(value => {
-          // Handle values that contain commas, quotes, or newlines
           if (value === null || value === undefined) return '';
           const stringValue = String(value);
           if (stringValue.includes(',') || stringValue.includes('"') || stringValue.includes('\n')) {
@@ -1275,31 +1397,19 @@ const DataPreview = ({
           return stringValue;
         }).join(',');
       });
-
-      // Combine headers and rows
       const csvContent = [csvHeaders, ...csvRows].join('\n');
 
-      // Create blob and download
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const link = document.createElement('a');
-      const url = URL.createObjectURL(blob);
-
-      // Generate filename
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
-      const filename = `${exportName}_${timestamp}.csv`;
-
-      link.setAttribute('href', url);
-      link.setAttribute('download', filename);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-
+      triggerDownload(csvContent, 'text/csv;charset=utf-8;', `${exportName}_${timestamp}.csv`);
       message.success('CSV exported successfully!');
     } catch (error) {
-      console.error('Error exporting CSV:', error);
-      message.error('Failed to export CSV');
+      console.error('Error exporting data:', error);
+      message.error('Failed to export data');
     }
+  };
+
+  const isCurrentDataJson = () => {
+    const { dataToExport } = getCurrentExportData();
+    return Boolean(dataToExport?.isJson);
   };
 
   // Don't render if no node is selected
@@ -1331,48 +1441,35 @@ const DataPreview = ({
   }
 
   return (
-    <div 
+    <div
       ref={containerRef}
       style={{
         position: 'fixed',
-        paddingLeft: 10,
         bottom: 0,
         left: 0,
         right: isNodeSidebarOpen ? '420px' : 0,
         height: `${height}px`,
         backgroundColor: '#fff',
-        borderTop: '1px solid #e8e8e8',
+        borderTop: '1px solid #e2e6eb',
         zIndex: 1000,
         display: 'flex',
-        flexDirection: 'column'
+        flexDirection: 'column',
+        fontFamily: "'Inter',-apple-system,sans-serif",
       }}
     >
       {/* Resize Handle */}
       <div
         onMouseDown={handleMouseDown}
         style={{
-          height: '6px',
-          marginTop: 5,
-          backgroundColor: '#f0f0f0',
+          height: 4,
           cursor: 'row-resize',
-          borderTop: '1px solid #d9d9d9',
-          position: 'relative',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: '3px',
-          borderRadius: '8px'
+          backgroundColor: '#e2e6eb',
+          flexShrink: 0,
+          transition: 'background 0.15s',
         }}
-      >
-        <div 
-          style={{ 
-            width: '40px', 
-            height: '4px', 
-            backgroundColor: '#bfbfbf', 
-            borderRadius: '2px' ,
-          }} 
-        />
-      </div>
+        onMouseEnter={(e) => e.currentTarget.style.background = '#2563eb'}
+        onMouseLeave={(e) => e.currentTarget.style.background = '#e2e6eb'}
+      />
 
 
       {/* Content */}
@@ -1380,59 +1477,64 @@ const DataPreview = ({
         {/* Table Name Header */}
         {selectedNode?.data?.config && (
           <div style={{
-            padding: '8px 16px',
-            borderBottom: '1px solid #f0f0f0',
+            padding: '7px 14px',
+            borderBottom: '1px solid #e2e6eb',
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'space-between'
+            justifyContent: 'space-between',
+            background: '#f7f9fc',
+            gap: 8,
+            flexShrink: 0,
           }}>
-            <Text strong style={{ fontSize: 13 }}>
-              {(() => {
-
-                // For single source nodes (dataSource, transformer with single source)
-                const config = selectedNode.data.config;
-
-                // For NoSQL (MongoDB/NeDB) - use source for DataSource nodes
-                if (config.sourceCollection) {
-                  return `Collection: ${config.sourceCollection}`;
-                }
-
-                // For SQL databases - use source for DataSource nodes
-                if (config.sourceTableName) {
-                  const schema = config.sourceSchema ? `${config.sourceSchema}.` : '';
-                  return `Table: ${schema}${config.sourceTableName}`;
-                }
-
-                // Fallback for legacy config
-                if (config.table) {
-                  return `Table: ${config.table}`;
-                }
-
-                // For file sources
-                if (config.dataset) {
-                  return `Dataset: ${config.dataset}`;
-                }
-
-                // For regular tables
-                if (config.table) {
-                  const schema = config.dbConfig?.schema ? `${config.dbConfig.schema}.` : '';
-                  return `Table: ${schema}${config.table}`;
-                }
-
-                return null;
-              })()}
-            </Text>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <span style={{
+                fontSize: 9,
+                fontFamily: "'JetBrains Mono', monospace",
+                fontWeight: 700,
+                letterSpacing: '0.1em',
+                color: '#9ca3af',
+                textTransform: 'uppercase',
+              }}>
+                Data Preview
+              </span>
+              <span style={{
+                fontSize: 11,
+                color: '#5a6678',
+                fontWeight: 500,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}>
+                {(() => {
+                  const config = selectedNode.data.config;
+                  if (config.sourceCollection) return `· ${config.sourceCollection}`;
+                  if (config.sourceTableName) {
+                    const schema = config.sourceSchema ? `${config.sourceSchema}.` : '';
+                    return `· ${schema}${config.sourceTableName}`;
+                  }
+                  if (config.table) return `· ${config.table}`;
+                  if (config.dataset) return `· ${config.dataset}`;
+                  return null;
+                })()}
+              </span>
+            </div>
             <Button
-              type="primary"
               size="small"
               icon={<DownloadOutlined />}
-              onClick={handleExportCSV}
+              onClick={handleExport}
               disabled={
                 (activeTab === 'preview' && (loadingPreview || !previewData)) ||
                 (activeTab === 'transformed' && (loadingTransformed || !transformedData))
               }
+              style={{
+                borderRadius: 4,
+                fontSize: 11,
+                color: '#5a6678',
+                borderColor: '#e2e6eb',
+                background: '#fff',
+              }}
             >
-              Export CSV
+              {isCurrentDataJson() ? 'Export JSON' : 'Export CSV'}
             </Button>
           </div>
         )}
@@ -1441,7 +1543,8 @@ const DataPreview = ({
           activeKey={activeTab}
           onChange={changeTab}
           size="small"
-          style={{ height: '100%', paddingLeft: 5, flex: 1 }}
+          style={{ height: '100%', paddingLeft: 12, flex: 1 }}
+          tabBarStyle={{ margin: 0, borderBottom: '1px solid #e2e6eb' }}
         >
           {previewData &&
           <TabPane
@@ -1452,7 +1555,7 @@ const DataPreview = ({
               </span>
             }
             key="preview"
-            style={{ height: '100%', padding: '8px 16px' }}
+            style={{ height: '100%', padding: '8px 0px' }}
           >
             {renderDataSourceTabs()}
           </TabPane>
@@ -1488,7 +1591,7 @@ const DataPreview = ({
             }
             key="transformed"
             disabled={!isTransformedTabEnabled()}
-            style={{ height: '100%', padding: '8px 16px' }}
+            style={{ height: '100%', padding: '8px 0px' }}
           >
             {!isTransformedTabEnabled() ? (
               <div style={{ textAlign: 'center', padding: '40px' }}>

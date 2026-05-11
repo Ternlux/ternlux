@@ -26,7 +26,7 @@ const DbIcon = ({ Icon, bg }) => (
 );
 
 const LocalFileConnectionForm = ({
-  fileType, // 'sqlite', 'nedb', 'json', 'spreadsheet', 'parquet', 'avro'
+  fileType, // 'sqlite', 'nedb', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'
   onSave,
   onCancel,
   editingConnection
@@ -66,6 +66,7 @@ const LocalFileConnectionForm = ({
     const filters = {
       sqlite: [{ name: 'SQLite Database', extensions: ['db', 'sqlite', 'sqlite3'] }],
       nedb: [{ name: 'NeDB Database', extensions: ['db', 'nedb'] }],
+      lancedb: [{ name: 'LanceDB Directory', extensions: ['lance'] }],
       json: [{ name: 'JSON Files', extensions: ['json'] }],
       spreadsheet: [
         { name: 'Spreadsheet Files', extensions: ['csv', 'xlsx', 'xls'] },
@@ -77,19 +78,24 @@ const LocalFileConnectionForm = ({
     };
 
     try {
-      const result = await window.electronAPI.openFileDialog({
-        properties: ['openFile'],
-        filters: filters[fileType] || []
-      });
+      // For LanceDB, open directory instead of file
+      const dialogOptions = fileType === 'lancedb'
+        ? { properties: ['openDirectory'] }
+        : { properties: ['openFile'], filters: filters[fileType] || [] };
+
+      const result = await window.electronAPI.openFileDialog(dialogOptions);
 
       if (!result.canceled && result.filePaths?.length > 0) {
         const selectedPath = result.filePaths[0];
         const selectedFileName = selectedPath.split(/[\\/]/).pop();
 
-        // Validate file extension
-        if (!isValidFileType(selectedFileName)) {
-          setIsDialogOpen(false);
-          return;
+        // For LanceDB (directory), skip file extension validation
+        if (fileType !== 'lancedb') {
+          // Validate file extension for file-based types
+          if (!isValidFileType(selectedFileName)) {
+            setIsDialogOpen(false);
+            return;
+          }
         }
 
         setFilePath(selectedPath);
@@ -115,6 +121,7 @@ const LocalFileConnectionForm = ({
     const validExtensions = {
       sqlite: ['.db', '.sqlite', '.sqlite3'],
       nedb: ['.db', '.nedb'],
+      lancedb: ['.lance'],
       json: ['.json'],
       spreadsheet: ['.csv', '.xlsx', '.xls'],
       parquet: ['.parquet'],
@@ -132,8 +139,8 @@ const LocalFileConnectionForm = ({
   };
 
   const handleBeforeUpload = async (file) => {
-    // Validate file type
-    if (!isValidFileType(file.name)) {
+    // Validate file type (skip for LanceDB directories)
+    if (fileType !== 'lancedb' && !isValidFileType(file.name)) {
       return Upload.LIST_IGNORE;
     }
 
@@ -208,6 +215,9 @@ const LocalFileConnectionForm = ({
         return;
       }
 
+      // Preserve the original file path before any imports
+      const originalFilePath = filePath;
+
       // Check for duplicate connection names (only if not editing)
       if (!editingConnection && window.electronAPI?.db) {
         const existingConnections = await window.electronAPI.db.find('connections', {});
@@ -279,9 +289,31 @@ const LocalFileConnectionForm = ({
 
         setUploadProgress(90);
       } else {
-        // SQLite and NeDB - direct file reference
+        // SQLite, NeDB, and LanceDB - direct file reference
         targetDbType = fileType;
         setUploadProgress(50);
+
+        // For LanceDB, list the tables in the database directory
+        if (fileType === 'lancedb') {
+          setUploadProgress(60);
+
+          if (window.electronAPI?.listLanceDBTables) {
+            try {
+              const tablesResult = await window.electronAPI.listLanceDBTables(filePath);
+              if (tablesResult.success) {
+                importedTables = tablesResult.tables || [];
+                message.success(`Found ${importedTables.length} table(s) in LanceDB`);
+              } else {
+                message.warning('Could not list LanceDB tables: ' + tablesResult.message);
+              }
+            } catch (error) {
+              console.error('Failed to list LanceDB tables:', error);
+              message.warning('Could not list LanceDB tables');
+            }
+          }
+
+          setUploadProgress(80);
+        }
       }
 
       const connectionData = {
@@ -289,11 +321,12 @@ const LocalFileConnectionForm = ({
         description: values.description,
         connectionType: connectionType,
         dbType: targetDbType,
+        dbCategory: targetDbType === 'lancedb' ? 'Vector' : undefined,
         fileType: fileType,
         fileInfo: {
           originalName: fileName,
           filePath: targetFilePath,
-          sourceFilePath: filePath, // Keep original for reference
+          sourceFilePath: originalFilePath, // Keep original file path before any imports
           fileSize: null,
           uploadedAt: new Date().toISOString(),
           tables: importedTables, // Store which tables belong to this connection
@@ -322,6 +355,7 @@ const LocalFileConnectionForm = ({
     const titles = {
       sqlite: 'SQLite Database',
       nedb: 'NeDB Database',
+      lancedb: 'LanceDB Vector Database',
       json: 'JSON File',
       spreadsheet: 'CSV/Excel File',
       parquet: 'Parquet File',
@@ -334,6 +368,7 @@ const LocalFileConnectionForm = ({
     const icons = {
       sqlite: <DatabaseOutlined style={{ fontSize: 48, color: '#0f80cc' }} />,
       nedb: <DatabaseOutlined style={{ fontSize: 48, color: '#52c41a' }} />,
+      lancedb: <DatabaseOutlined style={{ fontSize: 48, color: '#722ed1' }} />,
       json: <FileTextOutlined style={{ fontSize: 48, color: '#fa8c16' }} />,
       spreadsheet: <FileTextOutlined style={{ fontSize: 48, color: '#1890ff' }} />,
       parquet: <DbIcon Icon={ParquetIcon} bg="#9254de" />,
@@ -346,6 +381,7 @@ const LocalFileConnectionForm = ({
     const descriptions = {
       sqlite: 'Connect to an existing SQLite database file on your computer',
       nedb: 'Connect to an existing NeDB database file on your computer',
+      lancedb: 'Connect to a local LanceDB vector database directory',
       json: 'Upload a JSON file to import into a local NeDB database',
       spreadsheet: 'Upload a CSV or Excel file to import into a local SQLite database',
       parquet: 'Upload a Parquet file to import into a local SQLite database',
@@ -358,6 +394,7 @@ const LocalFileConnectionForm = ({
     const texts = {
       sqlite: 'Click or drag SQLite database file to this area',
       nedb: 'Click or drag NeDB database file to this area',
+      lancedb: 'Click to select LanceDB directory (contains .lance table folders)',
       json: 'Click or drag JSON file to this area to import',
       spreadsheet: 'Click or drag CSV or Excel file to this area to import',
       parquet: 'Click or drag Parquet file to this area to import',
@@ -370,6 +407,7 @@ const LocalFileConnectionForm = ({
     const accepts = {
       sqlite: '.db,.sqlite,.sqlite3',
       nedb: '.db,.nedb',
+      lancedb: '.lance',
       json: '.json',
       spreadsheet: '.csv,.xlsx,.xls',
       parquet: '.parquet',
@@ -382,6 +420,7 @@ const LocalFileConnectionForm = ({
     const helps = {
       sqlite: 'SQLite database files (.db, .sqlite, .sqlite3)',
       nedb: 'NeDB database files (.db, .nedb)',
+      lancedb: 'LanceDB vector database directory - Contains table folders with vector embeddings and metadata',
       json: 'JSON files (.json) - Arrays or single objects',
       spreadsheet: 'Excel (.xlsx, .xls) and CSV (.csv) files - Multi-sheet Excel files will create multiple tables',
       parquet: 'Parquet files (.parquet) - Columnar storage format',

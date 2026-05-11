@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
-import { Select } from 'antd';
+import { Select, Modal, message as antdMessage } from 'antd';
+import { PlusOutlined } from '@ant-design/icons';
 import { connectionsDb } from '../../../utils/localDb';
 import { getWorkflowAssistance, extractSQL } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
@@ -16,8 +17,12 @@ import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg
 import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
 import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
 import ChatPrompts from './ChatPrompts/Transfomer'
+import RestApiPrompts from './ChatPrompts/RestApi'
 import CloudStorageBrowser from '../CloudStorageBrowser';
 import GoogleDrivePicker from '../GoogleDrivePicker';
+import ConnectionTypeSelector from '../ConnectionTypeSelector';
+import DynamicConnectionForm from '../connections/DynamicConnectionForm';
+import LocalFileConnectionForm from '../connections/LocalFileConnectionForm';
 
 const { Option } = Select;
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +78,6 @@ const DataSourceNodeChat = ({
   onLoadDatabaseTables,
   onConfigUpdate,
   onPreviewConfigUpdate,
-  onExecute,
   executing = false
 }) => {
 
@@ -108,6 +112,31 @@ const DataSourceNodeChat = ({
   const [cloudStorageConnection, setCloudStorageConnection] = useState(null);
   const [pluginManager, setPluginManager] = useState(null);
 
+  // Connection Type Selector state
+  const [isConnectionTypeSelectorOpen, setIsConnectionTypeSelectorOpen] = useState(false);
+  const [activeDbType, setActiveDbType] = useState(null);
+  const [installedPlugins, setInstalledPlugins] = useState([]);
+
+  // Connections Tab modal state
+  const [isConnectionsTabOpen, setIsConnectionsTabOpen] = useState(false);
+
+  // REST API DataSource state
+  //   apiFetchPrompt       — user's last natural-language request
+  //   apiFetchCode         — async JS function expression (with placeholders)
+  //                          that the main process evaluates and runs
+  //   apiFetchExplanation  — one-line summary from the AI
+  //   apiFetchResult       — result of the most recent live fetch (rowCount/localPath)
+  const [apiFetchPrompt, setApiFetchPrompt] = useState(null);
+  const [apiFetchCode, setApiFetchCode] = useState(null);
+  const [apiFetchExplanation, setApiFetchExplanation] = useState(null);
+  const [apiFetchResult, setApiFetchResult] = useState(null);
+  const [apiRunning, setApiRunning] = useState(false);
+  // True when the AI has produced a fetch function that has not yet been
+  // executed against the live endpoint. Drives the Run & Save button so a
+  // saved node reopened later does not prompt the user to re-run unless
+  // they have refined the request.
+  const [apiFetchDirty, setApiFetchDirty] = useState(false);
+
   // console.log('node: ', node)
   // console.log('initialChat: ', initialChat)
   // console.log('chat: ', chat)
@@ -127,13 +156,14 @@ const DataSourceNodeChat = ({
         // console.log('Restoring saved config:', savedConfig);
 
         // Restore connection info
-        if (savedConfig.connectionId) {
+        if (savedConfig.connectionId || savedConfig.sourceConnectionId || savedConfig.sourceApiConnectionId) {
           const conn = {
             id: savedConfig.sourceConnectionId,
             name: savedConfig.sourceConnectionName,
             connectionType: savedConfig.sourceConnectionType,
             dbType: savedConfig.sourceDbType,
             dbConfig: savedConfig.sourceDbConfig,
+            dbCategory: savedConfig.sourceDbCategory,
             fileType: savedConfig.sourceType,
             apiType: savedConfig.sourceType
           };
@@ -151,8 +181,21 @@ const DataSourceNodeChat = ({
           if (savedConfig.connectionType === 'database') {
             loadDatabaseTables(conn, true);
 
+            // Restore selected tables/indexes
             if (savedConfig.selectedTables) {
               setAiSelectedTables(savedConfig.selectedTables);
+            } else if (savedConfig.sourceIndexName) {
+              // For vector databases, restore from sourceIndexName
+              const indexWithNamespace = savedConfig.sourceNamespace
+                ? `${savedConfig.sourceIndexName}/${savedConfig.sourceNamespace}`
+                : savedConfig.sourceIndexName;
+              setAiSelectedTables([indexWithNamespace]);
+            } else if (savedConfig.sourceTableName) {
+              // Fallback to sourceTableName
+              setAiSelectedTables([savedConfig.sourceTableName]);
+            } else if (savedConfig.sourceCollection) {
+              // Fallback to sourceCollection for NoSQL
+              setAiSelectedTables([savedConfig.sourceCollection]);
             }
 
             // Restore query for preview
@@ -166,8 +209,60 @@ const DataSourceNodeChat = ({
             }
 
             // Restore table schema
-            if (savedConfig.tableSchema) {
-              setTableSchema(savedConfig.tableSchema);
+            if (savedConfig.sourceTableSchema) {
+              setTableSchema(savedConfig.sourceTableSchema);
+            }
+          } else if (savedConfig.sourceConnectionType === 'api' || savedConfig.apiFetchCode) {
+            // Restore REST API fetch function so the user can refine or re-run
+            // it. Rebuild selConn so it points at the original API connection,
+            // not the local-nedb placeholder used for downstream routing.
+            const apiConn = {
+              id: savedConfig.sourceApiConnectionId,
+              name: savedConfig.sourceApiConnectionName,
+              connectionType: 'database',
+              dbType: 'rest-api',
+              dbConfig: savedConfig.apiConnectionPublicConfig || {},
+              dbCategory: 'API',
+            };
+            setSelConn(apiConn);
+
+            setApiFetchPrompt(savedConfig.apiFetchPrompt || null);
+            setApiFetchCode(savedConfig.apiFetchCode || null);
+            setApiFetchExplanation(savedConfig.apiFetchExplanation || '');
+            if (savedConfig.sourceLocalPath || savedConfig.sourceCollection) {
+              setApiFetchResult({
+                rowCount: null,
+                localPath: savedConfig.sourceLocalPath,
+                collection: savedConfig.sourceCollection,
+              });
+            }
+            // The fetch has already been run and saved — do not re-prompt for
+            // a run until the user refines the request (which flips the
+            // dirty flag).
+            setApiFetchDirty(false);
+          } else if (savedConfig.connectionType === 'file') {
+            // Restore for file-based connections (SQLite, NeDB, LanceDB)
+            // Add file path information if it's a file connection
+            if (savedConfig.sourceLocalPath) {
+              conn.fileInfo = {
+                filePath: savedConfig.sourceLocalPath
+              };
+            }
+
+            // Restore selected tables
+            if (savedConfig.sourceTableName) {
+              setAiSelectedTables([savedConfig.sourceTableName]);
+            } else if (savedConfig.sourceIndexName) {
+              // For LanceDB file connections
+              setAiSelectedTables([savedConfig.sourceIndexName]);
+            } else if (savedConfig.sourceCollection) {
+              // For NeDB file connections
+              setAiSelectedTables([savedConfig.sourceCollection]);
+            }
+
+            // Restore table schema
+            if (savedConfig.sourceTableSchema) {
+              setTableSchema(savedConfig.sourceTableSchema);
             }
           }
         }
@@ -254,8 +349,180 @@ const DataSourceNodeChat = ({
       await handleTableSelection(userMsg);
     } else if (ref === 'sheetSelection') {
       await handleSheetSelection(userMsg);
+    } else if (ref === 'apiFetchRequest' || ref === 'apiFetchRefine') {
+      await handleApiFetchRequest(userMsg);
     }
     // Removed: processingEnvironment and databaseQuery handlers
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // REST API fetch flow
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const sanitizeCollectionName = (raw) => {
+    const base = String(raw || node?.id || 'api_response')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 64);
+    return base || 'api_response';
+  };
+
+  const handleApiFetchRequest = async (userMsg) => {
+    if (!selConn) return;
+
+    setAiLoading(true);
+    try {
+      const conversationHistory = chat
+        .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
+        .join('\n');
+
+      const prompt = RestApiPrompts.restApiAnalysisRequest({
+        userRequest: userMsg.text,
+        connectionAuthType: selConn.dbConfig?.authType || 'none',
+        connectionBaseUrl: selConn.dbConfig?.baseUrl || '',
+        connectionApiKeyName: selConn.dbConfig?.apiKeyName || '',
+        connectionBasicUser: selConn.dbConfig?.basicUser || '',
+        conversationHistory,
+      });
+
+      const response = await getWorkflowAssistance(
+        'rest-api',
+        prompt,
+        { connectionId: selConn.id, userRequest: userMsg.text },
+        chat.map(m => ({ sender: m.sender, text: m.text }))
+      );
+
+      let parsed;
+      try {
+        parsed = JSON.parse(response);
+      } catch (err) {
+        console.error('[RestApi] failed to parse AI JSON:', err, response);
+        addBotMessage('I had trouble understanding that. Could you rephrase the request?', true, 'text', 'apiFetchRefine', 'Try again…');
+        return;
+      }
+
+      switch (parsed.action) {
+        case 'answer_directly': {
+          addBotMessage(parsed.directAnswer || '', false);
+          addBotMessage(
+            'Would you like to refine further, or describe a different call?',
+            true,
+            'text',
+            'apiFetchRefine',
+            'Describe the data you want to fetch…'
+          );
+          break;
+        }
+
+        case 'ask_questions': {
+          addBotMessage(
+            parsed.followUpQuestion || 'Could you share a bit more detail?',
+            true,
+            'text',
+            'apiFetchRefine',
+            'Provide additional details…'
+          );
+          break;
+        }
+
+        case 'create_plan':
+        default: {
+          if (!parsed.code || typeof parsed.code !== 'string') {
+            addBotMessage('The AI did not return a valid fetch function. Please refine your request.', true, 'text', 'apiFetchRefine', 'Try again…');
+            return;
+          }
+          setApiFetchPrompt(userMsg.text);
+          setApiFetchCode(parsed.code);
+          setApiFetchExplanation(parsed.explanation || '');
+          setApiFetchResult(null);
+          setApiFetchDirty(true);
+
+          addBotMessage(
+            `✓ Fetch function ready.\n\n${parsed.explanation || 'Fetch function generated.'}`,
+            false,
+            'text',
+            '',
+            '',
+            {
+              javascriptFunction: parsed.code,
+            }
+          );
+          addBotMessage(
+            'Refine the request, or click Run & Save to execute the function and cache the data into a local NeDB collection.',
+            true,
+            'text',
+            'apiFetchRefine',
+            'Ask for changes or press Run & Save…'
+          );
+          setSaveState(true);
+          break;
+        }
+      }
+    } catch (err) {
+      console.error('[handleApiFetchRequest]', err);
+      addBotMessage(`Error generating fetch plan: ${err.message}`, false);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  /**
+   * Fire the live fetch in the main process, materialise rows into NeDB, then
+   * emit the complete node config via onSave.
+   */
+  const runAndSaveApiFetch = async () => {
+    if (!selConn || !apiFetchCode) {
+      addBotMessage('No fetch function to run yet.', false);
+      return;
+    }
+    if (!window.electronAPI?.dbConnect?.executeRestApiFetch) {
+      addBotMessage('REST API execution is not available in this build.', false);
+      return;
+    }
+
+    setApiRunning(true);
+    setSaveState(false);
+    try {
+      const collection = sanitizeCollectionName(node?.data?.label || node?.id);
+      const result = await window.electronAPI.dbConnect.executeRestApiFetch({
+        apiConnectionId: selConn.id,
+        apiConnectionConfig: selConn.dbConfig || {},
+        apiFetchCode,
+        nedbCollection: collection,
+        operationMode: 'new_table',
+      });
+
+      if (!result?.success) {
+        addBotMessage(`✗ Fetch failed: ${result?.error || 'Unknown error'}`, false);
+        setSaveState(true);
+        return;
+      }
+
+      const freshResult = {
+        rowCount: result.rowCount || 0,
+        localPath: result.localPath,
+        collection: result.collection || collection,
+      };
+      setApiFetchResult(freshResult);
+      setApiFetchDirty(false);
+
+      addBotMessage(
+        `✓ Fetched ${result.rowCount || 0} row${result.rowCount === 1 ? '' : 's'} into "${result.collection || collection}".`,
+        false
+      );
+
+      // Persist config via the normal save path. Pass freshResult directly
+      // since setApiFetchResult above hasn't flushed yet.
+      const config = buildConfig(freshResult);
+      onSave(config, chat);
+    } catch (err) {
+      console.error('[runAndSaveApiFetch]', err);
+      addBotMessage(`✗ Fetch error: ${err.message}`, false);
+      setSaveState(true);
+    } finally {
+      setApiRunning(false);
+    }
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -285,6 +552,24 @@ const DataSourceNodeChat = ({
     };
 
     loadPluginManager();
+  }, []);
+
+  // Load installed plugins for connection forms
+  useEffect(() => {
+    const loadInstalledPlugins = async () => {
+      try {
+        if (window.electronAPI?.plugins?.listInstalled) {
+          const result = await window.electronAPI.plugins.listInstalled();
+          if (result.success) {
+            setInstalledPlugins(result.connectors || []);
+          }
+        }
+      } catch (error) {
+        console.error('Failed to load installed plugins:', error);
+      }
+    };
+
+    loadInstalledPlugins();
   }, []);
 
   // Handle file selection from cloud storage browser
@@ -344,16 +629,20 @@ const DataSourceNodeChat = ({
             setTableSchema(schema);
             console.log('Using saved schema:', schema);
           }
-        } else {
-          // Fallback: Load table schema from DB
+        } else if (fileInfo.dbType !== 'lancedb') {
+          // Fallback: Load table schema from DB (skip for LanceDB)
           await loadTableSchemaFromDB({ name: tableName, schema: null }, localConnection);
         }
 
         // Generate preview query based on database type
         const isNoSQL = fileInfo.dbType === 'nedb';
+        const isLanceDB = fileInfo.dbType === 'lancedb';
         let previewQuery;
 
-        if (isNoSQL) {
+        if (isLanceDB) {
+          // LanceDB - no SQL preview query needed for vector databases
+          previewQuery = null;
+        } else if (isNoSQL) {
           // NeDB/MongoDB - use JSON query format
           previewQuery = JSON.stringify({
             collection: tableName,
@@ -370,13 +659,15 @@ const DataSourceNodeChat = ({
           previewQuery = previewResult.success ? previewResult.previewQuery : `SELECT * FROM "${tableName}" LIMIT 100`;
         }
 
-        // Store the query for preview
-        setLatestWithSQL({
-          sql: previewQuery,
-          previewSql: previewQuery,
-          explanation: `Selecting all columns from ${tableName}`,
-          queryDescription: `Preview data from ${tableName}`
-        });
+        // Store the query for preview (skip for LanceDB)
+        if (!isLanceDB) {
+          setLatestWithSQL({
+            sql: previewQuery,
+            previewSql: previewQuery,
+            explanation: `Selecting all columns from ${tableName}`,
+            queryDescription: `Preview data from ${tableName}`
+          });
+        }
       }
 
       addBotMessage(
@@ -396,6 +687,25 @@ const DataSourceNodeChat = ({
     const conn = userMsg.data;
     setSelConn(conn);
 
+    // REST API connection: auth lives on the connection, but the actual
+    // endpoint + request shape is authored here via natural language. The
+    // resulting fetch plan will be executed in the main process and
+    // materialised to a local NeDB collection.
+    if (conn.dbType === 'rest-api') {
+      setconnectionComplete(true);
+      setDisableInput(false);
+      const baseUrl = conn.dbConfig?.baseUrl;
+      const urlLine = baseUrl ? `\n\nBase URL: ${baseUrl}` : '';
+      addBotMessage(
+        `Connected to "${conn.name}".${urlLine}\n\nDescribe the request you want to make — which endpoint to call and the HTTP method (e.g., "GET /users?status=active" or "POST /orders with a JSON body").`,
+        true,
+        'text',
+        'apiFetchRequest',
+        'e.g. GET /users?status=active'
+      );
+      return;
+    }
+
     // Check if this is a cloud storage connection
     const isCloudStorage = conn.dbCategory === 'CloudStorage';
 
@@ -407,8 +717,45 @@ const DataSourceNodeChat = ({
       return;
     }
 
+    // Handle LanceDB file connections separately - tables are already in fileInfo
+    if (conn.dbType === 'lancedb' && conn.connectionType === 'file') {
+      setDisableInput(true);
+      setconnectionComplete(true);
+
+      // Get tables from fileInfo (already loaded during import)
+      const tableList = conn.fileInfo?.tables || [];
+
+      if (tableList.length > 0) {
+        // Store table names
+        setDbTables(tableList);
+        setDbTableObjects(tableList.map(t => ({ name: t, schema: null, type: 'table' })));
+
+        addBotMessage(
+          `Connected! Found ${tableList.length} table${tableList.length !== 1 ? 's' : ''} in "${conn.name}".\n\nYou can view the schema in the Data Preview panel below.`,
+          false
+        );
+        addBotMessage(
+          'Which table would you like to use?',
+          true,
+          'choice',
+          'tableSelection',
+          '',
+          {
+            choices: tableList.map(tableName => ({
+              label: tableName,
+              value: tableName,
+              description: '',
+              _data: { name: tableName, schema: null, type: 'table' },
+              displayType: 'dropdown'
+            }))
+          }
+        );
+      } else {
+        addBotMessage('No tables found in this LanceDB. Make sure the directory contains valid .lance table folders.', false);
+      }
+    }
     // Handle database connections and local database files (SQLite, NeDB)
-    if (conn.connectionType === 'database' || conn.dbType === 'sqlite' || conn.dbType === 'nedb') {
+    else if (conn.connectionType === 'database' || conn.dbType === 'sqlite' || conn.dbType === 'nedb') {
       // Load database tables directly (no processing environment question)
       setDisableInput(true); // Keep input disabled for database connections
       setconnectionComplete(true);
@@ -480,6 +827,23 @@ const DataSourceNodeChat = ({
         setLoading(false);
         return;
       }
+    }
+
+    // Handle vector databases (LanceDB and Pinecone)
+    const isVectorDB = selConn?.dbCategory === 'Vector' || selConn?.dbType === 'lancedb' || selConn?.dbType === 'pinecone';
+
+    if (isVectorDB) {
+      // For vector databases, load schema from the database
+      setLoading(true);
+      await loadVectorTableSchema(selectedTable);
+      setLoading(false);
+
+      addBotMessage(
+        `Table "${selectedTable.name}" selected. Configuration complete! Click Save below.`,
+        false
+      );
+      setSaveState(true); // Enable save button
+      return;
     }
 
     // Generate a basic query for preview based on database type
@@ -689,6 +1053,63 @@ const DataSourceNodeChat = ({
   };
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Load Vector Database Schema (LanceDB and Pinecone)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const loadVectorTableSchema = async (selectedTable) => {
+    try {
+      const dbType = selConn.dbType;
+      const tableName = selectedTable.name;
+
+      // Use vector DB skill to query for preview
+      const result = await window.electronAPI.skills.queryVectorPreview({
+        vectorDbType: dbType,
+        tableName: tableName,
+        namespace: selectedTable.schema || '',
+        dbConfig: selConn.dbConfig || {},
+        connectionId: selConn.id,
+        targetLocalPath: selConn.localPath || selConn.fileInfo?.filePath
+      });
+
+      if (result.success && result.data && result.data.length > 0) {
+        // Infer schema from first record
+        const sampleRecord = result.data[0];
+        const columns = Object.keys(sampleRecord).map(key => ({
+          name: key,
+          type: inferColumnType(sampleRecord[key]),
+          nullable: true
+        }));
+
+        const schema = {
+          tableName: tableName,
+          columns: columns,
+          sampleData: result.data.slice(0, 5), // First 5 records
+          recordCount: result.totalRows || result.recordCount
+        };
+
+        setTableSchema(schema);
+        console.log('Loaded vector database schema:', schema);
+      } else {
+        console.warn('No data returned from vector database preview');
+      }
+    } catch (error) {
+      console.error('Failed to load vector table schema:', error);
+    }
+  };
+
+  // Helper function to infer column type from value
+  const inferColumnType = (value) => {
+    if (value === null || value === undefined) return 'string';
+    if (typeof value === 'number') return 'number';
+    if (typeof value === 'boolean') return 'boolean';
+    if (Array.isArray(value)) return 'array';
+    if (typeof value === 'string' && value.includes('[') && value.includes('dims]')) {
+      return 'vector'; // Vector field (compacted representation)
+    }
+    return 'string';
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Database Operations
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -738,6 +1159,201 @@ const DataSourceNodeChat = ({
       setLoading(false);
     }
   };
+
+  const handleConnectionTypeSelectorClose = () => {
+    setIsConnectionTypeSelectorOpen(false);
+    // Refresh connections list in case new ones were added
+    loadConnections();
+  };
+
+  // Handle connection type selection
+  const handleConnectionTypeSelect = (type) => {
+    setIsConnectionTypeSelectorOpen(false);
+    setActiveDbType(type);
+  };
+
+  // Test connection handler
+  const handleTestConnection = async (dbType, config) => {
+    let result;
+
+    // Prefer direct Electron IPC (no backend required)
+    if (window.electronAPI?.dbConnect) {
+      result = await window.electronAPI.dbConnect.test(dbType, config);
+    } else {
+      const token = localStorage.getItem('auth-token');
+      if (!token) {
+        result = { success: false, message: 'Sign in or use the desktop app to test live database connections.' };
+      } else {
+        try {
+          const response = await axios.post('/workflow/test-connection', { dbType, config }, {
+            headers: { 'auth-token': token },
+          });
+          result = response.data.success
+            ? { success: true, message: response.data.message || 'Connection successful!' }
+            : { success: false, message: response.data.error || 'Connection failed.' };
+        } catch (err) {
+          result = { success: false, message: err.response?.data?.error || 'Connection failed. Check your credentials.' };
+        }
+      }
+    }
+
+    if (result.success) {
+      antdMessage.success(result.message || 'Connection successful!');
+    } else {
+      antdMessage.error(result.message || 'Connection failed.');
+    }
+
+    return result;
+  };
+
+  // Save connection handler
+  const handleSaveDbConnection = async (connectionData) => {
+    const token = localStorage.getItem('auth-token');
+    const isFileConnection = connectionData.connectionType === 'file';
+
+    if (!token || isFileConnection) {
+      try {
+        // For database connections, separate sensitive credentials from connection data
+        if (connectionData.connectionType === 'database' && connectionData.dbConfig && window.electronAPI?.dbCredentials) {
+          const { dbConfig, ...connectionDataWithoutConfig } = connectionData;
+
+          let sensitiveFields = {};
+          let nonSensitiveConfig = {};
+
+          // Get the plugin's config schema to determine which fields are sensitive
+          const plugin = installedPlugins.find(p => p.id === connectionData.dbType);
+          if (plugin && plugin.configSchema && plugin.configSchema.fields) {
+            // Dynamically separate sensitive and non-sensitive fields based on plugin schema
+            plugin.configSchema.fields.forEach(field => {
+              const fieldValue = dbConfig[field.name];
+              if (fieldValue !== undefined) {
+                if (field.sensitive) {
+                  sensitiveFields[field.name] = fieldValue;
+                } else {
+                  nonSensitiveConfig[field.name] = fieldValue;
+                }
+              }
+            });
+          } else {
+            // Fallback: treat password, username, host, uri as sensitive
+            sensitiveFields = {
+              password: dbConfig.password,
+              username: dbConfig.username,
+              host: dbConfig.host,
+              uri: dbConfig.uri,
+            };
+
+            nonSensitiveConfig = {
+              port: dbConfig.port,
+              database: dbConfig.database,
+              ssl: dbConfig.ssl,
+              instanceName: dbConfig.instanceName,
+              engine: dbConfig.engine,
+              schema: dbConfig.schema,
+            };
+          }
+
+          // Prepare connection data with only non-sensitive config
+          const safeConnectionData = {
+            ...connectionDataWithoutConfig,
+            dbConfig: nonSensitiveConfig
+          };
+
+          const saved = await connectionsDb.save(safeConnectionData);
+          // Save credentials separately (encrypted) using the new connection ID
+          await window.electronAPI.dbCredentials.save(saved.id, sensitiveFields);
+
+          antdMessage.success('Connection saved securely.');
+          setActiveDbType(null);
+          loadConnections();
+        } else {
+          // Non-database connections (file, API) - save as-is
+          await connectionsDb.save(connectionData);
+          antdMessage.success('Connection saved.');
+          setActiveDbType(null);
+          loadConnections();
+        }
+      } catch (error) {
+        console.error('Error saving connection:', error);
+        antdMessage.error('Failed to save connection.');
+      }
+      return;
+    }
+
+    try {
+      const payload = { ...connectionData, status: 'untested' };
+      const response = await axios.post('/workflow/connection-save', payload, {
+        headers: { 'auth-token': token },
+      });
+      if (response.data.success) {
+        loadConnections();
+        setActiveDbType(null);
+        antdMessage.success('Connection saved.');
+      } else {
+        antdMessage.error(response.data.error || 'Failed to save connection.');
+      }
+    } catch (err) {
+      antdMessage.error('Failed to save connection.');
+    }
+  };
+
+  // Get modal title for connection type
+  const getModalTitle = (dbType) => {
+    const titleMap = {
+      sqlite: 'Connect SQLite Database',
+      nedb: 'Connect NeDB Database',
+      json: 'Upload JSON File',
+      spreadsheet: 'Add Spreadsheet',
+      parquet: 'Upload Parquet File',
+      avro: 'Upload Avro File',
+    };
+
+    if (titleMap[dbType]) {
+      return titleMap[dbType];
+    }
+
+    const plugin = installedPlugins.find(p => p.id === dbType);
+    if (plugin) {
+      return `Connect to ${plugin.metadata?.displayName || plugin.name}`;
+    }
+
+    return 'Connect to Database';
+  };
+
+  // Get active form component based on connection type
+  const getActiveFormComponent = () => {
+    if (!activeDbType) return null;
+
+    // Local file connections (sqlite, nedb, json, spreadsheet, parquet, avro)
+    if (['sqlite', 'nedb', 'json', 'spreadsheet', 'parquet', 'avro'].includes(activeDbType)) {
+      return () => (
+        <LocalFileConnectionForm
+          fileType={activeDbType}
+          onSave={handleSaveDbConnection}
+          onCancel={() => setActiveDbType(null)}
+          editingConnection={null}
+        />
+      );
+    }
+
+    // Database connectors use dynamic form based on plugin
+    const plugin = installedPlugins.find(p => p.id === activeDbType);
+    if (plugin) {
+      return () => (
+        <DynamicConnectionForm
+          plugin={plugin}
+          onSave={handleSaveDbConnection}
+          onCancel={() => setActiveDbType(null)}
+          onTest={handleTestConnection}
+          editingConnection={null}
+        />
+      );
+    }
+
+    return null;
+  };
+
+  const ActiveForm = getActiveFormComponent();
 
   const loadDatabaseTables = async (conn, silent = false) => {
     setLoading(true);
@@ -1202,19 +1818,63 @@ const DataSourceNodeChat = ({
   // Build Configuration
   // ─────────────────────────────────────────────────────────────────────────
   // console.log('chat: ', chat, aiSelectedTables)
-  const buildConfig = () => {
+  const buildConfig = (apiFetchOverride = null) => {
     const config = {};
 
     // Use selConn (which may have been updated after Google Sheets import)
     // instead of chat history to handle cases where connection was converted to SQLite
     const conn = selConn;
-    // console.log('buildConfig: ', conn)
+    console.log('buildConfig: ', conn)
     if (conn) {
       config.nodeType = 'datasource'
       config.sourceConnectionId = conn.id;
       config.sourceConnectionName = conn.name;
       config.sourceConnectionType = conn.connectionType || 'file';
       config.sourceType = conn.fileType || conn.apiType || conn.dbType;
+
+      // REST API sources materialise into local NeDB and behave like any
+      // other NoSQL local source for downstream nodes.
+      if (conn.dbType === 'rest-api') {
+        // Prefer the override (fresh result from runAndSaveApiFetch) over
+        // state, which may not have flushed yet when called synchronously
+        // after setApiFetchResult(...).
+        const fetchResult = apiFetchOverride || apiFetchResult;
+
+        config.sourceConnectionType = 'api';
+        config.sourceDbType = 'nedb';
+        config.sourceDbCategory = 'API';
+
+        // Point downstream at the same connection identifier used for other
+        // local NeDB imports so DataPreview / Joins can route correctly.
+        config.sourceApiConnectionId = conn.id;
+        config.sourceApiConnectionName = conn.name;
+        config.sourceConnectionId = 'local-nedb';
+
+        const collection = fetchResult?.collection || sanitizeCollectionName(node?.data?.label || node?.id);
+        config.sourceCollection = collection;
+        config.sourceDataset = collection;
+        // The NeDB file is always written by the main process; persist its
+        // path so downstream nodes can read the materialised collection
+        // without needing to re-run the fetch.
+        config.sourceLocalPath = fetchResult?.localPath || null;
+
+        // Fetch function — persisted so every workflow run can re-execute it.
+        config.apiFetchPrompt = apiFetchPrompt || null;
+        config.apiFetchExplanation = apiFetchExplanation || '';
+        config.apiFetchCode = apiFetchCode || '';
+
+        // Snapshot the public connection config so the chat can restore
+        // enough context on reopen to let the user refine the request without
+        // needing a live lookup of the connection.
+        config.apiConnectionPublicConfig = {
+          baseUrl: conn.dbConfig?.baseUrl || '',
+          authType: conn.dbConfig?.authType || 'none',
+          apiKeyName: conn.dbConfig?.apiKeyName || '',
+          basicUser: conn.dbConfig?.basicUser || '',
+        };
+
+        return config;
+      }
 
       // For file-based connections (SQLite, NeDB, spreadsheets, JSON)
       if (conn.connectionType === 'file') {
@@ -1225,9 +1885,15 @@ const DataSourceNodeChat = ({
           config.sourceLocalPath = conn.fileInfo.filePath;
         }
 
-        // For SQLite and NeDB, set appropriate dbType
-        if (conn.dbType === 'sqlite' || conn.dbType === 'nedb') {
+        // Add cloud source information if this file came from cloud storage
+        if (conn.cloudSource) {
+          config.cloudSource = conn.cloudSource;
+        }
+
+        // For SQLite, NeDB, and LanceDB, set appropriate dbType
+        if (conn.dbType === 'sqlite' || conn.dbType === 'nedb' || conn.dbType === 'lancedb') {
           config.sourceDbType = conn.dbType;
+          config.sourceDbCategory = conn.dbCategory || (conn.dbType === 'lancedb' ? 'Vector' : null);
 
           // For SQLite, set source table name
           if (conn.dbType === 'sqlite' && aiSelectedTables.length > 0) {
@@ -1237,6 +1903,13 @@ const DataSourceNodeChat = ({
           // For NeDB, set source collection name
           if (conn.dbType === 'nedb' && aiSelectedTables.length > 0) {
             config.sourceCollection = aiSelectedTables[0];
+          }
+
+          // For LanceDB, set source index name (table name)
+          if (conn.dbType === 'lancedb' && aiSelectedTables.length > 0) {
+            config.sourceIndexName = aiSelectedTables[0];
+            config.sourceTableName = aiSelectedTables[0];
+            config.sourceNamespace = ''; // LanceDB doesn't use namespaces
           }
 
           // Store table schema if available
@@ -1258,6 +1931,7 @@ const DataSourceNodeChat = ({
       // console.log('buildConfig: ', conn)
       if (conn.connectionType === 'database') {
         config.sourceDbType = conn.dbType;
+        config.sourceDbCategory = conn.dbCategory;
         config.sourceDbConfig = conn.dbConfig;
         config.sourceSelectedTables = aiSelectedTables;
 
@@ -1272,7 +1946,34 @@ const DataSourceNodeChat = ({
 
         // Set source table/collection name
         const isNoSQL = conn.dbType === 'mongodb' || conn.dbType === 'nedb';
-        if (isNoSQL) {
+        const isVector = conn.dbCategory === 'Vector' || conn.dbType === 'pinecone' || conn.dbType === 'lancedb';
+
+        if (isVector) {
+          // For Vector databases, set sourceIndexName and sourceNamespace
+          if (aiSelectedTables.length > 0) {
+            const selectedTable = aiSelectedTables[0];
+
+            if (conn.dbType === 'pinecone') {
+              // Pinecone: parse index/namespace if format is "index/namespace"
+              if (selectedTable.includes('/')) {
+                const parts = selectedTable.split('/');
+                config.sourceIndexName = parts[0];
+                config.sourceNamespace = parts.slice(1).join('/');
+              } else {
+                config.sourceIndexName = selectedTable;
+                config.sourceNamespace = selectedTableData?.namespace || '';
+              }
+              // Also set sourceTableName for compatibility with other parts of the system
+              config.sourceTableName = config.sourceIndexName;
+              config.sourceSchema = config.sourceNamespace;
+            } else if (conn.dbType === 'lancedb') {
+              // LanceDB: table name only (no namespace concept)
+              config.sourceIndexName = selectedTable;
+              config.sourceTableName = selectedTable;
+              config.sourceNamespace = '';
+            }
+          }
+        } else if (isNoSQL) {
           // For NoSQL, set sourceCollection
           config.sourceCollection = aiSelectedTables.length > 0 ? aiSelectedTables[0] : null;
         } else {
@@ -1325,7 +2026,24 @@ const DataSourceNodeChat = ({
 
     // Only show connection choices if connection not yet selected
     if (!connectionComplete && currentQ.responseType === 'connection') {
-      return connections.map(conn => {
+      const categorize = (conn) => {
+        if (conn.dbCategory === 'CloudStorage') return 'Cloud Storage';
+        if (conn.dbCategory === 'API') return 'APIs';
+        if (conn.connectionType === 'database') return 'Databases';
+        if (conn.connectionType === 'file') return 'Local Files';
+        return 'Other';
+      };
+
+      const groupColor = {
+        'Cloud Storage': '#0891b2',
+        'APIs': '#2563eb',
+        'Databases': '#7c3aed',
+        'Local Files': '#d97706',
+        'Other': '#5a6678',
+      };
+
+      const connectionChoices = connections.map(conn => {
+        const group = categorize(conn);
         return {
           label: conn.name,
           value: conn.id,
@@ -1333,8 +2051,24 @@ const DataSourceNodeChat = ({
           fullWidth: true,
           _data: conn,
           icon: getConnectionIcon(conn),
+          group,
+          groupColor: groupColor[group],
         };
       });
+
+      // Keep the "New Connection" button at the top, outside of groups
+      return [
+        {
+          label: 'New Connection',
+          value: '__new_connection__',
+          description: 'Create a new data source connection',
+          fullWidth: true,
+          variant: 'outlined',
+          icon: <PlusOutlined style={{ fontSize: 16 }} />,
+          _isNewConnection: true
+        },
+        ...connectionChoices
+      ];
     }
 
     // Show table selection choices
@@ -1387,7 +2121,19 @@ const DataSourceNodeChat = ({
 
   const displayChoices = () => {
     // Don't show choices while loading
-    if (loading || aiLoading || executing) return [];
+    if (loading || aiLoading || executing || apiRunning) return [];
+
+    // REST API: offer Run & Save only while there is a freshly generated
+    // fetch function that has not yet been executed. Reopening a saved node
+    // should not re-prompt the user to run unless they refine the request.
+    if (selConn?.dbType === 'rest-api' && apiFetchCode && apiFetchDirty) {
+      return [{
+        label: 'Run & Save Configuration',
+        value: 'run_save_api',
+        variant: 'contained',
+        fullWidth: true,
+      }];
+    }
 
     // Show Save when configuration is complete
     if (saveState) {
@@ -1400,6 +2146,11 @@ const DataSourceNodeChat = ({
   const handleChoiceClick = (choice) => {
     if (choice.value === 'save') {
       handleSave();
+    } else if (choice.value === 'run_save_api') {
+      runAndSaveApiFetch();
+    } else if (choice._isNewConnection) {
+      // Open ConnectionTypeSelector modal
+      setIsConnectionTypeSelectorOpen(true);
     } else {
       handleChoiceSelect(choice);
     }
@@ -1412,6 +2163,50 @@ const DataSourceNodeChat = ({
     sender: m.sender,
     timestamp: m.timestamp || new Date(),
   }));
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Code popup wiring — mapping from chat-message metadata field to node config
+  // ─────────────────────────────────────────────────────────────────────────
+  const handleCodeSave = useCallback((field, value, message) => {
+    const updatedChat = chat.map(m =>
+      m.id === message?.id
+        ? { ...m, metadata: { ...m.metadata, [field]: value } }
+        : m
+    );
+    setChat(updatedChat);
+
+    if (field === 'sql') {
+      setLatestWithSQL(prev => ({
+        ...(prev || {}),
+        sql: value,
+        previewSql: value,
+      }));
+    }
+
+    if (!onConfigUpdate || !node?.id) return;
+
+    let update;
+    switch (field) {
+      case 'sql':
+        update = { sourceSql: value, sourcePreviewSql: value };
+        break;
+      case 'ddl':
+        update = { sourceDdl: value };
+        break;
+      case 'transformFunction':
+        update = { transformFunction: value };
+        break;
+      case 'pythonCode':
+        update = { pythonCode: value };
+        break;
+      case 'javascriptFunction':
+        update = { javascriptFunction: value };
+        break;
+      default:
+        update = { [field]: value };
+    }
+    onConfigUpdate(node.id, { ...update, chat: updatedChat });
+  }, [onConfigUpdate, node?.id, chat]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Render
@@ -1445,6 +2240,7 @@ const DataSourceNodeChat = ({
           showRunButton={false}
           onRun={null}
           runButtonLoading={false}
+          onCodeSave={handleCodeSave}
         />
 
         {/* Cloud Storage Browser Modal */}
@@ -1466,6 +2262,33 @@ const DataSourceNodeChat = ({
               pluginManager={pluginManager}
             />
           ) : null
+        )}
+
+        {/* Connection Type Selector Modal */}
+        <ConnectionTypeSelector
+          open={isConnectionTypeSelectorOpen}
+          onClose={handleConnectionTypeSelectorClose}
+          onSelectType={handleConnectionTypeSelect}
+        />
+
+        {/* Connection Form Modal */}
+        {ActiveForm && (
+          <Modal
+            title={getModalTitle(activeDbType)}
+            open={Boolean(activeDbType)}
+            onCancel={() => {
+              // Cancel any active OAuth server
+              if (window.electronAPI?.oauth?.cancelServer) {
+                window.electronAPI.oauth.cancelServer(3000);
+              }
+              setActiveDbType(null);
+            }}
+            footer={null}
+            width={640}
+            destroyOnClose
+          >
+            <ActiveForm />
+          </Modal>
         )}
     </div>
   );

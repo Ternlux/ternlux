@@ -1,14 +1,96 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { connectionsDb } from '../../../utils/localDb';
 import ChatArea from '../../Chat/ChatArea';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 import CloudStorageBrowser from '../CloudStorageBrowser';
+import {
+  FileExcelOutlined,
+  FileTextOutlined,
+  DatabaseOutlined,
+  ApiOutlined,
+  CloudOutlined,
+  AppstoreOutlined,
+} from '@ant-design/icons';
+import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
+import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
+import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
+import { ReactComponent as MongodbIcon } from '../../ConnectorImages/Mongodb.svg';
+import { ReactComponent as SqlliteIcon } from '../../ConnectorImages/Sqllite.svg';
+import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/GoogleCloudStorage.svg';
+import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
+import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
+import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output Node Chat Component
 // Handles workflow output (export to file or insert to connection)
 // ─────────────────────────────────────────────────────────────────────────────
+
+const DESTINATION_GROUP_COLOR = {
+  'Cloud Storage': '#0891b2',
+  APIs: '#2563eb',
+  Vector: '#16a34a',
+  Databases: '#7c3aed',
+  'Local Files': '#d97706',
+  Other: '#5a6678',
+};
+
+const VECTOR_DB_TYPES = new Set(['lancedb', 'pinecone']);
+
+const categorizeConnection = (conn) => {
+  if (!conn) return 'Other';
+  if (conn.dbCategory === 'CloudStorage') return 'Cloud Storage';
+  if (conn.dbCategory === 'API' || conn.dbType === 'rest-api') return 'APIs';
+  if (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType)) return 'Vector';
+  if (conn.connectionType === 'database') return 'Databases';
+  if (conn.connectionType === 'file') return 'Local Files';
+  return 'Other';
+};
+
+const getDbIcon = (dbType) => {
+  const iconMap = {
+    postgres: PostgresIcon,
+    mysql: MysqlIcon,
+    mssql: MssqlIcon,
+    mongodb: MongodbIcon,
+    sqlite: SqlliteIcon,
+    nedb: SqlliteIcon,
+    gcs: GoogleCloudStorageIcon,
+    dropbox: DropboxIcon,
+    'google-drive': GoogleDriveIcon,
+    'google-sheets': GoogleSheetsIcon,
+  };
+  return iconMap[dbType?.toLowerCase()] || null;
+};
+
+const getConnectionIcon = (connection) => {
+  if (!connection) return null;
+  const category = categorizeConnection(connection);
+  if (category === 'APIs') return <ApiOutlined style={{ fontSize: 18 }} />;
+  if (category === 'Vector') return <AppstoreOutlined style={{ fontSize: 18 }} />;
+  if (category === 'Cloud Storage') {
+    const IconComponent = getDbIcon(connection.dbType);
+    return IconComponent
+      ? <IconComponent style={{ width: 20, height: 20 }} />
+      : <CloudOutlined style={{ fontSize: 18 }} />;
+  }
+  if (connection.connectionType === 'file') {
+    const fileName = connection.fileInfo?.fileName?.toLowerCase() || '';
+    if (fileName.endsWith('.csv')) {
+      return <FileTextOutlined style={{ fontSize: 20 }} />;
+    }
+    const IconComponent = getDbIcon(connection.dbType);
+    if (IconComponent) {
+      return <IconComponent style={{ width: 20, height: 20 }} />;
+    }
+    return <FileExcelOutlined style={{ fontSize: 20 }} />;
+  }
+  const IconComponent = getDbIcon(connection.dbType);
+  return IconComponent
+    ? <IconComponent style={{ width: 20, height: 20 }} />
+    : <DatabaseOutlined style={{ fontSize: 18 }} />;
+};
 
 const formatTimestamp = (ts) => {
   const diff = Math.floor((Date.now() - new Date(ts)) / 60000);
@@ -23,6 +105,7 @@ const OutputNodeChat = ({
   edges,
   initialChat,
   onSave,
+  onConfigUpdate,
   executeOutput,
   executingInd,
   executing = false
@@ -47,7 +130,7 @@ const OutputNodeChat = ({
   // Output configuration state
   const [outputSettings, setOutputSettings] = useState({
     outputType: null,           // "connection" or "local"
-    format: null,               // For local: "json", "csv", "excel", "nedb", "sqlite", "parquet", "avro"
+    format: null,               // For local: "json", "csv", "excel", "nedb", "sqlite", "lancedb", "parquet", "avro"
     savePath: null,             // For local: file path
     connectionId: null,         // For connection: target connection ID
     tableName: null,            // For connection: target table name
@@ -312,19 +395,28 @@ const OutputNodeChat = ({
 
     const connections = enrichedConnections
       .filter(conn => {
-        // Include database connections and cloud storage connections
-        return conn.connectionType === 'database' || conn.dbCategory === 'CloudStorage';
+        // Include database connections, cloud storage connections, and vector databases
+        return conn.connectionType === 'database' ||
+               conn.dbCategory === 'CloudStorage' ||
+               conn.dbCategory === 'Vector';
       })
       .map(conn => {
         const isCloudStorage = conn.dbCategory === 'CloudStorage';
+        const isVector = conn.dbCategory === 'Vector';
+        const group = categorizeConnection(conn);
         return {
           id: conn.id,
           label: conn.name,
           value: conn.id,
           description: isCloudStorage
             ? `Upload to ${conn.name} (${conn.dbType})`
-            : `Insert into ${conn.name} (${conn.dbType})`,
-          connection: conn
+            : isVector
+              ? `Insert vectors into ${conn.name} (${conn.dbType})`
+              : `Insert into ${conn.name} (${conn.dbType})`,
+          connection: conn,
+          icon: getConnectionIcon(conn),
+          group,
+          groupColor: DESTINATION_GROUP_COLOR[group] || DESTINATION_GROUP_COLOR.Other,
         };
       });
 
@@ -430,6 +522,7 @@ const OutputNodeChat = ({
         { label: 'Excel', value: 'excel', description: 'Export as Excel file (.xlsx)', variant: 'outlined', fullWidth: true },
         { label: 'NeDB', value: 'nedb', description: 'Export to local NeDB database', variant: 'outlined', fullWidth: true },
         { label: 'SQLite', value: 'sqlite', description: 'Export to local SQLite database', variant: 'outlined', fullWidth: true },
+        { label: 'LanceDB', value: 'lancedb', description: 'Export to local LanceDB vector database', variant: 'outlined', fullWidth: true },
         { label: 'Parquet', value: 'parquet', description: 'Export as Parquet file', variant: 'outlined', fullWidth: true },
         { label: 'Avro', value: 'avro', description: 'Export as Avro file', variant: 'outlined', fullWidth: true },
       ];
@@ -456,7 +549,10 @@ const OutputNodeChat = ({
         description: conn.description,
         _data: conn,
         variant: 'outlined',
-        fullWidth: true
+        fullWidth: true,
+        icon: conn.icon,
+        group: conn.group,
+        groupColor: conn.groupColor,
       }));
 
       setPendingChoices(connectionChoices);
@@ -496,6 +592,7 @@ const OutputNodeChat = ({
           { label: 'Excel', value: 'excel', description: 'Export as Excel file (.xlsx)', variant: 'outlined', fullWidth: true },
           { label: 'NeDB', value: 'nedb', description: 'Export to local NeDB database', variant: 'outlined', fullWidth: true },
           { label: 'SQLite', value: 'sqlite', description: 'Export to local SQLite database', variant: 'outlined', fullWidth: true },
+          { label: 'LanceDB', value: 'lancedb', description: 'Export to local LanceDB vector database', variant: 'outlined', fullWidth: true },
           { label: 'Parquet', value: 'parquet', description: 'Export as Parquet file', variant: 'outlined', fullWidth: true },
           { label: 'Avro', value: 'avro', description: 'Export as Avro file', variant: 'outlined', fullWidth: true },
         ];
@@ -549,14 +646,35 @@ const OutputNodeChat = ({
     setOutputSettings(updatedSettings);
     setPendingChoices([]);
     console.log('connection.connection: ', connection.connection, data, availableConnections)
+
     // Check if this is a cloud storage connection
     const isCloudStorage = connection.connection?.dbCategory === 'CloudStorage';
+    const isVector = connection.connection?.dbCategory === 'Vector';
 
     if (isCloudStorage) {
       // Open cloud storage browser for path selection
       setCloudStorageConnection(connection.connection);
       setCloudStorageBrowserOpen(true);
       addBotMessage(`Opening cloud storage browser to select output path...`, false);
+      return;
+    }
+
+    if (isVector) {
+      // For vector databases, ask for index/table name
+      const dbType = connection.connection?.dbType;
+      let prompt = '';
+      let placeholder = '';
+
+      if (dbType === 'pinecone') {
+        prompt = 'What Pinecone index should the vectors be inserted into?\n\n**Note**: Use format `index-name` or `index-name/namespace` to specify a namespace';
+        placeholder = 'index-name or index-name/namespace';
+      } else {
+        // LanceDB or other vector databases
+        prompt = 'What table name should the vectors be inserted into?';
+        placeholder = 'Enter table name...';
+      }
+
+      addBotMessage(prompt, true, 'text', 'tableName', placeholder);
       return;
     }
 
@@ -842,6 +960,33 @@ const OutputNodeChat = ({
   }));
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Code popup wiring
+  // ─────────────────────────────────────────────────────────────────────────
+  const handleCodeSave = useCallback((field, value, message) => {
+    setChat(prev => prev.map(m =>
+      m.id === message?.id
+        ? { ...m, metadata: { ...m.metadata, [field]: value } }
+        : m
+    ));
+
+    if (!onConfigUpdate || !node?.id) return;
+
+    let update;
+    switch (field) {
+      case 'sql':
+        update = { targetSql: value };
+        break;
+      case 'ddl':
+      case 'targetDdl':
+        update = { targetDdl: value };
+        break;
+      default:
+        update = { [field]: value };
+    }
+    onConfigUpdate(node.id, update);
+  }, [onConfigUpdate, node?.id]);
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Render
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -873,6 +1018,7 @@ const OutputNodeChat = ({
         showRunButton={false}
         onRun={null}
         runButtonLoading={false}
+        onCodeSave={handleCodeSave}
       />
 
       {cloudStorageBrowserOpen && cloudStorageConnection && pluginManager && (

@@ -316,6 +316,7 @@ function inferAvroSchema(data) {
  * @param {Object} pluginManager - Plugin manager instance
  * @param {Function} getFullConfig - Function to get full config with credentials
  * @param {Function} getDb - Function to get NeDB database instance by collection name
+ * @param {Object} [skillHelpers] - Helpers bundle for skill calls (e.g. vector-db-executor)
  * @returns {Promise<Object>} Result with success, message, filePath/rowsInserted
  */
 async function executeOutput(
@@ -324,7 +325,8 @@ async function executeOutput(
   outputSettings,
   pluginManager,
   getFullConfig,
-  getDb
+  getDb,
+  skillHelpers = null
 ) {
   try {
     const { outputType, format, savePath, connectionId, tableName } = outputSettings;
@@ -334,95 +336,170 @@ async function executeOutput(
     // Step 1: Load source data
     let sourceData = [];
 
-    // Handle local files separately (they don't use plugin system)
-    const isLocalFile = sourceConnection.localPath;
+    // Check if source is a vector database
+    const plugin = pluginManager.getConnector(sourceConnection.dbType);
+    // console.log('plugin: ', sourceConnection, plugin)
+    const isSourceVector = plugin?.dbCategory === 'Vector' ||
+                          sourceConnection.dbType === 'pinecone' ||
+                          sourceConnection.dbType === 'lancedb';
 
-    if (isLocalFile) {
-      if (sourceConnection.dbType === 'nedb') {
-        // Local NeDB file
-        const db = new Datastore({ filename: sourceConnection.localPath, autoload: false });
+    if (isSourceVector) {
+      // Load data from vector database
+      console.log(`[Output] Loading vectors from ${sourceConnection.dbType}...`);
 
-        await new Promise((resolve, reject) => {
-          db.loadDatabase((err) => err ? reject(err) : resolve());
-        });
+      const indexName = sourceTableSchema.indexName || sourceTableSchema.tableName;
+      const namespace = sourceTableSchema.schema || sourceTableSchema.namespace || '';
 
-        sourceData = await new Promise((resolve, reject) => {
-          db.find({}).limit(1000000).exec((err, docs) => {
-            if (err) reject(err);
-            else resolve(docs);
-          });
-        });
-      } else if (sourceConnection.dbType === 'sqlite') {
-        // Local SQLite file
-        const sqlite3 = require('sqlite3').verbose();
-        const db = new sqlite3.Database(sourceConnection.localPath);
+      if (sourceConnection.dbType === 'lancedb') {
+        // LanceDB: embedded library
+        const dbPath = sourceConnection.localPath || sourceConnection.dbConfig?.dbPath;
+        if (!dbPath) {
+          return {
+            success: false,
+            message: 'LanceDB path not found in connection config'
+          };
+        }
 
-        const query = `SELECT * FROM ${sourceTableSchema.tableName}`;
-        sourceData = await new Promise((resolve, reject) => {
-          db.all(query, (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
-          });
-        });
+        const lancedb = require('@lancedb/lancedb');
+        const db = await lancedb.connect(dbPath);
 
-        db.close();
-      }
-    } else {
-      // Remote connection - use plugin system
-      // Use the stored query from schema if available, otherwise construct one
-      let queryObj;
-
-
-      // Fallback: construct query from scratch
-      const schema = sourceConnection.dbConfig?.schema;
-      const plugin = pluginManager.getConnector(sourceConnection.dbType);
-
-      // Use quoteIdentifier to properly format table name with schema
-      let fullTableName;
-      if (plugin && plugin.quoteIdentifier) {
-        fullTableName = plugin.quoteIdentifier(sourceTableSchema.tableName, schema, sourceConnection.dbConfig);
+        try {
+          const table = await db.openTable(indexName);
+          const query = table.query().limit(1000000);
+          sourceData = await query.toArray();
+        } catch (error) {
+          return {
+            success: false,
+            message: `Failed to load LanceDB data: ${error.message}`
+          };
+        }
       } else {
-        // Fallback to manual formatting
-        fullTableName = schema ? `${schema}.${sourceTableSchema.tableName}` : sourceTableSchema.tableName;
+        // Pinecone or other vector DBs: use connector
+        const fullConfig = await getFullConfig(sourceConnection.id);
+
+        if (!plugin || !plugin.fetchAllVectors) {
+          return {
+            success: false,
+            message: `${sourceConnection.dbType} connector does not support fetchAllVectors method`
+          };
+        }
+
+        const result = await plugin.fetchAllVectors(
+          fullConfig,
+          sourceConnection.id,
+          {
+            indexName: indexName,
+            namespace: namespace,
+            filter: {},
+            includeValues: true,
+            includeMetadata: true,
+            limit: 1000000
+          }
+        );
+
+        if (!result.success) {
+          return {
+            success: false,
+            message: `Failed to load vectors: ${result.message}`
+          };
+        }
+
+        sourceData = result.rows || [];
+        // console.log('sourceData: ', sourceData)
       }
 
-      const sqlQuery = `SELECT * FROM ${fullTableName}`;
-      
-      queryObj = {
-        // For SQL databases
-        query: sqlQuery,
-        tableName: sourceTableSchema.tableName,
-        schema: sourceConnection.dbConfig?.schema,
+      console.log(`[Output] Loaded ${sourceData.length} vectors from source`);
 
-        // For MongoDB
-        collection: sourceTableSchema.tableName,
-        filter: {},
+    } else {
+      // Handle local files separately (they don't use plugin system)
+      const isLocalFile = sourceConnection.localPath;
 
-        // For Google Sheets
-        spreadsheetId: sourceTableSchema.tableName,
-        sheetName: sourceTableSchema.sheetName,
-        range: null,
+      if (isLocalFile) {
+        if (sourceConnection.dbType === 'nedb') {
+          // Local NeDB file
+          const db = new Datastore({ filename: sourceConnection.localPath, autoload: false });
 
-        // Common
-        limit: 1000000
-      };
-      const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
-      
-      const result = await plugin.runQuery(fullConfig, sourceConnection.id, queryObj);
-      // console.log('queryObj: ', queryObj)
-      sourceData = result.rows || [];
-      
-  
-      console.log(`[Output] Loaded ${sourceData.length} rows from source`);
+          await new Promise((resolve, reject) => {
+            db.loadDatabase((err) => err ? reject(err) : resolve());
+          });
+
+          sourceData = await new Promise((resolve, reject) => {
+            db.find({}).limit(1000000).exec((err, docs) => {
+              if (err) reject(err);
+              else resolve(docs);
+            });
+          });
+        } else if (sourceConnection.dbType === 'sqlite') {
+          // Local SQLite file
+          const sqlite3 = require('sqlite3').verbose();
+          const db = new sqlite3.Database(sourceConnection.localPath);
+
+          const query = `SELECT * FROM ${sourceTableSchema.tableName}`;
+          sourceData = await new Promise((resolve, reject) => {
+            db.all(query, (err, rows) => {
+              if (err) reject(err);
+              else resolve(rows);
+            });
+          });
+
+          db.close();
+        }
+      } else {
+        // Remote connection - use plugin system
+        // Use the stored query from schema if available, otherwise construct one
+        let queryObj;
+
+        // Fallback: construct query from scratch
+        const schema = sourceConnection.dbConfig?.schema;
+
+        // Use quoteIdentifier to properly format table name with schema
+        // let fullTableName;
+        // if (plugin && plugin.quoteIdentifier) {
+        //   fullTableName = plugin.quoteIdentifier(sourceTableSchema.tableName, schema, sourceConnection.dbConfig);
+        //   console.log('sourceTableSchema.tableName, schema: ', sourceTableSchema.tableName, schema, fullTableName)
+        // } else {
+        //   // Fallback to manual formatting
+        //   fullTableName = schema ? `${schema}.${sourceTableSchema.tableName}` : sourceTableSchema.tableName;
+        // }
+
+        const sqlQuery = `SELECT * FROM ${sourceTableSchema.tableName}`;
+
+        queryObj = {
+          // For SQL databases
+          query: sqlQuery,
+          tableName: sourceTableSchema.tableName,
+          schema: sourceConnection.dbConfig?.schema,
+
+          // For MongoDB
+          collection: sourceTableSchema.tableName,
+          filter: {},
+
+          // For Google Sheets
+          spreadsheetId: sourceTableSchema.tableName,
+          sheetName: sourceTableSchema.sheetName,
+          range: sourceTableSchema.sheetName,
+
+          // Common
+          limit: 1000000
+        };
+        const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
+
+        const result = await plugin.runQuery(fullConfig, sourceConnection.id, queryObj);
+        // console.log('queryObj: ', queryObj)
+        sourceData = result.rows || [];
+
+
+        console.log(`[Output] Loaded ${sourceData.length} rows from source`);
+      }
     }
 
 
     if (outputType === 'local') {
       // Export to local file
-      return await exportToLocalFile(sourceData, format, savePath);
+      return await exportToLocalFile(sourceData, format, savePath, pluginManager, skillHelpers);
     } else if (outputType === 'connection') {
       // Insert to database connection
-      return await insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb);
+      return await insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers);
     } else {
       return {
         success: false,
@@ -447,7 +524,7 @@ async function executeOutput(
  * @param {string} savePath - File path to save to
  * @returns {Promise<Object>} Result with success, message, filePath
  */
-async function exportToLocalFile(sourceData, format, savePath) {
+async function exportToLocalFile(sourceData, format, savePath, pluginManager, skillHelpers = null) {
 
   if (format === 'json') {
     fs.writeFileSync(savePath, JSON.stringify(sourceData, null, 2), 'utf8');
@@ -636,10 +713,35 @@ async function exportToLocalFile(sourceData, format, savePath) {
         message: `Failed to export Avro: ${error.message}`
       };
     }
+  } else if (format === 'lancedb') {
+    // LanceDB export uses the vector-db-executor skill
+    try {
+      const vectorSkill = pluginManager.getSkill('vector-db-executor');
+      if (!vectorSkill) {
+        return {
+          success: false,
+          message: 'Vector database executor skill not found. Please install the vector-db-executor skill to export to LanceDB.'
+        };
+      }
+
+      const result = await vectorSkill.exportToLanceDB({
+        sourceData,
+        savePath,
+        helpers: skillHelpers
+      });
+
+      return result;
+    } catch (error) {
+      console.error('LanceDB export error:', error);
+      return {
+        success: false,
+        message: `Failed to export LanceDB: ${error.message}`
+      };
+    }
   } else {
     return {
       success: false,
-      message: `Format ${format} is not supported. Supported formats: json, csv, excel, nedb, sqlite, parquet, avro`
+      message: `Format ${format} is not supported. Supported formats: json, csv, excel, nedb, sqlite, lancedb, parquet, avro`
     };
   }
 }
@@ -654,7 +756,7 @@ async function exportToLocalFile(sourceData, format, savePath) {
  * @param {Function} getDb - Function to get NeDB database instance by collection name
  * @returns {Promise<Object>} Result with success, message, documentsInserted/rowsInserted
  */
-async function insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb) {
+async function insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers = null) {
   const connectionsDb = getDb('connections');
   const targetConnectionDocs = await connectionsDb.findAsync({});
   const targetConnection = targetConnectionDocs.find(c => c.id === connectionId);
@@ -666,9 +768,15 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
     };
   }
 
-  // Check if target is cloud storage or Google Sheets
+  // Check target type
   const plugin = pluginManager.getConnector(targetConnection.dbType);
   const isCloudStorage = plugin?.storageType === 'cloud-storage' || targetConnection.dbType === 'google-sheets';
+  const isVector = plugin?.dbCategory === 'Vector' || targetConnection.dbType === 'pinecone' || targetConnection.dbType === 'lancedb';
+
+  if (isVector) {
+    // Vector database - use vector-db-executor skill
+    return await insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers);
+  }
 
   if (isCloudStorage) {
     // Upload data to cloud storage as JSON or CSV
@@ -779,7 +887,7 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
       const columns = Object.keys(sourceData[0]);
       const columnTypes = inferColumnTypes(sourceData, targetConnection.dbType);
       const columnDefs = columns.map(col => `${col} ${columnTypes[col]}`).join(', ');
-
+      console.log('tableName, schema, targetConnection.dbConfig: ', tableName, targetConnection.dbConfig)
       // Quote the table name using the plugin's quoteIdentifier
       // For BigQuery with dataset.table format, parse and quote properly
       let quotedTableName = tableName;
@@ -792,7 +900,8 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
           } else {
             quotedTableName = `\`${tableName}\``;
           }
-        } else {
+        } 
+        else {
           quotedTableName = plugin.quoteIdentifier(tableName, null, targetConnection.dbConfig);
         }
       }
@@ -856,10 +965,75 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
   }
 }
 
+/**
+ * Insert data to vector database (Pinecone, LanceDB, etc.)
+ * Uses vector-db-executor skill to handle embedding and insertion
+ * @param {Array} sourceData - Array of data rows
+ * @param {Object} targetConnection - Target vector database connection
+ * @param {string} tableName - Target index/table name (format: "index-name" or "index-name/namespace" for Pinecone)
+ * @param {Object} pluginManager - Plugin manager instance
+ * @param {Function} getFullConfig - Function to get full config with credentials
+ * @returns {Promise<Object>} Result with success, message, vectorsInserted
+ */
+async function insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers = null) {
+  try {
+    // Parse index name and namespace for Pinecone
+    let indexName = tableName;
+    let namespace = '';
+
+    if (targetConnection.dbType === 'pinecone' && tableName.includes('/')) {
+      const parts = tableName.split('/');
+      indexName = parts[0];
+      namespace = parts.slice(1).join('/');
+    }
+
+    // Get vector-db-executor skill
+    const vectorSkill = pluginManager.getSkill('vector-db-executor');
+    if (!vectorSkill) {
+      return {
+        success: false,
+        message: 'Vector database executor skill not found. Please install the vector-db-executor skill.'
+      };
+    }
+
+    // Execute data-to-vector transfer using the skill
+    const result = await vectorSkill.executeDataToVector({
+      sourceData,
+      targetConnection,
+      targetIndexName: indexName,
+      targetNamespace: namespace,
+      pluginManager,
+      getFullConfig,
+      helpers: skillHelpers
+    });
+
+    if (result.success) {
+      return {
+        success: true,
+        message: result.message || `Successfully inserted ${result.vectorsInserted || sourceData.length} vectors into ${indexName}${namespace ? `/${namespace}` : ''}`,
+        vectorsInserted: result.vectorsInserted || sourceData.length
+      };
+    } else {
+      return {
+        success: false,
+        message: `Failed to insert vectors: ${result.message}`
+      };
+    }
+  } catch (error) {
+    console.error('Vector database insertion error:', error);
+    return {
+      success: false,
+      message: `Failed to insert vectors: ${error.message}`,
+      error: error.stack
+    };
+  }
+}
+
 module.exports = {
   executeOutput,
   exportToLocalFile,
   insertToConnection,
+  insertToVectorDatabase,
   inferColumnTypes,
   inferColumnType,
   inferParquetSchema,

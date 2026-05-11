@@ -1,25 +1,23 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
-import { SettingOutlined, CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
+import { SettingOutlined, EditOutlined } from '@ant-design/icons';
+import { ExpandableCodes, extractLatestCodes, getLatestUserQuestion } from './nodeCardShared';
+
+const COLOR = '#7c3aed';
+const MONO = "'JetBrains Mono', monospace";
+const TEXT = '#111827';
+const MUTED = '#5a6678';
+const BORDER = '#e2e6eb';
+const GREEN = '#059669';
 
 const TransformerNode = ({ data, selected }) => {
-  // Check if the transformer is configured (has SQL or transformation request)
   const isConfigured = !!(data.config?.sql || data.config?.transformationRequest);
-  // console.log('TransformerNode data: ', data)
 
-  // Determine colors based on configuration status
-  const borderColor = isConfigured ? '#1890ff' : '#d9d9d9';
-  const iconColor = isConfigured ? '#1890ff' : '#999';
-  const textColor = isConfigured ? '#333' : '#999';
-
-  // Get display information
   const getDisplayName = () => {
-    // If node has a custom name, use it
     if (data.config?.node_name) {
       return data.config.node_name;
     }
 
-    // Show targetDbType if available, otherwise fall back to label or 'Transformer'
     const dbType = data.config?.targetDbType;
     if (dbType) {
       return dbType.charAt(0).toUpperCase() + dbType.slice(1);
@@ -33,19 +31,17 @@ const TransformerNode = ({ data, selected }) => {
 
     const config = data.config;
 
-    // Use SQL explanation if available
-    if (config.sqlExplanation || config.explanation) {
-      const explanation = config.sqlExplanation || config.explanation;
+    // Prefer the AI's explanation of what the transformation does. If no
+    // explanation was produced, fall back to the user's most recent question
+    // so the card still reflects intent rather than a generic string.
+    const explanation =
+      config.sqlExplanation ||
+      config.explanation ||
+      getLatestUserQuestion(config.chat);
+    if (explanation) {
       return explanation.length > 100 ? explanation.slice(0, 100) + '...' : explanation;
     }
 
-    // Use transformation request
-    if (config.transformationRequest) {
-      const request = config.transformationRequest;
-      return request.length > 100 ? request.slice(0, 100) + '...' : request;
-    }
-
-    // Fallback
     if (config.sql) {
       return 'Transformation configured';
     }
@@ -53,87 +49,106 @@ const TransformerNode = ({ data, selected }) => {
     return 'Click to configure transformation';
   };
 
+  const latestCodes = extractLatestCodes(data.config?.chat);
+
   return (
-    <div className={`react-flow__node-transformer ${selected ? 'selected' : ''}`}
-         style={{
-           borderLeft: `4px solid ${borderColor}`,
-           borderTop: `1px solid #e8e8e8`,
-           borderRight: `1px solid #e8e8e8`,
-           borderBottom: `2px solid #d0d0d0`,
-           backgroundColor: '#e6f7ff',
-           boxShadow: selected ? '0 4px 12px rgba(0,0,0,0.15)' : '0 2px 6px rgba(0,0,0,0.1)',
-           borderRadius: '2px',
-           minWidth: '220px',
-           maxWidth: '280px',
-           opacity: isConfigured ? 1 : 0.8,
-         }}>
-      {/* Target handle for incoming connections */}
+    <div
+      style={{
+        width: 264,
+        background: '#fff',
+        border: `1px solid ${selected ? COLOR : BORDER}`,
+        borderLeft: `3px solid ${COLOR}`,
+        borderRadius: 6,
+        boxShadow: selected
+          ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
+          : '0 1px 4px rgba(0,0,0,0.07)',
+        position: 'relative',
+        userSelect: 'none',
+        fontFamily: "'Inter',-apple-system,sans-serif",
+        opacity: isConfigured ? 1 : 0.9,
+      }}
+    >
       <Handle
         type="target"
         position={Position.Left}
         style={{
-          background: borderColor,
+          background: COLOR,
           border: '2px solid #fff',
-          width: '10px',
-          height: '10px',
-          left: '-5px',
+          width: 10,
+          height: 10,
+          left: -6,
+          boxShadow: `0 0 0 1px ${COLOR}44`,
         }}
       />
 
-      {/* Header with icon and name */}
+      {/* Header */}
       <div style={{
-        padding: '10px 12px',
-        borderBottom: '1px solid #f0f0f0',
+        padding: '7px 10px',
+        borderBottom: '1px solid #f0f2f5',
         display: 'flex',
         alignItems: 'center',
-        gap: '8px',
-        backgroundColor: 'rgba(255,255,255,0.5)',
+        gap: 7,
       }}>
-        {isConfigured ? (
-          <CheckCircleOutlined style={{ fontSize: '18px', color: iconColor }} />
-        ) : (
-          <SettingOutlined style={{ fontSize: '18px', color: iconColor }} />
-        )}
+        {isConfigured
+          ? <EditOutlined style={{ fontSize: 12, color: COLOR }} />
+          : <SettingOutlined style={{ fontSize: 12, color: COLOR }} />}
+        <span style={{
+          fontSize: 9,
+          fontFamily: MONO,
+          fontWeight: 700,
+          letterSpacing: '0.1em',
+          color: COLOR,
+          textTransform: 'uppercase',
+        }}>
+          TRANSFORM
+        </span>
         <div style={{
-          fontWeight: '600',
-          fontSize: '13px',
-          color: textColor,
-          flex: 1,
+          marginLeft: 'auto',
+          width: 6,
+          height: 6,
+          borderRadius: '50%',
+          background: isConfigured ? GREEN : BORDER,
+        }} />
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: '8px 10px' }}>
+        <div style={{
+          fontSize: 12,
+          fontWeight: 600,
+          color: TEXT,
+          marginBottom: 4,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
         }}>
           {getDisplayName()}
         </div>
+        <div style={{
+          fontSize: 11,
+          color: MUTED,
+          lineHeight: 1.5,
+          display: '-webkit-box',
+          WebkitLineClamp: 3,
+          WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+        }}>
+          {getSummary()}
+        </div>
       </div>
 
-      {/* Summary description */}
-      <div style={{
-        padding: '12px',
-        fontSize: '12px',
-        lineHeight: '1.5',
-        color: isConfigured ? '#555' : '#999',
-        fontStyle: isConfigured ? 'normal' : 'italic',
-        minHeight: '60px',
-        maxHeight: '90px',
-        overflow: 'hidden',
-        display: '-webkit-box',
-        WebkitLineClamp: 4,
-        WebkitBoxOrient: 'vertical',
-      }}>
-        {getSummary()}
-      </div>
+      <ExpandableCodes codes={latestCodes} />
 
-      {/* Source handle for outgoing connections */}
       <Handle
         type="source"
         position={Position.Right}
         style={{
-          background: borderColor,
+          background: COLOR,
           border: '2px solid #fff',
-          width: '10px',
-          height: '10px',
-          right: '-5px',
+          width: 10,
+          height: 10,
+          right: -6,
+          boxShadow: `0 0 0 1px ${COLOR}44`,
         }}
       />
     </div>

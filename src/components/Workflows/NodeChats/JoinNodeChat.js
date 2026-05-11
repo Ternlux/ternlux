@@ -1,10 +1,92 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { connectionsDb } from '../../../utils/localDb';
 import { getWorkflowAssistance } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
 import ChatPrompts from './ChatPrompts/Join';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
+import {
+  FileExcelOutlined,
+  FileTextOutlined,
+  DatabaseOutlined,
+  ApiOutlined,
+  CloudOutlined,
+  AppstoreOutlined,
+} from '@ant-design/icons';
+import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
+import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
+import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
+import { ReactComponent as MongodbIcon } from '../../ConnectorImages/Mongodb.svg';
+import { ReactComponent as SqlliteIcon } from '../../ConnectorImages/Sqllite.svg';
+import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/GoogleCloudStorage.svg';
+import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
+import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
+import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
+
+const DESTINATION_GROUP_COLOR = {
+  'Cloud Storage': '#0891b2',
+  APIs: '#2563eb',
+  Vector: '#16a34a',
+  Databases: '#7c3aed',
+  'Local Files': '#d97706',
+  Other: '#5a6678',
+};
+
+const VECTOR_DB_TYPES = new Set(['lancedb', 'pinecone']);
+
+const categorizeConnection = (conn) => {
+  if (!conn) return 'Other';
+  if (conn.dbCategory === 'CloudStorage') return 'Cloud Storage';
+  if (conn.dbCategory === 'API' || conn.dbType === 'rest-api') return 'APIs';
+  if (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType)) return 'Vector';
+  if (conn.connectionType === 'database') return 'Databases';
+  if (conn.connectionType === 'file') return 'Local Files';
+  return 'Other';
+};
+
+const getDbIcon = (dbType) => {
+  const iconMap = {
+    postgres: PostgresIcon,
+    mysql: MysqlIcon,
+    mssql: MssqlIcon,
+    mongodb: MongodbIcon,
+    sqlite: SqlliteIcon,
+    nedb: SqlliteIcon,
+    gcs: GoogleCloudStorageIcon,
+    dropbox: DropboxIcon,
+    'google-drive': GoogleDriveIcon,
+    'google-sheets': GoogleSheetsIcon,
+  };
+  return iconMap[dbType?.toLowerCase()] || null;
+};
+
+const getConnectionIcon = (connection) => {
+  if (!connection) return null;
+  const category = categorizeConnection(connection);
+  if (category === 'APIs') return <ApiOutlined style={{ fontSize: 18 }} />;
+  if (category === 'Vector') return <AppstoreOutlined style={{ fontSize: 18 }} />;
+  if (category === 'Cloud Storage') {
+    const IconComponent = getDbIcon(connection.dbType);
+    return IconComponent
+      ? <IconComponent style={{ width: 20, height: 20 }} />
+      : <CloudOutlined style={{ fontSize: 18 }} />;
+  }
+  if (connection.connectionType === 'file') {
+    const fileName = connection.fileInfo?.fileName?.toLowerCase() || '';
+    if (fileName.endsWith('.csv')) {
+      return <FileTextOutlined style={{ fontSize: 20 }} />;
+    }
+    const IconComponent = getDbIcon(connection.dbType);
+    if (IconComponent) {
+      return <IconComponent style={{ width: 20, height: 20 }} />;
+    }
+    return <FileExcelOutlined style={{ fontSize: 20 }} />;
+  }
+  const IconComponent = getDbIcon(connection.dbType);
+  return IconComponent
+    ? <IconComponent style={{ width: 20, height: 20 }} />
+    : <DatabaseOutlined style={{ fontSize: 18 }} />;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Join Node Chat Component
@@ -27,7 +109,6 @@ const JoinNodeChat = ({
   onLoadDatabaseTables,
   onConfigUpdate,
   onPreviewConfigUpdate,
-  onExecute,
   executeJoin,
   executingInd,
   executing = false
@@ -47,6 +128,10 @@ const JoinNodeChat = ({
   const [sourceNodes, setSourceNodes] = useState([]);
   const [sourceConnections, setSourceConnections] = useState([]);
   const [sourceTableSchemas, setSourceTableSchemas] = useState([]);
+
+  // Skills state
+  const [availableSkills, setAvailableSkills] = useState([]);
+  const [activeSkill, setActiveSkill] = useState(null); // { skillId, skillState: { code, params, etc. }, readyToExecute: bool }
 
   // Destination/target configuration
   const [targetConnection, setTargetConnection] = useState(null);
@@ -76,6 +161,39 @@ const JoinNodeChat = ({
   // ─────────────────────────────────────────────────────────────────────────
   // Initialize
   // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Load available skills for join category
+   */
+  const loadAvailableSkills = async () => {
+    if (window.electronAPI?.skills?.getDescriptions) {
+      try {
+        // Determine operationType based on target connection dbType
+        const dbType = targetConnection?.dbType;
+        const operationType = ['mongodb', 'nedb'].includes(dbType) ? 'nosql' : 'sql';
+
+        // Load join skills with context
+        const result = await window.electronAPI.skills.getDescriptions('join', {
+          operationType,
+          sourceSchemas: sourceTableSchemas
+        });
+
+        if (result.success) {
+          // Vector cases are handled inline by generateJoinQuery (see Join.js
+          // prompt + analyzeJoinRequest). Hide vector-db-executor from the
+          // join-skill list so the AI doesn't try to route through its
+          // single-source buildSkillPrompt — that path returns an empty
+          // response when fed multi-source join params.
+          const filtered = (result.descriptions || [])
+            .filter((s) => s.id !== 'vector-db-executor');
+          console.log('[JoinNodeChat] Loaded skills:', filtered);
+          setAvailableSkills(filtered);
+        }
+      } catch (error) {
+        console.error('[JoinNodeChat] Failed to load skills:', error);
+      }
+    }
+  };
 
   const initializationFunc = async () => {
     const sourcesDetectionResult = await detectSourceNodes();
@@ -136,7 +254,10 @@ const JoinNodeChat = ({
             description: dest.description,
             _data: dest,
             variant: 'outlined',
-            fullWidth: true
+            fullWidth: true,
+            icon: dest.icon,
+            group: dest.group,
+            groupColor: dest.groupColor,
           }));
 
           const questionText = `I detected ${sourcesDetectionResult.sources.length} data sources connected to this join node.\n\n**First, select where you want to store the joined data:**`;
@@ -156,6 +277,13 @@ const JoinNodeChat = ({
       initializationFunc();
     }
   }, []);
+
+  // Load available skills when target connection and source schemas are ready
+  useEffect(() => {
+    if (targetConnection && sourceTableSchemas.length > 0) {
+      loadAvailableSkills();
+    }
+  }, [targetConnection, sourceTableSchemas]);
 
   // Sync chat state with initialChat prop when node changes
   useEffect(() => {
@@ -299,19 +427,23 @@ const JoinNodeChat = ({
       allConnections = res.data || [];
     }
 
-    // Add all database connections as potential destinations (deduplicated by connection ID)
+    // Add all connections as potential destinations (deduplicated by connection ID),
+    // categorized so the picker shows separate sections for Databases, APIs, Vector
+    // stores, Cloud Storage, and Local Files.
     allConnections.forEach((conn) => {
-      // console.log('conn: ', conn)
-      if (conn.connectionType === 'database' && !seenConnectionIds.has(conn.id)) {
-        seenConnectionIds.add(conn.id);
-        destinations.push({
-          id: conn.id,
-          label: conn.name,
-          value: conn.id,
-          description: `Store in ${conn.name} (${conn.dbType})`,
-          connection: conn
-        });
-      }
+      if (!conn || seenConnectionIds.has(conn.id)) return;
+      seenConnectionIds.add(conn.id);
+      const group = categorizeConnection(conn);
+      destinations.push({
+        id: conn.id,
+        label: conn.name,
+        value: conn.id,
+        description: `Store in ${conn.name} (${conn.dbType})`,
+        connection: conn,
+        icon: getConnectionIcon(conn),
+        group,
+        groupColor: DESTINATION_GROUP_COLOR[group] || DESTINATION_GROUP_COLOR.Other,
+      });
     });
 
     // Add local storage options (always available)
@@ -320,7 +452,10 @@ const JoinNodeChat = ({
       label: 'Local SQLite',
       value: 'local-sqlite',
       description: 'Store locally in SQLite file',
-      connection: { dbType: 'sqlite', connectionType: 'file' }
+      connection: { dbType: 'sqlite', connectionType: 'file' },
+      icon: <SqlliteIcon style={{ width: 20, height: 20 }} />,
+      group: 'Local Files',
+      groupColor: DESTINATION_GROUP_COLOR['Local Files'],
     });
 
     destinations.push({
@@ -328,7 +463,10 @@ const JoinNodeChat = ({
       label: 'Local NeDB',
       value: 'local-nedb',
       description: 'Store locally in NeDB file',
-      connection: { dbType: 'nedb', connectionType: 'file' }
+      connection: { dbType: 'nedb', connectionType: 'file' },
+      icon: <DatabaseOutlined style={{ fontSize: 18 }} />,
+      group: 'Local Files',
+      groupColor: DESTINATION_GROUP_COLOR['Local Files'],
     });
 
     setAvailableDestinations(destinations);
@@ -404,7 +542,17 @@ const JoinNodeChat = ({
     const userMsg = addUserMessage(text, ref, value, data);
 
     if (ref === 'joinRequest' || ref === 'chatContinue') {
-      await startJoinFlow(userMsg);
+      // Check if we're in skill mode
+      if (activeSkill) {
+        // Route to skill flow
+        await handleSkillFlow(userMsg);
+      } else {
+        // Normal join flow
+        await startJoinFlow(userMsg);
+      }
+    } else if (ref === 'skillFollowUp') {
+      // Skill follow-up question response
+      await handleSkillFlow(userMsg);
     } else if (ref === 'destinationSelection') {
       await handleDestinationResponse(value, data);
     } else if (ref === 'operationMode') {
@@ -451,7 +599,231 @@ const JoinNodeChat = ({
       await analyzeJoinRequest(userMsg.text, sourcesInfo, chatHistory);
     } catch (error) {
       console.error('Join analysis error:', error);
-      addBotMessage('Failed to analyze your request. Please try again.', false);
+      addBotMessage(`Failed to analyze your request. Error: ${error}`, false);
+      setAiLoading(false);
+      setLoading(false);
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Skill Flow - Dedicated flow for skill interactions
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Handle all skill interactions through the skill's main function
+   * @param {Object} userMsg - User message object
+   * @param {Object} skillInfo - Optional skill info to use (for initial call when state hasn't updated yet)
+   */
+  const handleSkillFlow = async (userMsg, skillInfo = null) => {
+    const currentSkill = skillInfo || activeSkill;
+
+    if (!currentSkill || !currentSkill.skillId) {
+      console.error('[handleSkillFlow] No active skill');
+      addBotMessage('Error: No active skill found.', false);
+      setAiLoading(false);
+      setLoading(false);
+      return;
+    }
+
+    console.log('[handleSkillFlow] Processing request with skill:', currentSkill.skillId);
+
+    setAiLoading(true);
+    setLoading(true);
+
+    try {
+      // Build chat history
+      const chatHistory = chat.map(msg => ({
+        sender: msg.sender,
+        text: msg.text
+      }));
+
+      // Determine operationType
+      const dbType = targetConnection?.dbType;
+      const operationType = ['mongodb', 'nedb'].includes(dbType) ? 'nosql' : 'sql';
+
+      // Build source schemas for context
+      const sourcesInfo = sourceTableSchemas.map(schema => ({
+        label: schema.sourceNodeLabel,
+        tableName: schema.tableName,
+        columns: schema.columns,
+        sampleData: schema.sampleData
+      }));
+
+      // Step 1: Build the skill prompt
+      const promptResult = await window.electronAPI.skills.buildPrompt({
+        skillId: currentSkill.skillId,
+        params: {
+          userRequest: userMsg.text,
+          chatHistory,
+          sourceSchema: { sources: sourcesInfo }, // Join has multiple sources
+          operationType,
+          settings: joinSettings,
+          currentState: currentSkill.skillState || {}
+        }
+      });
+
+      if (!promptResult.success) {
+        addBotMessage(`Error building prompt: ${promptResult.message}`, false);
+        setAiLoading(false);
+        setLoading(false);
+        return;
+      }
+
+      let result;
+
+      if (promptResult.prompt) {
+        // Standard flow: skill returned a prompt to send to AI, then we hand
+        // the response back through processSkillResponse for validation.
+        const aiResponse = await getWorkflowAssistance(
+          `skill-${currentSkill.skillId}`,
+          promptResult.prompt,
+          promptResult.context,
+          chatHistory
+        );
+
+        // Defensive: an empty AI response means the skill prompt was malformed
+        // for the join context. Drop back to the standard join flow so the
+        // user sees something useful instead of a silent empty bot message.
+        if (!aiResponse || (typeof aiResponse === 'string' && aiResponse.trim() === '')) {
+          console.warn('[handleSkillFlow] Empty AI response; falling back to standard join flow.');
+          setActiveSkill(null);
+          setAiLoading(false);
+          setLoading(false);
+          addBotMessage(
+            `The ${currentSkill.skillId} skill could not produce a configuration for this join. Falling back to the standard join flow — please rephrase or describe your join in more detail.`,
+            true,
+            'text',
+            'joinRequest',
+            'Describe your join...'
+          );
+          return;
+        }
+
+        result = await window.electronAPI.skills.processResponse({
+          skillId: currentSkill.skillId,
+          aiResponse,
+          operationType,
+          currentState: currentSkill.skillState || {},
+          availableConnections: promptResult.context?.availableConnections
+        });
+
+        if (!result.success) {
+          addBotMessage(`Error: ${result.message}`, false);
+          setAiLoading(false);
+          setLoading(false);
+          return;
+        }
+      } else {
+        // Pre-resolved flow: skill orchestrated its own AI calls and returned
+        // a fully-validated result (action + relevant fields) at the top
+        // level. Skip the AI roundtrip and processResponse entirely.
+        result = promptResult;
+      }
+
+      console.log('[handleSkillFlow] Skill response:', result);
+
+      // Handle different actions
+      switch (result.action) {
+        case 'unrelateSkill':
+          // Exit skill mode and go back to normal flow
+          addBotMessage(
+            result.explanation || 'This request is not related to the skill join. Switching back to standard join flow.',
+            false
+          );
+          setActiveSkill(null);
+          setAiLoading(false);
+          setLoading(false);
+
+          // Re-process the request through normal flow
+          await startJoinFlow(userMsg);
+          break;
+
+        case 'answer_directly':
+          // Answer the user's question
+          setAiLoading(false);
+          setLoading(false);
+          addBotMessage(result.directAnswer || result.explanation, false);
+          addBotMessage(
+            'Continue refining your join, or execute when ready.',
+            true,
+            'text',
+            'chatContinue',
+            'Ask another question or refine the join...'
+          );
+          break;
+
+        case 'ask_questions':
+          // Ask follow-up questions
+          setAiLoading(false);
+          setLoading(false);
+          addBotMessage(
+            result.followUpQuestion || result.explanation,
+            true,
+            'text',
+            'skillFollowUp',
+            'Provide additional details...'
+          );
+          break;
+
+        case 'execute':
+          // Ready to execute - show save button
+          setAiLoading(false);
+          setLoading(false);
+
+          // Update skill state with execution params
+          const updatedSkill = {
+            ...currentSkill,
+            skillState: {
+              ...currentSkill.skillState,
+              ...result // Store all execution params
+            },
+            readyToExecute: true
+          };
+          setActiveSkill(updatedSkill);
+
+          // Prepare metadata to display code in chat
+          const skillMetadata = {
+            skillId: currentSkill.skillId,
+            ...result // Contains pythonCode or other skill-specific code
+          };
+
+          addBotMessage(
+            `✓ Join ready:\n${result.explanation || 'Ready to execute'}`,
+            false,
+            'text',
+            '',
+            '',
+            skillMetadata
+          );
+
+          // Re-enable chat input so users can refine before clicking Execute.
+          // chatContinue routes back through handleSkillFlow while activeSkill is set.
+          addBotMessage(
+            'Continue refining your join, or execute when ready.',
+            true,
+            'text',
+            'chatContinue',
+            'Ask another question or refine the join...'
+          );
+
+          // Set pending choices to show execute button
+          setPendingChoices([{
+            label: '▶ Execute & Save',
+            value: 'execute_skill',
+            variant: 'contained',
+            fullWidth: true
+          }]);
+          break;
+
+        default:
+          addBotMessage(`Unknown action: ${result.action}`, false);
+          setAiLoading(false);
+          setLoading(false);
+      }
+
+    } catch (error) {
+      console.error('[handleSkillFlow] Error:', error);
+      addBotMessage(`Error processing skill request: ${error.message}`, false);
       setAiLoading(false);
       setLoading(false);
     }
@@ -460,11 +832,19 @@ const JoinNodeChat = ({
   const analyzeJoinRequest = async (userRequest, sourcesInfo, chatHistory = []) => {
     const sourcesInfoStr = JSON.stringify(sourcesInfo, null, 2);
 
+    const hasVectorSource = sourceConnections.some(
+      (c) => c?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(c?.dbType)
+    );
+    const hasVectorDestination =
+      targetConnection?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetConnection?.dbType);
+
     const analysisPrompt = ChatPrompts.join.joinAnalysisRequest(
       userRequest,
       sourcesInfoStr,
       availableDestinations.map(d => `${d.label} (${d.description})`).join('\n'),
-      joinSettings.operationMode
+      joinSettings.operationMode,
+      availableSkills,
+      { hasVectorSource, hasVectorDestination }
     );
 
     const response = await getWorkflowAssistance('join', analysisPrompt, {
@@ -489,9 +869,63 @@ const JoinNodeChat = ({
 
     console.log('Join analysis:', analysis);
 
+    // Vector source/destination joins are handled inline by generateJoinQuery,
+    // not by a skill. The vector-db-executor skill's buildSkillPrompt is built
+    // for single-source transformer flows and produces an empty/garbled prompt
+    // when fed multi-source join params, so route those cases through the
+    // standard generate_join path instead.
+    if (analysis.usesSkill && analysis.skillId === 'vector-db-executor') {
+      console.log('[JoinNodeChat] Ignoring vector-db-executor skill route; handling vector join inline.');
+      analysis.usesSkill = false;
+      analysis.skillId = null;
+      if (analysis.action !== 'ask_questions' && analysis.action !== 'answer_directly') {
+        analysis.action = 'generate_join';
+      }
+    }
+
+    // Check if a skill was selected
+    if (analysis.usesSkill && analysis.skillId) {
+      console.log('[JoinNodeChat] Skill selected:', analysis.skillId);
+
+      // Find the skill name from availableSkills
+      const selectedSkill = availableSkills.find(s => s.id === analysis.skillId);
+      const skillName = selectedSkill?.name || analysis.skillId;
+
+      // Create skill info object
+      const skillInfo = {
+        skillId: analysis.skillId,
+        skillState: analysis.skillParams || {},
+        readyToExecute: false
+      };
+
+      // Activate skill mode
+      setActiveSkill(skillInfo);
+
+      // Add bot message explaining skill will be used
+      addBotMessage(
+        `Activating ${skillName}:\n${analysis.skillExplanation || analysis.explanation || ''}`,
+        false
+      );
+
+      // Automatically start skill flow with the user's request
+      // Create a mock user message object for the skill flow
+      const userMsgForSkill = {
+        text: userRequest,
+        timestamp: new Date()
+      };
+
+      // Call skill flow directly, passing the skill info since state hasn't updated yet
+      await handleSkillFlow(userMsgForSkill, skillInfo);
+      return; // End processing - skill flow is handling it
+    }
+
     // Update join settings with inferred values
     const inferredSettings = { ...joinSettings, ...analysis.inferredSettings };
     inferredSettings.userRequest = userRequest;
+    // The analyser is the single authority for whether this join needs
+    // embedding/similarity-search code (Scenario B). Persist its decision so
+    // generateJoinConfiguration can gate the Scenario B prompt block.
+    inferredSettings.vectorRequired = analysis.vectorRequired === true;
 
     setJoinSettings(inferredSettings);
 
@@ -723,6 +1157,28 @@ const JoinNodeChat = ({
   // AI Join Configuration Generation
   // ─────────────────────────────────────────────────────────────────────────
 
+  /**
+   * Handle execute skill button click
+   */
+  const handleExecuteSkill = async () => {
+    if (!activeSkill || !activeSkill.readyToExecute) {
+      addBotMessage('Skill is not ready to execute. Please complete the configuration first.', false);
+      return;
+    }
+
+    // Clear pending choices
+    setPendingChoices([]);
+
+    addBotMessage('Skill-based joins are not yet fully implemented. This feature will execute the skill and save the configuration.', false);
+
+    // TODO: Implement skill execution for joins
+    // For now, just notify the user
+    addBotMessage(
+      'The skill execution framework is ready, but join-specific execution logic needs to be implemented.',
+      false
+    );
+  };
+
   const generateJoinConfiguration = async (settings) => {
     setAiLoading(true);
     setLoading(true);
@@ -733,6 +1189,8 @@ const JoinNodeChat = ({
                           : 'sqlite');
 
     const isNoSQL = targetDbType === 'mongodb' || targetDbType === 'nedb';
+    const isVectorDestination =
+      targetConnection?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetDbType);
 
     const targetTableName = settings.targetTableName || node.id.replace('-', '_').toLowerCase();
 
@@ -743,20 +1201,32 @@ const JoinNodeChat = ({
       const sourceConnectionId = sourceConnections[idx]?.id;
       const sourceDbType = sourceConnections[idx]?.dbType;
       const isSourceNoSQL = sourceDbType === 'mongodb' || sourceDbType === 'nedb';
+      const isSourceVector =
+        sourceConnections[idx]?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(sourceDbType);
       const isInDestinationDb = sourceConnectionId === destinationConnectionId;
 
       // Determine what fields are needed for this source
       let requiredFields = [];
 
-      if (isNoSQL) {
+      if (isVectorDestination) {
+        // Vector destination: JS join in memory; pull each source however appropriate.
+        if (isSourceVector) requiredFields = ['vectorFetchOperation'];
+        else if (isSourceNoSQL) requiredFields = ['nosqlOperation'];
+        else requiredFields = ['sql'];
+      } else if (isNoSQL) {
         // NoSQL Destination: Everything loaded into memory, no temp tables
-        if (isSourceNoSQL) {
+        if (isSourceVector) {
+          requiredFields = ['vectorFetchOperation']; // Skill pulls vectors as rows
+        } else if (isSourceNoSQL) {
           requiredFields = ['nosqlOperation']; // Query to fetch from NoSQL source
         } else {
           requiredFields = ['sql']; // Query to fetch from SQL source
         }
       } else {
-        if (isSourceNoSQL) {
+        if (isSourceVector) {
+          // Vector source feeding a SQL destination: skill pulls rows, executor inserts into a temp table
+          requiredFields = ['tempTableName', 'ddl', 'vectorFetchOperation', 'insertSql'];
+        } else if (isSourceNoSQL) {
           requiredFields = ['tempTableName', 'ddl', 'nosqlOperation', 'insertSql']; // Query to fetch from NoSQL source
         } else if (isInDestinationDb) {
           // Source already in destination - reference directly in joinSql
@@ -775,16 +1245,35 @@ const JoinNodeChat = ({
         sampleData: schema.sampleData,
         connectionId: sourceConnectionId,
         dbType: sourceDbType,
+        connectionType: sourceConnections[idx]?.connectionType,
+        // Surface the local file path so the AI can pass it as ctx.runQuery's
+        // dbPath when this source is a local nedb / sqlite / lancedb file.
+        localPath: sourceConnections[idx]?.localPath || null,
         isInDestinationDb: isInDestinationDb,
+        isSourceVector,
         requiredFields: requiredFields
       };
     });
+
+    // True when any source — or the destination — is a local nedb / sqlite /
+    // lancedb file. Gates the dbPath note in the join-generation prompt.
+    const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['nedb', 'sqlite', 'lancedb']);
+    const hasLocalSource = sourcesInfo.some((s) => s.localPath);
+    const destinationIsLocal = LOCAL_DB_TYPES_FOR_PROMPT.has(targetDbType);
 
     const destinationConfig = {
       dbType: targetDbType,
       tableName: targetTableName,
       operationMode: settings.operationMode,
-      connectionId: destinationConnectionId
+      connectionId: destinationConnectionId,
+      isVectorDestination,
+      // Set by the analyser (joinAnalysisRequest) — true only when the join
+      // needs runtime embedding / similarity-search logic (Scenario B). Gates
+      // the JS-function-with-ctx block in the generation prompt.
+      vectorRequired: settings.vectorRequired === true,
+      // Gates the local-dbPath note in the prompt (cheap to compute, keeps the
+      // section out of the prompt when no local file is involved).
+      hasLocalConnection: hasLocalSource || destinationIsLocal
     };
 
     const chatHistory = chat.slice(0, -1).map(msg => ({
@@ -799,6 +1288,10 @@ const JoinNodeChat = ({
         settings,
         destinationConfig
       );
+      console.log('[JoinNodeChat] Vector context for join prompt:', {
+        isVectorDestination,
+        vectorSources: sourcesInfo.filter((s) => s.isSourceVector).map((s) => s.sourceNodeId)
+      });
 
       const response = await getWorkflowAssistance('join', joinPrompt, {
         sources: sourcesInfo,
@@ -861,8 +1354,9 @@ const JoinNodeChat = ({
         joinRequest: settings.userRequest
       };
 
-      // For NoSQL, store the JavaScript join function as transformFunction
-      if (isNoSQL && parsedResponse.javascriptFunction) {
+      // For NoSQL or vector destinations, the join runs in JS — surface the
+      // function as transformFunction (the executor reads either name).
+      if ((isNoSQL || isVectorDestination) && parsedResponse.javascriptFunction) {
         joinConfig.transformFunction = parsedResponse.javascriptFunction;
       }
 
@@ -870,9 +1364,11 @@ const JoinNodeChat = ({
       setSaveState(true);
 
       // Display explanation
-      const executionNote = isNoSQL
-        ? '\n\n**Note:** This join will be executed using JavaScript in the local environment, then uploaded to the destination database.'
-        : '';
+      const executionNote = isVectorDestination
+        ? '\n\n**Note:** This join runs locally in JavaScript; the vector-db-executor skill embeds the chosen column and upserts vectors into the destination.'
+        : (isNoSQL
+          ? '\n\n**Note:** This join will be executed using JavaScript in the local environment, then uploaded to the destination database.'
+          : '');
 
       addBotMessage(
         `✓ Join configuration generated!\n\n${parsedResponse.explanation || 'Join is ready to execute.'}${executionNote}`,
@@ -981,6 +1477,9 @@ const JoinNodeChat = ({
     config.joinSql = latestJoinConfig.joinSql;
     config.targetDdl = latestJoinConfig.targetDdl;
     config.transformFunction = latestJoinConfig.transformFunction || latestJoinConfig.javascriptFunction;
+    if (latestJoinConfig.vectorDestination) {
+      config.vectorDestination = latestJoinConfig.vectorDestination;
+    }
 
     // Target configuration
     const targetTableName = joinSettings.targetTableName || node.id.replace('-', '_').toLowerCase();
@@ -1205,8 +1704,15 @@ const JoinNodeChat = ({
     }
 
     if (choice.value === 'fix_error') {
-      // TODO: Implement AI error fix
-      addBotMessage('Error recovery not yet implemented. Please refine your join manually.', false);
+      const errorText = executionError?.error || 'an unknown error';
+      const message = `Fix this error: ${errorText}`;
+      setExecutionError(null);
+      handleUserResponse(message, 'chatContinue', message, null);
+      return;
+    }
+
+    if (choice.value === 'execute_skill') {
+      handleExecuteSkill();
       return;
     }
 
@@ -1228,6 +1734,56 @@ const JoinNodeChat = ({
     sender: m.sender,
     timestamp: m.timestamp || new Date(),
   }));
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Code popup wiring
+  // ─────────────────────────────────────────────────────────────────────────
+  const safeParseJson = (str) => {
+    if (typeof str !== 'string') return str;
+    try { return JSON.parse(str); } catch { return str; }
+  };
+
+  const handleCodeSave = useCallback((field, value, message) => {
+    setChat(prev => prev.map(m =>
+      m.id === message?.id
+        ? { ...m, metadata: { ...m.metadata, [field]: value } }
+        : m
+    ));
+
+    if (!onConfigUpdate || !node?.id) return;
+
+    let update;
+    switch (field) {
+      case 'sql':
+        update = { targetSql: value };
+        break;
+      case 'ddl':
+      case 'targetDdl':
+        update = { targetDdl: value };
+        break;
+      case 'joinSql':
+        update = { targetSql: value, joinSql: value };
+        break;
+      case 'joinColumns':
+        update = { joinColumns: safeParseJson(value) };
+        break;
+      case 'selectedColumns':
+        update = { selectedColumns: safeParseJson(value) };
+        break;
+      case 'sourcesConfig':
+        update = { sourcesConfig: safeParseJson(value) };
+        break;
+      case 'javascriptFunction':
+        update = { javascriptFunction: value };
+        break;
+      case 'pythonCode':
+        update = { pythonCode: value };
+        break;
+      default:
+        update = { [field]: value };
+    }
+    onConfigUpdate(node.id, update);
+  }, [onConfigUpdate, node?.id]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Render
@@ -1261,6 +1817,7 @@ const JoinNodeChat = ({
         showRunButton={false}
         onRun={null}
         runButtonLoading={false}
+        onCodeSave={handleCodeSave}
       />
     </div>
   );

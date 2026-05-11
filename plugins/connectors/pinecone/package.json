@@ -1,0 +1,9 @@
+{
+  "name": "@dagflux/connector-pinecone",
+  "version": "1.0.0",
+  "description": "Pinecone vector database connector for DagFlux",
+  "main": "index.js",
+  "dependencies": {
+    "@pinecone-database/pinecone": "^3.0.0"
+  }
+}
