@@ -16,6 +16,7 @@
     "avsc": "^5.7.9",
     "axios": "^1.5.1",
     "chokidar": "^5.0.0",
+    "electron-updater": "^6.8.9",
     "node-cron": "^4.2.1",
     "openai": "^6.22.0",
     "parquetjs": "^0.11.2",
@@ -27,20 +28,32 @@
     "build": "react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject",
-    "electron-dev": "concurrently \"cross-env BROWSER=none react-scripts start\" \"wait-on http://localhost:3000 && electron .\"",
-    "electron-pack": "react-scripts build && electron-builder",
-    "dist:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && electron-builder --mac",
-    "dist:linux": "react-scripts build && electron-builder --linux",
-    "dist:win": "react-scripts build && electron-builder --win",
-    "dist:all": "react-scripts build && electron-builder --mac --linux --win",
-    "pack:mac": "node scripts/ensure-mac-prebuilts.js && electron-builder --mac",
-    "pack:linux": "electron-builder --linux",
-    "pack:win": "electron-builder --win"
+    "electron-dev": "concurrently \"cross-env BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3000 && electron .\"",
+    "minify-dist": "node scripts/minify-dist.js",
+    "electron-pack": "react-scripts build && node scripts/minify-dist.js && electron-builder",
+    "dist:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "dist:linux": "react-scripts build && node scripts/minify-dist.js && electron-builder --linux",
+    "dist:win": "react-scripts build && node scripts/minify-dist.js && electron-builder --win",
+    "dist:all": "react-scripts build && node scripts/minify-dist.js && electron-builder --mac --linux --win",
+    "pack:mac": "node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "pack:linux": "node scripts/minify-dist.js && electron-builder --linux",
+    "pack:win": "node scripts/minify-dist.js && electron-builder --win",
+    "release:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac --publish always -c.directories.output=$HOME/Ternlux-dist; }",
+    "release:win": "react-scripts build && node scripts/minify-dist.js && electron-builder --win --publish always",
+    "release:linux": "react-scripts build && node scripts/minify-dist.js && electron-builder --linux --publish always"
   },
   "build": {
-    "appId": "com.dagflux.app",
-    "productName": "DagFlux",
+    "appId": "com.ternlux.app",
+    "productName": "Ternlux",
     "asar": true,
+    "extraMetadata": {
+      "main": "public/electron.js"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Ternlux",
+      "repo": "releases"
+    },
     "asarUnpack": [
       "**/*.node",
       "node_modules/sqlite3/**",
@@ -49,25 +62,27 @@
     "afterPack": "scripts/after-pack.js",
     "files": [
       "build/**/*",
-      "public/electron.js",
-      "public/preload.js",
-      "public/pluginManager.js",
-      "public/aiProviders.js",
-      "public/analytics.js",
-      "public/SqliteConnectionPool.js",
-      "public/image/**/*",
-      "public/imports/**/*",
-      "public/joins/**/*",
-      "public/lib/**/*",
-      "public/NodeExecution/**/*",
-      "public/transfomers/**/*",
-      "public/triggers/**/*",
-      "public/workflows/**/*",
-      "plugins/**/*",
       "!**/*.map",
       "!**/*.log",
       "!**/.DS_Store",
-      "!**/._*"
+      "!**/._*",
+      "!build/*.js",
+      "!build/NodeExecution/**",
+      "!build/chat/**",
+      "!build/ChatPrompts/**",
+      "!build/imports/**",
+      "!build/joins/**",
+      "!build/lib/**",
+      "!build/transfomers/**",
+      "!build/triggers/**",
+      {
+        "from": "dist-min/public",
+        "to": "public"
+      },
+      {
+        "from": "dist-min/plugins",
+        "to": "plugins"
+      }
     ],
     "directories": {
       "buildResources": "assets",
@@ -76,16 +91,36 @@
     "mac": {
       "category": "public.app-category.productivity",
       "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ],
       "icon": "assets/icon.png",
-      "hardenedRuntime": false,
+      "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "identity": null
+      "entitlements": "assets/entitlements.mac.plist",
+      "entitlementsInherit": "assets/entitlements.mac.plist",
+      "notarize": true
     },
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "assets/icon.png"
     },
@@ -96,7 +131,12 @@
     },
     "linux": {
       "target": [
-        { "target": "AppImage", "arch": ["x64"] }
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "assets/icon.png",
       "category": "Office"
@@ -142,8 +182,8 @@
     "cross-env": "^10.1.0",
     "electron": "^40.4.1",
     "electron-builder": "^26.7.0",
+    "esbuild": "^0.28.1",
     "html2canvas": "^1.4.1",
-    "hyperformula": "^2.6.1",
     "jspdf": "^2.5.1",
     "moment": "^2.29.4",
     "papaparse": "^5.4.1",
