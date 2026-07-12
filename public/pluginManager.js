@@ -1,5 +1,5 @@
 /**
- * Plugin Manager for DagFlux
+ * Plugin Manager for Ternlux
  * Handles loading and managing database connector plugins
  */
 

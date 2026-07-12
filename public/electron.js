@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
@@ -6,6 +6,19 @@ const Datastore = require('@seald-io/nedb');
 const pluginManager = require('./pluginManager');
 const aiProviders = require('./aiProviders');
 const analytics = require('./analytics');
+const {
+  externalizeWorkflowCode,
+  externalizeUpdateCode,
+  inlineWorkflowCode,
+  deleteWorkflowCode,
+  workflowDirName,
+} = require('./lib/workflowCode');
+const {
+  watchWorkflowCode,
+  unwatchWorkflowCode,
+  unwatchAllForWebContents,
+  stopAllCodeWatchers,
+} = require('./lib/workflowCodeWatcher');
 
 // Patch ipcMain.handle FIRST so every IPC handler registered below is
 // automatically wrapped with anonymous analytics tracking (channel name,
@@ -31,10 +44,34 @@ const { registerCronJob, unregisterCronJob, getActiveCronJobs, stopAllCronJobs }
 const { registerFileWatcher, unregisterFileWatcher, getActiveFileWatchers, stopAllFileWatchers } = require('./triggers/fileWatchTriggers');
 const { registerAllWorkflowTriggers } = require('./triggers/registerAllTriggers');
 const chatAssistant = require('./chat/chatAssistant');
+const workflowBuilder = require('./chat/workflowBuilder');
+
+// Chat prompt builders. These live in public/ChatPrompts/ and were previously
+// imported directly into the renderer. They're loaded here and exposed via
+// the chatPrompts:build IPC channel so NodeChat components don't reach into
+// the public/ tree themselves.
+const CHAT_PROMPT_MODULES = {
+  join: require('./ChatPrompts/Join').join,
+  transfomer: require('./ChatPrompts/Transfomer').transfomer,
+  restApi: require('./ChatPrompts/RestApi'),
+};
+
+ipcMain.handle('chatPrompts:build', async (_event, key, args = []) => {
+  const [moduleName, method] = String(key || '').split('.');
+  const fn = CHAT_PROMPT_MODULES[moduleName]?.[method];
+  if (typeof fn !== 'function') {
+    return { success: false, message: `Unknown chat prompt: ${key}` };
+  }
+  try {
+    return { success: true, prompt: fn(...(Array.isArray(args) ? args : [args])) };
+  } catch (err) {
+    return { success: false, message: err?.message || String(err) };
+  }
+});
 
 // Ensure the same userData directory is used in both dev and production,
 // so a key saved during development persists when the packaged app is launched.
-app.setName('DagFlux');
+app.setName('Ternlux');
 
 // Single SQLite database path for all local transformations
 let appSqliteDbPath = null;
@@ -105,6 +142,38 @@ function loadApiKeys() {
     console.error('[loadApiKeys]', err);
     return null;
   }
+}
+
+// AI preferences (non-secret) — currently just the user's default provider.
+// Kept in a plain JSON file so the main process can honor the renderer's
+// "Default AI Provider" choice for backend-internal calls (chat, titles,
+// workflow builds) that never pass an explicit provider.
+function getAiPrefsPath() {
+  return path.join(app.getPath('userData'), 'ai-prefs.json');
+}
+
+function loadAiPrefs() {
+  try {
+    const p = getAiPrefsPath();
+    if (!fs.existsSync(p)) return {};
+    return JSON.parse(fs.readFileSync(p, 'utf8')) || {};
+  } catch (err) {
+    console.error('[loadAiPrefs]', err);
+    return {};
+  }
+}
+
+function loadDefaultProvider() {
+  return loadAiPrefs().defaultProvider || null;
+}
+
+// Encrypt and persist the full provider-key map to llm-config.dat.
+function writeApiKeys(allKeys) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('safeStorage is not available on this system');
+  }
+  const encrypted = safeStorage.encryptString(JSON.stringify(allKeys));
+  fs.writeFileSync(getConfigPath(), encrypted.toString('base64'), 'utf8');
 }
 
 /**
@@ -379,15 +448,147 @@ ipcMain.handle('db-credentials:delete', (_event, { connectionId }) => {
 const _dbs = {};
 const VALID_COLLECTIONS = ['workflows', 'connections', 'executions', 'chatSessions'];
 
+// NeDB forbids object KEYS that contain a "." (it reserves the dot for
+// dot-notation queries) and throws "Field names cannot contain a .". Workflow
+// configs legitimately use dotted keys (e.g. join selectedColumns keyed by
+// "dbo.transactions"), so we transparently encode "." → "||" in keys on write
+// and decode "||" → "." on read for the workflows collection only. Values are
+// never touched — only object keys.
+const DOT_TOKEN = '||';
+const _dbWrappers = {};
+
+function encodeDotKeys(value) {
+  if (Array.isArray(value)) return value.map(encodeDotKeys);
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      const nk = k.indexOf('.') !== -1 ? k.split('.').join(DOT_TOKEN) : k;
+      out[nk] = encodeDotKeys(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
+function decodeDotKeys(value) {
+  if (Array.isArray(value)) return value.map(decodeDotKeys);
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      const nk = k.indexOf(DOT_TOKEN) !== -1 ? k.split(DOT_TOKEN).join('.') : k;
+      out[nk] = decodeDotKeys(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
+// Encode a document update so stored keys never contain a ".".
+//  • Full-document replacement → encode the whole document's keys.
+//  • Modifier update ($set/$push/…) → encode the VALUES under each operator
+//    (that's where deep dotted keys live, e.g. $set.nodes[…].config.…), but
+//    leave the operator names and their field-path keys (e.g. "nodes",
+//    "data.config") untouched — NeDB intentionally allows dots in those.
+function encodeUpdate(update) {
+  if (!update || typeof update !== 'object') return update;
+  const hasOperators = Object.keys(update).some((k) => k.startsWith('$'));
+  if (!hasOperators) return encodeDotKeys(update);
+
+  const out = {};
+  for (const [op, fields] of Object.entries(update)) {
+    if (op.startsWith('$') && fields && typeof fields === 'object' && !Array.isArray(fields)) {
+      const encodedFields = {};
+      for (const [fieldPath, val] of Object.entries(fields)) {
+        encodedFields[fieldPath] = encodeDotKeys(val);   // encode the value, keep the field path
+      }
+      out[op] = encodedFields;
+    } else {
+      out[op] = fields;
+    }
+  }
+  // console.log('encodeUpdate: ', out)
+  return out;
+}
+
+// A cursor wrapper that mirrors NeDB's chainable+awaitable cursor but decodes
+// keys in the resolved documents. An optional postProcess runs on the decoded
+// docs (used to re-inline externalized workflow code).
+function wrapDecodingCursor(cursor, postProcess) {
+  const wrapper = {
+    sort(...a) { cursor.sort(...a); return wrapper; },
+    skip(...a) { cursor.skip(...a); return wrapper; },
+    limit(...a) { cursor.limit(...a); return wrapper; },
+    projection(...a) { cursor.projection(...a); return wrapper; },
+    then(onFulfilled, onRejected) {
+      return Promise.resolve(cursor)
+        .then((docs) => decodeDotKeys(docs))
+        .then((docs) => (postProcess ? postProcess(docs) : docs))
+        .then(onFulfilled, onRejected);
+    },
+    catch(onRejected) { return wrapper.then(undefined, onRejected); },
+  };
+  return wrapper;
+}
+
+// Proxy that encodes keys on write and decodes on read. Queries are passed
+// through untouched (workflows are queried by dot-free id/_id/name), so only
+// stored documents carry the encoding. Any method we don't override forwards
+// straight to the raw datastore.
+function wrapKeySafeDb(raw) {
+  // Code in node configs is externalized to files under this dir on write and
+  // re-inlined on read. Computed here (after app-ready, since the wrapper is
+  // created lazily on first getDb('workflows')).
+  const codeBaseDir = path.join(app.getPath('userData'), 'workflow-code');
+  const inline = (docs) => inlineWorkflowCode(docs, codeBaseDir);
+  const overrides = {
+    insertAsync: (doc) => {
+      const wfId = doc && (doc.id || doc._id);
+      const externalized = wfId ? externalizeWorkflowCode(doc, wfId, codeBaseDir) : doc;
+      return raw.insertAsync(encodeDotKeys(externalized)).then(decodeDotKeys).then(inline);
+    },
+    findOneAsync: (...args) => raw.findOneAsync(...args).then(decodeDotKeys).then(inline),
+    findAsync: (...args) => wrapDecodingCursor(raw.findAsync(...args), inline),
+    updateAsync: async (query, update, options = {}) => {
+      let externalized = update;
+      const set = update && update.$set;
+      if (set && (Array.isArray(set.nodes) || Array.isArray(set.executionSteps))) {
+        // Directory naming needs the workflow name; modify updates may omit it,
+        // so fall back to the stored doc's name.
+        let wfName = set.name;
+        if (wfName === undefined) {
+          const existing = await raw.findOneAsync(query);
+          wfName = existing && existing.name;
+        }
+        externalized = externalizeUpdateCode(query, update, codeBaseDir, wfName);
+      }
+      const res = await raw.updateAsync(query, encodeUpdate(externalized), options);
+      if (res && res.affectedDocuments) res.affectedDocuments = inline(decodeDotKeys(res.affectedDocuments));
+      return res;
+    },
+  };
+  return new Proxy(raw, {
+    get(target, prop, receiver) {
+      if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop];
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
 function getDb(collection) {
   if (!VALID_COLLECTIONS.includes(collection)) {
     throw new Error(`Unknown collection: ${collection}`);
   }
   if (!_dbs[collection]) {
     _dbs[collection] = new Datastore({
-      filename: path.join(app.getPath('userData'), `dagflux-${collection}.db`),
+      filename: path.join(app.getPath('userData'), `ternlux-${collection}.db`),
       autoload: true,
     });
+  }
+  // Only workflows need dotted-key encoding; other collections are returned raw.
+  if (collection === 'workflows') {
+    if (!_dbWrappers[collection]) _dbWrappers[collection] = wrapKeySafeDb(_dbs[collection]);
+    return _dbWrappers[collection];
   }
   return _dbs[collection];
 }
@@ -423,6 +624,16 @@ ipcMain.handle('db:update', async (_event, { collection, query = {}, update = {}
 // db:remove — remove matching documents; options: { multi }
 ipcMain.handle('db:remove', async (_event, { collection, query = {}, options = {} }) => {
   const db = getDb(collection);
+  // Clean up externalized code files for deleted workflows. The code folder is
+  // named after the workflow name (falling back to its id), so resolve the
+  // matching docs to compute the same directory name externalize used.
+  if (collection === 'workflows') {
+    const codeBaseDir = path.join(app.getPath('userData'), 'workflow-code');
+    const matches = await db.findAsync(query);
+    for (const m of (Array.isArray(matches) ? matches : [])) {
+      deleteWorkflowCode(workflowDirName(m.name, m.id || m._id), codeBaseDir);
+    }
+  }
   return db.removeAsync(query, options);
 });
 
@@ -1432,7 +1643,7 @@ ipcMain.handle('oauth:start-callback-server', async (_event, { port = 3000 }) =>
               <head><title>Authorization Successful</title></head>
               <body style="font-family: sans-serif; text-align: center; padding: 50px;">
                 <h1>Authorization Successful!</h1>
-                <p>You can close this window and return to DagFlux.</p>
+                <p>You can close this window and return to Ternlux.</p>
                 <script>window.close();</script>
               </body>
             </html>
@@ -1516,6 +1727,210 @@ ipcMain.handle('oauth:cancel-server', async (_event, { port = 3000 }) => {
     return { success: false, message: error.message };
   }
 });
+
+/**
+ * auth:google-login — run Google's OAuth loopback flow for desktop apps.
+ * Opens the system browser, captures the authorization code on a temporary
+ * 127.0.0.1 server, and returns { success, code, redirectUri, codeVerifier }
+ * for the renderer to exchange via the backend (/api/auth/google).
+ */
+ipcMain.handle('auth:google-login', async () => {
+  const http = require('http');
+  const crypto = require('crypto');
+
+  try {
+    // The backend owns the OAuth client configuration.
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
+    let config;
+    try {
+      ({ data: config } = await axios.get(`${backendUrl}/api/auth/google/config`));
+    } catch (err) {
+      const serverMessage = err.response?.data?.error;
+      console.error('Google login config error:', serverMessage || err.message);
+      return { success: false, message: serverMessage || 'Could not reach the Ternlux server for Google sign-in.' };
+    }
+    if (!config?.clientId) {
+      return { success: false, message: 'Google sign-in is not configured on the server.' };
+    }
+
+    // PKCE pair — the verifier goes to the backend for the token exchange.
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const state = crypto.randomBytes(16).toString('hex');
+
+    return await new Promise((resolve) => {
+      const server = http.createServer();
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        server.close();
+        resolve(result);
+      };
+
+      // Give up if the user abandons the browser flow.
+      const timeout = setTimeout(() => {
+        finish({ success: false, message: 'Google sign-in timed out. Please try again.' });
+      }, 5 * 60 * 1000);
+
+      server.on('request', (req, res) => {
+        const url = new URL(req.url, 'http://127.0.0.1');
+        if (url.pathname !== '/callback') {
+          res.writeHead(404).end();
+          return;
+        }
+
+        const respond = (title, body) => {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(`<html><body style="font-family: sans-serif; text-align: center; padding-top: 80px;">
+            <h2>${title}</h2><p>${body}</p></body></html>`);
+        };
+
+        const error = url.searchParams.get('error');
+        const code = url.searchParams.get('code');
+        const returnedState = url.searchParams.get('state');
+
+        if (error || !code) {
+          respond('Sign-in cancelled', 'You can close this window and return to Ternlux.');
+          finish({ success: false, message: error === 'access_denied' ? 'Google sign-in was cancelled.' : `Google sign-in failed: ${error || 'no code returned'}` });
+          return;
+        }
+        if (returnedState !== state) {
+          respond('Sign-in failed', 'Security check failed. Close this window and try again.');
+          finish({ success: false, message: 'OAuth state mismatch.' });
+          return;
+        }
+
+        respond('Signed in with Google', 'You can close this window and return to Ternlux.');
+        finish({
+          success: true,
+          code,
+          redirectUri: `http://127.0.0.1:${server.address().port}/callback`,
+          codeVerifier
+        });
+      });
+
+      server.on('error', (err) => finish({ success: false, message: `Could not start sign-in listener: ${err.message}` }));
+
+      server.listen(0, '127.0.0.1', () => {
+        const redirectUri = `http://127.0.0.1:${server.address().port}/callback`;
+        const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+          client_id: config.clientId,
+          redirect_uri: redirectUri,
+          response_type: 'code',
+          scope: 'openid email profile',
+          code_challenge: codeChallenge,
+          code_challenge_method: 'S256',
+          state,
+          prompt: 'select_account'
+        }).toString();
+        shell.openExternal(authUrl);
+      });
+    });
+  } catch (err) {
+    console.error('Google login error:', err);
+    return { success: false, message: err.message || 'Google sign-in failed.' };
+  }
+});
+
+/**
+ * auth:apple-login — run Apple's Sign In flow for desktop apps.
+ * Apple forbids loopback redirect URIs, so the backend brokers the OAuth
+ * exchange: we open the browser at the backend's /apple/start, Apple posts
+ * back to the backend's HTTPS callback, and the backend redirects the
+ * browser to our temporary 127.0.0.1 server with a ready-to-use JWT.
+ * Returns { success, token, user } or { success: false, message }.
+ */
+/* Apple sign-in disabled
+ipcMain.handle('auth:apple-login', async () => {
+  const http = require('http');
+  const crypto = require('crypto');
+
+  try {
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
+    try {
+      await axios.get(`${backendUrl}/api/auth/apple/config`);
+    } catch (err) {
+      const serverMessage = err.response?.data?.error;
+      console.error('Apple login config error:', serverMessage || err.message);
+      return { success: false, message: serverMessage || 'Could not reach the Ternlux server for Apple sign-in.' };
+    }
+
+    const state = crypto.randomBytes(16).toString('hex');
+
+    return await new Promise((resolve) => {
+      const server = http.createServer();
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        server.close();
+        resolve(result);
+      };
+
+      const timeout = setTimeout(() => {
+        finish({ success: false, message: 'Apple sign-in timed out. Please try again.' });
+      }, 5 * 60 * 1000);
+
+      server.on('request', (req, res) => {
+        const url = new URL(req.url, 'http://127.0.0.1');
+        if (url.pathname !== '/callback') {
+          res.writeHead(404).end();
+          return;
+        }
+
+        const respond = (title, body) => {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(`<html><body style="font-family: sans-serif; text-align: center; padding-top: 80px;">
+            <h2>${title}</h2><p>${body}</p></body></html>`);
+        };
+
+        const error = url.searchParams.get('error');
+        const payload = url.searchParams.get('payload');
+        const returnedState = url.searchParams.get('state');
+
+        if (returnedState !== state) {
+          respond('Sign-in failed', 'Security check failed. Close this window and try again.');
+          finish({ success: false, message: 'OAuth state mismatch.' });
+          return;
+        }
+        if (error || !payload) {
+          respond('Sign-in cancelled', 'You can close this window and return to Ternlux.');
+          finish({ success: false, message: error || 'Apple sign-in failed.' });
+          return;
+        }
+
+        try {
+          const session = JSON.parse(Buffer.from(payload, 'base64url').toString());
+          if (!session.token) throw new Error('missing token');
+          respond('Signed in with Apple', 'You can close this window and return to Ternlux.');
+          finish({ success: true, token: session.token, user: session.user });
+        } catch (err) {
+          respond('Sign-in failed', 'Invalid response from the server. Close this window and try again.');
+          finish({ success: false, message: 'Invalid sign-in payload from server.' });
+        }
+      });
+
+      server.on('error', (err) => finish({ success: false, message: `Could not start sign-in listener: ${err.message}` }));
+
+      server.listen(0, '127.0.0.1', () => {
+        const startUrl = `${backendUrl}/api/auth/apple/start?` + new URLSearchParams({
+          port: String(server.address().port),
+          state
+        }).toString();
+        shell.openExternal(startUrl);
+      });
+    });
+  } catch (err) {
+    console.error('Apple login error:', err.message);
+    return { success: false, message: err.message || 'Apple sign-in failed.' };
+  }
+});
+*/
 
 /**
  * dbconn:list-plugins — list all available connector plugins
@@ -1704,7 +2119,9 @@ ipcMain.handle('ai:call', async (_event, { prompt, options = {} } = {}) => {
     if (!apiKeys) {
       return { success: false, message: 'No API keys configured. Set one up in settings.' };
     }
-    const text = await aiProviders.callAIWithKeys(prompt, { ...options, apiKeys });
+    // Fall back to the persisted default provider when the renderer didn't send one.
+    const provider = options.provider || loadDefaultProvider() || undefined;
+    const text = await aiProviders.callAIWithKeys(prompt, { ...options, provider, apiKeys });
     return { success: true, text };
   } catch (err) {
     console.error('[ai:call]', err);
@@ -1722,6 +2139,104 @@ ipcMain.handle('ai:listProviders', async () => {
 });
 
 /**
+ * ai:listModels — models a provider currently offers, fetched live via its SDK
+ * using the decrypted key (which never leaves main). Returns
+ * { success, models: [{ value, label }] } or { success: false, error }.
+ */
+ipcMain.handle('ai:listModels', async (_event, { provider } = {}) => {
+  try {
+    if (!provider) return { success: false, error: 'provider is required' };
+    const apiKeys = loadApiKeys() || {};
+    const entry = aiProviders.resolveProviderEntry(provider, apiKeys);
+    if (!entry) return { success: false, error: 'No API key configured for this provider' };
+    const models = await aiProviders.listModels(provider, { apiKey: entry.apiKey, baseURL: entry.baseURL });
+    return { success: true, models };
+  } catch (err) {
+    console.error('[ai:listModels]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+/**
+ * ai:getDefaultProvider — the persisted "Default AI Provider" choice (or null).
+ */
+ipcMain.handle('ai:getDefaultProvider', async () => {
+  return { success: true, provider: loadDefaultProvider() };
+});
+
+/**
+ * ai:getCompatProvider — non-secret config for an OpenAI-compatible provider.
+ * Returns { hasKey, baseURL, model } WITHOUT the API key, so the settings UI can
+ * prefill the URL/model and show that a key exists without ever exposing it.
+ */
+ipcMain.handle('ai:getCompatProvider', async (_event, { provider } = {}) => {
+  try {
+    if (!provider) return { success: false, error: 'provider is required' };
+    const allKeys = loadApiKeys() || {};
+    const stored = allKeys[provider];
+    let meta = { hasKey: false, baseURL: '', model: '' };
+    if (stored) {
+      const entry = typeof stored === 'object' ? stored : { apiKey: stored };
+      meta = {
+        hasKey: !!(entry.apiKey || entry.key),
+        baseURL: entry.baseURL || '',
+        model: entry.model || '',
+      };
+    }
+    return { success: true, meta };
+  } catch (err) {
+    console.error('[ai:getCompatProvider]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+/**
+ * ai:saveCompatProvider — store config for an OpenAI-compatible provider as
+ * { apiKey, baseURL, model }. A blank/omitted apiKey preserves the existing key
+ * (so the user can edit URL/model without re-entering, and the key never needs
+ * to be sent back to the renderer).
+ */
+ipcMain.handle('ai:saveCompatProvider', async (_event, { provider, config = {} } = {}) => {
+  try {
+    if (!provider) return { success: false, error: 'provider is required' };
+    const allKeys = loadApiKeys() || {};
+    const stored = allKeys[provider];
+    const existing = stored && typeof stored === 'object'
+      ? stored
+      : (typeof stored === 'string' ? { apiKey: stored } : {});
+    const newKey = (config.apiKey && String(config.apiKey).length > 0)
+      ? config.apiKey
+      : (existing.apiKey || existing.key || '');
+    allKeys[provider] = {
+      apiKey: newKey,
+      baseURL: config.baseURL || existing.baseURL || '',
+      model: config.model || existing.model || '',
+    };
+    writeApiKeys(allKeys);
+    return { success: true };
+  } catch (err) {
+    console.error('[ai:saveCompatProvider]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+/**
+ * ai:setDefaultProvider — persist the user's default provider so backend-internal
+ * AI calls (chat, titles, workflow builds) use it when no provider is specified.
+ */
+ipcMain.handle('ai:setDefaultProvider', async (_event, { provider } = {}) => {
+  try {
+    const prefs = loadAiPrefs();
+    prefs.defaultProvider = provider || null;
+    fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+    return { success: true };
+  } catch (err) {
+    console.error('[ai:setDefaultProvider]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+/**
  * chat:step — one turn of the agentic chat assistant. The renderer drives
  * the loop: each call performs ONE AI turn, executes whatever tools the
  * model asked for (possibly several in a single turn), and returns the
@@ -1735,6 +2250,9 @@ ipcMain.handle('chat:step', async (_event, {
   scratchpad = [],
   activeContext = null,
   provider = null,
+  agentMode = 'main',
+  workflowSession = null,
+  triggerPlanWorkflowBuild = null,
 } = {}) => {
   try {
     const helpers = await buildSkillHelpers();
@@ -1744,11 +2262,150 @@ ipcMain.handle('chat:step', async (_event, {
       scratchpad,
       activeContext,
       provider,
+      agentMode,
+      workflowSession,
+      triggerPlanWorkflowBuild,
       getDb,
       helpers,
     });
   } catch (err) {
     console.error('[chat:step]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * chat:generateTitle — produce a 3-5 word topic title for a freshly-started
+ * conversation. The renderer calls this once, on the user's first message,
+ * so the chat sidebar shows something more descriptive than a truncated
+ * prefix of the user's text.
+ */
+ipcMain.handle('chat:generateTitle', async (_event, { message, provider = null } = {}) => {
+  try {
+    if (!message || !String(message).trim()) {
+      return { success: false, message: 'message is required' };
+    }
+    const helpers = await buildSkillHelpers();
+    const prompt = `Write a 3-5 word title that summarises the TOPIC of this conversation. ` +
+      `Reply with ONLY the title — no quotes, no trailing punctuation, no prefix like "Title:". ` +
+      `Use title case.\n\nUser's first message: "${String(message).trim()}"`;
+    const raw = await helpers.callAI(prompt, { maxTokens: 30, provider });
+    const cleaned = String(raw || '')
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .replace(/^title:\s*/i, '')
+      .replace(/[.!?]+$/g, '')
+      .split('\n')[0]
+      .trim();
+    return { success: true, title: cleaned || 'New chat' };
+  } catch (err) {
+    console.error('[chat:generateTitle]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * workflow:executeBuild — apply a previously-returned workflow plan directly,
+ * bypassing the chat agent. Wired from the renderer's "Accept plan" button so
+ * the user's click goes straight to workflowBuilder.executeBuild without
+ * round-tripping a "Confirm build" text turn through the AI.
+ */
+ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
+  try {
+    if (!plan || !Array.isArray(plan.steps)) {
+      return { success: false, message: 'plan with steps[] is required' };
+    }
+    const helpers = await buildSkillHelpers();
+    const wfId = plan.workflowId;
+    let workflow = null;
+    if (plan.mode === 'modify' && wfId) {
+      const wfDb = getDb('workflows');
+      workflow = await wfDb.findOneAsync({ $or: [{ id: wfId }, { _id: wfId }] });
+    }
+    // Stream per-step build progress to the renderer that initiated the build
+    // so the chat can show a live build log. Guard the send: the window may be
+    // gone mid-build, and progress must never break the build itself.
+    const onProgress = (evt) => {
+      try {
+        if (!event.sender.isDestroyed()) event.sender.send('workflow:buildProgress', evt);
+      } catch (_) { /* best-effort */ }
+    };
+    const result = await workflowBuilder.executeBuild({ plan, workflow, helpers, getDb, onProgress });
+    return {
+      success: true,
+      workflowId: result.workflowId,
+      workflowName: result.workflowName,
+      workflowDescription: result.workflowDescription || '',
+      mode: plan.mode || 'new',
+      nodeCount: result.nodes.length,
+      edgeCount: result.edges.length,
+      warnings: result.warnings,
+    };
+  } catch (err) {
+    // A builder asking the user for more info isn't really an error — pass
+    // it through as a structured response so the renderer can prompt the
+    // user and retry with plan.clarifications appended.
+    if (err && err.isClarificationNeeded) {
+      return {
+        success: false,
+        needsClarification: true,
+        question: err.question,
+        stepIndex: err.stepIndex,
+        stepType: err.stepType || null,
+        kind: err.context?.kind || null,
+        // Nodes already built this pass — the renderer passes them back so the
+        // resumed build skips them instead of rebuilding from step 0.
+        builtSteps: err.builtSteps || null,
+      };
+    }
+    // Skill subagent required — surface enough state for the renderer to
+    // drive the skill conversation via chat:skillStep until the skill
+    // either returns `execute` (re-run executeBuild with plan.skillResults)
+    // or the user closes out (re-run with plan.skipSkills).
+    if (err && err.isSkillSubagentRequired) {
+      return {
+        success: false,
+        needsSkillSubagent: true,
+        skillId:   err.skillId,
+        nodeId:    err.nodeId,
+        stepIndex: err.stepIndex,
+        stepType:  err.stepType || null,
+        action:    err.action,
+        question:  err.question,
+        directAnswer: err.directAnswer,
+        state:     err.state || {},
+        context:   err.context || {},
+        // See needsClarification above — lets the resumed build skip rebuilt nodes.
+        builtSteps: err.builtSteps || null,
+      };
+    }
+    console.error('[workflow:executeBuild]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * chat:skillStep — one round-trip with a skill subagent. The renderer
+ * calls this for every user reply while a skill subagent is active.
+ * Returns { success, action, question?, directAnswer?, executionParams?,
+ * state, explanation? } where action is one of
+ *   execute | ask_questions | answer_directly | unrelateSkill.
+ */
+ipcMain.handle('chat:skillStep', async (_event, { skillId, userMessage, currentState = {}, context = {} } = {}) => {
+  try {
+    if (!skillId) return { success: false, message: 'skillId is required' };
+    if (!userMessage || !String(userMessage).trim()) {
+      return { success: false, message: 'userMessage is required' };
+    }
+    const helpers = await buildSkillHelpers();
+    const result = await workflowBuilder.runSkillTurn(helpers, skillId, {
+      userRequest:  String(userMessage),
+      currentState,
+      context,
+    });
+    return { success: true, ...result };
+  } catch (err) {
+    console.error('[chat:skillStep]', err);
     return { success: false, message: err.message };
   }
 });
@@ -1775,9 +2432,25 @@ ipcMain.handle('analytics:set-opt-in', async (_event, { optIn } = {}) => {
 
 /**
  * Look up a saved connection by name or id from a connections array.
+ * Accepts either a string (id/name) or a connection-shaped object —
+ * callers like helpers.getTables/runQuery often pass the full connection
+ * object they already hold, and we want that to round-trip cleanly
+ * instead of stringifying to "[object Object]".
  */
 function findConnection(connections, ref) {
   if (!ref) return null;
+  if (typeof ref === 'object') {
+    const id = ref.id || ref._id;
+    if (id) {
+      const byId = connections.find((c) => (c.id || c._id) === id);
+      if (byId) return byId;
+    }
+    if (ref.name) {
+      const byName = connections.find((c) => c.name === ref.name);
+      if (byName) return byName;
+    }
+    return null;
+  }
   return (
     connections.find((c) => (c.id || c._id) === ref) ||
     connections.find((c) => c.name === ref) ||
@@ -1840,11 +2513,42 @@ async function buildSkillHelpers(defaultDbPath = null) {
     return { dbType, dbPath, lib: localLib(dbType) };
   };
 
+  /**
+   * Route a RESOLVED saved-connection record (looked up by name/id) to the
+   * local lib when its dbType is a local builtin (sqlite / nedb / lancedb).
+   *
+   * This is the path the chat assistant and headless workflow builder hit:
+   * they pass a connection id/name (not a bare dbType + dbPath), so
+   * resolveLocal can't catch them. Without this, an imported-file connection
+   * would fall through to pluginManager.getConnector(dbType) — which has no
+   * connector registered for the local stores — and throw "No connector
+   * registered for dbType: sqlite". Imported CSV/Excel files all live in the
+   * shared app SQLite db (fileInfo.filePath === appSqliteDbPath) and own a
+   * specific set of tables (fileInfo.tables); direct .sqlite/.db/.lancedb
+   * files carry their own path.
+   */
+  const resolveLocalConnection = (conn) => {
+    if (!conn || !LOCAL_DB_TYPES.has(conn.dbType)) return null;
+    const dbPath = conn.fileInfo?.filePath
+      || conn.localPath
+      || conn.dbConfig?.dbPath
+      || (conn.dbType === 'sqlite' ? appSqliteDbPath : null);
+    if (!dbPath) return null;
+    const ownTables = Array.isArray(conn.fileInfo?.tables) && conn.fileInfo.tables.length
+      ? conn.fileInfo.tables.map((t) => (typeof t === 'string' ? t : t?.name)).filter(Boolean)
+      : null;
+    return { dbType: conn.dbType, dbPath, lib: localLib(conn.dbType), ownTables };
+  };
+
   const requireConnection = (ref) => {
     const conn = findConnection(connections, ref);
     if (!conn) {
       const names = connections.map((c) => c.name).join(', ');
-      throw new Error(`Connection not found: ${ref}. Available: ${names || 'none'}`);
+      // Print a readable label whether ref is a string, an object, or null.
+      const label = typeof ref === 'object' && ref
+        ? (ref.name || ref.id || ref._id || JSON.stringify(ref).slice(0, 80))
+        : String(ref);
+      throw new Error(`Connection not found: ${label}. Available: ${names || 'none'}`);
     }
     return conn;
   };
@@ -1871,6 +2575,11 @@ async function buildSkillHelpers(defaultDbPath = null) {
       return local.lib.runQuery({ ...queryObj, dbPath: local.dbPath });
     }
     const conn = requireConnection(connection);
+    const localConn = resolveLocalConnection(conn);
+    if (localConn) {
+      const queryObj = (query && typeof query === 'object') ? query : { query };
+      return localConn.lib.runQuery({ ...queryObj, dbPath: localConn.dbPath });
+    }
     const connector = requireConnector(conn);
     const id = conn.id || conn._id;
     const fullConfig = await getFullConfig(id, conn.dbConfig || {});
@@ -1886,6 +2595,14 @@ async function buildSkillHelpers(defaultDbPath = null) {
     const local = resolveLocal(connection, dbPath);
     if (local) return local.lib.getTables({ dbPath: local.dbPath });
     const conn = requireConnection(connection);
+    const localConn = resolveLocalConnection(conn);
+    if (localConn) {
+      // Imported CSV/Excel files share one app-wide SQLite db; scope the
+      // result to the tables this connection owns so callers don't see
+      // unrelated imports. Direct files (no recorded tables) list all.
+      if (localConn.ownTables) return localConn.ownTables;
+      return localConn.lib.getTables({ dbPath: localConn.dbPath });
+    }
     const connector = requireConnector(conn);
     const id = conn.id || conn._id;
     const fullConfig = await getFullConfig(id, conn.dbConfig || {});
@@ -1897,6 +2614,11 @@ async function buildSkillHelpers(defaultDbPath = null) {
     const local = resolveLocal(connection, dbPath);
     if (local) return local.lib.getColumns({ dbPath: local.dbPath, table });
     const conn = requireConnection(connection);
+    const localConn = resolveLocalConnection(conn);
+    if (localConn) {
+      const t = table || (localConn.ownTables && localConn.ownTables[0]) || null;
+      return localConn.lib.getColumns({ dbPath: localConn.dbPath, table: t });
+    }
     const connector = requireConnector(conn);
     const id = conn.id || conn._id;
     const fullConfig = await getFullConfig(id, conn.dbConfig || {});
@@ -1906,7 +2628,9 @@ async function buildSkillHelpers(defaultDbPath = null) {
 
   /** Call AI from inside a skill or from generated code. Routes through aiProviders. */
   async function callAI(prompt, options = {}) {
-    return aiProviders.callAIWithKeys(prompt, { ...options, apiKeys });
+    // Honor the user's "Default AI Provider" when the caller didn't specify one.
+    const provider = options.provider || loadDefaultProvider() || undefined;
+    return aiProviders.callAIWithKeys(prompt, { ...options, provider, apiKeys });
   }
 
   /** Generate embeddings using the shared vector-embeddings library. */
@@ -1948,7 +2672,17 @@ async function buildSkillHelpers(defaultDbPath = null) {
     appSqliteDbPath,
     sqlitePool,
     pluginManager,
-    getFullConfig
+    getFullConfig,
+    // Start-node trigger registration, bound to executeWorkflowFromTrigger so
+    // the headless workflow builder can register a CRON job / file watcher the
+    // same way StartNodeChat.handleSave does in the renderer. Mirrors the
+    // start-trigger:* IPC handlers.
+    startTriggers: {
+      registerCron:        (params) => registerCronJob(params, executeWorkflowFromTrigger),
+      unregisterCron:      (params) => unregisterCronJob(params),
+      registerFileWatch:   (params) => registerFileWatcher(params, executeWorkflowFromTrigger),
+      unregisterFileWatch: (params) => unregisterFileWatcher(params),
+    },
   };
 }
 
@@ -2268,7 +3002,7 @@ ipcMain.handle('cloud-storage:get-picker-credentials', async (_event, { connecti
 // Import file from cloud storage to local SQLite/NeDB
 ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fileType, sheetName, sheets = [], containerName, connectionName }) => {
   try {
-    const tmpDir = path.join(app.getPath('temp'), 'dagflux-cloud-imports');
+    const tmpDir = path.join(app.getPath('temp'), 'ternlux-cloud-imports');
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true });
     }
@@ -2705,7 +3439,7 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
 
 
     const notificationOptions = {
-      title: 'DagFlux',
+      title: 'Ternlux',
       body: `Workflow "${workflow.name}" is now running...`,
     };
 
@@ -2842,7 +3576,7 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
 
         if (Notification.isSupported()) {
           new Notification({
-            title: 'DagFlux - Workflow Failed',
+            title: 'Ternlux - Workflow Failed',
             body: `Workflow "${workflow.name}" failed: ${error.message}`,
           }).show();
         }
@@ -2880,7 +3614,7 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
 
     if (Notification.isSupported()) {
       new Notification({
-        title: 'DagFlux - Workflow Completed',
+        title: 'Ternlux - Workflow Completed',
         body: `Workflow "${workflow.name}" executed successfully!`,
       }).show();
     }
@@ -2916,7 +3650,7 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
 
     if (Notification.isSupported()) {
       new Notification({
-        title: 'DagFlux - Workflow Error',
+        title: 'Ternlux - Workflow Error',
         body: `Workflow "${workflowName}" encountered an error: ${error.message}`,
       }).show();
     }
@@ -2977,6 +3711,39 @@ ipcMain.handle('start-trigger:get-active', async () => {
   }
 });
 
+/**
+ * Watch the open workflow's externalized-code folder and notify the renderer
+ * when a code file changes on disk, so the editor can reload and stay in sync
+ * with {userData}/workflow-code/{workflow}. Editor sync only — does not run the
+ * workflow (see triggers/fileWatchTriggers.js for the execution trigger).
+ */
+ipcMain.handle('workflow:watchCode', async (event, { workflowId } = {}) => {
+  if (!workflowId) return { success: false, message: 'workflowId required' };
+  try {
+    const db = getDb('workflows');
+    const doc = await db.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+    if (!doc) return { success: false, message: 'Workflow not found' };
+
+    const codeBaseDir = path.join(app.getPath('userData'), 'workflow-code');
+    const workflowDir = workflowDirName(doc.name, doc.id || doc._id);
+    const watchPath = path.join(codeBaseDir, String(workflowDir));
+
+    const sender = event.sender;
+    return watchWorkflowCode(
+      { webContentsId: sender.id, workflowId, watchPath },
+      (payload) => { if (!sender.isDestroyed()) sender.send('workflow:codeChanged', payload); },
+    );
+  } catch (error) {
+    console.error('[CodeWatch] watchCode error:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+/** Stop watching a workflow's code folder for the calling renderer. */
+ipcMain.handle('workflow:unwatchCode', async (event, { workflowId } = {}) => {
+  return unwatchWorkflowCode({ webContentsId: event.sender.id, workflowId });
+});
+
 // ---------------------------------------------------------------------------
 // Window creation
 // ---------------------------------------------------------------------------
@@ -2993,7 +3760,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
     },
     titleBarStyle: 'default',
-    title: 'DagFlux',
+    title: 'Ternlux',
     show: false,
   });
 
@@ -3012,6 +3779,57 @@ function createWindow() {
     shell.openExternal(url);
     return { action: 'deny' };
   });
+
+  // Tear down any editor code watchers this window registered.
+  win.webContents.on('destroyed', () => {
+    unwatchAllForWebContents(win.webContents.id).catch((err) =>
+      console.error('[CodeWatch] cleanup on window close failed:', err));
+  });
+}
+
+// ─── Auto-updates ────────────────────────────────────────────────────────────
+// Checks the GitHub Releases feed (build.publish in package.json), downloads
+// updates in the background, and installs on quit. Dormant in dev and until
+// a release actually exists — failed checks are logged, never surfaced.
+
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+
+function setupAutoUpdates() {
+  if (!app.isPackaged) return;
+
+  let autoUpdater;
+  try {
+    ({ autoUpdater } = require('electron-updater'));
+  } catch (err) {
+    console.warn('[updater] electron-updater unavailable:', err.message);
+    return;
+  }
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('error', (err) => {
+    console.log('[updater] update check failed:', err?.message || err);
+  });
+
+  autoUpdater.on('update-downloaded', async (info) => {
+    const { response } = await dialog.showMessageBox({
+      type: 'info',
+      buttons: ['Restart Now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Update ready',
+      message: `Ternlux ${info.version} has been downloaded.`,
+      detail: 'Restart now to apply the update, or keep working — it will install automatically when you quit.'
+    });
+    if (response === 0) autoUpdater.quitAndInstall(false, true);
+  });
+
+  const check = () => autoUpdater.checkForUpdates().catch((err) => {
+    console.log('[updater] update check failed:', err?.message || err);
+  });
+  check();
+  setInterval(check, UPDATE_CHECK_INTERVAL_MS);
 }
 
 app.whenReady().then(async () => {
@@ -3030,6 +3848,8 @@ app.whenReady().then(async () => {
   await registerAllWorkflowTriggers(getDb, executeWorkflowFromTrigger);
 
   createWindow();
+
+  setupAutoUpdates();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -3051,6 +3871,10 @@ app.on('before-quit', async (event) => {
   // Stop all file watchers
   console.log('[Electron] Stopping all file watchers...');
   await stopAllFileWatchers();
+
+  // Stop all editor code watchers
+  console.log('[Electron] Stopping all code watchers...');
+  await stopAllCodeWatchers();
 
   // Close SQLite connection pool
   if (sqlitePool) {
