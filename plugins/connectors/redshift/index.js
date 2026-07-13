@@ -1,5 +1,5 @@
 /**
- * Amazon Redshift Connector Plugin for DagFlux
+ * Amazon Redshift Connector Plugin for Ternlux
  * Handles all Redshift database operations
  */
 
