@@ -1,5 +1,5 @@
 /**
- * SharePoint Storage Connector Plugin for DagFlux
+ * SharePoint Storage Connector Plugin for Ternlux
  * Handles all SharePoint storage operations via Microsoft Graph API
  */
 
