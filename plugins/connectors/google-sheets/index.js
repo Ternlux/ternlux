@@ -1,5 +1,5 @@
 /**
- * Google Sheets Connector Plugin for DagFlux
+ * Google Sheets Connector Plugin for Ternlux
  * OAuth2.0-based authentication for accessing Google Sheets
  */
 
