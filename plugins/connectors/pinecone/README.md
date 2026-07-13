@@ -1,4 +1,4 @@
-# Pinecone Connector for DagFlux
+# Pinecone Connector for Ternlux
 
 Vector database connector for Pinecone.io
 

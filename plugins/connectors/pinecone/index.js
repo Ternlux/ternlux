@@ -1,5 +1,5 @@
 /**
- * Pinecone.io Connector Plugin for DagFlux
+ * Pinecone.io Connector Plugin for Ternlux
  * Vector database connector
  * Requires vector-db-executor skill to be installed
  */
