@@ -1,5 +1,5 @@
 /**
- * MySQL Connector Plugin for DagFlux
+ * MySQL Connector Plugin for Ternlux
  * Handles all MySQL database operations
  */
 
