@@ -1,5 +1,5 @@
 /**
- * PostgreSQL Connector Plugin for DagFlux
+ * PostgreSQL Connector Plugin for Ternlux
  * Handles all PostgreSQL database operations
  */
 

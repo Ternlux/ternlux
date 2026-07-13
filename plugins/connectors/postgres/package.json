@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-postgres",
+  "name": "@ternlux/connector-postgres",
   "version": "1.0.0",
-  "description": "PostgreSQL database connector for DagFlux",
+  "description": "PostgreSQL database connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "postgres",
     "displayName": "PostgreSQL",
@@ -14,6 +14,6 @@
     "pg": "^8.7.1",
     "pg-cursor": "^2.10.3"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }
