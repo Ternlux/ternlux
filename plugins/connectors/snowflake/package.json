@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-snowflake",
+  "name": "@ternlux/connector-snowflake",
   "version": "1.0.0",
-  "description": "Snowflake database connector for DagFlux",
+  "description": "Snowflake database connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "snowflake",
     "displayName": "Snowflake",
@@ -13,6 +13,6 @@
   "dependencies": {
     "snowflake-sdk": "^1.9.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }
