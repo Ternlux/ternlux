@@ -1,5 +1,5 @@
 /**
- * Microsoft SQL Server Connector Plugin for DagFlux
+ * Microsoft SQL Server Connector Plugin for Ternlux
  * Handles all SQL Server database operations
  */
 
@@ -39,6 +39,30 @@ async function getPool(config, connectionId) {
   }
 
   return connectionPools.get(key);
+}
+
+/**
+ * Quote a SQL Server identifier (table / schema name).
+ *
+ * A dotted name passed as a single string ("dbo.test_values") with no explicit
+ * schema is treated as a multi-part schema.table name and EACH part is bracketed
+ * → [dbo].[test_values]. The previous behaviour wrapped the whole string in one
+ * bracket pair → [dbo.test_values], i.e. a table whose name literally contains a
+ * dot — which then mismatched the unbracketed `INSERT INTO dbo.test_values`
+ * (parsed by SQL Server as schema dbo / table test_values) and surfaced as
+ * "Invalid object name 'dbo.test_values'".
+ */
+function quoteSqlServerIdentifier(identifier, schema = null) {
+  if (!identifier) return identifier;
+  if (typeof identifier === 'string' && identifier.startsWith('[')) return identifier;
+
+  if (schema) {
+    return `[${schema}].[${identifier}]`;
+  }
+  if (typeof identifier === 'string' && identifier.includes('.')) {
+    return identifier.split('.').map((part) => `[${part}]`).join('.');
+  }
+  return `[${identifier}]`;
 }
 
 module.exports = {
@@ -264,7 +288,7 @@ module.exports = {
           return `(${values.join(', ')})`;
         });
 
-        const insertSql = `INSERT INTO ${tableName} (${quotedColumns.join(', ')}) VALUES ${valueRows.join(', ')}`;
+        const insertSql = `INSERT INTO ${quoteSqlServerIdentifier(tableName)} (${quotedColumns.join(', ')}) VALUES ${valueRows.join(', ')}`;
         // console.log('insertSql: ', insertSql)
 
         await transaction.request().query(insertSql);
@@ -526,18 +550,8 @@ module.exports = {
    * @param {object} config - Database configuration (not used for SQL Server)
    * @returns {string} Properly quoted identifier
    */
-  quoteIdentifier: (identifier, schema = null, config = null) => {
-    if (!identifier) return identifier;
-    if (identifier.startsWith("[")) return identifier;
-
-    const quotedIdentifier = `[${identifier}]`;
-
-    if (schema) {
-      return `[${schema}].${quotedIdentifier}`;
-    }
-
-    return quotedIdentifier;
-  },
+  quoteIdentifier: (identifier, schema = null, config = null) =>
+    quoteSqlServerIdentifier(identifier, schema),
 
   /**
    * Generate preview SQL query with database-specific syntax
