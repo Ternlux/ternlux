@@ -1,6 +1,6 @@
 # Slack Connector Plugin
 
-This plugin enables DagFlux to connect to Slack workspaces, allowing you to:
+This plugin enables Ternlux to connect to Slack workspaces, allowing you to:
 - **Read messages** from channels, direct messages, and threads (Data Source)
 - **Send messages** to channels and users (Output)
 
@@ -11,7 +11,7 @@ This plugin enables DagFlux to connect to Slack workspaces, allowing you to:
 1. Go to [Slack API Apps](https://api.slack.com/apps)
 2. Click **Create New App**
 3. Choose **From scratch**
-4. Enter an app name (e.g., "DagFlux Integration")
+4. Enter an app name (e.g., "Ternlux Integration")
 5. Select your workspace
 
 ### 2. Configure OAuth & Permissions
@@ -43,15 +43,15 @@ This plugin enables DagFlux to connect to Slack workspaces, allowing you to:
 2. Click **Install to Workspace**
 3. Authorize the app
 
-### 5. Configure in DagFlux
+### 5. Configure in Ternlux
 
-1. In DagFlux, go to **Connections** tab
+1. In Ternlux, go to **Connections** tab
 2. Click **New Connection**
 3. Select **Slack**
 4. Enter your **Client ID** and **Client Secret**
 5. Click **Authorize** to connect
 6. You'll be redirected to Slack to authorize the app
-7. After authorization, you'll be redirected back to DagFlux
+7. After authorization, you'll be redirected back to Ternlux
 
 ## Usage
 
@@ -85,7 +85,7 @@ Message format examples:
 ```json
 // Single message
 {
-  "text": "Hello from DagFlux!",
+  "text": "Hello from Ternlux!",
   "thread_ts": "1234567890.123456"  // Optional: reply in thread
 }
 

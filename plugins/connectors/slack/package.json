@@ -1,17 +1,17 @@
 {
-  "name": "@dagflux/connector-slack",
+  "name": "@ternlux/connector-slack",
   "version": "1.0.0",
-  "description": "Slack connector plugin for DagFlux - read messages and send messages to Slack channels",
+  "description": "Slack connector plugin for Ternlux - read messages and send messages to Slack channels",
   "main": "index.js",
   "keywords": [
-    "dagflux",
+    "ternlux",
     "plugin",
     "connector",
     "slack",
     "api",
     "messaging"
   ],
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.0"
