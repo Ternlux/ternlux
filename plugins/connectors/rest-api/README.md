@@ -1,6 +1,6 @@
 # REST API Connector
 
-A generic HTTP connector for DagFlux. One connection carries the base URL and
+A generic HTTP connector for Ternlux. One connection carries the base URL and
 auth credentials; the request itself (method, endpoint path, headers, body,
 response shape) is authored per-usage on the DataSource node via natural
 language.

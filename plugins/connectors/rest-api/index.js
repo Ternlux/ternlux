@@ -1,5 +1,5 @@
 /**
- * REST API Connector Plugin for DagFlux
+ * REST API Connector Plugin for Ternlux
  *
  * Two-stage design:
  *   - This plugin carries only the connection-level auth (baseUrl + credentials).
@@ -242,7 +242,7 @@ module.exports = {
     displayName: 'REST API',
     description: 'Generic HTTP endpoint connector. Auth stays here; requests are authored on the DataSource node.',
     version: '1.0.0',
-    author: 'DagFlux',
+    author: 'Ternlux',
     capabilities: ['read'],
     documentationUrl: '',
   },

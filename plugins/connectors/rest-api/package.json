@@ -1,17 +1,17 @@
 {
-  "name": "@dagflux/connector-rest-api",
+  "name": "@ternlux/connector-rest-api",
   "version": "1.0.0",
-  "description": "Generic REST API connector for DagFlux — auth lives here, per-endpoint fetch logic is authored on the DataSource node.",
+  "description": "Generic REST API connector for Ternlux — auth lives here, per-endpoint fetch logic is authored on the DataSource node.",
   "main": "index.js",
   "keywords": [
-    "dagflux",
+    "ternlux",
     "plugin",
     "connector",
     "rest",
     "api",
     "http"
   ],
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.0"
