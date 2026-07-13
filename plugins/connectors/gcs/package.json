@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-gcs",
+  "name": "@ternlux/connector-gcs",
   "version": "1.0.0",
-  "description": "Google Cloud Storage connector for DagFlux",
+  "description": "Google Cloud Storage connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "gcs",
     "displayName": "Google Cloud Storage",
@@ -13,6 +13,6 @@
   "dependencies": {
     "@google-cloud/storage": "^7.0.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }

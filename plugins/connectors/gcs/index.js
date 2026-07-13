@@ -1,5 +1,5 @@
 /**
- * Google Cloud Storage Connector Plugin for DagFlux
+ * Google Cloud Storage Connector Plugin for Ternlux
  * Handles all GCS storage operations
  */
 
