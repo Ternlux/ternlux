@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/skill-javascript-executor",
+  "name": "@ternlux/skill-javascript-executor",
   "version": "1.0.0",
-  "description": "JavaScript executor skill for DagFlux - runs an AI-generated JavaScript function with helpers for connectors, AI calls, embeddings, sqlite/nedb, and HTTP",
+  "description": "JavaScript executor skill for Ternlux - runs an AI-generated JavaScript function with helpers for connectors, AI calls, embeddings, sqlite/nedb, and HTTP",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "skill",
     "id": "javascript-executor",
     "displayName": "JavaScript Executor",
@@ -12,12 +12,12 @@
     "minAppVersion": "1.0.0"
   },
   "keywords": [
-    "dagflux",
+    "ternlux",
     "skill",
     "javascript",
     "transformer"
   ],
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT",
   "dependencies": {
     "@seald-io/nedb": "^4.0.2"

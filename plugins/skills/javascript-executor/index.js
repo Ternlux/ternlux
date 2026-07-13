@@ -1,5 +1,5 @@
 /**
- * JavaScript Executor Skill Plugin for DagFlux
+ * JavaScript Executor Skill Plugin for Ternlux
  *
  * Two-stage flow inside buildSkillPrompt:
  *
@@ -280,8 +280,13 @@ When this skill fits, return:
           recordCount: output.length
         });
       } else {
+        // Honor an explicit destination path when the caller provides one (the
+        // workflow builder records targetLocalPath as
+        // userData/local-collections/<targetCollection>.db so downstream nodes
+        // and previews can locate the output). Fall back to a nodeId-derived
+        // file for ad-hoc runs that don't specify a path.
         const outDir = path.join(app.getPath('userData'), 'local-collections');
-        localPath = path.join(outDir, `${targetTableName}.db`);
+        localPath = targetLocalPath || path.join(outDir, `${targetTableName}.db`);
         await helpers.runQuery(
           'nedb',
           { operation: 'insert', mode: 'replace', docs: output },
@@ -319,7 +324,7 @@ When this skill fits, return:
     displayName: 'JavaScript Executor',
     description: 'Run an AI-generated JavaScript function with helpers for connectors, AI, embeddings, and HTTP',
     version: '1.0.0',
-    author: 'DagFlux'
+    author: 'Ternlux'
   }
 };
 
@@ -399,7 +404,7 @@ function buildPlanningPrompt({ userRequest, sourceConnection, sourceTableSchema,
         .join('\n')
     : '(no other connections configured)';
 
-  return `You are PLANNING a JavaScript-based transformation in DagFlux.
+  return `You are PLANNING a JavaScript-based transformation in Ternlux.
 
 User's request: "${userRequest}"
 
@@ -515,7 +520,7 @@ function buildFunctionPrompt({ userRequest, plan, schemaContext, sourceConnectio
   const outputIsLocal = outputType === 'nedb' || outputType === 'lancedb';
   const includeLocalNote = sourceIsLocal || outputIsLocal;
 
-  return `You are writing a JavaScript transformation function for DagFlux.
+  return `You are writing a JavaScript transformation function for Ternlux.
 
 User's request: "${userRequest}"
 
@@ -640,15 +645,49 @@ async function loadSourceRecords({ sourceConnection, sourceTableSchema, helpers 
   const tableName = isNoSQL
     ? (sourceTableSchema.originalTableName || sourceTableSchema.tableName)
     : sourceTableSchema.tableName;
-  return helpers.runQuery(sourceConnection.name || sourceConnection.id, {
-    query: `SELECT * FROM ${sourceTableSchema.tableName}`,
-    tableName,
-    schema: sourceTableSchema.schema || sourceConnection.dbConfig?.schema,
-    collection: tableName,
-    filter: {},
-    sheetName: sourceTableSchema.sheetName,
-    limit: 1000000
-  });
+
+  // NoSQL connectors (MongoDB) expect a structured { collection, filter, limit }
+  // query and JSON.parse any `query` string they receive — so never hand them a
+  // SQL string. SQL connectors get the SELECT form.
+  const queryObj = isNoSQL
+    ? {
+        collection: tableName,
+        filter: {},
+        limit: 1000000
+      }
+    : {
+        query: `SELECT * FROM ${sourceTableSchema.tableName}`,
+        tableName,
+        schema: sourceTableSchema.schema || sourceConnection.dbConfig?.schema,
+        sheetName: sourceTableSchema.sheetName,
+        limit: 1000000
+      };
+  return helpers.runQuery(sourceConnection.name || sourceConnection.id, queryObj);
+}
+
+/**
+ * Compile and run a transform(records, ctx) function INLINE and return its
+ * output array — WITHOUT loading source records or persisting to NeDB/LanceDB.
+ * Mirrors the compile/run half of `execute`, but is meant for callers (e.g.
+ * the chat assistant's run_javascript tool) that just want the computed result
+ * data back so they can answer or visualise it. Caller supplies `records`.
+ */
+async function runTransformFunction({ transformFunction, records = [], helpers }) {
+  if (!helpers) throw new Error('helpers bundle is required');
+  if (!transformFunction) throw new Error('transformFunction is required');
+
+  let fn;
+  try {
+    // eslint-disable-next-line no-eval
+    fn = eval(`(${transformFunction})`);
+  } catch (err) {
+    throw new Error(`Failed to compile transform function: ${err.message}`);
+  }
+  if (typeof fn !== 'function') throw new Error('Compiled transform is not a function');
+
+  const ctx = buildContext(helpers);
+  const result = await fn(Array.isArray(records) ? records : [], ctx);
+  return Array.isArray(result) ? result : [result];
 }
 
 function buildConfig({
@@ -704,3 +743,11 @@ function buildConfig({
     needsSchemaLoad: true
   };
 }
+
+// Expose the stage-2 prompt builder, the source loader, and the inline runner
+// so other callers (notably public/chat/chatAssistant.js's run_javascript
+// tool) can drive the same "build function prompt → callAI → execute" flow
+// without going through the full buildSkillPrompt two-stage planner.
+module.exports.buildFunctionPrompt   = buildFunctionPrompt;
+module.exports.loadSourceRecords     = loadSourceRecords;
+module.exports.runTransformFunction  = runTransformFunction;
