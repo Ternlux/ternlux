@@ -11,6 +11,26 @@ import { hasApiKeyForProvider, getConfiguredProviderName } from './apiKeyStorage
 
 const PROVIDER_SETTINGS_KEY = 'ai-provider-settings';
 
+// OpenAI-compatible providers reachable via the OpenAI SDK + a custom baseURL.
+// Mirrors OPENAI_COMPAT_PROVIDERS in public/aiProviders.js. The base URL and
+// model for these live in the encrypted key entry (set in provider settings),
+// so the renderer only needs to forward the provider id — the main process
+// resolves the rest. `null` baseURL means the user supplies it (custom).
+export const OPENAI_COMPAT_PROVIDERS = {
+  openrouter: { name: 'OpenRouter', baseURL: 'https://openrouter.ai/api/v1', requiresKey: true, color: '#6566F1', placeholderModel: 'openai/gpt-4o-mini', docsUrl: 'https://openrouter.ai/keys' },
+  groq:       { name: 'Groq',       baseURL: 'https://api.groq.com/openai/v1', requiresKey: true, color: '#F55036', placeholderModel: 'llama-3.3-70b-versatile', docsUrl: 'https://console.groq.com/keys' },
+  together:   { name: 'Together AI', baseURL: 'https://api.together.xyz/v1', requiresKey: true, color: '#0F6FFF', placeholderModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', docsUrl: 'https://api.together.xyz/settings/api-keys' },
+  mistral:    { name: 'Mistral AI', baseURL: 'https://api.mistral.ai/v1', requiresKey: true, color: '#FA520F', placeholderModel: 'mistral-large-latest', docsUrl: 'https://console.mistral.ai/api-keys' },
+  nvidia:     { name: 'NVIDIA AI', baseURL: 'https://integrate.api.nvidia.com/v1', requiresKey: true, color: '#76B900', placeholderModel: 'meta/llama-3.1-70b-instruct', docsUrl: 'https://build.nvidia.com/' },
+  ollama:     { name: 'Ollama',     baseURL: 'http://localhost:11434/v1', requiresKey: false, color: '#000000', placeholderModel: 'llama3.1', docsUrl: 'https://ollama.com/download' },
+  lmstudio:   { name: 'LM Studio',  baseURL: 'http://localhost:1234/v1', requiresKey: false, color: '#4B5563', placeholderModel: 'local-model', docsUrl: 'https://lmstudio.ai/docs/local-server' },
+  custom:     { name: 'Custom (OpenAI-compatible)', baseURL: '', requiresKey: false, color: '#8C8C8C', placeholderModel: '', docsUrl: '' }
+};
+
+export function isOpenAICompatProvider(provider) {
+  return !!provider && Object.prototype.hasOwnProperty.call(OPENAI_COMPAT_PROVIDERS, String(provider).toLowerCase());
+}
+
 function readSavedSettings() {
   try {
     const raw = localStorage.getItem(PROVIDER_SETTINGS_KEY);
@@ -36,9 +56,16 @@ function readSavedSettings() {
  */
 export async function callAI(prompt, options = {}) {
   const saved = readSavedSettings() || {};
+  // The user-chosen default provider wins over the last-configured one.
+  const provider = options.provider || saved.defaultProvider || saved.provider;
   const merged = {
-    provider: options.provider || saved.provider,
-    model: options.model || saved.model,
+    provider,
+    // saved.model belongs to saved.provider; for any other provider let the
+    // main process fall back to that provider's default model. For OpenAI-
+    // compatible providers the model + baseURL live in the encrypted key entry,
+    // so the main process resolves them — we only forward an explicit override.
+    model: options.model || (provider === saved.provider ? saved.model : undefined),
+    ...(options.baseURL ? { baseURL: options.baseURL } : {}),
     maxTokens: options.maxTokens || saved.maxTokens || 2048,
     systemPrompt: options.systemPrompt || null,
     chatHistory: options.chatHistory || []
@@ -83,5 +110,7 @@ export default {
   callAI,
   getConfiguredProvider,
   isProviderConfigured,
-  getSupportedProviders
+  getSupportedProviders,
+  OPENAI_COMPAT_PROVIDERS,
+  isOpenAICompatProvider
 };
