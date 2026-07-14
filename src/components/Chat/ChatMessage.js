@@ -12,7 +12,9 @@ import {
 import {
     SmartToy as BotIcon,
     Code as CodeIcon,
-    OpenInFull as OpenInFullIcon
+    OpenInFull as OpenInFullIcon,
+    ContentCopy as ContentCopyIcon,
+    Check as CheckIcon
 } from '@mui/icons-material';
 import Editor from '@monaco-editor/react';
 import DataVisualization from './DataVisualization';
@@ -20,48 +22,203 @@ import MultiStepProgress from './MultiStepProgress';
 import StepResultHeader from './StepResultHeader';
 import CodeEditorPopup from './CodeEditorPopup';
 
-// Helper function to parse markdown bold syntax and newlines into React elements
-const parseMarkdownBold = (text) => {
-    if (!text) return text;
+const MONO_FONT = "'JetBrains Mono', monospace";
 
-    const lines = text.split('\n');
+// ── Lightweight markdown rendering for AI chat responses ──
+// Handles fenced code blocks (```lang ... ```), #/##/### headers (rendered as
+// bold), **bold**, and inline `code`. Anything else is rendered as plain text
+// with line breaks preserved.
 
-    const processLine = (line, lineIndex) => {
-        const parts = [];
-        let lastIndex = 0;
-        const boldRegex = /\*\*(.*?)\*\*/g;
-        let match;
+// Parse inline markup within a single line: **bold** and `inline code`.
+const parseInline = (text, keyPrefix) => {
+    if (!text) return [text];
+    const nodes = [];
+    const regex = /\*\*(.+?)\*\*|`([^`]+?)`/g;
+    let lastIndex = 0;
+    let match;
+    let i = 0;
 
-        while ((match = boldRegex.exec(line)) !== null) {
-            if (match.index > lastIndex) {
-                parts.push(line.substring(lastIndex, match.index));
-            }
-            parts.push(
-                <strong key={`${lineIndex}-${match.index}`} style={{ fontWeight: 700 }}>
+    while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            nodes.push(text.slice(lastIndex, match.index));
+        }
+        if (match[1] !== undefined) {
+            nodes.push(
+                <strong key={`${keyPrefix}-b-${i}`} style={{ fontWeight: 700 }}>
                     {match[1]}
                 </strong>
             );
-            lastIndex = match.index + match[0].length;
+        } else if (match[2] !== undefined) {
+            nodes.push(
+                <Box
+                    component="code"
+                    key={`${keyPrefix}-c-${i}`}
+                    sx={{
+                        fontFamily: MONO_FONT,
+                        fontSize: '0.92em',
+                        bgcolor: 'rgba(0,0,0,0.06)',
+                        px: 0.5,
+                        py: '1px',
+                        borderRadius: 0.5,
+                        wordBreak: 'break-word',
+                    }}
+                >
+                    {match[2]}
+                </Box>
+            );
         }
+        lastIndex = regex.lastIndex;
+        i++;
+    }
+    if (lastIndex < text.length) {
+        nodes.push(text.slice(lastIndex));
+    }
+    return nodes.length > 0 ? nodes : [text];
+};
 
-        if (lastIndex < line.length) {
-            parts.push(line.substring(lastIndex));
+// Styled, copy-able code block for fenced sections.
+const CodeBlock = ({ code, language }) => {
+    const [copied, setCopied] = useState(false);
+
+    const handleCopy = async () => {
+        try {
+            await navigator.clipboard.writeText(code);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+        } catch (e) {
+            // Clipboard unavailable — silently ignore
         }
-
-        return parts.length > 0 ? parts : line;
     };
 
-    const result = [];
-    lines.forEach((line, index) => {
-        if (index > 0) {
-            result.push(<br key={`br-${index}`} />);
+    return (
+        <Box
+            sx={{
+                my: 1,
+                borderRadius: 1,
+                overflow: 'hidden',
+                border: '1px solid #e2e6eb',
+                bgcolor: '#f7f9fc',
+            }}
+        >
+            <Box
+                sx={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    px: 1,
+                    py: 0.25,
+                    bgcolor: '#eef1f6',
+                    borderBottom: '1px solid #e2e6eb',
+                }}
+            >
+                <Typography
+                    component="span"
+                    sx={{
+                        fontFamily: MONO_FONT,
+                        fontSize: 9.5,
+                        color: '#5a6678',
+                        textTransform: 'uppercase',
+                        letterSpacing: 0.6,
+                    }}
+                >
+                    {language || 'code'}
+                </Typography>
+                <Tooltip title={copied ? 'Copied' : 'Copy'}>
+                    <IconButton
+                        size="small"
+                        onClick={handleCopy}
+                        sx={{ p: 0.25, color: '#5a6678', '&:hover': { color: '#111827' } }}
+                    >
+                        {copied
+                            ? <CheckIcon sx={{ fontSize: 13, color: '#2e7d32' }} />
+                            : <ContentCopyIcon sx={{ fontSize: 13 }} />}
+                    </IconButton>
+                </Tooltip>
+            </Box>
+            <Box
+                component="pre"
+                sx={{
+                    m: 0,
+                    p: 1.25,
+                    overflowX: 'auto',
+                    fontFamily: MONO_FONT,
+                    fontSize: 11.5,
+                    lineHeight: 1.6,
+                    color: '#111827',
+                    whiteSpace: 'pre',
+                }}
+            >
+                <code>{code}</code>
+            </Box>
+        </Box>
+    );
+};
+
+// Render a run of non-code text: headers (# ## ###) become bold lines,
+// everything else keeps its line breaks and inline markup.
+const renderTextBlock = (text, keyPrefix) => {
+    const lines = text.split('\n');
+    const out = [];
+
+    lines.forEach((line, idx) => {
+        const headerMatch = line.match(/^\s*(#{1,6})\s+(.*)$/);
+        if (headerMatch) {
+            const level = headerMatch[1].length;
+            out.push(
+                <Box
+                    component="div"
+                    key={`${keyPrefix}-h-${idx}`}
+                    sx={{
+                        fontWeight: 700,
+                        fontSize: level <= 2 ? '1.08em' : '1em',
+                        mt: idx === 0 ? 0 : 1,
+                        mb: 0.25,
+                    }}
+                >
+                    {parseInline(headerMatch[2], `${keyPrefix}-h-${idx}`)}
+                </Box>
+            );
+            return;
         }
-        // Empty lines (from \n\n) already contributed a <br> above — skip rendering content
-        if (line.trim() === '') return;
-        result.push(...(Array.isArray(processLine(line, index)) ? processLine(line, index) : [processLine(line, index)]));
+        out.push(
+            <React.Fragment key={`${keyPrefix}-l-${idx}`}>
+                {parseInline(line, `${keyPrefix}-l-${idx}`)}
+                {idx < lines.length - 1 && <br />}
+            </React.Fragment>
+        );
     });
 
-    return result.length > 0 ? result : text;
+    return <React.Fragment key={keyPrefix}>{out}</React.Fragment>;
+};
+
+// Top-level renderer: splits the message into fenced code blocks and text runs.
+const renderMarkdown = (text) => {
+    if (!text) return text;
+
+    const blocks = [];
+    const fenceRegex = /```(\w*)[ \t]*\r?\n?([\s\S]*?)```/g;
+    let lastIndex = 0;
+    let match;
+    let key = 0;
+
+    while ((match = fenceRegex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            const chunk = text.slice(lastIndex, match.index);
+            if (chunk.trim() !== '') blocks.push(renderTextBlock(chunk, `t-${key}`));
+        }
+        const lang = (match[1] || '').trim();
+        const code = match[2].replace(/\s+$/, '');
+        blocks.push(<CodeBlock key={`code-${key}`} code={code} language={lang} />);
+        lastIndex = fenceRegex.lastIndex;
+        key++;
+    }
+
+    if (lastIndex < text.length) {
+        const chunk = text.slice(lastIndex);
+        if (chunk.trim() !== '') blocks.push(renderTextBlock(chunk, `t-${key}`));
+    }
+
+    return blocks.length > 0 ? blocks : text;
 };
 
 // Helper function to get segmentation image link
@@ -97,7 +254,7 @@ const CodeEditor = ({ code, language = 'sql', height = 300 }) => {
                 defaultLanguage={language}
                 value={code}
                 beforeMount={(monaco) => {
-                    monaco.editor.defineTheme('dagflux-light', {
+                    monaco.editor.defineTheme('ternlux-light', {
                         base: 'vs',
                         inherit: true,
                         rules: [],
@@ -120,7 +277,7 @@ const CodeEditor = ({ code, language = 'sql', height = 300 }) => {
                         },
                     });
                 }}
-                theme="dagflux-light"
+                theme="ternlux-light"
                 options={{
                     readOnly: true,
                     minimap: { enabled: false },
@@ -377,17 +534,17 @@ const ChatMessage = ({
                                 {/* Message text */}
                                 <Box sx={{ flex: 1 }}>
                                     <Typography
+                                        component="div"
                                         variant="body1"
                                         sx={{
                                             fontSize: 12,
                                             lineHeight: 1.65,
-                                            whiteSpace: 'pre-wrap',
                                             wordWrap: 'break-word',
                                             color: isUser ? '#fff' : 'inherit',
+                                            ...(isUser ? { whiteSpace: 'pre-wrap' } : {}),
                                         }}
                                     >
-                                        {message.text}
-                                        {/* {parseMarkdownBold(isLongMessage ? collapsedText : message.text)} */}
+                                        {isUser ? message.text : renderMarkdown(message.text)}
                                     </Typography>
                                     {/* {isLongMessage && (
                                         <Box
