@@ -2,7 +2,7 @@
 
 When the AI assistant generates a piece of code (a transformation, a
 join function, a REST API fetch, or a skill invocation), that code runs
-inside DagFlux's background engine. Wherever it runs, it sees the same
+inside Ternlux's background engine. Wherever it runs, it sees the same
 predictable set of capabilities — so the AI's mental model of "what's
 available to me" is the same across every node and every skill.
 
@@ -31,7 +31,7 @@ generate the same code regardless of which path is going to run it.
 For example, a join function that performs per-row similarity search
 uses the exact same calls whether the destination is a relational
 database, a document store, or a vector store. The AI doesn't need to
-know which path was selected — DagFlux routes it automatically.
+know which path was selected — Ternlux routes it automatically.
 
 The same surface is also documented to the AI in every prompt that
 might generate code, so the model is prompted with the exact set of
