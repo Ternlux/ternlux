@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/skill-vector-db-executor",
+  "name": "@ternlux/skill-vector-db-executor",
   "version": "1.0.0",
-  "description": "Vector database executor skill for DagFlux - supports LanceDB and Pinecone with OpenAI/HuggingFace embeddings",
+  "description": "Vector database executor skill for Ternlux - supports LanceDB and Pinecone with OpenAI/HuggingFace embeddings",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "skill",
     "id": "vector-db-executor",
     "displayName": "Vector Database Executor",
@@ -15,7 +15,7 @@
     "postinstall": "echo Vector DB Executor skill dependencies installed successfully"
   },
   "keywords": [
-    "dagflux",
+    "ternlux",
     "skill",
     "vector-database",
     "embeddings",
@@ -24,7 +24,7 @@
     "openai",
     "huggingface"
   ],
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT",
   "dependencies": {
     "openai": "^4.28.0",
