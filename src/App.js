@@ -23,26 +23,27 @@ function App() {
           const record = await window.electronAPI.terms.get();
           accepted = !!record?.accepted;
         } else {
-          accepted = localStorage.getItem('dagflux_terms_accepted') === 'true';
+          accepted = localStorage.getItem('ternlux_terms_accepted') === 'true';
         }
       } catch (e) {
         console.warn('Could not read terms acceptance:', e);
-        accepted = localStorage.getItem('dagflux_terms_accepted') === 'true';
+        accepted = localStorage.getItem('ternlux_terms_accepted') === 'true';
       }
       setTermsAccepted(accepted);
 
       // Push the persisted analytics preference to the main process so it
       // can gate event sending. Default to off if it has never been set.
       try {
-        const optIn = localStorage.getItem('dagflux_analytics_opt_in') === 'true';
+        const optIn = localStorage.getItem('ternlux_analytics_opt_in') === 'true';
         await window.electronAPI?.analytics?.setOptIn(optIn);
       } catch (e) {
         console.warn('Could not sync analytics preference:', e);
       }
 
+      // An LLM API key is required to use the app; signing in is optional
+      // (it only unlocks plugins) and is offered as step 2 of onboarding.
       const hasLlmKey = await hasAnyApiKey();
-      const hasAuthToken = Boolean(localStorage.getItem('auth-token'));
-      setApiKeyReady(hasLlmKey || hasAuthToken);
+      setApiKeyReady(hasLlmKey);
     };
     init();
   }, []);
@@ -72,7 +73,7 @@ function App() {
     </div>
     // <div className="app">
     //   <nav className="app-nav">
-    //     {/* <div className="app-nav-brand">DagFlux</div> */}
+    //     {/* <div className="app-nav-brand">Ternlux</div> */}
     //     <div className="app-nav-tabs">
     //       {/* <button
     //         className={`app-nav-tab${activeView === 'dashboard' ? ' active' : ''}`}
