@@ -29,7 +29,8 @@ const LocalFileConnectionForm = ({
   fileType, // 'sqlite', 'nedb', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'
   onSave,
   onCancel,
-  editingConnection
+  editingConnection,
+  initialFile // optional File object (e.g. dropped onto the workflow canvas)
 }) => {
   const [form] = Form.useForm();
   const [filePath, setFilePath] = useState(editingConnection?.fileInfo?.filePath || '');
@@ -204,6 +205,15 @@ const LocalFileConnectionForm = ({
 
     return false; // Prevent default upload behavior
   };
+
+  // Auto-process a file handed in from outside the form (e.g. dropped onto the
+  // workflow canvas) so the user lands on a pre-filled form instead of an empty one.
+  React.useEffect(() => {
+    if (initialFile && !editingConnection) {
+      handleBeforeUpload(initialFile);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialFile]);
 
   const handleSave = async () => {
     try {
