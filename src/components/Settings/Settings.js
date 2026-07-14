@@ -5,35 +5,28 @@ import {
   UserOutlined,
   RobotOutlined,
   CloseOutlined,
-  AppstoreAddOutlined,
   SafetyOutlined
 } from '@ant-design/icons';
 import ProviderSettings from './ProviderSettings';
 import ApiKeySetup from '../ApiKeySetup/ApiKeySetup';
-import PluginMarketplace from './PluginMarketplace';
 import PrivacySettings from './PrivacySettings';
 import './Settings.css';
 
 const { Sider, Content } = Layout;
 
-const Settings = ({ onClose }) => {
-  const [activeTab, setActiveTab] = useState('provider');
+const Settings = ({ onClose, initialTab = 'account' }) => {
+  const [activeTab, setActiveTab] = useState(initialTab);
 
   const menuItems = [
-    {
-      key: 'provider',
-      icon: <RobotOutlined />,
-      label: 'AI Provider'
-    },
     {
       key: 'account',
       icon: <UserOutlined />,
       label: 'Account'
     },
     {
-      key: 'plugins',
-      icon: <AppstoreAddOutlined />,
-      label: 'Plugins'
+      key: 'provider',
+      icon: <RobotOutlined />,
+      label: 'AI Provider'
     },
     {
       key: 'privacy',
@@ -54,12 +47,10 @@ const Settings = ({ onClose }) => {
         return <ProviderSettings />;
       case 'account':
         return <ApiKeySetup isSettingsMode={true} onComplete={handleApiKeyComplete} />;
-      case 'plugins':
-        return <PluginMarketplace />;
       case 'privacy':
         return <PrivacySettings />;
       default:
-        return <ProviderSettings />;
+        return <ApiKeySetup isSettingsMode={true} onComplete={handleApiKeyComplete} />;
     }
   };
 
