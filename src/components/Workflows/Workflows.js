@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import WorkflowsTab from './WorkflowsTab';
 import ConnectionsTab from './ConnectionsTab';
 import ExecutionTab from './ExecutionTab';
@@ -10,15 +10,53 @@ import './Workflows.css';
 const Workflows = () => {
   const [activeTab, setActiveTab] = useState('workflows');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState('account');
+
+  // Deeply nested components (e.g. ConnectionTypeSelector's "Login to access")
+  // request Settings via this window event instead of prop drilling.
+  useEffect(() => {
+    const handler = (e) => {
+      setSettingsTab(e.detail?.tab || 'account');
+      setIsSettingsOpen(true);
+    };
+    window.addEventListener('ternlux:open-settings', handler);
+    return () => window.removeEventListener('ternlux:open-settings', handler);
+  }, []);
   // What the user is currently focused on — passed down so each tab can
   // notify the chat assistant when the user clicks a workflow / connection /
   // execution. Shape: { kind, id, name, summary }.
   const [chatContext, setChatContext] = useState(null);
 
+  // Cross-cutting signal: ChatAssistant calls onWorkflowBuilt after a
+  // successful Accept-plan build. We bounce to the Workflows tab and
+  // hand the workflow id to WorkflowsTab so it can refresh + open it.
+  // The bump counter forces the effect to fire even when the same
+  // workflow id is "built" twice in a row.
+  const [pendingOpenWorkflow, setPendingOpenWorkflow] = useState(null); // { id, bump }
+  // True while a node-config chat panel inside WorkflowEditor is open.
+  // Hides the global ChatAssistant so the two don't fight for the corner.
+  const [nodeChatOpen, setNodeChatOpen] = useState(false);
+
   const reportContext = useCallback((ctx) => setChatContext(ctx || null), []);
+  const handleNodeChatOpenChange = useCallback((isOpen) => setNodeChatOpen(!!isOpen), []);
+
+  const handleWorkflowBuilt = useCallback(({ workflowId } = {}) => {
+    if (!workflowId) return;
+    setActiveTab('workflows');
+    setPendingOpenWorkflow((prev) => ({ id: workflowId, bump: (prev?.bump || 0) + 1 }));
+  }, []);
+
+  const clearPendingOpen = useCallback(() => setPendingOpenWorkflow(null), []);
 
   const TABS = [
-    { id: 'workflows',   label: 'Workflows',   render: () => <WorkflowsTab   onContextChange={reportContext} /> },
+    { id: 'workflows',   label: 'Workflows',   render: () => (
+      <WorkflowsTab
+        onContextChange={reportContext}
+        pendingOpenWorkflow={pendingOpenWorkflow}
+        onPendingOpenHandled={clearPendingOpen}
+        onNodeChatOpenChange={handleNodeChatOpenChange}
+      />
+    ) },
     { id: 'connections', label: 'Connections', render: () => <ConnectionsTab onContextChange={reportContext} /> },
     { id: 'execution',   label: 'Executions',  render: () => <ExecutionTab   onContextChange={reportContext} /> },
   ];
@@ -63,7 +101,7 @@ const Workflows = () => {
         <div style={{ flex: 1 }} />
         <button
           type="button"
-          onClick={() => setIsSettingsOpen(true)}
+          onClick={() => { setSettingsTab('account'); setIsSettingsOpen(true); }}
           title="Settings"
           aria-label="Settings"
           style={{
@@ -95,10 +133,10 @@ const Workflows = () => {
       </div>
 
       {isSettingsOpen && (
-        <Settings onClose={() => setIsSettingsOpen(false)} />
+        <Settings initialTab={settingsTab} onClose={() => setIsSettingsOpen(false)} />
       )}
 
-      <ChatAssistant activeContext={chatContext} />
+      <ChatAssistant activeContext={chatContext} onWorkflowBuilt={handleWorkflowBuilt} hidden={nodeChatOpen} />
     </div>
   );
 };

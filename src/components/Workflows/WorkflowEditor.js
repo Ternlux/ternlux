@@ -22,10 +22,11 @@ import JoinNode from './nodes/JoinNode';
 import OutputNode from './nodes/OutputNode';
 import NodeTypePanel from './NodeTypePanel';
 import NodeChatPanel from './NodeChatPanel';
-import DataSourceUpload from './DataSourceUpload';
+import LocalFileConnectionForm from './connections/LocalFileConnectionForm';
 import DataPreview from './DataPreview';
 import WorkflowStepsEditor from './WorkflowStepsEditor';
 import { generateStepsFromNodes } from '../../utils/workflowUtils';
+import { connectionsDb } from '../../utils/localDb';
 import axios from 'axios';
 
 const { Title } = Typography;
@@ -80,7 +81,7 @@ const isValidFile = (file) => {
   return true;
 };
 
-const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest }) => {
+const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest, onSidebarOpenChange }) => {
   const reactFlowWrapper = useRef(null);
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
@@ -101,6 +102,12 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   const [currentWorkflowId, setCurrentWorkflowId] = useState(workflow?.id || null);
   const [editorLoading, setEditorLoading] = useState(!!workflow?.id);
   const [saveAfterStepsEditor, setSaveAfterStepsEditor] = useState(false);
+
+  // Latest signals the on-disk code watcher reads to decide whether a
+  // 'workflow:codeChanged' event should reload the canvas. `suppressUntil`
+  // ignores the file writes our own auto-save makes (which would otherwise
+  // trigger a reload loop).
+  const reloadGuardRef = useRef({ saving: false, hasUnsavedChanges: false, suppressUntil: 0 });
 
   // Database schema state (shared between chat and preview)
   const [dbTables, setDbTables] = useState([]); // Full table objects with schema info
@@ -139,77 +146,70 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     }
   }, [selectedNode?.id, selectedNode?.type, selectedNode?.data?.config?.connectionType]);
 
+  // Bubble the node-chat panel's open state up so the top-level
+  // ChatAssistant can hide itself while a node chat is active (they share
+  // the same screen corner).
+  useEffect(() => {
+    if (typeof onSidebarOpenChange === 'function') onSidebarOpenChange(isSidebarOpen);
+    return () => {
+      if (typeof onSidebarOpenChange === 'function') onSidebarOpenChange(false);
+    };
+  }, [isSidebarOpen, onSidebarOpenChange]);
+
+  // Fetch a saved workflow from the local database and hydrate the editor.
+  // Reused for the initial load and for live reloads when the workflow's
+  // externalized code files change on disk (see the code-watcher effect).
+  const loadWorkflowFromDb = useCallback(async (id, { isReload = false } = {}) => {
+    if (!isReload) setEditorLoading(true);
+    try {
+      // User is not logged in - fetch from local database
+      const { workflowsDb } = await import('../../utils/localDb');
+      const fullWorkflow = await workflowsDb.getById(id);
+
+      if (!fullWorkflow) {
+        if (!isReload) message.error('Failed to load workflow details');
+        return;
+      }
+
+      // Set workflow data
+      setWorkflowName(fullWorkflow.name || '');
+      setWorkflowDescription(fullWorkflow.description || '');
+      setCurrentWorkflowId(fullWorkflow.id || null);
+
+      const workflowNodes = Array.isArray(fullWorkflow.nodes) ? fullWorkflow.nodes : [];
+      const workflowEdges = Array.isArray(fullWorkflow.edges) ? fullWorkflow.edges : [];
+
+      setNodes(workflowNodes);
+      setEdges(workflowEdges);
+      setExecutionSteps(fullWorkflow.executionSteps || []);
+
+      setInitialWorkflowState({
+        name: fullWorkflow.name || '',
+        description: fullWorkflow.description || '',
+        nodes: workflowNodes,
+        edges: workflowEdges
+      });
+
+      if (isReload) message.info('Workflow code changed on disk — canvas reloaded');
+    } catch (error) {
+      if (error.response?.status === 401 || error.response?.status === 204 ||
+          error.response?.status === 400) {
+        localStorage.removeItem('auth-token');
+        message.error('Session expired. Please log in again.');
+        window.location.href = '/login';
+        return;
+      }
+      console.error('Error loading workflow:', error);
+      if (!isReload) message.error('Failed to load workflow details');
+    } finally {
+      if (!isReload) setEditorLoading(false);
+    }
+  }, [setNodes, setEdges]);
+
   // Initialize workflow data
   useEffect(() => {
     if (workflow?.id) {
-      // Fetch full workflow data from API or local database
-      const fetchFullWorkflow = async () => {
-        setEditorLoading(true);
-        try {
-          const token = localStorage.getItem('auth-token');
-          let fullWorkflow;
-
-          if (token) {
-            // User is logged in - fetch from API
-            const response = await axios.get(`/workflow/workflow/${workflow.id}`, {
-              headers: {
-                'auth-token': token
-              }
-            });
-
-            if (response.data.success) {
-              fullWorkflow = response.data.data;
-            } else {
-              message.error('Failed to load workflow details');
-              setEditorLoading(false);
-              return;
-            }
-          } else {
-            // User is not logged in - fetch from local database
-            const { workflowsDb } = await import('../../utils/localDb');
-            fullWorkflow = await workflowsDb.getById(workflow.id);
-
-            if (!fullWorkflow) {
-              message.error('Failed to load workflow details');
-              setEditorLoading(false);
-              return;
-            }
-          }
-
-          // Set workflow data
-          setWorkflowName(fullWorkflow.name || '');
-          setWorkflowDescription(fullWorkflow.description || '');
-          setCurrentWorkflowId(fullWorkflow.id || null);
-
-          const workflowNodes = Array.isArray(fullWorkflow.nodes) ? fullWorkflow.nodes : [];
-          const workflowEdges = Array.isArray(fullWorkflow.edges) ? fullWorkflow.edges : [];
-
-          setNodes(workflowNodes);
-          setEdges(workflowEdges);
-          setExecutionSteps(fullWorkflow.executionSteps || []);
-
-          setInitialWorkflowState({
-            name: fullWorkflow.name || '',
-            description: fullWorkflow.description || '',
-            nodes: workflowNodes,
-            edges: workflowEdges
-          });
-
-        } catch (error) {
-          if (error.response?.status === 401 || error.response?.status === 204 ||
-              error.response?.status === 400) {
-            localStorage.removeItem('auth-token');
-            message.error('Session expired. Please log in again.');
-            window.location.href = '/login';
-            return;
-          }
-          console.error('Error loading workflow:', error);
-          message.error('Failed to load workflow details');
-        } finally {
-          setEditorLoading(false);
-        }
-      };
-      fetchFullWorkflow();
+      loadWorkflowFromDb(workflow.id);
     } else if (workflow?.nodes) {
       // Pre-loaded imported workflow (has nodes/edges but no saved id yet)
       const workflowNodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
@@ -258,7 +258,40 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       });
       setEditorLoading(false);
     }
-  }, [workflow, setNodes, setEdges]);
+  }, [workflow, setNodes, setEdges, loadWorkflowFromDb]);
+
+  // Watch the open workflow's externalized-code folder on disk. When a code
+  // file is edited externally (e.g. in an IDE or by an AI tool), reload the
+  // canvas so the editor and {userData}/workflow-code/{workflow} stay in sync.
+  // Reloads are skipped while saving / shortly after a save (our own writes)
+  // and when there are unsaved canvas edits (to avoid clobbering them).
+  useEffect(() => {
+    const api = window.electronAPI?.workflow;
+    if (!api?.watchCode || !api?.onCodeChanged || !currentWorkflowId) return;
+    const wfId = currentWorkflowId;
+
+    api.watchCode(wfId);
+    const unsubscribe = api.onCodeChanged(({ workflowId }) => {
+      if (workflowId !== wfId) return;
+      const guard = reloadGuardRef.current;
+      if (guard.saving || Date.now() < guard.suppressUntil) return;
+      if (guard.hasUnsavedChanges) {
+        message.warning('Workflow code changed on disk, but you have unsaved canvas edits — not reloaded.');
+        return;
+      }
+      loadWorkflowFromDb(wfId, { isReload: true });
+    });
+
+    return () => {
+      unsubscribe();
+      api.unwatchCode(wfId);
+    };
+  }, [currentWorkflowId, loadWorkflowFromDb]);
+
+  // Mirror save state into the code-watcher guard so externally-detected file
+  // changes can tell our own auto-save writes apart from real edits.
+  useEffect(() => { reloadGuardRef.current.saving = saving; }, [saving]);
+  useEffect(() => { reloadGuardRef.current.hasUnsavedChanges = hasUnsavedChanges; }, [hasUnsavedChanges]);
 
   // Track changes to detect unsaved modifications (for UI display only, not auto-save)
   useEffect(() => {
@@ -271,28 +304,39 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       edges
     };
 
-    // Helper function to compare nodes without position data
+    // ReactFlow mutates transient UI/layout fields (selection, drag state,
+    // measured width/height, absolute position) on every click, drag, and
+    // render. Those are not user content, so strip them before comparing —
+    // otherwise selecting a node after a save would re-flag "unsaved changes"
+    // and the close confirmation would pop up even though nothing was edited.
+    const NODE_TRANSIENT_KEYS = [
+      'position', 'positionAbsolute', 'selected', 'dragging',
+      'resizing', 'width', 'height',
+    ];
+    const EDGE_TRANSIENT_KEYS = ['selected'];
+
+    const stripKeys = (obj, keys) => {
+      const out = { ...obj };
+      for (const k of keys) delete out[k];
+      return out;
+    };
+
     const compareNodesWithoutPosition = (nodes1, nodes2) => {
       if (nodes1.length !== nodes2.length) return false;
-      
-      const nodes1WithoutPos = nodes1.map(node => ({
-        ...node,
-        position: undefined // Remove position for comparison
-      }));
-      
-      const nodes2WithoutPos = nodes2.map(node => ({
-        ...node,
-        position: undefined // Remove position for comparison  
-      }));
-      
-      return JSON.stringify(nodes1WithoutPos) === JSON.stringify(nodes2WithoutPos);
+      const norm = (list) => list.map((node) => stripKeys(node, NODE_TRANSIENT_KEYS));
+      return JSON.stringify(norm(nodes1)) === JSON.stringify(norm(nodes2));
+    };
+
+    const compareEdges = (edges1, edges2) => {
+      const norm = (list) => (list || []).map((edge) => stripKeys(edge, EDGE_TRANSIENT_KEYS));
+      return JSON.stringify(norm(edges1)) === JSON.stringify(norm(edges2));
     };
 
     const hasChanges = (
       currentState.name !== initialWorkflowState.name ||
       currentState.description !== initialWorkflowState.description ||
       !compareNodesWithoutPosition(currentState.nodes, initialWorkflowState.nodes) ||
-      JSON.stringify(currentState.edges) !== JSON.stringify(initialWorkflowState.edges)
+      !compareEdges(currentState.edges, initialWorkflowState.edges)
     );
 
     setHasUnsavedChanges(hasChanges);
@@ -1018,6 +1062,10 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
       setInitialWorkflowState({ name: workflowName, description: workflowDescription, nodes, edges });
       setHasUnsavedChanges(false);
+      // Auto-save just rewrote this workflow's externalized code files, which
+      // the on-disk watcher will see. Suppress the resulting reload so we don't
+      // bounce the canvas right after saving.
+      reloadGuardRef.current.suppressUntil = Date.now() + 3000;
     } catch (error) {
       console.error('Auto-save failed:', error, );
       if (error.message === 'Duplicate workflow name') {
@@ -1102,25 +1150,36 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   }, [triggerSidebarSave, workflowName]);
 
 
-  const handleUploadComplete = (uploadResult) => {
+  const handleSaveDroppedConnection = async (connectionData) => {
+    // Persist the local file connection (same path ConnectionsTab uses for file
+    // connections) so we get a connection with an id to reference from the node.
+    let saved;
+    try {
+      saved = await connectionsDb.save(connectionData);
+    } catch (error) {
+      console.error('Error saving dropped data source:', error);
+      message.error('Failed to create data source.');
+      return;
+    }
+
     // Close the upload modal
     setIsUploadModalOpen(false);
     setDroppedFile(null);
-    
+
     // Show success message
     message.success('Data source created successfully! You can now add it to your workflow.');
-    
+
     // Optionally create a data source node automatically
     if (reactFlowInstance) {
       const newNode = {
         id: `dataSource-${Date.now()}`,
         type: 'dataSource',
         position: { x: 100, y: 100 },
-        data: { 
+        data: {
           label: 'Data Source',
           config: {
-            connectionId: uploadResult.id,
-            connectionName: uploadResult.name
+            connectionId: saved.id,
+            connectionName: saved.name
           }
         },
       };
@@ -1250,16 +1309,16 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
       // Send notification that workflow is running
       if (window.Notification && Notification.permission === 'granted') {
-        new Notification('DagFlux', {
+        new Notification('Ternlux', {
           body: `Workflow "${workflowName || 'Untitled Workflow'}" is now running...`,
-          // icon: '/image/dagflux.png'
+          // icon: '/image/ternlux.png'
         });
       } else if (window.Notification && Notification.permission !== 'denied') {
         Notification.requestPermission().then(permission => {
           if (permission === 'granted') {
-            new Notification('DagFlux', {
+            new Notification('Ternlux', {
               body: `Workflow "${workflowName || 'Untitled Workflow'}" is now running...`,
-              // icon: '/image/dagflux.png'
+              // icon: '/image/ternlux.png'
             });
           }
         });
@@ -1279,9 +1338,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
         // Send success notification
         if (window.Notification && Notification.permission === 'granted') {
-          new Notification('DagFlux - Workflow Completed', {
+          new Notification('Ternlux - Workflow Completed', {
             body: `Workflow "${workflowName || 'Untitled Workflow'}" executed successfully!`,
-            // icon: '/image/dagflux.png'
+            // icon: '/image/ternlux.png'
           });
         }
 
@@ -1294,9 +1353,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
         // Send failure notification
         if (window.Notification && Notification.permission === 'granted') {
-          new Notification('DagFlux - Workflow Failed', {
+          new Notification('Ternlux - Workflow Failed', {
             body: `Workflow "${workflowName || 'Untitled Workflow'}" failed: ${result.message || 'Unknown error'}`,
-            // icon: '/image/dagflux.png'
+            // icon: '/image/ternlux.png'
           });
         }
       }
@@ -1306,9 +1365,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
       // Send error notification
       if (window.Notification && Notification.permission === 'granted') {
-        new Notification('DagFlux - Workflow Error', {
+        new Notification('Ternlux - Workflow Error', {
           body: `Workflow "${workflowName || 'Untitled Workflow'}" encountered an error: ${error.message}`,
-          // icon: '/image/dagflux.png'
+          // icon: '/image/ternlux.png'
         });
       }
     } finally {
@@ -1414,7 +1473,7 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
                   disabled={!nodes || nodes.length === 0}
                   onClick={handleExportJSON}
                 >
-                  Export JSON
+                  Export Workflow
                 </Menu.Item>
               </Menu>
             }
@@ -1632,13 +1691,14 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         open={isUploadModalOpen}
         onCancel={handleUploadCancel}
         footer={null}
-        width={1000}
+        width={640}
         destroyOnClose
       >
-        <DataSourceUpload
-          onUploadComplete={handleUploadComplete}
+        <LocalFileConnectionForm
+          fileType="spreadsheet"
+          initialFile={droppedFile}
+          onSave={handleSaveDroppedConnection}
           onCancel={handleUploadCancel}
-          droppedFile={droppedFile}
         />
       </Modal>
 

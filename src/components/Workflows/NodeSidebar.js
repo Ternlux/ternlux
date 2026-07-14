@@ -9,9 +9,8 @@ import {
 } from '../api/workflowApi';
 import { Card, Form, Button, Space, Typography, message, Modal, Divider } from 'antd';
 import { CloseOutlined, DatabaseOutlined, SettingOutlined, MergeOutlined, ExportOutlined, EyeOutlined, PlayCircleOutlined } from '@ant-design/icons';
-import HyperFormulaService from './services/HyperFormulaService';
 import DataPreviewModal from './DataPreviewModal';
-import DataSourceUpload from './DataSourceUpload';
+import LocalFileConnectionForm from './connections/LocalFileConnectionForm';
 import { DataSourceConfig, TransformerConfig, JoinConfig, StartConfig, OutputConfig } from './NodeConfigurations';
 import axios from 'axios';
 
@@ -381,12 +380,24 @@ const NodeSidebar = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate }) =>
     }
   };
 
-  const handleDataSourceUpdateComplete = (updatedConnection) => {
-    // Refresh connections and close modal
-    fetchConnections();
-    setIsEditDataSourceOpen(false);
-    setEditingConnection(null);
-    message.success('Data source updated successfully');
+  const handleDataSourceSave = async (connectionData) => {
+    // Persist the local file connection (same path ConnectionsTab uses for file
+    // connections), then refresh and close the modal.
+    try {
+      const connectionId = editingConnection?.id || editingConnection?._id;
+      if (connectionId) {
+        await connectionsDb.update(connectionId, connectionData);
+      } else {
+        await connectionsDb.save(connectionData);
+      }
+      fetchConnections();
+      setIsEditDataSourceOpen(false);
+      setEditingConnection(null);
+      message.success('Data source updated successfully');
+    } catch (error) {
+      console.error('Error saving data source:', error);
+      message.error('Failed to save data source.');
+    }
   };
 
 
@@ -835,16 +846,17 @@ const NodeSidebar = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate }) =>
           setEditingConnection(null);
         }}
         footer={null}
-        width={700}
+        width={640}
         destroyOnClose
       >
-        <DataSourceUpload
-          onUploadComplete={handleDataSourceUpdateComplete}
+        <LocalFileConnectionForm
+          fileType={editingConnection?.fileType || editingConnection?.dbType || 'spreadsheet'}
+          editingConnection={editingConnection}
+          onSave={handleDataSourceSave}
           onCancel={() => {
             setIsEditDataSourceOpen(false);
             setEditingConnection(null);
           }}
-          editingConnection={editingConnection}
         />
       </Modal>
  

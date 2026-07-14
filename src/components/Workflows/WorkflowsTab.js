@@ -43,7 +43,6 @@ const WorkflowCard = ({ wf, onEdit, onRun, onDelete }) => {
         <MoreMenu items={[
           { label: 'Run Workflow', icon: 'play', onClick: () => onRun(wf.id) },
           { label: 'Edit',         icon: 'edit', onClick: () => onEdit(wf) },
-          '---',
           { label: 'Delete',       icon: 'trash', danger: true, onClick: () => onDelete(wf.id) },
         ]} />
       </div>
@@ -74,7 +73,12 @@ const WorkflowCard = ({ wf, onEdit, onRun, onDelete }) => {
   );
 };
 
-const WorkflowsTab = ({ onContextChange = () => {} }) => {
+const WorkflowsTab = ({
+  onContextChange = () => {},
+  pendingOpenWorkflow = null,           // { id, bump } — signal from ChatAssistant via Workflows.js
+  onPendingOpenHandled = () => {},      // call after we've handled the signal so it doesn't re-fire
+  onNodeChatOpenChange = () => {},      // forwarded from Workflows.js so the top-level ChatAssistant can hide
+}) => {
   const [workflows, setWorkflows] = useState([]);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [editingWorkflow, setEditingWorkflow] = useState(null);
@@ -98,26 +102,56 @@ const WorkflowsTab = ({ onContextChange = () => {} }) => {
     fetchWorkflows();
   }, []);
 
+  // When ChatAssistant (via Workflows.js) signals a freshly-built workflow,
+  // refresh the list and open that workflow in the editor. Keyed on `bump`
+  // so re-building the same id still re-triggers.
+  useEffect(() => {
+    if (!pendingOpenWorkflow?.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const localWorkflows = await workflowsDb.getAll();
+        if (cancelled) return;
+        const enriched = localWorkflows.map((wf) => ({
+          ...wf,
+          createdAt: moment(wf.createdAt),
+          lastRun: wf.lastExecuted ? moment(wf.lastExecuted) : null,
+          updatedAt: moment(wf.updatedAt),
+        }));
+        setWorkflows(enriched);
+        const target = enriched.find((w) => (w.id || w._id) === pendingOpenWorkflow.id);
+        if (target) handleEditWorkflow(target);
+      } finally {
+        if (!cancelled) onPendingOpenHandled();
+      }
+    })();
+    return () => { cancelled = true; };
+    // handleEditWorkflow is stable enough for this use; we key purely on bump+id.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingOpenWorkflow?.id, pendingOpenWorkflow?.bump]);
+
   const fetchWorkflows = async () => {
     setLoading(true);
     try {
-      const token = localStorage.getItem('auth-token');
-
-      if (token) {
-        const response = await axios.get('/workflow/workflows', {
-          headers: { 'auth-token': token }
-        });
-
-        if (response.data.success) {
-          const workflowsData = response.data.data.workflows.map(workflow => ({
-            ...workflow,
-            createdAt: moment(workflow.createdAt),
-            lastRun: workflow.lastExecuted ? moment(workflow.lastExecuted) : null,
-            updatedAt: moment(workflow.updatedAt),
-          }));
-          setWorkflows(workflowsData);
-        }
-      }
+      // Remote workflow fetch disabled — backend returns 403 for logged-in
+      // tokens, so we rely on the local IndexedDB store below instead.
+      // const token = localStorage.getItem('auth-token');
+      //
+      // if (token) {
+      //   const response = await axios.get('/workflow/workflows', {
+      //     headers: { 'auth-token': token }
+      //   });
+      //
+      //   if (response.data.success) {
+      //     const workflowsData = response.data.data.workflows.map(workflow => ({
+      //       ...workflow,
+      //       createdAt: moment(workflow.createdAt),
+      //       lastRun: workflow.lastExecuted ? moment(workflow.lastExecuted) : null,
+      //       updatedAt: moment(workflow.updatedAt),
+      //     }));
+      //     setWorkflows(workflowsData);
+      //   }
+      // }
       const localWorkflows = await workflowsDb.getAll();
       setWorkflows(localWorkflows.map(workflow => ({
         ...workflow,
@@ -140,15 +174,17 @@ const WorkflowsTab = ({ onContextChange = () => {} }) => {
   };
 
   const fetchAllConnections = async () => {
-    const token = localStorage.getItem('auth-token');
-    if (token) {
-      try {
-        const response = await axios.post('/workflow/connections', { transformer: false }, {
-          headers: { 'auth-token': token },
-        });
-        if (response.data.success) return response.data.data;
-      } catch (e) { /* fall through to local */ }
-    }
+    // Remote connections fetch disabled — backend returns 403 for logged-in
+    // tokens, so we use the local IndexedDB store only.
+    // const token = localStorage.getItem('auth-token');
+    // if (token) {
+    //   try {
+    //     const response = await axios.post('/workflow/connections', { transformer: false }, {
+    //       headers: { 'auth-token': token },
+    //     });
+    //     if (response.data.success) return response.data.data;
+    //   } catch (e) { /* fall through to local */ }
+    // }
     return connectionsDb.getAll();
   };
 
@@ -260,20 +296,22 @@ const WorkflowsTab = ({ onContextChange = () => {} }) => {
       cancelText: 'Cancel',
       async onOk() {
         try {
-          const token = localStorage.getItem('auth-token');
-          if (token) {
-            const response = await axios.post('/workflow/workflow-action', {
-              action: 'delete', workflowId,
-            }, { headers: { 'auth-token': token } });
-            if (response.data.success) {
-              setWorkflows(prev => prev.filter(w => w.id !== workflowId));
-              message.success('Workflow deleted successfully');
-            }
-          } else {
-            await workflowsDb.delete(workflowId);
-            setWorkflows(prev => prev.filter(w => w.id !== workflowId));
-            message.success('Workflow deleted locally');
-          }
+          // Remote delete disabled — backend returns 403 for logged-in tokens,
+          // so we always delete from the local IndexedDB store.
+          // const token = localStorage.getItem('auth-token');
+          // if (token) {
+          //   const response = await axios.post('/workflow/workflow-action', {
+          //     action: 'delete', workflowId,
+          //   }, { headers: { 'auth-token': token } });
+          //   if (response.data.success) {
+          //     setWorkflows(prev => prev.filter(w => w.id !== workflowId));
+          //     message.success('Workflow deleted successfully');
+          //   }
+          // } else {
+          await workflowsDb.delete(workflowId);
+          setWorkflows(prev => prev.filter(w => w.id !== workflowId));
+          message.success('Workflow deleted locally');
+          // }
         } catch (error) {
           if (handleAuthError(error)) return;
           console.error('Error deleting workflow:', error);
@@ -309,39 +347,41 @@ const WorkflowsTab = ({ onContextChange = () => {} }) => {
       throw new Error('Duplicate workflow name');
     }
 
-    const token = localStorage.getItem('auth-token');
-    if (token) {
-      if (workflowId) {
-        const response = await axios.post('/workflow/workflow-action', {
-          action: 'update', workflowId, ...workflowData,
-        }, { headers: { 'auth-token': token } });
-        if (!response.data.success) throw new Error(response.data.error || 'Failed to update workflow');
-        return workflowId;
-      } else {
-        const newWorkflowData = {
-          ...workflowData,
-          ...(uploadedDataSource && { connectionId: uploadedDataSource.connectionId }),
-        };
-        const response = await axios.post('/workflow/workflow-save', newWorkflowData, {
-          headers: { 'auth-token': token },
-        });
-        if (!response.data.success) throw new Error(response.data.error || 'Failed to create workflow');
-        return response.data.data?.id || null;
-      }
+    // Remote save/update disabled — backend returns 403 for logged-in tokens,
+    // so we always persist to the local IndexedDB store.
+    // const token = localStorage.getItem('auth-token');
+    // if (token) {
+    //   if (workflowId) {
+    //     const response = await axios.post('/workflow/workflow-action', {
+    //       action: 'update', workflowId, ...workflowData,
+    //     }, { headers: { 'auth-token': token } });
+    //     if (!response.data.success) throw new Error(response.data.error || 'Failed to update workflow');
+    //     return workflowId;
+    //   } else {
+    //     const newWorkflowData = {
+    //       ...workflowData,
+    //       ...(uploadedDataSource && { connectionId: uploadedDataSource.connectionId }),
+    //     };
+    //     const response = await axios.post('/workflow/workflow-save', newWorkflowData, {
+    //       headers: { 'auth-token': token },
+    //     });
+    //     if (!response.data.success) throw new Error(response.data.error || 'Failed to create workflow');
+    //     return response.data.data?.id || null;
+    //   }
+    // } else {
+    console.log("workflowId, workflowData: ", workflowId, workflowData)
+    if (workflowId) {
+      await workflowsDb.update(workflowId, workflowData);
+      return workflowId;
     } else {
-      console.log("workflowId, workflowData: ", workflowId, workflowData)
-      if (workflowId) {
-        await workflowsDb.update(workflowId, workflowData);
-        return workflowId;
-      } else {
-        const newWorkflow = {
-          ...workflowData,
-          ...(uploadedDataSource && { connectionId: uploadedDataSource.connectionId }),
-        };
-        const saved = await workflowsDb.save(newWorkflow);
-        return saved.id;
-      }
+      const newWorkflow = {
+        ...workflowData,
+        ...(uploadedDataSource && { connectionId: uploadedDataSource.connectionId }),
+      };
+      const saved = await workflowsDb.save(newWorkflow);
+      return saved.id;
     }
+    // }
   };
 
   const handleSaveWorkflow = async (workflowData) => {
@@ -387,6 +427,9 @@ const WorkflowsTab = ({ onContextChange = () => {} }) => {
     setEditingWorkflow(null);
     setUploadedDataSource(null);
     workflowCloseHandlerRef.current = null;
+    // Closing the modal tears down WorkflowEditor (destroyOnClose) so its
+    // sidebar effect's cleanup fires false too; this is just belt-and-braces.
+    onNodeChatOpenChange(false);
   };
 
   const registerWorkflowCloseHandler = (handler) => {
@@ -456,6 +499,7 @@ const WorkflowsTab = ({ onContextChange = () => {} }) => {
           onAutoSave={handleAutoSave}
           onCancel={handleWorkflowClose}
           onCloseRequest={registerWorkflowCloseHandler}
+          onSidebarOpenChange={onNodeChatOpenChange}
         />
       </Modal>
     </div>
