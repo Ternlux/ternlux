@@ -3,7 +3,7 @@ import axios from 'axios';
 import { connectionsDb } from '../../../utils/localDb';
 import { getWorkflowAssistance } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
-import ChatPrompts from './ChatPrompts/Join';
+import { buildChatPrompt } from '../../../utils/chatPrompts';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 import {
   FileExcelOutlined,
@@ -418,14 +418,14 @@ const JoinNodeChat = ({
     // Load all database connections from the system
     const token = localStorage.getItem('auth-token');
     let allConnections = [];
-    if (!token) {
+    // if (!token) {
       allConnections = await connectionsDb.getAll();
-    } else {
-      const res = await axios.post('/workflow/connections', { transformer: false }, {
-        headers: { 'auth-token': token },
-      });
-      allConnections = res.data || [];
-    }
+    // } else {
+    //   const res = await axios.post('/workflow/connections', { transformer: false }, {
+    //     headers: { 'auth-token': token },
+    //   });
+    //   allConnections = res.data || [];
+    // }
 
     // Add all connections as potential destinations (deduplicated by connection ID),
     // categorized so the picker shows separate sections for Databases, APIs, Vector
@@ -838,14 +838,14 @@ const JoinNodeChat = ({
     const hasVectorDestination =
       targetConnection?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetConnection?.dbType);
 
-    const analysisPrompt = ChatPrompts.join.joinAnalysisRequest(
+    const analysisPrompt = await buildChatPrompt('join.joinAnalysisRequest', [
       userRequest,
       sourcesInfoStr,
       availableDestinations.map(d => `${d.label} (${d.description})`).join('\n'),
       joinSettings.operationMode,
       availableSkills,
-      { hasVectorSource, hasVectorDestination }
-    );
+      { hasVectorSource, hasVectorDestination },
+    ]);
 
     const response = await getWorkflowAssistance('join', analysisPrompt, {
       sources: sourcesInfo,
@@ -1282,12 +1282,12 @@ const JoinNodeChat = ({
     }));
 
     try {
-      const joinPrompt = ChatPrompts.join.generateJoinQuery(
+      const joinPrompt = await buildChatPrompt('join.generateJoinQuery', [
         targetDbType,
         sourcesInfo,
         settings,
-        destinationConfig
-      );
+        destinationConfig,
+      ]);
       console.log('[JoinNodeChat] Vector context for join prompt:', {
         isVectorDestination,
         vectorSources: sourcesInfo.filter((s) => s.isSourceVector).map((s) => s.sourceNodeId)
