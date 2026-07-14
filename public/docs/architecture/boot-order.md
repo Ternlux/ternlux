@@ -1,13 +1,13 @@
 # Startup behaviour
 
-When DagFlux launches, it goes through a fixed sequence before showing
+When Ternlux launches, it goes through a fixed sequence before showing
 you the main window. Understanding this helps explain why the first
 moment after launch may feel slightly slower than navigating the app
 afterward.
 
 ## What happens at launch
 
-1. **Local workspace is opened.** DagFlux opens its single shared SQLite
+1. **Local workspace is opened.** Ternlux opens its single shared SQLite
    workspace and prepares it for the workflows that will read from or
    write to it.
 2. **Execution engine is wired up.** The components that run
@@ -17,7 +17,7 @@ afterward.
    installed AI skill is loaded from the plugin folder. Each is checked
    to make sure it implements the required behaviours; broken plugins
    are skipped and logged.
-4. **Saved triggers are reactivated.** DagFlux walks through every saved
+4. **Saved triggers are reactivated.** Ternlux walks through every saved
    workflow and re-registers any scheduled trigger or file watcher that
    the workflow relies on. From this moment on, scheduled workflows can
    fire even if you never open the workflow.
@@ -26,7 +26,7 @@ afterward.
 
 ## What happens at shutdown
 
-When you quit DagFlux, the background engine performs a graceful
+When you quit Ternlux, the background engine performs a graceful
 teardown:
 
 1. All scheduled triggers stop firing.

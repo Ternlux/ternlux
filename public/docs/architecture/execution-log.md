@@ -7,7 +7,7 @@ output.
 
 ## What's captured for each run
 
-For every workflow run, DagFlux records:
+For every workflow run, Ternlux records:
 
 - A unique execution id.
 - Which workflow ran, by id and name.
@@ -25,7 +25,7 @@ For every workflow run, DagFlux records:
 
 ## How a run progresses
 
-When a run starts, DagFlux:
+When a run starts, Ternlux:
 
 1. Creates the execution record with status "running".
 2. Walks the workflow's execution order step by step.
@@ -39,7 +39,7 @@ When a run starts, DagFlux:
 ## Concurrency rules for triggered runs
 
 When a workflow is fired by a schedule, a file change, or a webhook,
-DagFlux ensures the same workflow does not start a second run while a
+Ternlux ensures the same workflow does not start a second run while a
 previous run is still in progress. New triggers that arrive during an
 active run are skipped — they are recorded and the workflow simply
 catches them on the next firing.
@@ -49,6 +49,6 @@ same destination.
 
 ## Notifications
 
-For triggered runs, DagFlux also sends desktop notifications when the
+For triggered runs, Ternlux also sends desktop notifications when the
 run starts, when it completes successfully, and when it fails. Manual
 runs do not send notifications because you are already watching them.
