@@ -1,4 +1,4 @@
-# Required Python packages for DagFlux Python Executor Skill
+# Required Python packages for Ternlux Python Executor Skill
 # Install with: pip install -r requirements.txt
 
 # Core data manipulation

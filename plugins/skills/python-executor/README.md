@@ -1,6 +1,6 @@
 # Python Executor Skill Plugin
 
-Execute Python code directly on your local machine for complex data transformations in DagFlux workflows.
+Execute Python code directly on your local machine for complex data transformations in Ternlux workflows.
 
 ## Overview
 
@@ -208,7 +208,7 @@ If your transformation fails, check:
 
 ## Security Considerations
 
-- Python code executes with the same permissions as the DagFlux application
+- Python code executes with the same permissions as the Ternlux application
 - Code runs in a temporary directory that's automatically cleaned up
 - 5-minute timeout prevents runaway processes
 - No network access restrictions (use caution with external API calls)
@@ -228,18 +228,18 @@ To use a Python virtual environment:
 
 ```bash
 # Create virtual environment
-python3 -m venv dagflux-env
+python3 -m venv ternlux-env
 
 # Activate it
-source dagflux-env/bin/activate  # Unix/macOS
+source ternlux-env/bin/activate  # Unix/macOS
 # or
-dagflux-env\Scripts\activate  # Windows
+ternlux-env\Scripts\activate  # Windows
 
 # Install libraries
 pip install pandas numpy scipy
 
-# Use the venv Python path in DagFlux
-# /path/to/dagflux-env/bin/python
+# Use the venv Python path in Ternlux
+# /path/to/ternlux-env/bin/python
 ```
 
 ## Limitations

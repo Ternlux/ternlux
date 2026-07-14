@@ -105,7 +105,7 @@ if __name__ == '__main__':
     print("Setup verification complete!")
     print("=" * 50)
     print()
-    print("You can now use Python transformations in DagFlux.")
+    print("You can now use Python transformations in Ternlux.")
     print()
     print("Example transformation:")
     print("""

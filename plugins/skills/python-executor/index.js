@@ -1,5 +1,5 @@
 /**
- * Python Executor Skill Plugin for DagFlux
+ * Python Executor Skill Plugin for Ternlux
  * Allows executing Python code directly on the local machine for transformations
  */
 
@@ -475,7 +475,7 @@ Otherwise use standard SQL/NoSQL transformation.
       const data = sourceData;
 
       // Create temporary directory for execution
-      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dagflux-python-'));
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ternlux-python-'));
       const scriptPath = path.join(tempDir, 'transform_script.py');
       const inputPath = path.join(tempDir, 'input.json');
       const outputPath = path.join(tempDir, 'output.json');
@@ -935,7 +935,7 @@ print(json.dumps(packages))
     displayName: 'Python Executor',
     description: 'Execute Python code for complex data transformations',
     version: '1.0.0',
-    author: 'DagFlux',
+    author: 'Ternlux',
     requires: ['python3'],
     recommendedLibraries: ['pandas', 'numpy', 'scipy', 'scikit-learn'],
     setupInstructions: 'Run setup.sh (Unix/macOS) or setup.bat (Windows) to install Python dependencies',

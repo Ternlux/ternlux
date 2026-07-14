@@ -1,9 +1,9 @@
 @echo off
-REM Setup script for DagFlux Python Executor Skill (Windows)
+REM Setup script for Ternlux Python Executor Skill (Windows)
 REM This script checks Python installation and installs required dependencies
 
 echo ======================================
-echo DagFlux Python Executor Setup
+echo Ternlux Python Executor Setup
 echo ======================================
 echo.
 
@@ -50,7 +50,7 @@ if errorlevel 0 (
     echo ======================================
     echo.
     echo Python Executor Skill is ready to use.
-    echo You can now use Python transformations in DagFlux workflows.
+    echo You can now use Python transformations in Ternlux workflows.
 ) else (
     echo.
     echo X Failed to install Python packages
