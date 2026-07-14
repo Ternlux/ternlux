@@ -47,7 +47,7 @@ generates the operation using a prompt tuned for the source's database:
 
 - **New collection** — picks the right approach automatically:
   - **Aggregation pipeline** for filtering, projection, grouping,
-    lookups, and computed fields. DagFlux automatically appends the
+    lookups, and computed fields. Ternlux automatically appends the
     final stage that writes the result to the target collection.
   - **Filter operation** for simple subset queries.
   - **Custom JavaScript** for logic that can't be expressed as
@@ -71,7 +71,7 @@ generates the operation using a prompt tuned for the source's database:
 ## Placeholders
 
 Generated operations may include named placeholders like
-`{{current_date}}` and `{{current_timestamp}}`. DagFlux substitutes
+`{{current_date}}` and `{{current_timestamp}}`. Ternlux substitutes
 them with the actual runtime values when the workflow executes, so
 "set archived_date to today" works for every future run without
 modification.
