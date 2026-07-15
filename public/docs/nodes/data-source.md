@@ -34,7 +34,7 @@ the node behaves:
 
 ## Sample data and schema preview
 
-When you select a table, collection, or index, DagFlux fetches a
+When you select a table, collection, or index, Ternlux fetches a
 small sample (typically five rows) and the inferred column / field
 list. This is shown in the chat panel so the AI assistant has
 concrete context for any follow-up question (e.g. "what's in this
@@ -53,7 +53,7 @@ custom fetch function. The function:
 - Returns rows as an array of plain objects.
 
 Once the function is generated, it's saved into the node and is
-"clean" — the node can be reopened without DagFlux re-asking the AI.
+"clean" — the node can be reopened without Ternlux re-asking the AI.
 If you refine your request (e.g. "also include items from the archive
 endpoint"), the function is marked dirty and regenerated on the next
 save. This avoids unnecessary regeneration on every reopen and keeps
@@ -66,7 +66,7 @@ the background engine, just before the function runs.
 
 ## The cloud storage path
 
-When the source is a cloud bucket file, DagFlux:
+When the source is a cloud bucket file, Ternlux:
 
 1. Downloads the object using the cloud connection.
 2. Detects the file type from its extension and shows the appropriate

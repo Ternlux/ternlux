@@ -34,7 +34,7 @@ prefers — the connector behaves identically.
 2. In the left nav, open **Security + networking → Access keys**.
 3. Click **Show keys**.
 4. Copy either of the **Connection string** values.
-5. In DagFlux, paste it into the **Connection String** field. Leave
+5. In Ternlux, paste it into the **Connection String** field. Leave
    account name and key empty.
 
 ### Option B — Account name and key
@@ -42,7 +42,7 @@ prefers — the connector behaves identically.
 1. Same starting point — **Storage Account → Access keys**.
 2. Note the **Storage account name** at the top.
 3. Copy one of the **Key** values.
-4. In DagFlux, fill **Account Name** and **Account Key**. Leave
+4. In Ternlux, fill **Account Name** and **Account Key**. Leave
    connection string empty.
 
 ### Option C — Use a least-privilege approach (recommended for
@@ -61,7 +61,7 @@ shared access signature (SAS):
    user account you can sign in with).
 5. Use the service principal's connection string format
    (`DefaultEndpointsProtocol=https;AccountName=…;AuthType=AAD;…`)
-   in DagFlux.
+   in Ternlux.
 
 Alternatively, you can constrain access using a SAS token attached
 to a connection string — the Azure portal can generate this under

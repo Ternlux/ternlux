@@ -1,5 +1,5 @@
 /**
- * Google BigQuery Connector Plugin for DagFlux
+ * Google BigQuery Connector Plugin for Ternlux
  * Handles all BigQuery database operations
  */
 

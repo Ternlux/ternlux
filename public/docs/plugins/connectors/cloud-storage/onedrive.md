@@ -27,7 +27,7 @@ automatically when you authorise.
 
 ## Setting up credentials
 
-You register an Azure AD application in the Azure portal so DagFlux
+You register an Azure AD application in the Azure portal so Ternlux
 can authorise on your behalf.
 
 ### Step 1 — Open the Azure portal
@@ -42,7 +42,7 @@ Azure Active Directory).
 ### Step 3 — Register an application
 
 1. Go to **App registrations → + New registration**.
-2. Name: `DagFlux`.
+2. Name: `Ternlux`.
 3. Supported account types: pick **Accounts in any organizational
    directory and personal Microsoft accounts** for personal
    OneDrive support, or restrict to your tenant for work-only.
@@ -82,7 +82,7 @@ For read-only, use `Files.Read.All` instead of `Files.ReadWrite.All`.
 If your organisation requires admin consent, click **Grant admin
 consent for [tenant]**.
 
-### Step 7 — Enter the credentials in DagFlux
+### Step 7 — Enter the credentials in Ternlux
 
 - **Application (client) ID** — from step 4.
 - **Client Secret** — from step 5.
@@ -93,7 +93,7 @@ consent for [tenant]**.
 ### Step 8 — Authorise
 
 Click **Authorize** in the form, sign in with the Microsoft account
-that owns the OneDrive, and consent. DagFlux saves the tokens
+that owns the OneDrive, and consent. Ternlux saves the tokens
 encrypted.
 
 ## Behaviour notes

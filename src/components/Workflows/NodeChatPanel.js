@@ -54,6 +54,7 @@ const SANS = "'Inter',-apple-system,sans-serif";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose, onConfigUpdate, onPreviewConfigUpdate, onLoadDatabaseTables, onDataPreviewRefresh }) => {
+  console.log('NodeChatPanel: ', nodes, edges)
   const [resetKey, setResetKey] = useState(0);
   const [executing, setExecuting] = useState(false);
 
@@ -743,7 +744,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
   return (
     <div
       style={{
-        position: 'fixed', right: 0, top: 0, bottom: 0, width: 420, zIndex: 1010,
+        position: 'fixed', right: 0, top: 0, bottom: 0, width: 420, zIndex: 1030,
         background: '#fff', borderLeft: '1px solid #e2e6eb',
         boxShadow: '-6px 0 24px rgba(0,0,0,0.08)',
         display: 'flex', flexDirection: 'column',

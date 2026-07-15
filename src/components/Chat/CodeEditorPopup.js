@@ -185,7 +185,7 @@ const CodeEditorPopup = ({
                     onChange={(value) => setCode(value ?? '')}
                     onMount={handleEditorMount}
                     beforeMount={(monaco) => {
-                        monaco.editor.defineTheme('dagflux-light', {
+                        monaco.editor.defineTheme('ternlux-light', {
                             base: 'vs',
                             inherit: true,
                             rules: [],
@@ -211,7 +211,7 @@ const CodeEditorPopup = ({
                             },
                         });
                     }}
-                    theme="dagflux-light"
+                    theme="ternlux-light"
                     options={{
                         minimap: { enabled: true },
                         fontSize: 13,

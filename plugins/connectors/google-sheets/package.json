@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-google-sheets",
+  "name": "@ternlux/connector-google-sheets",
   "version": "1.0.0",
-  "description": "Google Sheets connector plugin for DagFlux with OAuth2.0 authentication",
+  "description": "Google Sheets connector plugin for Ternlux with OAuth2.0 authentication",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "id": "google-sheets",
     "displayName": "Google Sheets",
     "type": "connector",

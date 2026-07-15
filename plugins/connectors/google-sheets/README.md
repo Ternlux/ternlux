@@ -1,4 +1,4 @@
-# Google Sheets Connector for DagFlux
+# Google Sheets Connector for Ternlux
 
 OAuth2.0-based connector for accessing Google Sheets data.
 
@@ -18,9 +18,9 @@ OAuth2.0-based connector for accessing Google Sheets data.
 4. Add authorized redirect URI: `http://localhost:3000/oauth/callback`
 5. Copy the **Client ID** and **Client Secret**
 
-### 3. Configure Connector in DagFlux
+### 3. Configure Connector in Ternlux
 
-1. Add new connection in DagFlux
+1. Add new connection in Ternlux
 2. Select "Google Sheets" connector
 3. Enter your Client ID and Client Secret
 4. Click "Authorize" to complete OAuth flow

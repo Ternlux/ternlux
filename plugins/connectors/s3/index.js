@@ -1,5 +1,5 @@
 /**
- * Amazon S3 Storage Connector Plugin for DagFlux
+ * Amazon S3 Storage Connector Plugin for Ternlux
  * Handles all S3 storage operations
  */
 

@@ -1,5 +1,5 @@
 /**
- * Snowflake Connector Plugin for DagFlux
+ * Snowflake Connector Plugin for Ternlux
  * Handles all Snowflake database operations
  */
 

@@ -199,7 +199,9 @@ async function embedAndUpsertJoinedRows({
     await helpers.lancedb.executeLanceDBOperation({
       operation: 'upsert',
       data: records,
-      config: { dbPath, tableName: targetTable }
+      // A vector-destination join is always a fresh new_table write — overwrite
+      // so re-runs don't duplicate rows or fail on cross-run schema drift.
+      config: { dbPath, tableName: targetTable, overwrite: true }
     });
     return {
       success: true,

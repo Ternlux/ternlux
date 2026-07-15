@@ -1,6 +1,6 @@
 # Runtime topology
 
-DagFlux has two cooperating layers.
+Ternlux has two cooperating layers.
 
 ## The interactive layer
 
@@ -9,13 +9,13 @@ beside each node, the connections list, the execution history view, and
 the settings screens. It builds and edits the workflow but never holds
 your secrets or talks directly to your databases.
 
-When you ask DagFlux to do anything that touches a credential or runs a
+When you ask Ternlux to do anything that touches a credential or runs a
 piece of generated logic, the interactive layer asks the background
 engine to do it.
 
 ## The background engine
 
-Always running in the background while DagFlux is open. It is responsible
+Always running in the background while Ternlux is open. It is responsible
 for:
 
 - Keeping your AI provider keys and connection credentials encrypted at
@@ -32,7 +32,7 @@ for:
 
 ## What's stored locally
 
-Inside your user data directory, DagFlux maintains:
+Inside your user data directory, Ternlux maintains:
 
 - An encrypted file holding your AI provider keys.
 - An encrypted file holding the secret parts of every saved connection
@@ -48,8 +48,11 @@ Inside your user data directory, DagFlux maintains:
 - Local document-store files for any data you choose to import or
   produce in document form.
 
-You can see and manage everything from inside DagFlux; nothing is sent
-anywhere automatically.
+You can see and manage everything from inside Ternlux. Your workflow data
+is not uploaded to Ternlux's servers; it leaves your machine only when you
+direct it to — to the databases, cloud storage, REST APIs, and AI/embedding
+providers you connect, and to the services the app itself uses (signing in,
+downloading plugins, and opt-in usage analytics).
 
 ## How communication is shielded
 
@@ -64,7 +67,7 @@ with it.
 
 ## Telemetry
 
-DagFlux can record anonymous, opt-in telemetry about which operations
+Ternlux can record anonymous, opt-in telemetry about which operations
 are used and how long they take. Telemetry is off by default and is
 toggled from the settings screen and the terms-and-conditions flow.
 Nothing about your data, your prompts, or your credentials is ever

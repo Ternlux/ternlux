@@ -10,6 +10,24 @@ transformer nodes and join nodes, and it is also called directly by
 other nodes (output, data preview) when they need to read or write
 vectors.
 
+## Transformer node vs Join node — which one this belongs in
+
+Selecting this skill does NOT decide the node type; the node type is
+chosen first, and only some vector work belongs in a transformer:
+
+- **Transformer** — use it only when the operation stays within a single
+  source: embedding/vectorising a column into a vector table (Mode 1), or
+  in-place maintenance of a vector store's own records — update, delete, or
+  tag them, optionally selected by a similarity or metadata search (Mode 2).
+  A transformer NEVER produces "row + its matches" output.
+- **Join** — use it for ALL similarity *matching*: "for each row, find the
+  top-K most similar rows and combine / enrich / attach the matches"
+  (recommendations, semantic join, "find similar items"). This is true even
+  when the matches come from the SAME vector table (a self-join). Mode 2 is
+  the wrong fit here because it only rewrites each record in place — it can't
+  emit each row joined to its top-K neighbours. Route these through a JOIN
+  node (the join engine calls this skill's join hooks automatically).
+
 ## When the AI picks this skill
 
 The assistant offers this skill whenever your request involves:
@@ -20,26 +38,18 @@ The assistant offers this skill whenever your request involves:
 - You mention "embeddings", "vectors", "similarity search",
   "vectorise this column", or "find rows similar to ...".
 
-If you don't have an embedding API key configured (OpenAI or Hugging
-Face), the skill returns a clear error before any work starts and
-points you to the settings screen.
+If you don't have an embedding API key configured (OpenAI), the skill
+returns a clear error before any work starts and points you to the
+settings screen.
 
 ## Embedding providers and models
 
-Two embedding providers are supported:
+One embedding provider is supported:
 
 - **OpenAI** — uses the same key as your ChatGPT key.
   - `text-embedding-3-small` (1536 dimensions) — recommended default.
   - `text-embedding-3-large` (3072 dimensions) — higher quality.
   - `text-embedding-ada-002` (1536 dimensions) — legacy.
-- **Hugging Face** — needs its own key.
-  - `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) — fast.
-  - `BAAI/bge-small-en-v1.5` (384 dimensions) — good quality.
-  - `BAAI/bge-base-en-v1.5` (768 dimensions) — better.
-  - `BAAI/bge-large-en-v1.5` (1024 dimensions) — best.
-
-If only one embedding provider has a key configured, the skill uses it
-without asking. If both are configured, the skill asks you to pick.
 
 ## Vector destinations
 
@@ -64,15 +74,18 @@ already a vector database or not.
 
 This is the "embed and insert" path. The skill:
 
-1. Loads all rows from the source.
+1. Loads all rows from the source. **The source data is not filtered —
+   every record from the source is included in the import.** There is
+   currently no way to narrow down or exclude rows on the way in; if you
+   need a subset, filter the data before it reaches this skill (for
+   example with a transformer upstream).
 2. Picks the embedding column you nominate, plus the embedding
    provider and model.
 3. For OpenAI, estimates the cost up front from the token count of
    the texts to embed. Costs above one US dollar trigger a warning so
    you can confirm before sending data to a paid API.
-4. Generates embeddings in batches — one hundred texts per batch for
-   OpenAI, one at a time for Hugging Face — handling large datasets
-   without overwhelming the provider.
+4. Generates embeddings in batches — one hundred texts per batch —
+   handling large datasets without overwhelming the provider.
 5. Tags each record with the original text, the provider, the model,
    and an embedded-at timestamp so future debugging is easy.
 6. Upserts the resulting vectors into the destination, with the rest
@@ -104,9 +117,9 @@ The skill drives the workflow in three steps:
 2. **Apply a transform function to each found record.** The AI writes
    a small JavaScript function that receives the record plus a shared
    state object that persists across the loop. The function returns:
-   - The modified record → DagFlux **updates** the record in the index.
-   - `null` → DagFlux **deletes** the record from the index.
-   - The unchanged record → DagFlux **skips** the record (no operation).
+   - The modified record → Ternlux **updates** the record in the index.
+   - `null` → Ternlux **deletes** the record from the index.
+   - The unchanged record → Ternlux **skips** the record (no operation).
    - The new state → passed to the next record. The state is useful
      for counting, grouping, or tracking changes across the run.
    You can optionally seed an initial state object.
@@ -141,7 +154,7 @@ vector store.
 
 ## Used by outputs
 
-When you choose a vector store as an Output destination, DagFlux
+When you choose a vector store as an Output destination, Ternlux
 delegates the embedding and upsert to this skill. The same applies to
 the LanceDB local-file export format. The skill auto-detects whether
 the source data already contains vectors (which it does when the
@@ -164,13 +177,13 @@ namespace shown in full.
 - **No valid text in the embedding column.** The skill skips empty /
   null values rather than embedding empty strings.
 - **Index does not exist (Pinecone).** Pinecone indexes must be
-  created in the Pinecone dashboard first — DagFlux does not create
+  created in the Pinecone dashboard first — Ternlux does not create
   them. LanceDB tables are created automatically on first upsert.
 
 ## What the skill remembers per record
 
 When upserting into Pinecone (where vectors and metadata are stored
-separately), DagFlux preserves:
+separately), Ternlux preserves:
 
 - The vector itself.
 - Every original column from the source row as metadata.

@@ -4,9 +4,9 @@ import { SafetyOutlined, BarChartOutlined, SaveOutlined, LockOutlined } from '@a
 
 const { Title, Text, Paragraph } = Typography;
 
-const STORAGE_KEY_ANALYTICS = 'dagflux_analytics_opt_in';
-const STORAGE_KEY_ACCEPTED_AT = 'dagflux_terms_accepted_at';
-const STORAGE_KEY_TERMS_VERSION = 'dagflux_terms_version';
+const STORAGE_KEY_ANALYTICS = 'ternlux_analytics_opt_in';
+const STORAGE_KEY_ACCEPTED_AT = 'ternlux_terms_accepted_at';
+const STORAGE_KEY_TERMS_VERSION = 'ternlux_terms_version';
 
 const PrivacySettings = () => {
   const [analyticsOptIn, setAnalyticsOptIn] = useState(false);
@@ -30,7 +30,7 @@ const PrivacySettings = () => {
     setLoading(true);
     try {
       localStorage.setItem(STORAGE_KEY_ANALYTICS, analyticsOptIn ? 'true' : 'false');
-      localStorage.setItem('dagflux_analytics_updated_at', new Date().toISOString());
+      localStorage.setItem('ternlux_analytics_updated_at', new Date().toISOString());
 
       try {
         await window.electronAPI?.analytics?.setOptIn(analyticsOptIn);
@@ -41,7 +41,7 @@ const PrivacySettings = () => {
       setInitialOptIn(analyticsOptIn);
       message.success(
         analyticsOptIn
-          ? 'Analytics sharing enabled. Thanks for helping us improve DagFlux!'
+          ? 'Analytics sharing enabled. Thanks for helping us improve Ternlux!'
           : 'Analytics sharing disabled.'
       );
     } catch (e) {
@@ -70,7 +70,7 @@ const PrivacySettings = () => {
             Privacy & Analytics
           </Title>
           <Paragraph type="secondary">
-            Control what usage data DagFlux collects. Your workflow contents and credentials
+            Control what usage data Ternlux collects. Your workflow contents and credentials
             are never shared.
           </Paragraph>
         </div>
@@ -116,7 +116,7 @@ const PrivacySettings = () => {
                 />
               </div>
               <Paragraph type="secondary" style={{ fontSize: 13, marginBottom: 12 }}>
-                Help us improve DagFlux by sharing anonymous usage data — feature
+                Help us improve Ternlux by sharing anonymous usage data — feature
                 interactions, performance metrics, and crash reports. We never collect
                 your workflow contents, credentials, or personally identifiable
                 information.

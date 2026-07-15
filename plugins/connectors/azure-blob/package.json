@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-azure-blob",
+  "name": "@ternlux/connector-azure-blob",
   "version": "1.0.0",
-  "description": "Azure Blob Storage connector for DagFlux",
+  "description": "Azure Blob Storage connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "azure-blob",
     "displayName": "Azure Blob Storage",
@@ -13,6 +13,6 @@
   "dependencies": {
     "@azure/storage-blob": "^12.17.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }

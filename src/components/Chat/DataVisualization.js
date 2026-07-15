@@ -27,8 +27,30 @@ import {
     Legend,
     ArcElement,
 } from 'chart.js';
-import { Bar, Line, Pie } from 'react-chartjs-2';
+import { Bar, Line, Pie, Scatter } from 'react-chartjs-2';
+import Editor from '@monaco-editor/react';
 import { Boxdataset } from '../ui_components/boxdataset';
+
+// Read-only Monaco JSON view for unstructured / document results, matching the
+// look DataPreview uses for NeDB/MongoDB data.
+const defineTernluxLightTheme = (monaco) => {
+    monaco.editor.defineTheme('ternlux-light', {
+        base: 'vs',
+        inherit: true,
+        rules: [],
+        colors: {
+            'editor.background': '#ffffff',
+            'editor.foreground': '#111827',
+            'editorLineNumber.foreground': '#9ca3af',
+            'editorLineNumber.activeForeground': '#5a6678',
+            'editor.lineHighlightBackground': '#f7f9fc',
+            'editorIndentGuide.background': '#eef1f6',
+            'editorGutter.background': '#ffffff',
+            'scrollbarSlider.background': '#e2e6eb88',
+            'minimap.background': '#f7f9fc',
+        },
+    });
+};
 
 // Register Chart.js components
 ChartJS.register(
@@ -70,7 +92,7 @@ const chartOptions = {
     },
 };
 
-const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, isLoading = false, hideMenu = false, compact = false }) => {
+const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, isLoading = false, hideMenu = false, compact = false, bare = false }) => {
     const [anchorEl, setAnchorEl] = useState(null);
     const open = Boolean(anchorEl);
 
@@ -84,10 +106,12 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
     // Determine if we should show the menu (only in ChatBot context and when hideMenu is false)
     const showMenu = !hideMenu && onSaveToMain !== null;
     
-    // Determine if we should show the title and container box
+    // Determine if we should show the title and container box.
+    // `bare` mode (used by the chat's tabbed VisualsPanel) suppresses both —
+    // the panel supplies its own framing, title, and footer.
     // In chat: show container for ALL types (including box)
     // In dashboard: show container for all types EXCEPT box
-    const showContainer = onSaveToMain !== null || (onSaveToMain === null && visualizationData.type !== 'box');
+    const showContainer = !bare && (onSaveToMain !== null || (onSaveToMain === null && visualizationData.type !== 'box'));
     const showTitle = showContainer;
 
     const handleMenuClick = (event) => {
@@ -213,10 +237,10 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
                 }
                 
                 const pieData = {
-                    labels: visualizationData.data.map(item => item.name),
+                    labels: visualizationData.data.map(item => item.x ?? item.name),
                     datasets: [
                         {
-                            data: visualizationData.data.map(item => item.value),
+                            data: visualizationData.data.map(item => item.y ?? item.value),
                             backgroundColor: COLORS.slice(0, visualizationData.data.length),
                             borderColor: '#ffffff',
                             borderWidth: 2,
@@ -254,16 +278,56 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
                         </TableContainer>
                     );
                 }
-                
+
+                // Unstructured / document data → read-only Monaco JSON view.
+                if (visualizationData.isJson) {
+                    return (
+                        <div style={{ height: 360, backgroundColor: '#fff', border: '1px solid #e2e6eb', borderRadius: 6, overflow: 'hidden' }}>
+                            <Editor
+                                height="100%"
+                                language="json"
+                                value={JSON.stringify(visualizationData.json ?? visualizationData.data ?? null, null, 2)}
+                                beforeMount={defineTernluxLightTheme}
+                                theme="ternlux-light"
+                                options={{
+                                    readOnly: true,
+                                    minimap: { enabled: false },
+                                    fontSize: 12,
+                                    fontFamily: 'JetBrains Mono, Menlo, Consolas, monospace',
+                                    scrollBeyondLastLine: false,
+                                    automaticLayout: true,
+                                    wordWrap: 'on',
+                                    tabSize: 2,
+                                    lineNumbers: 'on',
+                                    padding: { top: 10, bottom: 10 },
+                                }}
+                            />
+                        </div>
+                    );
+                }
+
+                // Columns may be supplied explicitly; otherwise derive them
+                // from the first row's keys.
+                const tableRows = Array.isArray(visualizationData.data) ? visualizationData.data : [];
+                const tableColumns = (Array.isArray(visualizationData.columns) && visualizationData.columns.length)
+                    ? visualizationData.columns
+                    : (tableRows[0] && typeof tableRows[0] === 'object' ? Object.keys(tableRows[0]) : []);
+
+                const renderCell = (val) => {
+                    if (val === null || val === undefined) return '';
+                    if (typeof val === 'object') return JSON.stringify(val);
+                    return String(val);
+                };
+
                 return (
                     <TableContainer component={Paper} sx={{ maxHeight: 400 }}>
                         <Table stickyHeader size="small">
                             <TableHead>
                                 <TableRow>
-                                    {visualizationData.columns.map((column, index) => (
-                                        <TableCell 
+                                    {tableColumns.map((column, index) => (
+                                        <TableCell
                                             key={index}
-                                            sx={{ 
+                                            sx={{
                                                 backgroundColor: '#f5f5f5',
                                                 fontWeight: 600,
                                                 fontSize: 12,
@@ -276,14 +340,14 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
                                 </TableRow>
                             </TableHead>
                             <TableBody>
-                                {visualizationData.data.map((row, rowIndex) => (
+                                {tableRows.map((row, rowIndex) => (
                                     <TableRow key={rowIndex}>
-                                        {visualizationData.columns.map((column, colIndex) => (
-                                            <TableCell 
+                                        {tableColumns.map((column, colIndex) => (
+                                            <TableCell
                                                 key={colIndex}
                                                 sx={{ fontSize: 11 }}
                                             >
-                                                {row[column]}
+                                                {renderCell(row[column])}
                                             </TableCell>
                                         ))}
                                     </TableRow>
@@ -336,6 +400,67 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
                     </div>
                 );
 
+            case 'scatter': {
+                if (isLoading) {
+                    return (
+                        <div style={{ height: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <CircularProgress />
+                        </div>
+                    );
+                }
+                const scatterData = {
+                    datasets: [
+                        {
+                            label: visualizationData.title || 'Points',
+                            data: (visualizationData.data || []).map(item => ({
+                                x: Number(item.x),
+                                y: Number(item.y),
+                            })),
+                            backgroundColor: COLORS[2],
+                        },
+                    ],
+                };
+                const scatterOptions = {
+                    ...chartOptions,
+                    scales: {
+                        x: { type: 'linear', position: 'bottom', ticks: { font: { size: 11 } } },
+                        y: { beginAtZero: true, ticks: { font: { size: 11 } } },
+                    },
+                };
+                return (
+                    <div style={{ height: chartHeight }}>
+                        <Scatter data={scatterData} options={scatterOptions} />
+                    </div>
+                );
+            }
+
+            case 'kpi': {
+                // One or more headline numbers: each datum is { x: label, y: value }.
+                const kpis = Array.isArray(visualizationData.data) ? visualizationData.data : [];
+                if (kpis.length === 0) return null;
+                return (
+                    <div style={{
+                        display: 'flex', flexWrap: 'wrap', gap: 16,
+                        alignItems: 'stretch', justifyContent: 'flex-start',
+                    }}>
+                        {kpis.map((item, idx) => (
+                            <div key={idx} style={{
+                                flex: '1 1 120px', minWidth: 120,
+                                padding: '14px 16px', borderRadius: 10,
+                                background: '#ffffff', border: '1px solid #e9ecef',
+                            }}>
+                                <div style={{ fontSize: 22, fontWeight: 700, color: '#111827', lineHeight: 1.2 }}>
+                                    {typeof item.y === 'number' ? item.y.toLocaleString() : String(item.y ?? '')}
+                                </div>
+                                <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
+                                    {String(item.x ?? '')}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                );
+            }
+
             default:
                 return null;
         }
@@ -344,7 +469,7 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
     return (
         <Box
             sx={{
-                mt: 2,
+                mt: bare ? 0 : 2,
                 height: '90%',
                 p: showContainer ? 2 : 0, // Show container styling only in chat
                 backgroundColor: showContainer ? '#f8f9fa' : 'transparent',

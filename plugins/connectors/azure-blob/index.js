@@ -1,5 +1,5 @@
 /**
- * Azure Blob Storage Connector Plugin for DagFlux
+ * Azure Blob Storage Connector Plugin for Ternlux
  * Handles all Azure Blob storage operations
  */
 

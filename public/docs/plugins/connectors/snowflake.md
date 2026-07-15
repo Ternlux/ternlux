@@ -6,7 +6,7 @@ cost), and identifiers are uppercase by convention.
 
 ## What it lets you do
 
-- Test that DagFlux can reach Snowflake with your credentials.
+- Test that Ternlux can reach Snowflake with your credentials.
 - List databases, schemas, tables, and views.
 - List columns of any table.
 - Run any Snowflake SQL query.
@@ -43,44 +43,44 @@ and users).
 ```sql
 USE ROLE ACCOUNTADMIN;
 
--- Create a role for DagFlux
-CREATE ROLE dagflux_role;
+-- Create a role for Ternlux
+CREATE ROLE ternlux_role;
 
 -- Create a user with that role as default
-CREATE USER dagflux
+CREATE USER ternlux
   PASSWORD = 'Choose-A-Strong-Password!'
-  DEFAULT_ROLE = dagflux_role
+  DEFAULT_ROLE = ternlux_role
   DEFAULT_WAREHOUSE = COMPUTE_WH
   MUST_CHANGE_PASSWORD = FALSE;
 
 -- Assign the role to the user
-GRANT ROLE dagflux_role TO USER dagflux;
+GRANT ROLE ternlux_role TO USER ternlux;
 ```
 
 ### Step 3 — Grant warehouse access
 
 ```sql
 -- Allow the role to use the compute warehouse
-GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE dagflux_role;
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE ternlux_role;
 ```
 
 ### Step 4 — Grant database, schema, and table access
 
 ```sql
 -- Allow accessing the database and one schema
-GRANT USAGE ON DATABASE MYDB TO ROLE dagflux_role;
-GRANT USAGE ON SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
+GRANT USAGE ON DATABASE MYDB TO ROLE ternlux_role;
+GRANT USAGE ON SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
 
 -- Read + write on existing tables
 GRANT SELECT, INSERT, UPDATE, DELETE
-  ON ALL TABLES IN SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
+  ON ALL TABLES IN SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
 
 -- Same permissions on tables created in the future
 GRANT SELECT, INSERT, UPDATE, DELETE
-  ON FUTURE TABLES IN SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
+  ON FUTURE TABLES IN SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
 
 -- Allow creating new tables (needed for new-table transformations and joins)
-GRANT CREATE TABLE ON SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
+GRANT CREATE TABLE ON SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
 ```
 
 ### Step 5 — Read-only variant
@@ -88,11 +88,11 @@ GRANT CREATE TABLE ON SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
 If you'll only use the connection for sources:
 
 ```sql
-GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE dagflux_role;
-GRANT USAGE ON DATABASE MYDB TO ROLE dagflux_role;
-GRANT USAGE ON SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
-GRANT SELECT ON ALL TABLES IN SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
-GRANT SELECT ON FUTURE TABLES IN SCHEMA MYDB.PUBLIC TO ROLE dagflux_role;
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE ternlux_role;
+GRANT USAGE ON DATABASE MYDB TO ROLE ternlux_role;
+GRANT USAGE ON SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
+GRANT SELECT ON ALL TABLES IN SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA MYDB.PUBLIC TO ROLE ternlux_role;
 ```
 
 ### Step 6 — Find your account identifier
@@ -102,14 +102,14 @@ Your account identifier is in the Snowflake URL:
 `.snowflakecomputing.com`. For some regions Snowflake includes the
 region (e.g. `xy12345.us-east-1`).
 
-### Step 7 — Enter the credentials in DagFlux
+### Step 7 — Enter the credentials in Ternlux
 
 - **Account** — the identifier from step 6.
 - **Username / Password** — what you set in step 2.
 - **Warehouse** — the warehouse the role can use (e.g. `COMPUTE_WH`).
 - **Database** — the database you granted access to.
 - **Schema** — the schema you granted access to (defaults to `PUBLIC`).
-- **Role** — `dagflux_role`. Leave empty to use the user's default
+- **Role** — `ternlux_role`. Leave empty to use the user's default
   role.
 
 ## Behaviour notes

@@ -5,7 +5,7 @@ databases (MariaDB, Aurora MySQL, etc.).
 
 ## What it lets you do
 
-- Test that DagFlux can reach your MySQL server.
+- Test that Ternlux can reach your MySQL server.
 - List schemas, tables, and views.
 - List columns of any table with type, nullability, and primary-key
   flag.
@@ -39,7 +39,7 @@ target database (commonly `root`).
 
 ```sql
 -- Replace the password with a strong one of your own
-CREATE USER 'dagflux'@'%' IDENTIFIED BY 'choose-a-strong-password';
+CREATE USER 'ternlux'@'%' IDENTIFIED BY 'choose-a-strong-password';
 ```
 
 The `'%'` host allows the user to connect from any IP. If you want
@@ -50,10 +50,10 @@ or hostname.
 
 ```sql
 -- Read + write on every table in the database
-GRANT SELECT, INSERT, UPDATE, DELETE ON mydb.* TO 'dagflux'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mydb.* TO 'ternlux'@'%';
 
 -- Allow creating new tables (needed for new-table transformations and joins)
-GRANT CREATE, DROP, ALTER, INDEX ON mydb.* TO 'dagflux'@'%';
+GRANT CREATE, DROP, ALTER, INDEX ON mydb.* TO 'ternlux'@'%';
 
 FLUSH PRIVILEGES;
 ```
@@ -63,7 +63,7 @@ FLUSH PRIVILEGES;
 If you'll only use the connection for sources:
 
 ```sql
-GRANT SELECT ON mydb.* TO 'dagflux'@'%';
+GRANT SELECT ON mydb.* TO 'ternlux'@'%';
 FLUSH PRIVILEGES;
 ```
 
@@ -74,7 +74,7 @@ allowed (in your provider's security group, in `iptables`, in the
 cloud console firewall, etc.). For SSL-only servers, enable the SSL
 checkbox in the form.
 
-### Step 6 — Enter the credentials in DagFlux
+### Step 6 — Enter the credentials in Ternlux
 
 Use the user and password you created. Enter the database name. Leave
 the port at 3306 unless your server uses a custom port.

@@ -1,5 +1,5 @@
 /**
- * OneDrive Storage Connector Plugin for DagFlux
+ * OneDrive Storage Connector Plugin for Ternlux
  * Handles all OneDrive storage operations via Microsoft Graph API
  */
 

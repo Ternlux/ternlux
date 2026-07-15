@@ -42,12 +42,12 @@ and then generates the skill's parameters.
 ## What skills can use
 
 Every skill execution receives the same predictable surface from
-DagFlux. See [Skill capabilities at run time](../../ai-providers/helpers-bundle.md)
+Ternlux. See [Skill capabilities at run time](../../ai-providers/helpers-bundle.md)
 for the full description.
 
 ## Installation
 
-The first install of a skill requires you to restart DagFlux so the
+The first install of a skill requires you to restart Ternlux so the
 interactive layer can pick up the new capability. After that, the skill
 appears in the connection-type selector under the "Skills" tab and is
 automatically considered by the AI when generating transformations or

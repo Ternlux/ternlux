@@ -26,6 +26,21 @@ function bindLibs(helpers) {
   ({ executeLanceDBOperation, listTables: listLanceTables, getLanceDBConnection } = helpers.lancedb);
 }
 
+// Normalize a vector value into a PLAIN number array. Vectors read back from
+// LanceDB arrive as a Float32Array / Arrow vector (NOT a JS Array), so the old
+// `Array.isArray(v) ? v : [v]` wrapped a 1536-element typed array into a
+// length-1 array — which made Pinecone auto-create the index with dimension 1
+// and then reject the real 1536-dim vectors ("dimension 1536 does not match the
+// dimension of the index 1"). Array.from() unwraps typed arrays / iterables to
+// real numbers; only a genuine scalar is wrapped as a single-element vector.
+const toVectorArray = (v) => {
+  if (v == null) return v;
+  if (Array.isArray(v)) return v;
+  if (typeof v.toArray === 'function') return Array.from(v.toArray()); // Arrow vector
+  if (ArrayBuffer.isView(v) || typeof v.length === 'number') return Array.from(v); // TypedArray / array-like
+  return [v]; // genuine scalar
+};
+
 const replaceNulls = (value) => {
   if (value === null) return '';
 
@@ -136,6 +151,7 @@ module.exports = {
    */
   buildSkillPrompt: async (params) => {
     bindLibs(params.helpers);
+    // console.log('params: ', params)
     const {
       userRequest,
       sourceTableSchema,
@@ -149,7 +165,7 @@ module.exports = {
     } = params;
 
     // Fetch available connections from the database (using same pattern as electron.js getDb)
-    const connectionsDbPath = path.join(app.getPath('userData'), 'dagflux-connections.db');
+    const connectionsDbPath = path.join(app.getPath('userData'), 'ternlux-connections.db');
     const connectionsDb = new Datastore({ filename: connectionsDbPath, autoload: true });
 
     const availableConnections = await new Promise((resolve, reject) => {
@@ -450,6 +466,14 @@ You are helping embed regular data into a vector database.
 - Total Records: ${sourceTableSchema?.sampleData?.length || 'Unknown'}
 
 **User's Request:** "${params.userRequest || 'Embed and store in vector database'}"
+
+**Important — No source filtering:** This skill does NOT filter the data
+imported from the source. ALL records from the source are embedded and
+included in the import; there is currently no option to narrow down,
+filter, or exclude rows on the way in. If the user asks to import only a
+subset of the data, explain that filtering is not supported here and that
+they should filter the data upstream (e.g. with a transformer) before it
+reaches this step.
 
 **Available Embedding Providers (you have API keys for):**
 ${availableProviders.map((p, idx) => `
@@ -907,7 +931,10 @@ IMPORTANT:
           embeddingProvider,
           embeddingModel,
           embeddingApiKey,
-          columnToEmbed
+          columnToEmbed,
+          // A new_table embed is a fresh write — overwrite so re-runs don't
+          // accumulate duplicate rows (and don't drift the column schema).
+          overwrite: operationMode === 'new_table'
         });
       } else {
         // For cloud vector databases (Pinecone, etc.), use connector's executeVectorOperation
@@ -1221,14 +1248,14 @@ IMPORTANT:
 
           return {
             id,
-            values: Array.isArray(vector) ? vector : [vector],
+            values: toVectorArray(vector),
             metadata,
             namespace: targetNamespace
           };
         } else {
           // LanceDB: flat structure
           const record = { ...row, id };
-          record.vector = Array.isArray(vector) ? vector : [vector];
+          record.vector = toVectorArray(vector);
           delete record.values;
           delete record.embedding;
           delete record._id;
@@ -1392,7 +1419,7 @@ IMPORTANT:
       const processedData = sourceData.map(row => {
         const vector = row.vector || row.values || row.embedding;
         const record = { ...row };
-        record.vector = Array.isArray(vector) ? vector : [vector];
+        record.vector = toVectorArray(vector);
         delete record.values;
         delete record.embedding;
         delete record._id; // Remove NeDB/MongoDB internal ID
@@ -1524,7 +1551,7 @@ IMPORTANT:
     displayName: 'Vector Database Executor',
     description: 'Generate embeddings and run vector operations on LanceDB or Pinecone — embed columns, upsert vectors, and run semantic search via OpenAI or HuggingFace.',
     version: '1.0.0',
-    author: 'DagFlux'
+    author: 'Ternlux'
   }
 };
 
@@ -2077,18 +2104,51 @@ async function loadSourceData({
     const connector = pluginManager.getConnector(sourceConnection.dbType);
 
     if (connector) {
-      const queryResult = await connector.runQuery(
-        fullConfig.dbConfig,
-        fullConfig.id,
-        {
+      // Different connectors expect different query shapes — runQuery is
+      // intentionally polymorphic. SQL connectors take a SQL string;
+      // MongoDB takes a JSON object with collection / filter / limit;
+      // NeDB takes a similar JSON shape. Build the right shape per
+      // dbType so we don't hand a SQL string to a doc store (which
+      // would JSON.parse-throw inside the connector and return success:
+      // false, surfacing here as "Unable to load data from source").
+      const dbType = String(sourceConnection.dbType || '').toLowerCase();
+      let queryPayload;
+      if (dbType === 'mongodb') {
+        queryPayload = { collection: tableName, filter: {}, limit: 10000 };
+      } else if (dbType === 'nedb') {
+        queryPayload = { operation: 'find', filter: {}, limit: 10000 };
+      } else {
+        // SQL-shaped connectors (Postgres, MySQL, MSSQL, Snowflake,
+        // BigQuery, Redshift, …): keep the SELECT * the previous code
+        // emitted. Tables with schemas are referenced as
+        // "schema.table" by the planner so the literal form is fine.
+        queryPayload = {
           query: `SELECT * FROM ${tableName}`,
           tableName: tableName,
-          limit: 10000  // Safety limit
-        }
+          limit: 10000,
+        };
+      }
+
+      // getFullConfig returns the merged connection config (with `uri`,
+      // `database`, etc. at the top level — NOT nested under `.dbConfig`).
+      // Every other call site in this codebase (electron.js handlers, the
+      // executor helpers) passes `fullConfig` directly. Match that, or
+      // the connector's getConnection reads `.uri` from undefined.
+      const queryResult = await connector.runQuery(
+        fullConfig,
+        sourceConnection.id,
+        queryPayload,
+        10000,
       );
 
-      if (queryResult.success) {
+      if (queryResult && queryResult.success) {
         return queryResult.rows || [];
+      }
+      // Surface the connector's error message instead of the generic
+      // "Unable to load data" — the caller wraps it with the dbType so
+      // the user still sees that context.
+      if (queryResult && queryResult.message) {
+        throw new Error(`Source query failed on ${sourceConnection.dbType}: ${queryResult.message}`);
       }
     }
   }
@@ -2163,11 +2223,14 @@ async function executeLanceDB({
   embeddingProvider,
   embeddingModel,
   embeddingApiKey,
-  columnToEmbed
+  columnToEmbed,
+  overwrite = false
 }) {
   const config = {
     ...lancedbConfig,
-    tableName: targetTable
+    tableName: targetTable,
+    // Forwarded to upsertVectors — drop+recreate the table for new_table writes.
+    overwrite: overwrite === true
   };
 
   if (operation === 'upsert') {

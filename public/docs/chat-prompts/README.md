@@ -2,7 +2,13 @@
 
 Each chat-enabled node has its own AI conversation panel. You describe
 what you want; the assistant turns that into a concrete operation that
-DagFlux can run.
+Ternlux can run.
+
+These per-node panels are distinct from the app-wide
+[chat assistant](../chat-assistant/README.md), which talks about your
+whole workspace and can build entire workflows. When it does, its
+[workflow builder](../chat-assistant/workflow-builder.md) configures each
+node using the very templates described here.
 
 The conversation always follows the same two-phase rhythm:
 

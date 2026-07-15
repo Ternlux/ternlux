@@ -39,7 +39,9 @@ const prompts = {
         - Placeholders like {{current_date}}, {{current_timestamp}} will be replaced at runtime
         - NeDB uses MongoDB-style query syntax but doesn't support aggregation pipelines
 
-        Return your response in this JSON format:
+        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
+
+        Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of the transformation approach",
           "operationType": "filter" | "javascript",
@@ -112,7 +114,9 @@ const prompts = {
         - For explanations text to bolden key points use **text** and to break lines use \\n
         - Placeholders like {{current_date}}, {{current_timestamp}} will be replaced at runtime
 
-        Return your response in this JSON format:
+        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
+
+        Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of what will be deleted or updated and why",
           "operationType": "delete" | "update" | "javascript",
@@ -180,7 +184,9 @@ const prompts = {
         - For explanations text to bolden key points use **text** and to break lines use \\n
         - Use standard SQL syntax that works across databases
 
-        Return your response in this JSON format:
+        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
+
+        Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of the transformation approach",
           "ddl": "CREATE TABLE statement",
@@ -233,7 +239,9 @@ const prompts = {
           - Cannot modify column types directly (requires table recreation)
         - If both ddl and sql are provided, ddl will execute first, then sql
 
-        Return your response in this JSON format:
+        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
+
+        Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of what will be modified and why",
           "ddl": "ALTER TABLE statement (null if not needed)",
@@ -366,6 +374,8 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
         - current application execution plan injects $out into statement and takes care of deleting collection if it needs to be replaced for new_table
         - Do not include any additional keys in the response
 
+        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, explanation, or corrected SQL before or after the object. If you need to explain something to the user, answer a question, or correct/diagnose SQL, put that text inside the "directAnswer" field and set "action" to "answer_directly" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
+
         Return your response as JSON:
         {
           "action": "answer_directly" | "generate_transformation" | "ask_questions",
@@ -388,4 +398,5 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
     }
 }
 
-export default prompts
+module.exports = prompts;
+module.exports.default = prompts;

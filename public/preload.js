@@ -280,6 +280,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   /**
+   * Account authentication helpers.
+   * The Google OAuth loopback flow must run in the main process (system
+   * browser + local callback server); the renderer exchanges the returned
+   * code with the backend for a JWT.
+   */
+  auth: {
+    /** Run Google sign-in. Returns { success, code, redirectUri, codeVerifier } or { success: false, message }. */
+    googleLogin: () =>
+      ipcRenderer.invoke('auth:google-login'),
+
+    /* Apple sign-in disabled
+    appleLogin: () =>
+      ipcRenderer.invoke('auth:apple-login'),
+    */
+  },
+
+  /**
    * Plugin management.
    * Install, uninstall, and list connector plugins.
    */
@@ -315,6 +332,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /** List providers that have a usable API key configured. */
     listProviders: () =>
       ipcRenderer.invoke('ai:listProviders'),
+
+    /** List the models a provider currently offers (fetched live via its SDK). */
+    listModels: (provider) =>
+      ipcRenderer.invoke('ai:listModels', { provider }),
+
+    /** Read the persisted default provider (used by backend-internal calls). */
+    getDefaultProvider: () =>
+      ipcRenderer.invoke('ai:getDefaultProvider'),
+
+    /** Non-secret config { hasKey, baseURL, model } for an OpenAI-compatible provider. */
+    getCompatProvider: (provider) =>
+      ipcRenderer.invoke('ai:getCompatProvider', { provider }),
+
+    /** Save { apiKey, baseURL, model } for a compat provider; blank apiKey keeps the existing key. */
+    saveCompatProvider: (provider, config) =>
+      ipcRenderer.invoke('ai:saveCompatProvider', { provider, config }),
+
+    /** Persist the user's default provider so the main process honors it. */
+    setDefaultProvider: (provider) =>
+      ipcRenderer.invoke('ai:setDefaultProvider', { provider }),
   },
 
   /**
@@ -338,8 +375,104 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * } | { success:false, message:string }>}
    */
   chat: {
-    step: ({ message, history = [], scratchpad = [], activeContext = null, provider = null } = {}) =>
-      ipcRenderer.invoke('chat:step', { message, history, scratchpad, activeContext, provider }),
+    step: ({
+      message,
+      history = [],
+      scratchpad = [],
+      activeContext = null,
+      provider = null,
+      agentMode = 'main',
+      workflowSession = null,
+    } = {}) => ipcRenderer.invoke('chat:step', {
+      message, history, scratchpad, activeContext, provider, agentMode, workflowSession,
+    }),
+    /**
+     * Ask the AI to produce a 3-5 word topic title for a new conversation.
+     * Returns { success, title } — fall back to a synchronous truncation
+     * if success=false.
+     */
+    generateTitle: ({ message, provider = null } = {}) =>
+      ipcRenderer.invoke('chat:generateTitle', { message, provider }),
+    /**
+     * Drive one round-trip with a skill subagent. Used while a node
+     * build is paused on a skill that returned ask_questions /
+     * answer_directly. Returns:
+     *   { success, action, question?, directAnswer?, executionParams?, state, explanation? }
+     * where action ∈ { execute, ask_questions, answer_directly, unrelateSkill }.
+     */
+    skillStep: ({ skillId, userMessage, currentState = {}, context = {} } = {}) =>
+      ipcRenderer.invoke('chat:skillStep', { skillId, userMessage, currentState, context }),
+  },
+
+  /**
+   * Workflow operations.
+   * - executeBuild: applies a plan_workflow_build envelope directly (wired from
+   *   the renderer's "Accept plan" button so confirmations don't burn a turn).
+   * - executeWorkflow: runs a workflow's nodes in topological order.
+   */
+  workflow: {
+    /**
+     * @param {Object} args
+     * @param {Object} args.plan  Plan envelope from plan_workflow_build,
+     *                            with action='plan' and a steps[] array.
+     * @returns {Promise<{ success, workflowId?, workflowName?, nodeCount?, edgeCount?, warnings?, message? }>}
+     */
+    executeBuild: ({ plan } = {}) => ipcRenderer.invoke('workflow:executeBuild', { plan }),
+
+    /**
+     * Subscribe to live build-progress events emitted by executeBuild while a
+     * plan is being applied. The callback receives one event object per step:
+     *   { phase: 'start', mode, totalSteps }
+     *   { phase: 'step', status: 'running'|'done', stepIndex, stepType, label, action }
+     *   { phase: 'done', workflowId, workflowName, nodeCount, edgeCount }
+     * Returns an unsubscribe function — call it on cleanup to avoid leaks.
+     * @param {(evt: object) => void} callback
+     * @returns {() => void}
+     */
+    onBuildProgress: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      const listener = (_e, payload) => callback(payload);
+      ipcRenderer.on('workflow:buildProgress', listener);
+      return () => ipcRenderer.removeListener('workflow:buildProgress', listener);
+    },
+
+    /**
+     * @param {object} params - { workflowId, workflowName, nodes, edges }
+     * @returns {Promise<{ success, executionId, message, results }>}
+     */
+    executeWorkflow: (params) => ipcRenderer.invoke('workflow:execute', params),
+
+    /**
+     * Start watching the open workflow's externalized-code folder
+     * ({userData}/workflow-code/{workflow}). When a code file changes on disk
+     * the main process emits 'workflow:codeChanged' — subscribe with
+     * onCodeChanged to reload the editor. Editor sync only; does not run the
+     * workflow.
+     * @param {string} workflowId
+     * @returns {Promise<{ success, message, watching? }>}
+     */
+    watchCode: (workflowId) => ipcRenderer.invoke('workflow:watchCode', { workflowId }),
+
+    /**
+     * Stop watching a workflow's code folder.
+     * @param {string} workflowId
+     * @returns {Promise<{ success, message }>}
+     */
+    unwatchCode: (workflowId) => ipcRenderer.invoke('workflow:unwatchCode', { workflowId }),
+
+    /**
+     * Subscribe to code-file changes for watched workflows. The callback
+     * receives { workflowId, event, path }. Returns an unsubscribe function —
+     * call it on cleanup to avoid leaks.
+     * @param {(evt: { workflowId: string, event: string, path: string }) => void} callback
+     * @returns {() => void}
+     */
+    onCodeChanged: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      const listener = (_e, payload) => callback(payload);
+      ipcRenderer.on('workflow:codeChanged', listener);
+      return () => ipcRenderer.removeListener('workflow:codeChanged', listener);
+    },
   },
 
   /**
@@ -395,6 +528,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /** Query vector database for preview. Returns { success, data, recordCount, isJson, storageType }. */
     queryVectorPreview: (params) =>
       ipcRenderer.invoke('skills:queryVectorPreview', params),
+  },
+
+  /**
+   * Chat prompt builders sourced from public/ChatPrompts. The renderer passes
+   * a "moduleName.methodName" key and the argument array; the main process
+   * calls the matching prompt function and returns { success, prompt }.
+   */
+  chatPrompts: {
+    build: (key, args = []) =>
+      ipcRenderer.invoke('chatPrompts:build', key, args),
   },
 
   /**
@@ -492,20 +635,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
      */
     cancelServer: (port = 3000) =>
       ipcRenderer.invoke('oauth:cancel-server', { port }),
-  },
-
-  /**
-   * Workflow execution.
-   * Execute workflows and track execution history.
-   */
-  workflow: {
-    /**
-     * Execute a workflow by processing all nodes in topological order.
-     * @param {object} params - { workflowId, workflowName, nodes, edges }
-     * Returns { success, executionId, message, results }
-     */
-    executeWorkflow: (params) =>
-      ipcRenderer.invoke('workflow:execute', params),
   },
 
   /**

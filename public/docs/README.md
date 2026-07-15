@@ -1,16 +1,16 @@
-# DagFlux Documentation
+# Ternlux Documentation
 
-DagFlux is a desktop application for designing, automating, and running
+Ternlux is a desktop application for designing, automating, and running
 data workflows. You assemble a workflow as a graph of typed nodes — a
 trigger, one or more data sources, transformations, joins, and outputs —
 and let the built-in AI assistant translate plain-language descriptions
 into the exact operations needed to move and reshape your data.
 
 This documentation is the conceptual map of the product. It explains how
-each part of DagFlux behaves, what it can do, and how the pieces fit
+each part of Ternlux behaves, what it can do, and how the pieces fit
 together. It does not document source code.
 
-## How DagFlux works in one minute
+## How Ternlux works in one minute
 
 You start with a blank canvas and drop nodes onto it. Each node has a job:
 
@@ -21,16 +21,16 @@ You start with a blank canvas and drop nodes onto it. Each node has a job:
 - A **Transformer** node modifies data from a single upstream source.
 - A **Join** node merges data from two or more upstream sources.
 - An **Output** node writes results to a file, a database, a cloud
-  bucket, a vector store, or an AI analysis report.
+  bucket, or a vector store.
 - A **Branch** node checks a condition and routes execution down one of
   two paths.
 
-When you describe what you want a node to do in plain language, DagFlux
+When you describe what you want a node to do in plain language, Ternlux
 asks clarifying questions if needed, then generates the precise operation
 that will run at execution time. You see and approve that operation
 before the workflow is saved.
 
-When the workflow runs, DagFlux executes nodes in order, logs every step,
+When the workflow runs, Ternlux executes nodes in order, logs every step,
 and records the result so you can inspect what happened.
 
 Throughout, your credentials and AI provider keys stay encrypted on your
@@ -41,15 +41,16 @@ anywhere except to the service the connection actually targets.
 
 | Section | What it covers |
 | --- | --- |
-| [Architecture](architecture/README.md) | How DagFlux is structured, what runs locally, how runs are recorded |
-| [Plugins](plugins/README.md) | How DagFlux is extended with connectors and AI skills |
+| [Architecture](architecture/README.md) | How Ternlux is structured, what runs locally, how runs are recorded |
+| [Plugins](plugins/README.md) | How Ternlux is extended with connectors and AI skills |
 | [Connections](connections/README.md) | Saved data sources, credential storage, OAuth |
-| [AI providers](ai-providers/README.md) | Which AI providers DagFlux supports and how it uses them |
+| [AI providers](ai-providers/README.md) | Which AI providers Ternlux supports and how it uses them |
 | [Nodes](nodes/README.md) | What each node type does and how it behaves at run time |
+| [Chat assistant](chat-assistant/README.md) | The app-wide AI assistant that answers questions, runs queries, and builds workflows |
 | [Chat prompts](chat-prompts/README.md) | How the AI assistant turns descriptions into operations |
 | [Triggers](triggers/README.md) | Scheduled, file-based, and webhook automation |
 
-## What DagFlux can do
+## What Ternlux can do
 
 In one workflow you can:
 
@@ -65,7 +66,6 @@ In one workflow you can:
   generated automatically).
 - Run the whole workflow on demand, on a schedule, when a file changes,
   or in response to an HTTP webhook.
-- Automatically generate an AI analysis report on the final output.
 
-DagFlux ships with a curated set of integrations and can install more
+Ternlux ships with a curated set of integrations and can install more
 on demand from the plugin catalog.

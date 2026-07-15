@@ -1,5 +1,5 @@
 /**
- * MongoDB Connector Plugin for DagFlux
+ * MongoDB Connector Plugin for Ternlux
  * Handles all MongoDB database operations
  */
 
@@ -132,8 +132,10 @@ module.exports = {
       const params = typeof query === 'string' ? JSON.parse(query) : query;
       const db = connection.db;
 
-      // Handle different operation types
-      if (params.operation) {
+      // Handle different operation types. An explicit `operation: "find"` is
+      // the same as omitting `operation` — fall through to the default find
+      // path below instead of failing with "Unknown operation type: find".
+      if (params.operation && params.operation !== 'find') {
         const coll = db.collection(params.collection);
 
         switch (params.operation) {
@@ -168,6 +170,35 @@ module.exports = {
               insertedCount: result.insertedCount
             };
 
+          case 'count': {
+            // Document count for params.filter (defaults to all docs).
+            const n = await coll.countDocuments(params.filter || {});
+            return {
+              success: true,
+              rows: [{ count: n }],
+              columns: ['count'],
+              rowCount: 1,
+              count: n,
+              json: true,
+            };
+          }
+
+          case 'aggregate': {
+            // Run an aggregation pipeline. `params.pipeline` is required.
+            if (!Array.isArray(params.pipeline)) {
+              return { success: false, message: 'aggregate requires params.pipeline (array)' };
+            }
+            const docs = await coll.aggregate(params.pipeline).toArray();
+            const columns = docs.length ? Object.keys(docs[0]) : [];
+            return {
+              success: true,
+              rows: docs,
+              columns,
+              rowCount: docs.length,
+              json: true,
+            };
+          }
+
           default:
             return {
               success: false,
@@ -176,10 +207,12 @@ module.exports = {
         }
       }
 
-      // Default: run find query
+      // Default: run find query (honors optional sort / projection)
       const coll = db.collection(params.collection);
-      const docs = await coll
-        .find(params.filter || {})
+      let cursor = coll.find(params.filter || {});
+      if (params.sort) cursor = cursor.sort(params.sort);
+      if (params.projection) cursor = cursor.project(params.projection);
+      const docs = await cursor
         .limit(params.limit || limit)
         .toArray();
 

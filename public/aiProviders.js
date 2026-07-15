@@ -6,11 +6,53 @@
  * that decrypted API keys never leave the main process.
  */
 
+const fs = require('fs');
+const path = require('path');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const Anthropic = require('@anthropic-ai/sdk');
 const OpenAI = require('openai');
 
-const PROVIDER_PRIORITY = ['openai', 'claude', 'gemini'];
+// Dev-only prompt log. Single JSON file at frontend/dev-logs/ai-prompts.json
+// — reset on the first callAI invocation of each process, then re-written
+// (whole array) after every log entry so the file stays valid JSON at rest.
+// Disabled when NODE_ENV=production. Failures are swallowed.
+const PROMPT_LOG_PATH = path.join(__dirname, '..', 'dev-logs', 'ai-prompts.json');
+const promptLogEntries = [];
+let promptLogInitialized = false;
+function logPromptToFile(entry) {
+  if (process.env.NODE_ENV === 'production') return;
+  try {
+    if (!promptLogInitialized) {
+      fs.mkdirSync(path.dirname(PROMPT_LOG_PATH), { recursive: true });
+      promptLogEntries.length = 0;
+      promptLogInitialized = true;
+    }
+    promptLogEntries.push(entry);
+    fs.writeFileSync(PROMPT_LOG_PATH, JSON.stringify(promptLogEntries, null, 2));
+  } catch (_err) {
+    // intentional: never propagate logging errors
+  }
+}
+
+// OpenAI-compatible providers. Each exposes a `/chat/completions` endpoint that
+// the `openai` SDK can drive by overriding `baseURL`, so they all route through
+// callOpenAI. `requiresKey: false` providers are local servers (Ollama, LM
+// Studio) that accept any non-empty key. `custom` has no fixed baseURL — the
+// user supplies one in the UI, stored alongside the key.
+const OPENAI_COMPAT_PROVIDERS = {
+  openrouter: { label: 'OpenRouter', baseURL: 'https://openrouter.ai/api/v1', defaultModel: 'openai/gpt-4o-mini', requiresKey: true },
+  groq:       { label: 'Groq',       baseURL: 'https://api.groq.com/openai/v1', defaultModel: 'llama-3.3-70b-versatile', requiresKey: true },
+  together:   { label: 'Together AI', baseURL: 'https://api.together.xyz/v1', defaultModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', requiresKey: true },
+  mistral:    { label: 'Mistral AI', baseURL: 'https://api.mistral.ai/v1', defaultModel: 'mistral-large-latest', requiresKey: true },
+  nvidia:     { label: 'NVIDIA AI', baseURL: 'https://integrate.api.nvidia.com/v1', defaultModel: 'meta/llama-3.1-70b-instruct', requiresKey: true },
+  ollama:     { label: 'Ollama',     baseURL: 'http://localhost:11434/v1', defaultModel: 'llama3.1', requiresKey: false },
+  lmstudio:   { label: 'LM Studio',  baseURL: 'http://localhost:1234/v1', defaultModel: 'local-model', requiresKey: false },
+  custom:     { label: 'Custom (OpenAI-compatible)', baseURL: '', defaultModel: '', requiresKey: false }
+};
+
+// Built-in providers first (preferred when several are configured), then any
+// configured OpenAI-compatible provider as a fallback.
+const PROVIDER_PRIORITY = ['openai', 'claude', 'gemini', ...Object.keys(OPENAI_COMPAT_PROVIDERS)];
 
 const DEFAULT_MODELS = {
   openai: 'gpt-5.2',
@@ -124,9 +166,10 @@ function stripMarkdownCodeBlocks(text) {
 
 async function callGemini(prompt, model, maxTokens, apiKey, chatHistory = []) {
   const genAI = new GoogleGenerativeAI(apiKey);
+  const generationConfig = maxTokens ? { maxOutputTokens: maxTokens } : {};
   const geminiModel = genAI.getGenerativeModel({
     model,
-    generationConfig: { maxOutputTokens: maxTokens }
+    generationConfig
   });
 
   let fullPrompt = prompt;
@@ -155,7 +198,10 @@ async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null,
   }
   messages.push({ role: 'user', content: prompt });
 
-  const requestParams = { model, max_tokens: maxTokens, messages };
+  // Anthropic's Messages API REQUIRES max_tokens — omitting it returns a 400.
+  // Always send it, defaulting when the caller didn't specify one.
+  const requestParams = { model, max_tokens: maxTokens || 4096, messages };
+
   if (systemPrompt) requestParams.system = systemPrompt;
 
   const message = await anthropic.messages.create(requestParams);
@@ -165,9 +211,13 @@ async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null,
   throw new Error('Invalid response format from Claude API');
 }
 
-async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = []) {
+async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null) {
   const OpenAICtor = OpenAI.default || OpenAI;
-  const openai = new OpenAICtor({ apiKey });
+  // Local servers (Ollama, LM Studio) need no real key, but the SDK rejects an
+  // empty apiKey — pass a placeholder when none was supplied.
+  const clientOptions = { apiKey: apiKey || 'not-needed' };
+  if (baseURL) clientOptions.baseURL = baseURL;
+  const openai = new OpenAICtor(clientOptions);
 
   const messages = [];
   if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
@@ -179,67 +229,206 @@ async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null,
   }
   messages.push({ role: 'user', content: prompt });
 
-  const completion = await openai.chat.completions.create({
+  const params = {
     model,
     messages,
-    max_completion_tokens: maxTokens
-  });
+  }
+  // Optional for OpenAI — only send when the caller specified a cap.
+  if (maxTokens) params.max_completion_tokens = maxTokens;
+  const completion = await openai.chat.completions.create(params);
   if (completion.choices && completion.choices[0]?.message?.content) {
     return stripMarkdownCodeBlocks(completion.choices[0].message.content);
   }
   throw new Error('Invalid response format from OpenAI API');
 }
 
+// OpenAI exposes many non-chat models (embeddings, audio, image, moderation)
+// through the same /models endpoint. Drop those so the model picker only offers
+// models that chat.completions can actually drive.
+const OPENAI_NON_CHAT = /(embedding|whisper|tts|audio|dall-e|moderation|image|realtime|transcribe|search|similarity|davinci|babbage|^ada|curie)/i;
+
+/**
+ * List the models a provider currently offers, via its own SDK/API — the
+ * dynamic replacement for the hardcoded PROVIDER_MODELS list. Returns
+ * `[{ value, label }]` (value = model id used in requests). The renderer
+ * enriches these with curated descriptions and falls back to its bundled list
+ * when this throws (offline, bad key, etc.).
+ *
+ * @param {string} provider            'claude' | 'gemini' | 'openai' | any OpenAI-compatible id
+ * @param {Object} opts
+ * @param {string} opts.apiKey
+ * @param {string} [opts.baseURL]      Required for OpenAI-compatible providers.
+ */
+async function listModels(provider, { apiKey, baseURL } = {}) {
+  const p = (provider || '').toLowerCase();
+
+  if (p === 'claude') {
+    const AnthropicCtor = Anthropic.default || Anthropic;
+    const anthropic = new AnthropicCtor({ apiKey });
+    const page = await anthropic.models.list({ limit: 1000 });
+    // More recent models are returned first; preserve that order.
+    return (page.data || []).map((m) => ({ value: m.id, label: m.display_name || m.id }));
+  }
+
+  if (p === 'gemini') {
+    // @google/generative-ai has no list endpoint, so hit the REST models API.
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=${encodeURIComponent(apiKey || '')}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Gemini models request failed: ${res.status} ${res.statusText}`);
+    const body = await res.json();
+    return (body.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => ({ value: String(m.name || '').replace(/^models\//, ''), label: m.displayName || m.name }));
+  }
+
+  // openai + any OpenAI-compatible provider (same /models shape).
+  const OpenAICtor = OpenAI.default || OpenAI;
+  const clientOptions = { apiKey: apiKey || 'not-needed' };
+  if (baseURL) clientOptions.baseURL = baseURL;
+  const openai = new OpenAICtor(clientOptions);
+  const page = await openai.models.list();
+  const models = (page.data || [])
+    .map((m) => ({ value: m.id, label: m.id }))
+    .filter((m) => !OPENAI_NON_CHAT.test(m.value));
+  models.sort((a, b) => a.value.localeCompare(b.value));
+  return models;
+}
+
 /**
  * Provider-agnostic dispatcher. Caller supplies the apiKey explicitly.
  */
 async function callAI(prompt, options = {}) {
-  console.log('prompt: ', prompt)
-  const { provider, model, maxTokens = 2048, apiKey, systemPrompt = null, chatHistory = [] } = options;
+  const { provider, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null } = options;
   if (!provider) throw new Error('provider is required');
-  if (!apiKey) throw new Error('apiKey is required');
+  const compatConf = OPENAI_COMPAT_PROVIDERS[provider.toLowerCase()];
+  // Keyless OpenAI-compatible providers (local servers) may run without a key.
+  if (!apiKey && (!compatConf || compatConf.requiresKey)) throw new Error('apiKey is required');
 
   const trimmedHistory = trimChatHistoryToFit({
     prompt,
     chatHistory,
     model,
-    maxResponseTokens: maxTokens,
+    maxResponseTokens: maxTokens ? maxTokens : 4096,
     systemPrompt
   });
 
-  switch (provider.toLowerCase()) {
-    case 'gemini':
-      return callGemini(prompt, model, maxTokens, apiKey, trimmedHistory);
-    case 'claude':
-      return callClaude(prompt, model, maxTokens, apiKey, systemPrompt, trimmedHistory);
-    case 'openai':
-    case 'chatgpt':
-      return callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt, trimmedHistory);
-    default:
-      throw new Error(`Unknown AI provider: ${provider}. Supported: gemini, claude, openai`);
+  const requestEntry = {
+    kind:        'request',
+    ts:          new Date().toISOString(),
+    provider,
+    model:       model || null,
+    maxTokens,
+    systemPrompt,
+    chatHistory: trimmedHistory,
+    prompt,
+  };
+  logPromptToFile(requestEntry);
+
+
+  let response;
+  let callError = null;
+  try {
+    switch (provider.toLowerCase()) {
+      case 'gemini':
+        response = await callGemini(prompt, model, maxTokens, apiKey, trimmedHistory);
+        break;
+      case 'claude':
+        response = await callClaude(prompt, model, maxTokens, apiKey, systemPrompt, trimmedHistory);
+        break;
+      case 'openai':
+      case 'chatgpt':
+        response = await callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt, trimmedHistory);
+        break;
+      default: {
+        // Any OpenAI-compatible provider (OpenRouter, Groq, Together, Mistral,
+        // Ollama, LM Studio, custom) routes through the OpenAI SDK + baseURL.
+        if (!compatConf) {
+          throw new Error(`Unknown AI provider: ${provider}. Supported: gemini, claude, openai, ${Object.keys(OPENAI_COMPAT_PROVIDERS).join(', ')}`);
+        }
+        const url = baseURL || compatConf.baseURL;
+        if (!url) throw new Error(`Provider "${provider}" requires a base URL. Set one in AI provider settings.`);
+        if (!model) throw new Error(`Provider "${provider}" requires a model name.`);
+        response = await callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt, trimmedHistory, url);
+        break;
+      }
+    }
+  } catch (err) {
+    callError = err;
   }
+
+  // Response goes first so it sits ABOVE the matching request in the file
+  // (the file is read top→bottom, append-only).
+  logPromptToFile({
+    kind:     'response',
+    ts:       new Date().toISOString(),
+    provider,
+    model:    model || null,
+    ...(callError ? { error: callError.message } : { response }),
+  });
+
+  if (callError) throw callError;
+  return response;
 }
 
-function resolveApiKey(provider, apiKeys = {}) {
+/**
+ * Resolve a provider's stored configuration into a normalized entry the
+ * dispatcher can use: { apiKey, baseURL?, model? }, or null if the provider
+ * isn't usable (no key for a key-requiring provider, or a custom provider with
+ * no base URL configured).
+ *
+ * OpenAI-compatible providers may be stored either as a plain key string or as
+ * an object { apiKey, baseURL, model } so the UI can carry a per-provider base
+ * URL and model. A provider is only considered configured if it has a stored
+ * entry — keyless local providers are NOT auto-enabled.
+ */
+function resolveProviderEntry(provider, apiKeys = {}) {
   if (!provider) return null;
-  if (provider === 'openai' || provider === 'chatgpt') {
-    return apiKeys.chatgpt || apiKeys.openai || null;
+  const p = provider.toLowerCase();
+
+  if (p === 'openai' || p === 'chatgpt') {
+    const key = apiKeys.chatgpt || apiKeys.openai;
+    return key ? { apiKey: key } : null;
   }
-  return apiKeys[provider] || null;
+  if (p === 'claude' || p === 'gemini') {
+    return apiKeys[p] ? { apiKey: apiKeys[p] } : null;
+  }
+
+  const conf = OPENAI_COMPAT_PROVIDERS[p];
+  if (conf) {
+    const stored = apiKeys[p];
+    if (!stored) return null; // never auto-enable a compat provider
+    const entry = typeof stored === 'object' ? stored : { apiKey: stored };
+    const apiKey = entry.apiKey || entry.key || '';
+    const baseURL = entry.baseURL || conf.baseURL || '';
+    const model = entry.model || conf.defaultModel || undefined;
+    if (conf.requiresKey && !apiKey) return null;
+    if (!baseURL) return null; // custom provider needs a URL
+    return { apiKey, baseURL, model };
+  }
+  return null;
+}
+
+// Backward-compatible helper: just the API key string (or null).
+function resolveApiKey(provider, apiKeys = {}) {
+  const entry = resolveProviderEntry(provider, apiKeys);
+  return entry ? (entry.apiKey || null) : null;
 }
 
 function listAvailableProviders(apiKeys = {}) {
-  return PROVIDER_PRIORITY.filter((p) => !!resolveApiKey(p, apiKeys));
+  return PROVIDER_PRIORITY.filter((p) => !!resolveProviderEntry(p, apiKeys));
 }
 
 function pickProvider(apiKeys = {}, requested) {
   if (requested) {
-    const key = resolveApiKey(requested, apiKeys);
-    if (key) return { provider: requested === 'chatgpt' ? 'openai' : requested, apiKey: key };
+    const entry = resolveProviderEntry(requested, apiKeys);
+    if (entry) {
+      const provider = requested.toLowerCase() === 'chatgpt' ? 'openai' : requested.toLowerCase();
+      return { provider, ...entry };
+    }
   }
   for (const p of PROVIDER_PRIORITY) {
-    const key = resolveApiKey(p, apiKeys);
-    if (key) return { provider: p, apiKey: key };
+    const entry = resolveProviderEntry(p, apiKeys);
+    if (entry) return { provider: p, ...entry };
   }
   return null;
 }
@@ -265,7 +454,8 @@ async function callAIWithKeys(prompt, options = {}) {
   return callAI(prompt, {
     provider: picked.provider,
     apiKey: picked.apiKey,
-    model: model || DEFAULT_MODELS[picked.provider],
+    baseURL: picked.baseURL,
+    model: model || picked.model || DEFAULT_MODELS[picked.provider],
     maxTokens,
     systemPrompt,
     chatHistory
@@ -279,12 +469,16 @@ module.exports = {
   callOpenAI,
   callAI,
   callAIWithKeys,
+  listModels,
   pickProvider,
+  resolveProviderEntry,
+  resolveApiKey,
   listAvailableProviders,
   trimChatHistoryToFit,
   estimateTokens,
   windowForModel,
   PROVIDER_PRIORITY,
   DEFAULT_MODELS,
-  MODEL_CONTEXT_WINDOWS
+  MODEL_CONTEXT_WINDOWS,
+  OPENAI_COMPAT_PROVIDERS
 };

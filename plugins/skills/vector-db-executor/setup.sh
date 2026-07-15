@@ -29,7 +29,7 @@ if [ $? -eq 0 ]; then
     echo "The Vector DB Executor skill is now ready to use."
     echo ""
     echo "Next steps:"
-    echo "1. Restart DagFlux to load the skill"
+    echo "1. Restart Ternlux to load the skill"
     echo "2. Add your API keys:"
     echo "   - OpenAI API key (for OpenAI embeddings)"
     echo "   - HuggingFace API key (for HuggingFace embeddings)"

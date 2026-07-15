@@ -56,10 +56,10 @@ remember:
 
 When the workflow runs, the background engine substitutes the
 placeholders with the real decrypted values just before evaluating the
-function. The function then fetches everything and DagFlux writes the
+function. The function then fetches everything and Ternlux writes the
 returned rows into a local document collection that downstream nodes
 read from.
 
-If the API returns nothing, DagFlux still creates an empty collection
+If the API returns nothing, Ternlux still creates an empty collection
 so downstream nodes have a defined source. If the API returns a single
-object, DagFlux wraps it as a single-element array.
+object, Ternlux wraps it as a single-element array.

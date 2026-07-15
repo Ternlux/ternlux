@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-onedrive",
+  "name": "@ternlux/connector-onedrive",
   "version": "1.0.0",
-  "description": "OneDrive storage connector for DagFlux",
+  "description": "OneDrive storage connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "onedrive",
     "displayName": "OneDrive",
@@ -14,6 +14,6 @@
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "isomorphic-fetch": "^3.0.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }

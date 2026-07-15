@@ -4,6 +4,21 @@
  */
 
 const Datastore = require('@seald-io/nedb');
+const localSqlite = require('../lib/sqlite');
+
+// Imported-file SQLite connections have NO plugin connector (sqlite is a local
+// builtin, read via public/lib/sqlite.js). Detect that case so we read the
+// source directly from its .db file instead of calling
+// pluginManager.getConnector('sqlite') — which returns undefined and crashes
+// with "Cannot read properties of undefined (reading 'runQuery')".
+function isLocalSqliteSource(conn, pluginManager) {
+  return !!conn && conn.dbType === 'sqlite'
+    && (!pluginManager || typeof pluginManager.hasConnector !== 'function' || !pluginManager.hasConnector('sqlite'));
+}
+
+function localSqlitePath(conn) {
+  return conn.fileInfo?.filePath || conn.localPath || conn.dbConfig?.dbPath || null;
+}
 
 /**
  * Load data from a source (SQL or NoSQL)
@@ -15,6 +30,14 @@ const Datastore = require('@seald-io/nedb');
  */
 async function loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig) {
   const sourceDbType = sourceConnection.dbType;
+
+  // Local imported-file SQLite source — read straight from its .db file.
+  if (isLocalSqliteSource(sourceConnection, pluginManager)) {
+    const dbPath = localSqlitePath(sourceConnection);
+    if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
+    const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '');
+    return await localSqlite.runQuery({ dbPath, query: sql });
+  }
 
   // Check if connector is available
   if (!pluginManager.hasConnector(sourceDbType) && sourceDbType !== 'nedb') {
@@ -80,6 +103,27 @@ async function loadSQLSourceInChunks(
   onChunk
 ) {
   const sourceDbType = sourceConnection.dbType;
+
+  // Local imported-file SQLite source — page through it with the local lib
+  // (LIMIT/OFFSET) since there is no plugin connector for sqlite.
+  if (isLocalSqliteSource(sourceConnection, pluginManager)) {
+    const dbPath = localSqlitePath(sourceConnection);
+    if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
+    let offset = 0;
+    let totalProcessed = 0;
+    while (true) {
+      const paginationClause = `LIMIT ${chunkSize} OFFSET ${offset}`;
+      const chunkQuery = sql.includes('{LIMIT_OFFSET_HERE}')
+        ? sql.replace('{LIMIT_OFFSET_HERE}', paginationClause)
+        : `${sql} ${paginationClause}`;
+      const rows = await localSqlite.runQuery({ dbPath, query: chunkQuery });
+      if (rows.length === 0) break;
+      totalProcessed += rows.length;
+      await onChunk(rows, offset, totalProcessed);
+      offset += chunkSize;
+    }
+    return totalProcessed;
+  }
 
   if (!pluginManager.hasConnector(sourceDbType)) {
     throw new Error(`Database type ${sourceDbType} is not supported`);
@@ -272,6 +316,13 @@ async function executeLocalSQLiteJoin(
         sourceData = sourceConfig._preloadedRows;
       } else if (isNoSQLSource) {
         sourceData = await loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig);
+      } else if (isLocalSqliteSource(sourceConnection, pluginManager)) {
+        // Imported-file SQLite source — no plugin connector exists; read
+        // directly from its .db file via the local lib.
+        const dbPath = localSqlitePath(sourceConnection);
+        if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
+        const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '');
+        sourceData = await localSqlite.runQuery({ dbPath, query: sql });
       } else {
         const sourcePlugin = pluginManager.getConnector(sourceConnection.dbType);
         const sourceFullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});

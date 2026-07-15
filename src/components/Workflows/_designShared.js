@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-// Design tokens — mirrors design/Dagflux Tabs.html
+// Design tokens — mirrors design/Ternlux Tabs.html
 export const C = {
   bg: '#fff', surface: '#f7f9fc', s2: '#eef1f6',
   border: '#e2e6eb', border2: '#cdd2db',

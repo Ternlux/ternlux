@@ -1,6 +1,6 @@
 # Plugins
 
-DagFlux is built around plugins. Every database integration, every cloud
+Ternlux is built around plugins. Every database integration, every cloud
 storage integration, and every AI-routable capability is a plugin. New
 ones can be added without modifying the rest of the application.
 
@@ -22,10 +22,10 @@ There are two kinds of plugins:
 
 ## Where plugins come from
 
-DagFlux ships with a curated set of plugins. You can install additional
+Ternlux ships with a curated set of plugins. You can install additional
 plugins from the catalog at any time, and uninstall ones you don't use.
 Every plugin is self-contained — it has its own folder, its own
-dependencies, and an icon and configuration form that DagFlux renders
+dependencies, and an icon and configuration form that Ternlux renders
 automatically.
 
 ## Roles you'll see in the product

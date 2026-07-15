@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Modal, message, Spin } from 'antd';
 import { C, MONO, SANS, I } from './_designShared';
+import { isLoggedIn } from '../../utils/authService';
 
-const LOGO_PREFIX = 'http://www.dagflux.com/wp-content/uploads/2026/04/';
+const LOGO_PREFIX = 'http://www.ternlux.com/wp-content/uploads/2026/04/';
 
 // Source of truth: connectors mirror the keys/categories used elsewhere in
-// the app. `img` is set only for connectors covered by the dagflux.com logo
+// the app. `img` is set only for connectors covered by the ternlux.com logo
 // list; everything else falls back to monogram letters.
 const CONNECTION_TYPES = [
   // Local files
@@ -30,7 +31,7 @@ const CONNECTION_TYPES = [
   { key: 's3',           title: 'Amazon S3',            description: 'Connect to Amazon S3 object storage', category: 'storage', img: LOGO_PREFIX + 'Amazon_S3.png',            tone: '#ff9900' },
   { key: 'gcs',          title: 'Google Cloud Storage', description: 'Connect to Google Cloud Storage',     category: 'storage', img: LOGO_PREFIX + 'Google_Cloud_Storage.png', tone: '#4285f4' },
   { key: 'azure-blob',   title: 'Azure Blob Storage',   description: 'Connect to Azure Blob Storage',       category: 'storage', img: LOGO_PREFIX + 'Azure_blob.png',           tone: '#0078d4' },
-  { key: 'dropbox',      title: 'Dropbox',              description: 'Connect to Dropbox cloud storage',    category: 'storage', img: 'http://www.dagflux.com/wp-content/uploads/2026/05/Dropbox-scaled.png', letters: 'DB', tone: '#0061ff' },
+  { key: 'dropbox',      title: 'Dropbox',              description: 'Connect to Dropbox cloud storage',    category: 'storage', img: 'http://www.ternlux.com/wp-content/uploads/2026/05/Dropbox-scaled.png', letters: 'DB', tone: '#0061ff' },
   { key: 'google-drive', title: 'Google Drive',         description: 'Connect to Google Drive',             category: 'storage', letters: 'GD', tone: '#34a853' },
   { key: 'onedrive',     title: 'OneDrive',             description: 'Connect to Microsoft OneDrive',       category: 'storage', letters: 'OD', tone: '#0078d4' },
 
@@ -51,6 +52,14 @@ const SECTIONS = [
 ];
 
 const NO_PLUGIN_REQUIRED = ['spreadsheet', 'json', 'sqlite', 'nedb', 'lancedb', 'parquet', 'avro', 'generic'];
+
+// Plugin connectors require a (free) Ternlux account; local file connectors stay open.
+const LoginLockIcon = ({ color = '#d97706', size = 12 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
+    <rect x="3" y="11" width="18" height="11" rx="2" />
+    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+  </svg>
+);
 
 // Inject hover/focus styles — inline styles can't express :hover.
 const STYLE_TAG_ID = 'cts-design-styles';
@@ -123,7 +132,7 @@ const Icon = ({ c }) => {
   );
 };
 
-const StatusTag = ({ c, installing, installed }) => {
+const StatusTag = ({ c, installing, installed, locked }) => {
   const base = {
     display: 'inline-flex', alignItems: 'center', gap: 4,
     fontFamily: MONO, fontSize: 9.5, fontWeight: 600,
@@ -134,6 +143,13 @@ const StatusTag = ({ c, installing, installed }) => {
     <span style={{ width: 5, height: 5, borderRadius: '50%', background: color }} />
   );
 
+  if (locked) {
+    return (
+      <span style={{ ...base, color: C.amber, background: 'rgba(217,119,6,0.08)', border: '1px solid rgba(217,119,6,0.25)' }}>
+        <LoginLockIcon color={C.amber} size={10} /> Login to access
+      </span>
+    );
+  }
   if (installing) {
     return (
       <span style={{ ...base, color: C.violet, background: 'rgba(124,58,237,0.08)', border: '1px solid rgba(124,58,237,0.22)' }}>
@@ -197,6 +213,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
   const [activeTab, setActiveTab] = useState('connectors');
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all'); // all | installed | available
+  const [loggedIn, setLoggedIn] = useState(isLoggedIn());
   const searchRef = useRef(null);
 
   useEffect(() => { ensureStyles(); }, []);
@@ -205,6 +222,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
     if (open) {
       loadInstalledPlugins();
       loadInstalledSkills();
+      setLoggedIn(isLoggedIn());
       setSearch('');
       setFilter('all');
       setActiveTab('connectors');
@@ -258,7 +276,22 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
     return installedPlugins.some((p) => p.id === key);
   };
 
+  // Plugin connectors are locked behind a (free) account; local file
+  // connectors never require login.
+  const isLocked = (key) => !NO_PLUGIN_REQUIRED.includes(key) && !loggedIn;
+
+  // Close the selector and send the user to Settings → Account to sign in.
+  const handleLockedClick = (type) => {
+    message.info(`Sign in to access the ${type.title} plugin.`);
+    onClose();
+    window.dispatchEvent(new CustomEvent('ternlux:open-settings', { detail: { tab: 'account' } }));
+  };
+
   const handleInstallPlugin = async (type) => {
+    if (isLocked(type.key)) {
+      handleLockedClick(type);
+      return;
+    }
     setInstalling((prev) => ({ ...prev, [type.key]: true }));
     try {
       if (!window.electronAPI?.plugins?.install) {
@@ -281,6 +314,10 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
   };
 
   const handleSelect = (type) => {
+    if (isLocked(type.key)) {
+      handleLockedClick(type);
+      return;
+    }
     if (!isPluginInstalled(type.key)) {
       message.warning(`Please install the ${type.title} connector first`);
       return;
@@ -306,9 +343,10 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
 
   // Card ---------------------------------------------------------------------
   const renderCard = (c, section) => {
+    const locked = isLocked(c.key);
     const installed = isPluginInstalled(c.key);
     const isInstalling = !!installing[c.key];
-    const selectable = installed && !isInstalling;
+    const selectable = !locked && installed && !isInstalling;
     return (
       <div
         key={c.key}
@@ -321,10 +359,23 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
           gap: 14,
           alignItems: 'flex-start',
           minHeight: 80,
+          ...(locked ? { opacity: 0.65 } : {}),
         }}
-        onClick={() => selectable && handleSelect(c)}
+        onClick={() => (locked ? handleLockedClick(c) : selectable && handleSelect(c))}
       >
-        <Icon c={c} />
+        <div style={{ position: 'relative' }}>
+          <Icon c={c} />
+          {locked && (
+            <div style={{
+              position: 'absolute', right: -5, bottom: -3,
+              width: 18, height: 18, borderRadius: '50%',
+              background: '#fff', border: `1px solid ${C.border2}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <LoginLockIcon color={C.amber} size={10} />
+            </div>
+          )}
+        </div>
         <div style={{ minWidth: 0, paddingTop: 1 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5, flexWrap: 'wrap' }}>
             <span style={{
@@ -332,7 +383,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
               color: selectable ? C.text : C.muted,
               letterSpacing: '-0.01em',
             }}>{c.title}</span>
-            <StatusTag c={c} installing={isInstalling} installed={installed} />
+            <StatusTag c={c} installing={isInstalling} installed={installed} locked={locked} />
           </div>
           <div style={{
             fontSize: 12, color: C.muted, lineHeight: 1.5,
@@ -340,7 +391,9 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
           }}>{c.description}</div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0, marginTop: 2 }}>
-          {isInstalling ? (
+          {locked ? (
+            <ActionBtn kind="ghost" label="Login to access" onClick={() => handleLockedClick(c)} />
+          ) : isInstalling ? (
             <ActionBtn kind="installing" label="Installing" disabled />
           ) : installed ? (
             <ActionBtn kind="primary" label={section.buttonText} onClick={() => handleSelect(c)} />

@@ -6,8 +6,8 @@
  * Electron) we fall back to localStorage so the dev workflow stays smooth.
  */
 
-const LS_PROVIDER = 'dagflux_llm_provider';
-const LS_KEY = 'dagflux_llm_key';
+const LS_PROVIDER = 'ternlux_llm_provider';
+const LS_KEY = 'ternlux_llm_key';
 
 function isElectron() {
   return typeof window !== 'undefined' && typeof window.electronAPI !== 'undefined';
@@ -42,6 +42,37 @@ export async function loadApiKey(provider) {
 
 
   return null;
+}
+
+/**
+ * Load NON-SECRET config for an OpenAI-compatible ("Others") provider:
+ * { hasKey, baseURL, model }. The API key itself is never returned — the UI
+ * shows that a key exists without exposing it.
+ *
+ * @param {string} provider
+ * @returns {Promise<{hasKey: boolean, baseURL: string, model: string} | null>}
+ */
+export async function loadProviderMeta(provider) {
+  if (isElectron() && window.electronAPI.ai?.getCompatProvider) {
+    const res = await window.electronAPI.ai.getCompatProvider(provider);
+    return res?.success ? res.meta : null;
+  }
+  return null;
+}
+
+/**
+ * Save config for an OpenAI-compatible provider. A blank apiKey preserves the
+ * currently stored key (so editing URL/model doesn't require re-entering it).
+ *
+ * @param {string} provider
+ * @param {{apiKey?: string, baseURL: string, model: string}} config
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+export async function saveProviderConfig(provider, config) {
+  if (isElectron() && window.electronAPI.ai?.saveCompatProvider) {
+    return window.electronAPI.ai.saveCompatProvider(provider, config);
+  }
+  return { success: true };
 }
 
 /**
@@ -124,7 +155,7 @@ export async function getConfiguredProviderName() {
     const savedSettings = localStorage.getItem('ai-provider-settings');
     if (savedSettings) {
       const settings = JSON.parse(savedSettings);
-      return settings.provider || null;
+      return settings.defaultProvider || settings.provider || null;
     }
 
     // Fallback: if no settings, return first provider that has a key

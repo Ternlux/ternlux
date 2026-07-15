@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-mongodb",
+  "name": "@ternlux/connector-mongodb",
   "version": "1.0.0",
-  "description": "MongoDB database connector for DagFlux",
+  "description": "MongoDB database connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "mongodb",
     "displayName": "MongoDB",
@@ -13,6 +13,6 @@
   "dependencies": {
     "mongoose": "^7.0.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }

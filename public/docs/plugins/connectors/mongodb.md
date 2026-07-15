@@ -7,10 +7,10 @@ stores.
 
 ## What it lets you do
 
-- Test that DagFlux can reach your MongoDB cluster.
+- Test that Ternlux can reach your MongoDB cluster.
 - List every collection in the connected database, with the database
   name shown as its "schema".
-- Inspect the fields of any collection — DagFlux samples up to one
+- Inspect the fields of any collection — Ternlux samples up to one
   hundred documents and reports the union of the fields it sees. The
   document id is marked as the primary field.
 - Run filter queries to read documents.
@@ -41,7 +41,7 @@ Switch to the `admin` database to create the user:
 use admin;
 
 db.createUser({
-  user: "dagflux",
+  user: "ternlux",
   pwd: "choose-a-strong-password",
   roles: [
     { role: "readWrite", db: "mydb" }
@@ -77,9 +77,9 @@ mongodb+srv://USERNAME:PASSWORD@CLUSTER.mongodb.net/DATABASE?retryWrites=true&w=
 
 URL-encode the password if it contains special characters.
 
-### Step 5 — Enter the URI in DagFlux
+### Step 5 — Enter the URI in Ternlux
 
-Paste the full URI into the **Connection URI** field. DagFlux uses
+Paste the full URI into the **Connection URI** field. Ternlux uses
 the database from the URI as the default; you can still browse other
 databases on the same cluster from the picker.
 
@@ -92,7 +92,7 @@ breakdown.
 
 ## Behaviour notes
 
-- DagFlux keeps a small connection pool per saved connection.
+- Ternlux keeps a small connection pool per saved connection.
 - Updating credentials closes the cached connection so the next query
   reconnects with the new URI.
 - The connector is also used as a destination for joins and outputs;

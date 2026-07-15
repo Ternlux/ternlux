@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-dropbox",
+  "name": "@ternlux/connector-dropbox",
   "version": "1.0.0",
-  "description": "Dropbox storage connector for DagFlux",
+  "description": "Dropbox storage connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "dropbox",
     "displayName": "Dropbox",
@@ -13,6 +13,6 @@
   "dependencies": {
     "dropbox": "^10.34.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }

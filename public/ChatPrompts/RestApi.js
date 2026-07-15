@@ -182,7 +182,9 @@ ${vocabulary.map(p => `- ${p}`).join('\n')}
 
 ${guidance}
 
-Return JSON with EXACTLY this shape (no extra keys, no extra prose):
+CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something or answer a question, put that text inside the "directAnswer"/"explanation" fields — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
+
+Return JSON with EXACTLY this shape (no extra keys):
 
 \`\`\`json
 {
@@ -228,5 +230,6 @@ Return ONLY the JSON object. No markdown fences, no commentary.
   },
 };
 
-export { placeholdersFor };
-export default RestApiPrompts;
+module.exports = RestApiPrompts;
+module.exports.default = RestApiPrompts;
+module.exports.placeholdersFor = placeholdersFor;

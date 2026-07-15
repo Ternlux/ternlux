@@ -1,4 +1,4 @@
-# DagFlux Skills Plugins
+# Ternlux Skills Plugins
 
 Skills are specialized plugins that enhance TransformerNodeChat and JoinNodeChat with custom execution capabilities beyond standard SQL/NoSQL operations.
 
@@ -187,14 +187,14 @@ Skills that execute code (like Python Executor) should:
 ## Testing Your Skill
 
 1. Place your skill in `plugins/skills/your-skill-name/`
-2. Restart the DagFlux application
+2. Restart the Ternlux application
 3. Check ConnectionTypeSelector → Skills tab
 4. Your skill should appear if properly structured
 5. Test in a TransformerNodeChat or JoinNodeChat
 
 ## Contributing Skills
 
-To contribute a skill to DagFlux:
+To contribute a skill to Ternlux:
 
 1. Create the skill following the structure above
 2. Add comprehensive README documentation

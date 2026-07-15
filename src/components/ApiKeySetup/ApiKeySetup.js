@@ -1,5 +1,4 @@
-import React, { useState } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -16,11 +15,8 @@ import {
   Paper,
   Chip,
   Alert,
-  Tabs,
-  Tab,
-  Card,
-  CardContent,
   Divider,
+  Avatar,
 } from '@mui/material';
 import {
   Visibility,
@@ -28,69 +24,85 @@ import {
   CheckCircle,
   OpenInNew,
   KeyOutlined,
-  PersonOutlined,
   ArrowBack,
-  CheckRounded,
-  WorkspacePremium,
+  MarkEmailReadOutlined,
+  Google,
+  // Apple, // Apple sign-in disabled
+  LockOpenOutlined,
+  Logout,
 } from '@mui/icons-material';
 import { saveApiKey } from '../../utils/apiKeyStorage';
+import OthersProviderForm from './OthersProviderForm';
+import {
+  register as registerAccount,
+  login as loginAccount,
+  loginWithGoogle,
+  // loginWithApple, // Apple sign-in disabled
+  resendVerification,
+  isLoggedIn,
+  getStoredUser,
+  fetchCurrentUser,
+  signOut,
+} from '../../utils/authService';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Static data
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PLANS = [
-  {
-    id: 'starter',
-    name: 'Starter',
-    price: 'Free',
-    period: '',
-    highlight: false,
-    cta: 'Get Started',
-    color: '#64748b',
-    features: [
-      'Up to 50 AI queries / month',
-      '2 active workflows',
-      'Basic data connectors',
-      'Community support',
-      'CSV & Excel uploads',
-    ],
-  },
-  {
-    id: 'pro',
-    name: 'Pro',
-    price: '$29',
-    period: '/ mo',
-    highlight: true,
-    cta: 'Get Started',
-    color: '#6366f1',
-    features: [
-      'Unlimited AI queries',
-      '10 active workflows',
-      'All data connectors',
-      'Multi-step analysis',
-      'Workflow scheduling',
-      'Priority email support',
-    ],
-  },
-  {
-    id: 'enterprise',
-    name: 'Enterprise',
-    price: '$99',
-    period: '/ mo',
-    highlight: false,
-    cta: 'Contact Sales',
-    color: '#0f172a',
-    features: [
-      'Everything in Pro',
-      'Unlimited workflows',
-      'Custom integrations',
-      'SSO & team seats',
-      'Dedicated support',
-      'SLA guarantee',
-    ],
-  },
-];
+// NOTE: Plans are disabled for now — accounts are free and only gate plugin
+// access. Re-enable this section when paid plans come back.
+// const PLANS = [
+//   {
+//     id: 'starter',
+//     name: 'Starter',
+//     price: 'Free',
+//     period: '',
+//     highlight: false,
+//     cta: 'Get Started',
+//     color: '#64748b',
+//     features: [
+//       'Up to 50 AI queries / month',
+//       '2 active workflows',
+//       'Basic data connectors',
+//       'Community support',
+//       'CSV & Excel uploads',
+//     ],
+//   },
+//   {
+//     id: 'pro',
+//     name: 'Pro',
+//     price: '$29',
+//     period: '/ mo',
+//     highlight: true,
+//     cta: 'Get Started',
+//     color: '#6366f1',
+//     features: [
+//       'Unlimited AI queries',
+//       '10 active workflows',
+//       'All data connectors',
+//       'Multi-step analysis',
+//       'Workflow scheduling',
+//       'Priority email support',
+//     ],
+//   },
+//   {
+//     id: 'enterprise',
+//     name: 'Enterprise',
+//     price: '$99',
+//     period: '/ mo',
+//     highlight: false,
+//     cta: 'Contact Sales',
+//     color: '#0f172a',
+//     features: [
+//       'Everything in Pro',
+//       'Unlimited workflows',
+//       'Custom integrations',
+//       'SSO & team seats',
+//       'Dedicated support',
+//       'SLA guarantee',
+//     ],
+//   },
+// ];
 
 const PROVIDERS = [
   {
@@ -158,11 +170,99 @@ const PROVIDERS = [
   },
 ];
 
+// "Others" tile — OpenAI-compatible providers (OpenRouter, Groq, Together,
+// Mistral, Ollama, LM Studio, or a custom endpoint). Handled by its own form
+// rather than the single key-paste panel, so it has no steps/keyPrefix.
+const OTHERS_TILE = {
+  id: 'others',
+  name: 'Others',
+  company: 'OpenAI-compatible',
+  bgColor: '#f0f0f0',
+  borderColor: '#8c8c8c',
+  logo: (selected) => (
+    <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+      <rect width="32" height="32" rx="8" fill={selected ? '#f0f0f0' : '#8c8c8c'} />
+      <circle cx="10" cy="16" r="2" fill={selected ? '#595959' : '#fff'} />
+      <circle cx="16" cy="16" r="2" fill={selected ? '#595959' : '#fff'} />
+      <circle cx="22" cy="16" r="2" fill={selected ? '#595959' : '#fff'} />
+    </svg>
+  ),
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
-// SignInView  —  default landing; login form only
+// SocialButtons — shared "Continue with Google / Apple" buttons
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
+const SocialButton = ({ label, icon, accent, action, onSuccess, onError, disabled }) => {
+  const [busy, setBusy] = useState(false);
+
+  const handleClick = async () => {
+    setBusy(true);
+    onError('');
+    try {
+      const result = await action();
+      if (result.success) {
+        onSuccess(result);
+      } else {
+        onError(result.error || `${label} sign-in failed.`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Button
+      variant="outlined"
+      fullWidth
+      onClick={handleClick}
+      disabled={disabled || busy}
+      startIcon={busy ? <CircularProgress size={16} color="inherit" /> : icon}
+      sx={{
+        borderRadius: 2,
+        fontWeight: 700,
+        py: 1.05,
+        textTransform: 'none',
+        color: 'text.primary',
+        borderColor: 'divider',
+        '&:hover': { borderColor: accent, bgcolor: `${accent}08` },
+      }}
+    >
+      {busy ? `Waiting for ${label}...` : `Continue with ${label}`}
+    </Button>
+  );
+};
+
+const SocialSignInButtons = ({ onSuccess, onError, disabled }) => (
+  <>
+    <SocialButton
+      label="Google"
+      icon={<Google sx={{ color: '#4285f4' }} />}
+      accent="#4285f4"
+      action={loginWithGoogle}
+      onSuccess={onSuccess}
+      onError={onError}
+      disabled={disabled}
+    />
+    {/* Apple sign-in disabled
+    <SocialButton
+      label="Apple"
+      icon={<Apple sx={{ color: '#000' }} />}
+      accent="#000000"
+      action={loginWithApple}
+      onSuccess={onSuccess}
+      onError={onError}
+      disabled={disabled}
+    />
+    */}
+  </>
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SignInView — default landing; login form + Google
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SignInView = ({ onRegister, onComplete, onNeedsVerification, onSkip = null, isSettingsMode = false }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -170,29 +270,26 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
 
+  const finish = () => {
+    setSuccess(true);
+    setTimeout(() => onComplete({ via: 'account' }), 800);
+  };
+
   const handleSignIn = async () => {
     if (!email.trim()) { setError('Email is required.'); return; }
     if (!password)     { setError('Password is required.'); return; }
 
     setSubmitting(true);
     setError('');
-    try {
-      const response = await axios.post('/auth/login', { email: email.trim(), password });
-      if (response.data.success && response.data.token) {
-        localStorage.setItem('auth-token', response.data.token);
-        setSuccess(true);
-        setTimeout(() => onComplete({ via: 'account' }), 800);
-      } else {
-        setError(response.data.error || 'Authentication failed. Please try again.');
-      }
-    } catch (err) {
-      setError(
-        err.response?.data?.error ||
-        err.response?.data?.message ||
-        'Unable to connect. Please check your connection and try again.'
-      );
-    } finally {
-      setSubmitting(false);
+    const result = await loginAccount({ email: email.trim(), password });
+    setSubmitting(false);
+
+    if (result.success) {
+      finish();
+    } else if (result.code === 'EMAIL_NOT_VERIFIED') {
+      onNeedsVerification(email.trim());
+    } else {
+      setError(result.error || 'Authentication failed. Please try again.');
     }
   };
 
@@ -213,7 +310,7 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
       }}
     >
       <Paper
-        elevation={isSettingsMode ? 0 : 0}
+        elevation={0}
         variant={isSettingsMode ? 'elevation' : 'outlined'}
         sx={{ width: '100%', maxWidth: 400, borderRadius: isSettingsMode ? 0 : 3, p: isSettingsMode ? 0 : 4, border: isSettingsMode ? 'none' : undefined }}
       >
@@ -221,7 +318,7 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
           Welcome back
         </Typography>
         <Typography variant="body2" color="text.secondary" mb={3}>
-          Sign in to continue to DagFlux.
+          Sign in to unlock plugin access in Ternlux.
         </Typography>
 
         {error && (
@@ -231,7 +328,7 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
         )}
         {success && (
           <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
-            Signed in! Loading DagFlux...
+            Signed in! Loading Ternlux...
           </Alert>
         )}
 
@@ -275,11 +372,12 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
             fullWidth
             onClick={handleSignIn}
             disabled={submitting || success}
-            // startIcon={submitting ? <CircularProgress size={16} color="inherit" /> : <CheckCircle />}
             sx={{ borderRadius: 2, fontWeight: 700, py: 1.1 }}
           >
             {submitting ? 'Signing in...' : 'Sign In'}
           </Button>
+
+          <SocialSignInButtons onSuccess={finish} onError={setError} disabled={submitting || success} />
         </Box>
 
         <Divider sx={{ my: 3 }}>
@@ -288,7 +386,7 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
 
         <Box sx={{ textAlign: 'center' }}>
           <Typography variant="body2" color="text.secondary" mb={1.5}>
-            New to DagFlux?
+            New to Ternlux? Registration is free.
           </Typography>
           <Button
             variant="outlined"
@@ -296,8 +394,20 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
             onClick={onRegister}
             sx={{ borderRadius: 2, fontWeight: 700, textTransform: 'none' }}
           >
-            VIEW PLANS
+            Create a Free Account
           </Button>
+
+          {onSkip && (
+            <Button
+              variant="text"
+              fullWidth
+              onClick={onSkip}
+              disabled={submitting || success}
+              sx={{ mt: 1.5, borderRadius: 2, fontWeight: 600, textTransform: 'none', color: 'text.secondary' }}
+            >
+              Skip for now
+            </Button>
+          )}
         </Box>
       </Paper>
     </Box>
@@ -305,11 +415,10 @@ const SignInView = ({ onRegister, onComplete, isSettingsMode = false }) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PricingRegisterPage  —  full-page pricing cards + register form
+// RegisterPage — free account registration (plans section commented out)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => {
-  const [selectedPlan, setSelectedPlan] = useState('pro'); // pre-select Most Popular
+const RegisterPage = ({ onBack, onComplete, onRegistered, isSettingsMode = false }) => {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -318,9 +427,6 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
   const [showConfirm, setShowConfirm] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const [success, setSuccess] = useState(false);
-
-  const selectedPlanObj = PLANS.find(p => p.id === selectedPlan);
 
   const validate = () => {
     if (!name.trim())        return 'Full name is required.';
@@ -337,28 +443,17 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
 
     setSubmitting(true);
     setError('');
-    try {
-      const response = await axios.post('/auth/register', {
-        name: name.trim(),
-        email: email.trim(),
-        password,
-        plan: selectedPlan,
-      });
-      if (response.data.success && response.data.token) {
-        localStorage.setItem('auth-token', response.data.token);
-        setSuccess(true);
-        setTimeout(() => onComplete({ via: 'account' }), 800);
-      } else {
-        setError(response.data.error || 'Registration failed. Please try again.');
-      }
-    } catch (err) {
-      setError(
-        err.response?.data?.error ||
-        err.response?.data?.message ||
-        'Unable to connect. Please check your connection and try again.'
-      );
-    } finally {
-      setSubmitting(false);
+    const result = await registerAccount({
+      name: name.trim(),
+      email: email.trim(),
+      password,
+    });
+    setSubmitting(false);
+
+    if (result.success) {
+      onRegistered(email.trim());
+    } else {
+      setError(result.error || 'Registration failed. Please try again.');
     }
   };
 
@@ -366,201 +461,47 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
     if (e.key === 'Enter' && !submitting) handleRegister();
   };
 
-  return (
-    <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden', flexDirection: isSettingsMode ? 'column' : 'row' }}>
+  const finishSocial = () => onComplete({ via: 'account' });
 
-      {/* ── Left: Pricing cards ── */}
-      <Box
-        sx={{
-          flex: isSettingsMode ? '1' : '0 0 58%',
-          p: isSettingsMode ? 0 : 4,
-          pt: isSettingsMode ? 3 : 3,
-          borderRight: isSettingsMode ? 'none' : '1px solid',
-          borderColor: 'divider',
-          overflowY: 'auto',
-          bgcolor: isSettingsMode ? 'transparent' : '#f8f9fa',
-        }}
+  return (
+    <Box
+      sx={{
+        flex: 1,
+        display: 'flex',
+        alignItems: isSettingsMode ? 'flex-start' : 'center',
+        justifyContent: 'center',
+        p: isSettingsMode ? 0 : 4,
+        pt: isSettingsMode ? 3 : 4,
+        overflowY: 'auto',
+        bgcolor: isSettingsMode ? 'transparent' : '#f8f9fa',
+      }}
+    >
+      <Paper
+        elevation={0}
+        variant={isSettingsMode ? 'elevation' : 'outlined'}
+        sx={{ width: '100%', maxWidth: 440, borderRadius: isSettingsMode ? 0 : 3, p: isSettingsMode ? 0 : 4, border: isSettingsMode ? 'none' : undefined }}
       >
-        {/* Back link */}
         <Button
           startIcon={<ArrowBack />}
           size="small"
           onClick={onBack}
-          sx={{ mb: 3, color: 'text.secondary', textTransform: 'none', fontWeight: 600, pl: 0 }}
+          sx={{ mb: 2, color: 'text.secondary', textTransform: 'none', fontWeight: 600, pl: 0 }}
         >
           Back to Sign In
         </Button>
 
         <Typography variant="h5" fontWeight={800} mb={0.5}>
-          Simple, transparent pricing
-        </Typography>
-        <Typography variant="body2" color="text.secondary" mb={4}>
-          Start free. Upgrade when you're ready.
-        </Typography>
-
-        {/* Cards — mt gives room for the "Most Popular" badge that peeks above */}
-        <Box sx={{ display: 'flex', gap: 2, alignItems: 'stretch', mt: '20px' }}>
-          {PLANS.map((plan) => {
-            const isSelected = selectedPlan === plan.id;
-            return (
-              <Box key={plan.id} sx={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column' }}>
-
-                {/* Most Popular badge — rendered outside Card so it's never clipped */}
-                {plan.highlight && (
-                  <Box
-                    sx={{
-                      position: 'absolute',
-                      top: -14,
-                      left: '50%',
-                      transform: 'translateX(-50%)',
-                      bgcolor: plan.color,
-                      color: '#fff',
-                      px: 1.5,
-                      py: 0.5,
-                      borderRadius: 10,
-                      fontSize: 11,
-                      fontWeight: 700,
-                      letterSpacing: 0.4,
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 0.5,
-                      whiteSpace: 'nowrap',
-                      zIndex: 1,
-                      boxShadow: `0 2px 8px ${plan.color}55`,
-                    }}
-                  >
-                    <WorkspacePremium sx={{ fontSize: 13 }} />
-                    Most Popular
-                  </Box>
-                )}
-
-                <Card
-                  variant="outlined"
-                  onClick={() => setSelectedPlan(plan.id)}
-                  sx={{
-                    flex: 1,
-                    borderRadius: 3,
-                    borderWidth: 2,
-                    borderColor: isSelected ? plan.color : plan.highlight ? `${plan.color}55` : 'divider',
-                    cursor: 'pointer',
-                    transition: 'all 0.15s ease',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    boxShadow: plan.highlight ? `0 4px 20px ${plan.color}20` : 'none',
-                    bgcolor: isSelected ? `${plan.color}06` : 'background.paper',
-                    '&:hover': {
-                      borderColor: plan.color,
-                      boxShadow: `0 4px 16px ${plan.color}25`,
-                    },
-                    // No overflow:hidden — let the badge live outside
-                  }}
-                >
-                  <CardContent sx={{ flex: 1, pt: 2.5, pb: 1.5 }}>
-                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}>
-                      <Typography variant="subtitle1" fontWeight={700} color={plan.color}>
-                        {plan.name}
-                      </Typography>
-                      {isSelected && <CheckCircle sx={{ fontSize: 18, color: plan.color }} />}
-                    </Box>
-
-                    <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.5, mb: 2 }}>
-                      <Typography variant="h4" fontWeight={800} lineHeight={1}>
-                        {plan.price}
-                      </Typography>
-                      {plan.period && (
-                        <Typography variant="body2" color="text.secondary">
-                          {plan.period}
-                        </Typography>
-                      )}
-                    </Box>
-
-                    <Divider sx={{ mb: 2 }} />
-
-                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                      {plan.features.map((feat, i) => (
-                        <Box key={i} sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
-                          <CheckRounded sx={{ fontSize: 15, color: plan.color, mt: 0.25, flexShrink: 0 }} />
-                          <Typography variant="body2" color="text.secondary" lineHeight={1.4}>
-                            {feat}
-                          </Typography>
-                        </Box>
-                      ))}
-                    </Box>
-                  </CardContent>
-
-                  <Box sx={{ px: 2, pb: 2, pt: 1 }}>
-                    <Button
-                      fullWidth
-                      variant={isSelected ? 'contained' : 'outlined'}
-                      size="small"
-                      onClick={(e) => { e.stopPropagation(); setSelectedPlan(plan.id); }}
-                      sx={{
-                        borderRadius: 2,
-                        fontWeight: 700,
-                        fontSize: 13,
-                        textTransform: 'none',
-                        ...(isSelected
-                          ? { bgcolor: plan.color, '&:hover': { bgcolor: plan.color, filter: 'brightness(0.9)' } }
-                          : { borderColor: plan.color, color: plan.color, '&:hover': { borderColor: plan.color, bgcolor: `${plan.color}10` } }),
-                      }}
-                    >
-                      {plan.cta}
-                    </Button>
-                  </Box>
-                </Card>
-              </Box>
-            );
-          })}
-        </Box>
-      </Box>
-
-      {/* ── Right: Register form ── */}
-      <Box
-        sx={{
-          flex: 1,
-          p: isSettingsMode ? 0 : 4,
-          pt: isSettingsMode ? 3 : 4,
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: isSettingsMode ? 'flex-start' : 'center',
-          overflowY: 'auto',
-          bgcolor: isSettingsMode ? 'transparent' : 'background.paper',
-        }}
-      >
-        <Typography variant="h6" fontWeight={700} mb={0.5}>
-          Create your account
+          Create your free account
         </Typography>
         <Typography variant="body2" color="text.secondary" mb={2.5}>
-          Get started with DagFlux in seconds.
+          Register to unlock plugin access. We'll send a link to verify your email.
         </Typography>
 
-        {/* Selected plan chip */}
-        {selectedPlanObj && (
-          <Box sx={{ mb: 2.5 }}>
-            <Typography variant="caption" color="text.secondary" fontWeight={600} display="block" mb={0.5}>
-              SELECTED PLAN
-            </Typography>
-            <Chip
-              label={`${selectedPlanObj.name} — ${selectedPlanObj.price}${selectedPlanObj.period}`}
-              size="small"
-              sx={{
-                bgcolor: `${selectedPlanObj.color}15`,
-                color: selectedPlanObj.color,
-                fontWeight: 700,
-                borderRadius: 1.5,
-              }}
-            />
-          </Box>
-        )}
+        {/* Pricing cards are hidden while plans are disabled — see PLANS above. */}
 
         {error && (
           <Alert severity="error" sx={{ mb: 2, borderRadius: 2 }}>
             {error}
-          </Alert>
-        )}
-        {success && (
-          <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
-            Account created! Loading DagFlux...
           </Alert>
         )}
 
@@ -573,7 +514,7 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
             size="small"
             fullWidth
             autoFocus
-            disabled={submitting || success}
+            disabled={submitting}
           />
 
           <TextField
@@ -585,7 +526,7 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
             size="small"
             fullWidth
             autoComplete="email"
-            disabled={submitting || success}
+            disabled={submitting}
           />
 
           <TextField
@@ -598,7 +539,7 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
             fullWidth
             autoComplete="new-password"
             helperText="Minimum 8 characters"
-            disabled={submitting || success}
+            disabled={submitting}
             InputProps={{
               endAdornment: (
                 <InputAdornment position="end">
@@ -619,7 +560,7 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
             size="small"
             fullWidth
             autoComplete="new-password"
-            disabled={submitting || success}
+            disabled={submitting}
             InputProps={{
               endAdornment: (
                 <InputAdornment position="end">
@@ -635,12 +576,14 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
             variant="contained"
             fullWidth
             onClick={handleRegister}
-            disabled={submitting || success}
+            disabled={submitting}
             startIcon={submitting ? <CircularProgress size={16} color="inherit" /> : <CheckCircle />}
             sx={{ borderRadius: 2, fontWeight: 700, py: 1.1, mt: 0.5 }}
           >
-            {submitting ? 'Creating account...' : 'Create Account'}
+            {submitting ? 'Creating account...' : 'Create Free Account'}
           </Button>
+
+          <SocialSignInButtons onSuccess={finishSocial} onError={setError} disabled={submitting} />
         </Box>
 
         <Divider sx={{ my: 2.5 }}>
@@ -659,13 +602,183 @@ const PricingRegisterPage = ({ onBack, onComplete, isSettingsMode = false }) => 
             Sign in
           </Link>
         </Typography>
-      </Box>
+      </Paper>
     </Box>
   );
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BringYourOwnKey  —  provider selection + key input (unchanged logic)
+// VerifyEmailView — shown after registering (or signing in unverified)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VerifyEmailView = ({ email, onBackToSignIn, isSettingsMode = false }) => {
+  const [resending, setResending] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+
+  const handleResend = async () => {
+    setResending(true);
+    setNotice('');
+    setError('');
+    const result = await resendVerification(email);
+    setResending(false);
+    if (result.success) {
+      setNotice('Verification email sent. Check your inbox (and spam folder).');
+    } else {
+      setError(result.error || 'Could not resend the verification email.');
+    }
+  };
+
+  return (
+    <Box
+      sx={{
+        flex: 1,
+        display: 'flex',
+        alignItems: isSettingsMode ? 'flex-start' : 'center',
+        justifyContent: 'center',
+        p: isSettingsMode ? 0 : 4,
+        pt: isSettingsMode ? 3 : 4,
+        bgcolor: isSettingsMode ? 'transparent' : '#f8f9fa',
+      }}
+    >
+      <Paper
+        elevation={0}
+        variant={isSettingsMode ? 'elevation' : 'outlined'}
+        sx={{ width: '100%', maxWidth: 440, borderRadius: isSettingsMode ? 0 : 3, p: isSettingsMode ? 0 : 4, border: isSettingsMode ? 'none' : undefined, textAlign: 'center' }}
+      >
+        <MarkEmailReadOutlined sx={{ fontSize: 56, color: 'primary.main', mb: 1.5 }} />
+        <Typography variant="h5" fontWeight={800} mb={0.5}>
+          Verify your email
+        </Typography>
+        <Typography variant="body2" color="text.secondary" mb={3}>
+          We sent a verification link to{' '}
+          <Box component="span" fontWeight={700} color="text.primary">{email}</Box>.
+          Click the link in that email, then come back and sign in.
+        </Typography>
+
+        {notice && (
+          <Alert severity="success" sx={{ mb: 2, borderRadius: 2, textAlign: 'left' }}>
+            {notice}
+          </Alert>
+        )}
+        {error && (
+          <Alert severity="error" sx={{ mb: 2, borderRadius: 2, textAlign: 'left' }}>
+            {error}
+          </Alert>
+        )}
+
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+          <Button
+            variant="contained"
+            fullWidth
+            onClick={onBackToSignIn}
+            sx={{ borderRadius: 2, fontWeight: 700, py: 1.1 }}
+          >
+            I've verified — Sign In
+          </Button>
+          <Button
+            variant="text"
+            fullWidth
+            onClick={handleResend}
+            disabled={resending}
+            startIcon={resending ? <CircularProgress size={14} color="inherit" /> : null}
+            sx={{ borderRadius: 2, fontWeight: 600, textTransform: 'none' }}
+          >
+            {resending ? 'Resending...' : "Didn't get it? Resend email"}
+          </Button>
+        </Box>
+      </Paper>
+    </Box>
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AccountView — shown when already signed in (mainly in Settings)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AccountView = ({ onSignOut, isSettingsMode = false }) => {
+  const [user, setUser] = useState(getStoredUser());
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchCurrentUser().then((fresh) => {
+      if (cancelled) return;
+      if (fresh) setUser(fresh);
+      else if (!isLoggedIn()) onSignOut(); // token was rejected
+    });
+    return () => { cancelled = true; };
+  }, [onSignOut]);
+
+  const handleSignOut = () => {
+    signOut();
+    onSignOut();
+  };
+
+  return (
+    <Box
+      sx={{
+        flex: 1,
+        display: 'flex',
+        alignItems: isSettingsMode ? 'flex-start' : 'center',
+        justifyContent: 'center',
+        p: isSettingsMode ? 0 : 4,
+        pt: isSettingsMode ? 3 : 4,
+        bgcolor: isSettingsMode ? 'transparent' : '#f8f9fa',
+      }}
+    >
+      <Paper
+        elevation={0}
+        variant={isSettingsMode ? 'elevation' : 'outlined'}
+        sx={{ width: '100%', maxWidth: 440, borderRadius: isSettingsMode ? 0 : 3, p: isSettingsMode ? 0 : 4, border: isSettingsMode ? 'none' : undefined }}
+      >
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 3 }}>
+          <Avatar src={user?.picture || undefined} sx={{ width: 52, height: 52, bgcolor: 'primary.main', fontWeight: 700 }}>
+            {(user?.name || user?.email || '?').charAt(0).toUpperCase()}
+          </Avatar>
+          <Box>
+            <Typography variant="h6" fontWeight={700} lineHeight={1.2}>
+              {user?.name || 'Your account'}
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {user?.email}
+            </Typography>
+          </Box>
+        </Box>
+
+        <Box sx={{ display: 'flex', gap: 1, mb: 3, flexWrap: 'wrap' }}>
+          <Chip
+            size="small"
+            icon={<LockOpenOutlined sx={{ fontSize: 14 }} />}
+            label="Plugin access unlocked"
+            sx={{ bgcolor: '#05966915', color: '#059669', fontWeight: 700, borderRadius: 1.5 }}
+          />
+          <Chip
+            size="small"
+            label={`${(user?.plan || 'free').toUpperCase()} plan`}
+            sx={{ bgcolor: '#6366f115', color: '#6366f1', fontWeight: 700, borderRadius: 1.5 }}
+          />
+        </Box>
+
+        <Typography variant="body2" color="text.secondary" mb={3}>
+          You're signed in. Locked plugins in the connector library are now available to install and use.
+        </Typography>
+
+        <Button
+          variant="outlined"
+          color="error"
+          startIcon={<Logout />}
+          onClick={handleSignOut}
+          sx={{ borderRadius: 2, fontWeight: 700, textTransform: 'none' }}
+        >
+          Sign Out
+        </Button>
+      </Paper>
+    </Box>
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BringYourOwnKey — provider selection + key input (unchanged logic)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
@@ -734,7 +847,7 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
             CHOOSE YOUR PROVIDER
           </Typography>
         )}
-        {PROVIDERS.map((p) => {
+        {[...PROVIDERS, OTHERS_TILE].map((p) => {
           const isSelected = selectedProvider === p.id;
           return (
             <Box
@@ -783,8 +896,28 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
             <KeyOutlined sx={{ fontSize: 56, opacity: 0.3 }} />
             <Typography variant="h6" fontWeight={500}>Select a provider to continue</Typography>
             <Typography variant="body2" textAlign="center" maxWidth={380}>
-              Choose Claude, Gemini, or ChatGPT and we'll show you exactly how to get your API key.
+              Choose Claude, Gemini, ChatGPT, or Others (any OpenAI-compatible provider) and we'll
+              show you exactly how to get set up.
             </Typography>
+          </Box>
+        ) : selectedProvider === 'others' ? (
+          <Box sx={{ p: 4, maxWidth: 660 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 3 }}>
+              {OTHERS_TILE.logo(false)}
+              <Box>
+                <Typography variant="h5" fontWeight={700}>{OTHERS_TILE.name}</Typography>
+                <Chip
+                  size="small"
+                  label={OTHERS_TILE.company}
+                  sx={{ bgcolor: OTHERS_TILE.bgColor, color: OTHERS_TILE.borderColor, fontWeight: 600, fontSize: 11, mt: 0.5 }}
+                />
+              </Box>
+            </Box>
+            <Typography variant="body2" color="text.secondary" mb={3}>
+              Connect OpenRouter, Groq, Together AI, Mistral, Ollama, LM Studio, or any
+              OpenAI-compatible endpoint. Pick a type to prefill its URL, or choose Custom to set your own.
+            </Typography>
+            <OthersProviderForm onComplete={onComplete} />
           </Box>
         ) : (
           <Box sx={{ p: 4, maxWidth: 660 }}>
@@ -857,7 +990,7 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
 
             {saved && (
               <Alert severity="success" sx={{ mb: 2 }}>
-                API key saved! Loading DagFlux...
+                API key saved!
               </Alert>
             )}
 
@@ -887,16 +1020,33 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
-  // 'signin' | 'pricing' | 'byok'
-  const [view, setView] = useState('signin');
+  // Full-screen onboarding: step 1 is the required API key ('key'), step 2 is
+  // the optional, skippable account ('signin' | 'register' | 'verify').
+  // Settings mode shows only the account flow ('account' when signed in).
+  const [view, setView] = useState(() =>
+    isSettingsMode ? (isLoggedIn() ? 'account' : 'signin') : 'key'
+  );
+  const [pendingEmail, setPendingEmail] = useState('');
 
-  // Tabs: 0 = account path (signin / pricing), 1 = byok
-  const tabValue = view === 'byok' ? 1 : 0;
-
-  const handleTabChange = (_, newValue) => {
-    if (newValue === 0) setView('signin');
-    else setView('byok');
+  const handleNeedsVerification = (email) => {
+    setPendingEmail(email);
+    setView('verify');
   };
+
+  const handleAccountComplete = (payload) => {
+    if (isSettingsMode) {
+      setView('account');
+      onComplete(payload);
+    } else {
+      onComplete(payload);
+    }
+  };
+
+  // Onboarding: key saved → offer the optional sign-in step.
+  const handleKeySaved = () => setView('signin');
+
+  // Onboarding: the account step can be skipped — the key alone unlocks the app.
+  const handleSkip = () => onComplete({ via: 'key' });
 
   // Different styling for settings mode vs full-screen mode
   const containerStyles = isSettingsMode
@@ -932,54 +1082,63 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
         bgcolor: 'background.paper',
       };
 
+  const onboardingStep = view === 'key' ? 1 : 2;
+
   return (
     <Box sx={containerStyles}>
-      {/* ── Header ── */}
-      <Box sx={headerStyles}>
-        {!isSettingsMode && (
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+      {/* ── Header (onboarding only — Settings has its own chrome) ── */}
+      {!isSettingsMode && (
+        <Box sx={headerStyles}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, pb: 2 }}>
             <KeyOutlined sx={{ color: 'primary.main', fontSize: 28 }} />
             <Box>
               <Typography variant="h6" fontWeight={700} lineHeight={1.2}>
-                DagFlux — Get Started
+                Ternlux — Get Started
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                Create an account or connect your own LLM provider
+                {onboardingStep === 1
+                  ? 'Step 1 of 2 — Connect your LLM provider with your own API key'
+                  : 'Step 2 of 2 — Sign in for plugin access (optional)'}
               </Typography>
             </Box>
           </Box>
-        )}
-
-        <Tabs
-          value={tabValue}
-          onChange={handleTabChange}
-          sx={{
-            '& .MuiTab-root': { fontWeight: 600, fontSize: 14, textTransform: 'none', minHeight: 40 },
-          }}
-        >
-          <Tab icon={<PersonOutlined sx={{ fontSize: 18 }} />} iconPosition="start" label="Sign In / Register" />
-          <Tab icon={<KeyOutlined sx={{ fontSize: 18 }} />} iconPosition="start" label="Use My Own Key" />
-        </Tabs>
-      </Box>
+        </Box>
+      )}
 
       {/* ── Body ── */}
       <Box sx={{ flex: 1, display: 'flex', overflow: isSettingsMode ? 'auto' : 'hidden' }}>
+        {view === 'key' && (
+          <BringYourOwnKey onComplete={handleKeySaved} isSettingsMode={isSettingsMode} />
+        )}
+        {view === 'account' && (
+          <AccountView
+            onSignOut={() => setView('signin')}
+            isSettingsMode={isSettingsMode}
+          />
+        )}
         {view === 'signin' && (
           <SignInView
-            onRegister={() => setView('pricing')}
-            onComplete={onComplete}
+            onRegister={() => setView('register')}
+            onComplete={handleAccountComplete}
+            onNeedsVerification={handleNeedsVerification}
+            onSkip={isSettingsMode ? null : handleSkip}
             isSettingsMode={isSettingsMode}
           />
         )}
-        {view === 'pricing' && (
-          <PricingRegisterPage
+        {view === 'register' && (
+          <RegisterPage
             onBack={() => setView('signin')}
-            onComplete={onComplete}
+            onComplete={handleAccountComplete}
+            onRegistered={handleNeedsVerification}
             isSettingsMode={isSettingsMode}
           />
         )}
-        {view === 'byok' && (
-          <BringYourOwnKey onComplete={onComplete} isSettingsMode={isSettingsMode} />
+        {view === 'verify' && (
+          <VerifyEmailView
+            email={pendingEmail}
+            onBackToSignIn={() => setView('signin')}
+            isSettingsMode={isSettingsMode}
+          />
         )}
       </Box>
     </Box>

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { getWorkflowAssistance } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
-import ChatPrompts from './ChatPrompts/Transfomer';
+import { buildChatPrompt } from '../../../utils/chatPrompts';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 // ─────────────────────────────────────────────────────────────────────────────
 // Transformer Node Chat Component
@@ -138,6 +138,10 @@ const TransformerNodeChat = ({
           userRequestRef.current = savedConfig.transformationSettings.userRequest;
         }
       }
+      // After restoring a previously-built node (including ones the workflow
+      // assistant pre-populated), leave the input enabled so the user can
+      // ask follow-up questions about the existing config.
+      setDisableInput(false);
     } else {
       // New node - detect source and start chat
       if (initialChat.length === 0) {
@@ -740,13 +744,13 @@ Source: ${sourceTableSchema.sourceNodeLabel}
     // Determine if source is local (data stored in local file vs remote database)
     const isSourceLocal = isFileLocal()
 
-    const analysisPrompt = ChatPrompts.transfomer.transformationRequest(
+    const analysisPrompt = await buildChatPrompt('transfomer.transformationRequest', [
       userRequest,
       sourceTableInfo,
       isVectorDB ? 'vector' : sourceConnection.dbType,
       isSourceLocal,
-      availableSkills
-    );
+      availableSkills,
+    ]);
 
     const response = await getWorkflowAssistance('transformer', analysisPrompt, {
       sourceTable: sourceTableSchema.tableName,
@@ -777,6 +781,11 @@ Source: ${sourceTableSchema.sourceNodeLabel}
     }
 
     console.log('Parsed analysis:', analysis);
+
+    // The model may omit these fields; ensure they always exist so downstream
+    // property access (e.g. analysis.questionsNeeded.storageLocation) is safe.
+    if (!analysis.questionsNeeded) analysis.questionsNeeded = {};
+    if (!analysis.inferredSettings) analysis.inferredSettings = {};
 
     // Check if a skill was selected
     if (analysis.usesSkill && analysis.skillId) {
@@ -826,17 +835,20 @@ Source: ${sourceTableSchema.sourceNodeLabel}
       inferredSettings.operationMode = 'new_table';
     }
     // console.log('sourceNode?.data?.config?.targetLocalPath: ', sourceNode?.data?.config)
-    // Default storageLocation based on source type if null and not being asked
+    // Default storageLocation based on source type if null and not being asked.
+    // Important: only fill a default when the analyser didn't already infer one —
+    // otherwise an explicit "store locally" request on a DB source (where
+    // isFileLocal() is false) would get silently overwritten back to 'database'.
     if (isFileLocal()) {
-      // If parent source has targetLocalPath, data is stored locally
+      // A local-file source has no remote DB to write back to, so force local.
       inferredSettings.storageLocation = 'local';
-    }else if(!analysis.questionsNeeded.storageLocation){
+    } else if (!inferredSettings.storageLocation && !analysis.questionsNeeded.storageLocation) {
       inferredSettings.storageLocation = 'database';
     }
 
     setTransformationSettings(inferredSettings);
 
-    if(analysis.questionsNeeded && Object.keys(analysis.questionsNeeded)){
+    if(analysis.questionsNeeded && Object.keys(analysis.questionsNeeded).length){
       analysis.action = 'ask_questions'
     }
     // console.log('after_change:', analysis);
@@ -1489,12 +1501,12 @@ Transformation Settings:
       let transformationPrompt;
 
       if (isNoSQL) {
-        // For local NoSQL (NeDB), use ChatPrompts. For remote NoSQL, fetch from plugin.
+        // For local NoSQL (NeDB), use the chatPrompts IPC. For remote NoSQL, fetch from plugin.
         if (dbType === 'nedb') {
           if (settings.operationMode === 'in_place') {
-            transformationPrompt = ChatPrompts.transfomer.nedbTransformationInPlace(settings, sourceTableInfo, settingsContext, sourceTableSchema);
+            transformationPrompt = await buildChatPrompt('transfomer.nedbTransformationInPlace', [settings, sourceTableInfo, settingsContext, sourceTableSchema]);
           } else {
-            transformationPrompt = ChatPrompts.transfomer.nedbTransformationNewTable(settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName);
+            transformationPrompt = await buildChatPrompt('transfomer.nedbTransformationNewTable', [settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName]);
           }
         } else {
           // Generate prompt from plugin (e.g., MongoDB)
@@ -1526,9 +1538,9 @@ Transformation Settings:
         if (dbType === 'sqlite') {
           // Use SQLite prompts only for local SQLite files
           if (settings.operationMode === 'in_place') {
-            transformationPrompt = ChatPrompts.transfomer.sqliteTransformationInPlace(settings, sourceTableInfo, settingsContext, sourceTableSchema);
+            transformationPrompt = await buildChatPrompt('transfomer.sqliteTransformationInPlace', [settings, sourceTableInfo, settingsContext, sourceTableSchema]);
           } else {
-            transformationPrompt = ChatPrompts.transfomer.sqliteTransformationNewTable(settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName);
+            transformationPrompt = await buildChatPrompt('transfomer.sqliteTransformationNewTable', [settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName]);
           }
         } else {
           // Generate prompt from plugin for all other cases (database storage or remote DB to local)

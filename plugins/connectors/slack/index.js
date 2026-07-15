@@ -1,5 +1,5 @@
 /**
- * Slack Connector Plugin for DagFlux
+ * Slack Connector Plugin for Ternlux
  * OAuth2.0-based authentication for accessing Slack workspace
  * Supports reading messages from channels and sending messages
  */
@@ -642,7 +642,7 @@ module.exports = {
     displayName: 'Slack',
     description: 'Connect to Slack to read messages from channels and send messages',
     version: '1.0.0',
-    author: 'DagFlux',
+    author: 'Ternlux',
     capabilities: ['read', 'write'],
     documentationUrl: 'https://api.slack.com/docs'
   }

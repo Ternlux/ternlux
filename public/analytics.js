@@ -7,8 +7,10 @@
  *  - Respects the user's opt-in. Default is OFF; the renderer pushes the
  *    current setting via the `analytics:set-opt-in` IPC after the user
  *    answers the Terms screen, and again whenever they toggle in Settings.
- *  - Generates a stable anonymous device id stored in userData. The id is
- *    NOT tied to user identity; it lets us deduplicate a single install.
+ *  - Anonymous by construction: NO persistent device identifier is generated
+ *    or sent, and the server never records the client IP. Only a per-launch
+ *    random sessionId (resets every app start) is attached, so events cannot
+ *    be linked to an individual or to one device over time.
  *  - Fire-and-forget POST. Failures are swallowed so analytics can never
  *    break a user-facing IPC call.
  *  - Never sends prompt contents, workflow rows, queries, credentials, or
@@ -24,17 +26,16 @@ const { app } = require('electron');
 
 const STATE_FILE = 'analytics-state.json';
 
-// Production ingest URL. Override at runtime with DAGFLUX_ANALYTICS_URL.
+// Production ingest URL. Override at runtime with TERNLUX_ANALYTICS_URL.
 // Replace this default with your deployed API Gateway invoke URL after
 // running `sam deploy` in analytics-server/ (the IngestUrl output).
 const DEFAULT_ENDPOINT = 'https://tlkoabdy60.execute-api.us-east-1.amazonaws.com/';
 
-let endpoint = process.env.DAGFLUX_ANALYTICS_URL || DEFAULT_ENDPOINT;
+let endpoint = process.env.TERNLUX_ANALYTICS_URL || DEFAULT_ENDPOINT;
 let optIn = false;          // Default to OFF until renderer confirms.
-let deviceId = null;
 let appVersion = null;
 let initialized = false;
-let sessionId = null;
+let sessionId = null;       // Per-launch only — NOT persisted across runs.
 
 // Allowlist of IPC channels that emit an analytics event. Anything not
 // listed here is passed through untouched. Keep this list small — only
@@ -153,24 +154,21 @@ function init() {
     try { return app.getVersion(); } catch { return 'unknown'; }
   })();
 
+  // Per-launch session id only. Regenerated every start and never persisted,
+  // so it cannot be used to track a device across runs.
   sessionId = crypto.randomUUID();
 
   const state = loadState() || {};
-  if (state.deviceId) {
-    deviceId = state.deviceId;
-  } else {
-    deviceId = crypto.randomUUID();
-  }
   if (typeof state.optIn === 'boolean') {
     optIn = state.optIn;
   }
-  saveState({ deviceId, optIn });
+  saveState({ optIn });
 }
 
 function setOptIn(value) {
   init();
   optIn = !!value;
-  saveState({ deviceId, optIn });
+  saveState({ optIn });
 }
 
 function getOptIn() {
@@ -184,7 +182,6 @@ function setEndpoint(url) {
 
 function commonContext() {
   return {
-    deviceId,
     sessionId,
     appVersion,
     platform: process.platform,
@@ -243,6 +240,8 @@ function patchIpcMain(ipcMain) {
   init();
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = function patchedHandle(channel, listener) {
+
+    console.log('channel, listener: ', channel, listener)
     if (!TRACK_CHANNELS.has(channel)) {
       return originalHandle(channel, listener);
     }

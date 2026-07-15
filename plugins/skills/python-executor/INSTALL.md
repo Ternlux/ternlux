@@ -66,9 +66,9 @@ Testing Python Executor Skill Setup
 ==================================================
 ```
 
-### Step 4: Test in DagFlux
+### Step 4: Test in Ternlux
 
-1. Open DagFlux application
+1. Open Ternlux application
 2. Create or open a workflow
 3. Add a Transformer node
 4. Try a Python transformation:
@@ -104,9 +104,9 @@ python3 -m ensurepip --upgrade
 1. Update pip: `pip3 install --upgrade pip`
 2. Use virtual environment:
    ```bash
-   python3 -m venv dagflux-env
-   source dagflux-env/bin/activate  # Unix/macOS
-   # or dagflux-env\Scripts\activate  # Windows
+   python3 -m venv ternlux-env
+   source ternlux-env/bin/activate  # Unix/macOS
+   # or ternlux-env\Scripts\activate  # Windows
    pip install -r requirements.txt
    ```
 
@@ -120,7 +120,7 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-### Import Errors in DagFlux
+### Import Errors in Ternlux
 
 **Error**: Python packages not found when executing transformations
 
@@ -154,12 +154,12 @@ For isolated Python environment:
 
 ```bash
 # Create virtual environment
-python3 -m venv dagflux-python-env
+python3 -m venv ternlux-python-env
 
 # Activate it
-source dagflux-python-env/bin/activate  # Unix/macOS
+source ternlux-python-env/bin/activate  # Unix/macOS
 # or
-dagflux-python-env\Scripts\activate  # Windows
+ternlux-python-env\Scripts\activate  # Windows
 
 # Install packages
 pip install -r requirements.txt
@@ -167,16 +167,16 @@ pip install -r requirements.txt
 # Verify
 python test_setup.py
 
-# Note: You'll need to configure DagFlux to use this Python path:
-# /path/to/dagflux-python-env/bin/python (Unix/macOS)
-# C:\path\to\dagflux-python-env\Scripts\python.exe (Windows)
+# Note: You'll need to configure Ternlux to use this Python path:
+# /path/to/ternlux-python-env/bin/python (Unix/macOS)
+# C:\path\to\ternlux-python-env\Scripts\python.exe (Windows)
 ```
 
 ## Next Steps
 
 - Read [README.md](./README.md) for usage examples
 - Check [examples](#) for common transformation patterns
-- Visit [DagFlux documentation](#) for more information
+- Visit [Ternlux documentation](#) for more information
 
 ## Getting Help
 
@@ -186,4 +186,4 @@ If you continue to have issues:
 2. Verify Python version: `python3 --version`
 3. Verify pip version: `pip3 --version`
 4. Run test script: `python3 test_setup.py`
-5. Check DagFlux logs for detailed error messages
+5. Check Ternlux logs for detailed error messages

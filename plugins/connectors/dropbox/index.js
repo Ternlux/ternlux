@@ -1,5 +1,5 @@
 /**
- * Dropbox Storage Connector Plugin for DagFlux
+ * Dropbox Storage Connector Plugin for Ternlux
  * Handles all Dropbox storage operations
  */
 

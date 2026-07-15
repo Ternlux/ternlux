@@ -1,10 +1,10 @@
 {
-  "name": "@dagflux/skill-python-executor",
+  "name": "@ternlux/skill-python-executor",
   "version": "1.0.0",
-  "description": "Execute Python code for complex data transformations in DagFlux",
+  "description": "Execute Python code for complex data transformations in Ternlux",
   "main": "index.js",
   "keywords": [
-    "dagflux",
+    "ternlux",
     "plugin",
     "skill",
     "python",
@@ -12,7 +12,7 @@
     "pandas",
     "numpy"
   ],
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT",
   "dependencies": {}
 }

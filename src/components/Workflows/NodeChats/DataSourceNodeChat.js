@@ -16,8 +16,7 @@ import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/
 import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
 import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
 import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
-import ChatPrompts from './ChatPrompts/Transfomer'
-import RestApiPrompts from './ChatPrompts/RestApi'
+import { buildChatPrompt } from '../../../utils/chatPrompts';
 import CloudStorageBrowser from '../CloudStorageBrowser';
 import GoogleDrivePicker from '../GoogleDrivePicker';
 import ConnectionTypeSelector from '../ConnectionTypeSelector';
@@ -377,14 +376,14 @@ const DataSourceNodeChat = ({
         .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
         .join('\n');
 
-      const prompt = RestApiPrompts.restApiAnalysisRequest({
+      const prompt = await buildChatPrompt('restApi.restApiAnalysisRequest', [{
         userRequest: userMsg.text,
         connectionAuthType: selConn.dbConfig?.authType || 'none',
         connectionBaseUrl: selConn.dbConfig?.baseUrl || '',
         connectionApiKeyName: selConn.dbConfig?.apiKeyName || '',
         connectionBasicUser: selConn.dbConfig?.basicUser || '',
         conversationHistory,
-      });
+      }]);
 
       const response = await getWorkflowAssistance(
         'rest-api',
@@ -1118,14 +1117,14 @@ const DataSourceNodeChat = ({
     try {
       const token = localStorage.getItem('auth-token');
       let conns = [];
-      if (!token) {
+      // if (!token) {
         conns = await connectionsDb.getAll();
-      } else {
-        const res = await axios.post('/workflow/connections', { transformer: false }, {
-          headers: { 'auth-token': token },
-        });
-        if (res.data.success) conns = res.data.data;
-      }
+      // } else {
+      //   const res = await axios.post('/workflow/connections', { transformer: false }, {
+      //     headers: { 'auth-token': token },
+      //   });
+      //   if (res.data.success) conns = res.data.data;
+      // }
 
       // Load plugins to get dbCategory for each connection
       let pluginsMap = new Map();

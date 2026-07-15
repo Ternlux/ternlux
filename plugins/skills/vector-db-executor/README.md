@@ -1,6 +1,6 @@
 # Vector Database Executor Skill
 
-A DagFlux skill plugin for performing vector database operations with automatic embedding generation.
+A Ternlux skill plugin for performing vector database operations with automatic embedding generation.
 
 ## Features
 
@@ -8,7 +8,7 @@ A DagFlux skill plugin for performing vector database operations with automatic 
 - **Multiple Vector Databases**: Support for LanceDB (local) and Pinecone (cloud)
 - **Vector Operations**: Upsert, query (semantic search), delete, and update
 - **Cost Estimation**: Automatic cost estimation for OpenAI embeddings
-- **Flexible Integration**: Works with any data source in DagFlux
+- **Flexible Integration**: Works with any data source in Ternlux
 
 ## Installation
 
@@ -283,8 +283,8 @@ Result:
 ## Support
 
 For issues, questions, or feature requests:
-- GitHub Issues: https://github.com/your-org/dagflux/issues
-- Documentation: https://dagflux.docs.io
+- GitHub Issues: https://github.com/your-org/ternlux/issues
+- Documentation: https://ternlux.docs.io
 
 ## License
 

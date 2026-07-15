@@ -16,8 +16,6 @@ You pick one of three trigger types:
   recurring schedule.
 - **File / folder watch** — the workflow runs whenever a watched file
   or directory changes.
-- **Webhook** — the workflow runs whenever an HTTP request is made to
-  a generated webhook endpoint.
 
 ## Schedule sub-types
 
@@ -53,21 +51,13 @@ Multi-select is allowed — for example, a watcher can fire on both
 "add" and "change". The available event list narrows based on whether
 the path you picked is a file or a directory.
 
-## Webhook trigger
-
-When you pick the webhook trigger type, you set an API token that the
-caller must present in the `Authorization` header. DagFlux generates
-the endpoint URL for you, scoped to the workflow's id, and shows it
-in the configuration screen so you can copy it into the calling
-system.
-
 ## What the Start node does at run time
 
 At execution time, the Start node itself is a no-op — it doesn't read
-or write data. Its real role is to be registered with DagFlux's
+or write data. Its real role is to be registered with Ternlux's
 trigger system at startup, so that scheduled or file-watch triggers
 can fire the workflow even when you have it closed. When you change
-the trigger configuration, DagFlux automatically unregisters the old
+the trigger configuration, Ternlux automatically unregisters the old
 trigger before registering the new one, so you never end up with
 orphaned background jobs from a previous setup.
 

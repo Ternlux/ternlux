@@ -508,7 +508,7 @@ const DataPreview = ({
     setLoadingPreview(true);
 
     // Check if user is logged in - if not, use local data fetching
-    if (!isLoggedIn()) {
+    // if (!isLoggedIn()) {
       try {
         let connection;
 
@@ -562,59 +562,59 @@ const DataPreview = ({
         setLoadingPreview(false);
         return;
       }
-    }
+    // }
 
     // User is logged in - use API
-    try {
-      console.log("selectedNode: ", config)
+    // try {
+    //   console.log("selectedNode: ", config)
 
-      const connectionSourceIdentifier = config?.targetTableName || config?.sourceTableName || config?.targetCollection || config.sourceCollection;
-      const response = await axios.post('/workflow/sample-data', {
-        connectionId: connectionId,
-        sourceIdentifier: connectionSourceIdentifier,
-        limit: 1000 // Limit for preview
-      }, {
-        headers: {
-          'auth-token': localStorage.getItem('auth-token')
-        }
-      });
+    //   const connectionSourceIdentifier = config?.targetTableName || config?.sourceTableName || config?.targetCollection || config.sourceCollection;
+    //   const response = await axios.post('/workflow/sample-data', {
+    //     connectionId: connectionId,
+    //     sourceIdentifier: connectionSourceIdentifier,
+    //     limit: 1000 // Limit for preview
+    //   }, {
+    //     headers: {
+    //       'auth-token': localStorage.getItem('auth-token')
+    //     }
+    //   });
 
-      if (response.data.success) {
-        // Convert sample data format to preview data format
-        const sampleData = response.data.data;
-        const headers = sampleData.columnMappings?.map(col => col.name) || [];
-        const rows = sampleData.sampleRows?.map(row =>
-          headers.map(header => {
-            const value = row.data[header];
-            // Handle null, undefined, and string 'null' values
-            if (value === null || value === undefined || value === 'null' || value === 'true') {
-              return '';
-            }
-            return String(value);
-          })
-        ) || [];
+    //   if (response.data.success) {
+    //     // Convert sample data format to preview data format
+    //     const sampleData = response.data.data;
+    //     const headers = sampleData.columnMappings?.map(col => col.name) || [];
+    //     const rows = sampleData.sampleRows?.map(row =>
+    //       headers.map(header => {
+    //         const value = row.data[header];
+    //         // Handle null, undefined, and string 'null' values
+    //         if (value === null || value === undefined || value === 'null' || value === 'true') {
+    //           return '';
+    //         }
+    //         return String(value);
+    //       })
+    //     ) || [];
 
-        const formattedData = {
-          headers: headers,
-          data: rows,
-          metadata: sampleData.metadata
-        };
-        setPreviewDataBySource(prev => ({
-          ...prev,
-          [connectionId + connectionSourceIdentifier]: formattedData
-        }));
-        setPreviewData(formattedData);
+    //     const formattedData = {
+    //       headers: headers,
+    //       data: rows,
+    //       metadata: sampleData.metadata
+    //     };
+    //     setPreviewDataBySource(prev => ({
+    //       ...prev,
+    //       [connectionId + connectionSourceIdentifier]: formattedData
+    //     }));
+    //     setPreviewData(formattedData);
 
-      } else {
-        message.error('Failed to load preview data');
-      }
-    } catch (error) {
-      if (handleAuthError(error)) return;
-      console.error('Error fetching preview data:', error);
-      message.error('Failed to load preview data');
-    } finally {
-      setLoadingPreview(false);
-    }
+    //   } else {
+    //     message.error('Failed to load preview data');
+    //   }
+    // } catch (error) {
+    //   if (handleAuthError(error)) return;
+    //   console.error('Error fetching preview data:', error);
+    //   message.error('Failed to load preview data');
+    // } finally {
+    //   setLoadingPreview(false);
+    // }
   };
 
   // Handle tab change in preview section
@@ -716,7 +716,7 @@ const DataPreview = ({
             language="json"
             value={JSON.stringify(data.data, null, 2)}
             beforeMount={(monaco) => {
-              monaco.editor.defineTheme('dagflux-light', {
+              monaco.editor.defineTheme('ternlux-light', {
                 base: 'vs',
                 inherit: true,
                 rules: [],
@@ -742,7 +742,7 @@ const DataPreview = ({
                 },
               });
             }}
-            theme="dagflux-light"
+            theme="ternlux-light"
             options={{
               readOnly: true,
               minimap: { enabled: true },
@@ -934,7 +934,7 @@ const DataPreview = ({
 
     try {
       // Use local data fetching for transformed data
-      if (!isLoggedIn()) {
+      // if (!isLoggedIn()) {
         let connection;
 
         // Check if this is a local storage placeholder ID (local-sqlite or local-nedb)
@@ -987,50 +987,50 @@ const DataPreview = ({
           }));
           setTransformedData(localData);
         }
-      } else {
-        // For logged-in users, query the database directly
-        const response = await axios.post('/workflow/sample-data', {
-          connectionId: nodeConfig.targetConnectionId,
-          query: nodeConfig.targetPreviewSql, // Use the targetPreviewSql to query the transformed table
-          limit: 1000
-        }, {
-          headers: {
-            'auth-token': localStorage.getItem('auth-token')
-          }
-        });
+      // } else {
+      //   // For logged-in users, query the database directly
+      //   const response = await axios.post('/workflow/sample-data', {
+      //     connectionId: nodeConfig.targetConnectionId,
+      //     query: nodeConfig.targetPreviewSql, // Use the targetPreviewSql to query the transformed table
+      //     limit: 1000
+      //   }, {
+      //     headers: {
+      //       'auth-token': localStorage.getItem('auth-token')
+      //     }
+      //   });
 
-        if (response.data.success) {
-          const sampleData = response.data.data;
-          const headers = sampleData.columnMappings?.map(col => col.name) || [];
-          const rows = sampleData.sampleRows?.map(row =>
-            headers.map(header => {
-              const value = row.data[header];
-              // Handle null, undefined, and string 'null' values
-              if (value === null || value === undefined || value === 'null' || value === 'true') {
-                return '';
-              }
-              return String(value);
-            })
-          ) || [];
+      //   if (response.data.success) {
+      //     const sampleData = response.data.data;
+      //     const headers = sampleData.columnMappings?.map(col => col.name) || [];
+      //     const rows = sampleData.sampleRows?.map(row =>
+      //       headers.map(header => {
+      //         const value = row.data[header];
+      //         // Handle null, undefined, and string 'null' values
+      //         if (value === null || value === undefined || value === 'null' || value === 'true') {
+      //           return '';
+      //         }
+      //         return String(value);
+      //       })
+      //     ) || [];
 
-          const formattedData = {
-            headers: headers,
-            data: rows,
-            metadata: sampleData.metadata
-          };
+      //     const formattedData = {
+      //       headers: headers,
+      //       data: rows,
+      //       metadata: sampleData.metadata
+      //     };
 
-          // Cache the transformed data using target connection name
-          const cacheKey = selectedNode.id + (nodeConfig?.targetConnectionName || '');
-          setPreviewDataBySource(prev => ({
-            ...prev,
-            [cacheKey]: formattedData
-          }));
+      //     // Cache the transformed data using target connection name
+      //     const cacheKey = selectedNode.id + (nodeConfig?.targetConnectionName || '');
+      //     setPreviewDataBySource(prev => ({
+      //       ...prev,
+      //       [cacheKey]: formattedData
+      //     }));
 
-          setTransformedData(formattedData);
-        } else {
-          message.error('Failed to load transformed data');
-        }
-      }
+      //     setTransformedData(formattedData);
+      //   } else {
+      //     message.error('Failed to load transformed data');
+      //   }
+      // }
     } catch (error) {
       if (handleAuthError(error)) return;
       console.error('Error fetching transformed data:', error);

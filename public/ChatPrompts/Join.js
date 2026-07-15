@@ -73,7 +73,7 @@ Analyze the user's request and conversation history to determine the next steps.
   "skillExplanation": "Brief explanation of why this skill is being used (only if usesSkill is true)",
   "vectorRequired": false | true,   // true ONLY when this join needs runtime embedding / similarity search (Scenario B). Defaults to false. Read the user's intent — a vector source on its own does NOT imply vectorRequired.
   "inferredSettings": {
-    "destinationSelection": "connection_id or local-sqlite or local-nedb" (optional),
+    "destinationSelection": "connection_id or local-sqlite or local-nedb or local-lancedb" (optional; use local-lancedb when the user wants the result stored as a LOCAL vector table — embeddings / a lancedb table / similarity-searchable — and named no saved vector connection. Do NOT downgrade a requested local vector table to local-sqlite),
     "operationMode": "new_table" | "merge_existing" (optional),
     "targetTableName": "table_name" ${operationMode === 'new_table' ? '(REQUIRED for new_table mode)' : '(optional)'},
     "joinType": "INNER" | "LEFT" | "FULL" (optional),
@@ -168,7 +168,7 @@ Example 4 - Informational:
 User: "What columns are available in the first source?"
 → action: "answer_directly", directAnswer: "The first source contains these columns: ..."
 
-Return ONLY valid JSON, no additional text.
+CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something or answer a question, put that text inside the "directAnswer" field and set "action" to "answer_directly" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
   `,
 
   /**
@@ -401,7 +401,7 @@ External sources are loaded into temp tables. Sources already in destination are
       "selectedColumns": ["col1", "col2", "col3"] // Array defining column order - DDL, SQL, and this array MUST all match
     }
   ],
-  "targetDdl": "CREATE TABLE ..." // Only if operationMode is "new_table", else null,
+  "targetDdl": "CREATE TABLE ..." // Only if operationMode is "new_table", else null. MUST be a SINGLE CREATE TABLE statement ONLY — the execution engine already DROPs the target table before running this DDL, so do NOT prepend "DROP TABLE ...;" or include any other statement (a multi-statement string only has its FIRST statement executed, which would run the DROP and skip the CREATE),
   "joinSql": "INSERT INTO target_table SELECT ... FROM temp_xxx t1 JOIN existing_table t2 ...",
   "previewSql": "SELECT * FROM ${destinationConfig.tableName} LIMIT 100",
   "joinColumns": [{"table1": "col", "table2": "col"}],
@@ -419,6 +419,12 @@ CRITICAL REQUIREMENTS for DDL, SQL, and selectedColumns order:
    - This placeholder will be replaced with database-specific pagination syntax (LIMIT/OFFSET, TOP, FETCH, etc.)
    - Example: "SELECT col1, col2 FROM table {LIMIT_OFFSET_HERE}"
    - Do NOT add your own LIMIT/OFFSET clauses - only use the placeholder
+8. CRITICAL: "targetDdl" MUST contain a SINGLE statement: just the CREATE TABLE. The
+   execution engine ALREADY drops the target table before running targetDdl, so do NOT
+   prepend "DROP TABLE IF EXISTS ...;" and do NOT include any second statement. Only the
+   FIRST statement of the string is executed — a leading DROP would run and the CREATE
+   would be skipped, causing "no such table" when the join INSERT runs. Same for any
+   per-source "ddl": a single CREATE TABLE statement, no DROP.
 
 Example 1 (External SQL source + SQL source in destination):
 {
@@ -480,7 +486,7 @@ Based on the user's request and conversation history, determine:
 
 Note: Each table pair can have different join types (e.g., Table A INNER JOIN Table B, result LEFT JOIN Table C).
 
-Return ONLY valid JSON, no additional text. Only return the keys provided in this prompt.
+CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Only return the keys provided in this prompt, and put any explanation inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
   `,
 
 };
@@ -489,4 +495,5 @@ const ChatPrompts = {
   join: JoinPrompts
 };
 
-export default ChatPrompts;
+module.exports = ChatPrompts;
+module.exports.default = ChatPrompts;

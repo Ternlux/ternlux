@@ -1,9 +1,9 @@
 {
-  "name": "@dagflux/connector-mssql",
+  "name": "@ternlux/connector-mssql",
   "version": "1.0.0",
-  "description": "Microsoft SQL Server connector for DagFlux",
+  "description": "Microsoft SQL Server connector for Ternlux",
   "main": "index.js",
-  "dagflux": {
+  "ternlux": {
     "type": "connector",
     "id": "mssql",
     "displayName": "SQL Server",
@@ -13,6 +13,6 @@
   "dependencies": {
     "mssql": "^9.0.0"
   },
-  "author": "DagFlux",
+  "author": "Ternlux",
   "license": "MIT"
 }

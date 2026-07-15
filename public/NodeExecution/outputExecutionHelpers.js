@@ -445,49 +445,51 @@ async function executeOutput(
           db.close();
         }
       } else {
-        // Remote connection - use plugin system
-        // Use the stored query from schema if available, otherwise construct one
-        let queryObj;
-
-        // Fallback: construct query from scratch
+        // Remote connection - use plugin system. Build a queryObj shaped
+        // to the source DB's category — sending a SQL `query` field to a
+        // NoSQL connector breaks because Mongo's runQuery prefers `query`
+        // when present and tries to JSON.parse the SQL string.
         const schema = sourceConnection.dbConfig?.schema;
+        const dbType = sourceConnection.dbType;
+        const dbCategory = plugin?.dbCategory || sourceConnection.dbCategory || null;
+        const isNoSQL = dbType === 'mongodb' || dbType === 'nedb' || dbCategory === 'NoSQL';
+        const isSheets = dbType === 'google-sheets';
 
-        // Use quoteIdentifier to properly format table name with schema
-        // let fullTableName;
-        // if (plugin && plugin.quoteIdentifier) {
-        //   fullTableName = plugin.quoteIdentifier(sourceTableSchema.tableName, schema, sourceConnection.dbConfig);
-        //   console.log('sourceTableSchema.tableName, schema: ', sourceTableSchema.tableName, schema, fullTableName)
-        // } else {
-        //   // Fallback to manual formatting
-        //   fullTableName = schema ? `${schema}.${sourceTableSchema.tableName}` : sourceTableSchema.tableName;
-        // }
+        let queryObj;
+        if (isNoSQL) {
+          // Mongo / NeDB envelope. Limit kept high enough to bulk-pull.
+          queryObj = {
+            collection: sourceTableSchema.tableName,
+            filter: {},
+            limit: 1000000,
+          };
+        } else if (isSheets) {
+          queryObj = {
+            spreadsheetId: sourceTableSchema.tableName,
+            sheetName: sourceTableSchema.sheetName,
+            range: sourceTableSchema.sheetName,
+            limit: 1000000,
+          };
+        } else {
+          // Generic SQL: prefer plugin's quoteIdentifier when available so
+          // identifiers with reserved words or mixed case survive.
+          let fullTableName;
+          if (plugin && typeof plugin.quoteIdentifier === 'function') {
+            fullTableName = plugin.quoteIdentifier(sourceTableSchema.tableName, schema, sourceConnection.dbConfig);
+          } else {
+            fullTableName = schema ? `${schema}.${sourceTableSchema.tableName}` : sourceTableSchema.tableName;
+          }
+          queryObj = {
+            query: `SELECT * FROM ${fullTableName}`,
+            tableName: sourceTableSchema.tableName,
+            schema,
+            limit: 1000000,
+          };
+        }
 
-        const sqlQuery = `SELECT * FROM ${sourceTableSchema.tableName}`;
-
-        queryObj = {
-          // For SQL databases
-          query: sqlQuery,
-          tableName: sourceTableSchema.tableName,
-          schema: sourceConnection.dbConfig?.schema,
-
-          // For MongoDB
-          collection: sourceTableSchema.tableName,
-          filter: {},
-
-          // For Google Sheets
-          spreadsheetId: sourceTableSchema.tableName,
-          sheetName: sourceTableSchema.sheetName,
-          range: sourceTableSchema.sheetName,
-
-          // Common
-          limit: 1000000
-        };
         const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
-
         const result = await plugin.runQuery(fullConfig, sourceConnection.id, queryObj);
-        // console.log('queryObj: ', queryObj)
-        sourceData = result.rows || [];
-
+        sourceData = result.rows || result.data || [];
 
         console.log(`[Output] Loaded ${sourceData.length} rows from source`);
       }
@@ -686,25 +688,30 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
         return processedRow;
       });
 
-      // Write to file
-      const encoder = avroType.createFileEncoder(savePath);
+      // Write to file. Pipe a BlockEncoder into the file stream and resolve on
+      // the FILE stream's finish — avsc's encoder 'finish' fires before the
+      // underlying file is flushed to disk, so resolving on it would report
+      // success while the file is still empty.
+      const fileStream = fs.createWriteStream(savePath);
+      const encoder = new avro.streams.BlockEncoder(avroType);
+      encoder.pipe(fileStream);
       processedData.forEach(row => encoder.write(row));
       encoder.end();
 
       return new Promise((resolve, reject) => {
-        encoder.on('finish', () => {
+        fileStream.on('finish', () => {
           resolve({
             success: true,
             message: `Successfully exported ${sourceData.length} rows to Avro`,
             filePath: savePath
           });
         });
-        encoder.on('error', (error) => {
-          reject({
-            success: false,
-            message: `Failed to export Avro: ${error.message}`
-          });
+        const fail = (error) => reject({
+          success: false,
+          message: `Failed to export Avro: ${error.message}`
         });
+        fileStream.on('error', fail);
+        encoder.on('error', fail);
       });
     } catch (error) {
       console.error('Avro export error:', error);
@@ -886,7 +893,14 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
     if (sourceData.length > 0) {
       const columns = Object.keys(sourceData[0]);
       const columnTypes = inferColumnTypes(sourceData, targetConnection.dbType);
-      const columnDefs = columns.map(col => `${col} ${columnTypes[col]}`).join(', ');
+      // Quote column identifiers so reserved words (e.g. a "timestamp" column on
+      // SQL Server) don't break the CREATE TABLE. Without this the CREATE fails
+      // with a syntax error that the try/catch below swallows, leaving the table
+      // uncreated — which then resurfaces as an "Invalid object name" on insert.
+      const quoteCol = (plugin && plugin.quoteIdentifier)
+        ? (c) => plugin.quoteIdentifier(c, null, targetConnection.dbConfig)
+        : (c) => c;
+      const columnDefs = columns.map(col => `${quoteCol(col)} ${columnTypes[col]}`).join(', ');
       console.log('tableName, schema, targetConnection.dbConfig: ', tableName, targetConnection.dbConfig)
       // Quote the table name using the plugin's quoteIdentifier
       // For BigQuery with dataset.table format, parse and quote properly

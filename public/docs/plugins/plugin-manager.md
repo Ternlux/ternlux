@@ -1,6 +1,6 @@
 # How plugins are loaded and managed
 
-When DagFlux starts, it scans its plugin folder, validates each plugin,
+When Ternlux starts, it scans its plugin folder, validates each plugin,
 and registers the ones that pass.
 
 ## Discovery
@@ -29,16 +29,16 @@ implements the required behaviours for that type:
   join, or both) and provide a description plus an execute action.
 
 Any plugin that doesn't meet its required behaviours is skipped — the
-problem is logged but the rest of DagFlux keeps running.
+problem is logged but the rest of Ternlux keeps running.
 
 ## Optional behaviours that unlock features
 
-A plugin can opt into extra capabilities that DagFlux uses when present:
+A plugin can opt into extra capabilities that Ternlux uses when present:
 
 - **Streaming reads** — large datasets are pulled in batches instead of
   all at once.
 - **Batch inserts** — destination writes happen in chunks for speed.
-- **Quoting** — DagFlux uses dialect-aware identifier quoting (for
+- **Quoting** — Ternlux uses dialect-aware identifier quoting (for
   example, BigQuery backticks vs PostgreSQL schema-qualified names).
 - **Preview queries** — the data preview pane uses the connector's
   preferred preview syntax.
@@ -50,7 +50,7 @@ A plugin can opt into extra capabilities that DagFlux uses when present:
 
 ## Install and uninstall
 
-You can install a plugin from the catalog at any time. DagFlux downloads
+You can install a plugin from the catalog at any time. Ternlux downloads
 the plugin package, replaces the existing folder if any, and reloads the
 plugin list — so the new connector or skill is available immediately.
 

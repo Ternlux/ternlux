@@ -519,25 +519,27 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
     if (showLoading) setLoading(true);
     const token = localStorage.getItem('auth-token');
     try {
-      if (token) {
-        const offset = (page - 1) * pagination.limit;
-        const response = await axios.get(
-          `/workflow/executions?limit=${pagination.limit}&offset=${offset}`,
-          { headers: { 'auth-token': token } });
-        if (response.data.success) {
-          setExecutions(response.data.data || []);
-          setPagination(prev => ({ ...prev, ...(response.data.pagination || {}) }));
-        } else {
-          message.error('Failed to load executions');
-          setExecutions([]);
-        }
-      } else {
-        const result = await executionsDb.getAll({ page, limit: pagination.limit });
-        setExecutions(result.docs || []);
-        setPagination(prev => ({
-          ...prev, page, total: result.total, hasMore: result.hasMore,
-        }));
-      }
+      // Remote executions fetch disabled — backend returns 403 for logged-in
+      // tokens, so we always read from the local executions store.
+      // if (token) {
+      //   const offset = (page - 1) * pagination.limit;
+      //   const response = await axios.get(
+      //     `/workflow/executions?limit=${pagination.limit}&offset=${offset}`,
+      //     { headers: { 'auth-token': token } });
+      //   if (response.data.success) {
+      //     setExecutions(response.data.data || []);
+      //     setPagination(prev => ({ ...prev, ...(response.data.pagination || {}) }));
+      //   } else {
+      //     message.error('Failed to load executions');
+      //     setExecutions([]);
+      //   }
+      // } else {
+      const result = await executionsDb.getAll({ page, limit: pagination.limit });
+      setExecutions(result.docs || []);
+      setPagination(prev => ({
+        ...prev, page, total: result.total, hasMore: result.hasMore,
+      }));
+      // }
     } catch (error) {
       console.error('Error fetching executions:', error);
       if (token && error.response?.status === 404) {
@@ -564,14 +566,16 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
   const fetchStats = async () => {
     const token = localStorage.getItem('auth-token');
     try {
-      if (token) {
-        const response = await axios.get('/workflow/executions/stats', {
-          headers: { 'auth-token': token },
-        });
-        if (response.data.success) setStats(response.data.data);
-      } else {
-        setStats(await executionsDb.getStats());
-      }
+      // Remote stats fetch disabled — backend returns 403 for logged-in
+      // tokens, so we always read stats from the local executions store.
+      // if (token) {
+      //   const response = await axios.get('/workflow/executions/stats', {
+      //     headers: { 'auth-token': token },
+      //   });
+      //   if (response.data.success) setStats(response.data.data);
+      // } else {
+      setStats(await executionsDb.getStats());
+      // }
     } catch (error) {
       console.error('Error fetching stats:', error);
       if (token && error.response?.status === 404) {
@@ -601,21 +605,21 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
   const fetchExecutionDetails = async (executionId) => {
     const token = localStorage.getItem('auth-token');
     try {
-      if (token) {
-        const response = await axios.get(`/workflow/executions/${executionId}`, {
-          headers: { 'auth-token': token },
-        });
-        if (response.data.success) {
-          setSelectedExecution(response.data.data);
-          reportSelected(response.data.data);
-        } else {
-          message.error('Failed to load execution details');
-        }
-      } else {
+      // if (token) {
+      //   const response = await axios.get(`/workflow/executions/${executionId}`, {
+      //     headers: { 'auth-token': token },
+      //   });
+      //   if (response.data.success) {
+      //     setSelectedExecution(response.data.data);
+      //     reportSelected(response.data.data);
+      //   } else {
+      //     message.error('Failed to load execution details');
+      //   }
+      // } else {
         const execution = await executionsDb.getById(executionId);
         if (execution) { setSelectedExecution(execution); reportSelected(execution); }
         else message.error('Execution not found');
-      }
+      // }
     } catch (error) {
       console.error('Error fetching execution details:', error);
       if (token && error.response?.status === 404) {

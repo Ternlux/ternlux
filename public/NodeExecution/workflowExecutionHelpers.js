@@ -797,6 +797,7 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     }
 
     const dbType = config.targetDbType || config.dbType;
+    const sourceDbType = config.sourceDbType || config.sourceType;
 
     if (!dbType) {
       return {
@@ -810,6 +811,51 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     const isNeDB = dbType === 'nedb';
     const isLocalStorage = config.transformationSettings?.storageLocation === 'local';
     const isInPlace = config.transformationSettings?.operationMode === 'in_place';
+
+    // Cross-database NoSQL case: the source is MongoDB but the destination is a
+    // local NeDB file (target dbType "nedb" / storageLocation "local"). The read
+    // and aggregation must run against MongoDB; the resulting documents are then
+    // persisted to local NeDB by handleTransformNoSQL via saveToLocalNeDB.
+    // Routing off the *target* dbType alone would mistakenly try to open a local
+    // NeDB source file that does not exist ("Source NeDB file not found").
+    const isMongoSourceToLocal =
+      sourceDbType === 'mongodb' && dbType !== 'mongodb' && (isNeDB || isLocalStorage);
+
+    if (isMongoSourceToLocal) {
+      const result = await handleTransformNoSQL({
+        dbType: 'mongodb',
+        config: config.sourceDbConfig || config.dbConfig,
+        connectionId: config.sourceConnectionId || config.connectionId,
+        sourceLocalPath: null,
+        sourceCollection: config.sourceCollection,
+        targetCollection: config.targetCollection,
+        operationType: config.operationType,
+        nosqlOperation: config.nosqlOperation,
+        transformFunction: config.transformFunction,
+        storageLocation: 'local',
+        operationMode: config.transformationSettings?.operationMode
+      });
+
+      return {
+        success: result.success,
+        message: result.message || (result.success ? 'NoSQL transformation completed' : 'NoSQL transformation failed'),
+        recordsProcessed: result.recordCount || result.modifiedCount
+          || result.documentsInserted || result.documentsProcessed || 0
+      };
+    }
+
+    // Cross-database SQL case: the source is a remote SQL database (MSSQL,
+    // Postgres, MySQL, …) but the destination is local SQLite (target dbType
+    // "sqlite" / storageLocation "local"). The transform SELECT must run on the
+    // *source* via its plugin; the rows are then written to local SQLite with
+    // ddl/insertSql by Sqlite.databaseToLocal. Routing off the target dbType
+    // would run the source SELECT (e.g. "FROM [dbo].[items]") against the local
+    // app DB → "no such table: dbo.items". Mirrors isMongoSourceToLocal above.
+    const isSqlSourceToLocal =
+      isLocalStorage && !isInPlace &&
+      dbType === 'sqlite' &&
+      sourceDbType && !['sqlite', 'nedb', 'mongodb'].includes(sourceDbType);
+
     const sourceLocalPath = (isNeDB || isLocalStorage || isInPlace) ? getSourceLocalPath(node, nodeMap, edges) : null;
 
     // NoSQL transformations (MongoDB, NeDB)
@@ -836,10 +882,17 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     }
 
     // SQL transformations (PostgreSQL, MySQL, MSSQL, SQLite, etc.)
+    // For a remote-SQL-source → local-SQLite transform, hand handleTransformSQL
+    // the *source* db/connection so its storageLocation==='local' branch pulls
+    // data from the source plugin into local SQLite; otherwise use the target.
     const result = await handleTransformSQL({
-      dbType,
-      config: config.targetDbConfig || config.dbConfig,
-      connectionId: config.targetConnectionId || config.connectionId,
+      dbType: isSqlSourceToLocal ? sourceDbType : dbType,
+      config: isSqlSourceToLocal
+        ? (config.sourceDbConfig || config.dbConfig)
+        : (config.targetDbConfig || config.dbConfig),
+      connectionId: isSqlSourceToLocal
+        ? (config.sourceConnectionId || config.connectionId)
+        : (config.targetConnectionId || config.connectionId),
       ddl: config.targetDdl,
       sql: config.targetSql,
       previewSql: config.targetPreviewSql,
@@ -895,8 +948,13 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
     };
   }
 
-  // Check if join is configured
-  if (!config.joinConfig) {
+  // Check if join is configured. Saved join nodes store the generated
+  // operation as flat fields (sourcesConfig, joinSql / transformFunction,
+  // targetDdl …) — there is no nested config.joinConfig; the executor rebuilds
+  // it below. So gate on what's actually generated: a SQL join has joinSql, a
+  // NoSQL/vector join has a transformFunction. Both JoinNodeChat (interactive)
+  // and the headless workflow builder produce this same flat shape.
+  if (!config.joinSql && !config.transformFunction) {
     return {
       success: false,
       message: 'Join configuration not found',
@@ -905,21 +963,27 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
   }
 
   try {
-    // Build destination connection from config
+    // Build destination connection from config. Include localPath so a local
+    // file destination (LanceDB directory / SQLite / NeDB file) resolves to the
+    // right path — the vector branch falls back to destinationConnection.localPath.
     const destinationConnection = {
       id: config.targetConnectionId || config.connectionId,
       dbType: config.targetDbType,
-      dbConfig: config.targetDbConfig || {}
+      dbConfig: config.targetDbConfig || {},
+      localPath: config.targetLocalPath
     };
 
-    // Build join config
+    // Build join config. Pass vectorDestination through so a vector destination
+    // (saved Pinecone connection OR local LanceDB table) gets embedded + upserted
+    // by the handler's vector branch.
     const joinConfig = {
       sourcesConfig: config.sourcesConfig,
       joinSql: config.joinSql,
       targetDdl: config.targetDdl,
       transformFunction: config.transformFunction,
       targetTableName: config.targetTableName,
-      targetCollection: config.targetCollection
+      targetCollection: config.targetCollection,
+      vectorDestination: config.vectorDestination
     };
 
     // Call the join handler directly
@@ -951,7 +1015,7 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
  * Calls the output handler directly
  */
 async function executeOutputNode(node, nodeMap, edges, helpers) {
-  const { getFullConfig, pluginManager } = helpers;
+  const { getFullConfig, pluginManager, getDb } = helpers;
 
   console.log(`[Workflow Execution] Executing Output node: ${node.id}`);
 
@@ -1023,8 +1087,9 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
       };
     }
 
-    // Call the output handler directly
-    // Note: getDb is not available in workflow execution context, passing null
+    // Call the output handler directly. getDb IS available on the helpers
+    // bundle (assembled in electron.js); the previous null hard-code broke
+    // insertToConnection's connection-lookup at outputExecutionHelpers.js:760.
     const skillHelpers = typeof helpers.buildSkillHelpers === 'function'
       ? await helpers.buildSkillHelpers()
       : null;
@@ -1034,7 +1099,7 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
       config.outputSettings,
       pluginManager,
       getFullConfig,
-      null,
+      getDb,
       skillHelpers
     );
 

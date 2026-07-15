@@ -159,6 +159,8 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
   const [explorerConnection, setExplorerConnection] = useState(null);
   const [installedPlugins, setInstalledPlugins] = useState([]);
   const [pluginsLoaded, setPluginsLoaded] = useState(false);
+  const [droppedFile, setDroppedFile] = useState(null);
+  const [isDragOver, setIsDragOver] = useState(false);
 
   useEffect(() => {
     fetchConnections();
@@ -191,26 +193,76 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
   };
 
   const fetchConnections = async () => {
-    if (!isLoggedIn()) {
-      const local = await connectionsDb.getAll();
-      setConnections(local);
-      return;
-    }
-    try {
-      const response = await axios.post('/workflow/connections', { transformer: false }, {
-        headers: { 'auth-token': localStorage.getItem('auth-token') },
-      });
-      if (response.data.success) setConnections(response.data.data);
-    } catch (error) {
-      if (handleAuthError(error)) return;
-      console.error('Error fetching connections:', error);
-      message.error('Failed to load connections');
-    }
+    // Remote connections fetch disabled — backend returns 403 for logged-in
+    // tokens, so we always read from the local IndexedDB store.
+    const local = await connectionsDb.getAll();
+    setConnections(local);
+    // try {
+    //   const response = await axios.post('/workflow/connections', { transformer: false }, {
+    //     headers: { 'auth-token': localStorage.getItem('auth-token') },
+    //   });
+    //   if (response.data.success) setConnections(response.data.data);
+    // } catch (error) {
+    //   if (handleAuthError(error)) return;
+    //   console.error('Error fetching connections:', error);
+    //   message.error('Failed to load connections');
+    // }
   };
 
   const handleConnectionTypeSelect = (type) => {
     setEditingConnection(null);
+    setDroppedFile(null);
     setActiveDbType(type);
+  };
+
+  // Map a dropped file's extension to the local file connection type so we can
+  // open the matching LocalFileConnectionForm. `.db` defaults to SQLite.
+  const detectFileType = (filename) => {
+    const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
+    const byExt = {
+      '.csv': 'spreadsheet', '.xlsx': 'spreadsheet', '.xls': 'spreadsheet',
+      '.json': 'json',
+      '.parquet': 'parquet',
+      '.avro': 'avro',
+      '.sqlite': 'sqlite', '.sqlite3': 'sqlite', '.db': 'sqlite',
+      '.nedb': 'nedb',
+    };
+    return byExt[ext] || null;
+  };
+
+  const onDragOver = (event) => {
+    event.preventDefault();
+    if (event.dataTransfer.types.includes('Files')) {
+      event.dataTransfer.dropEffect = 'copy';
+      setIsDragOver(true);
+    }
+  };
+
+  const onDragLeave = (event) => {
+    event.preventDefault();
+    // Only clear when the cursor actually leaves the container, not a child.
+    if (!event.currentTarget.contains(event.relatedTarget)) {
+      setIsDragOver(false);
+    }
+  };
+
+  const onDrop = (event) => {
+    event.preventDefault();
+    setIsDragOver(false);
+
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length === 0) return;
+
+    const file = files[0];
+    const fileType = detectFileType(file.name);
+    if (!fileType) {
+      message.error('Unsupported file type. Drop a CSV, Excel, JSON, Parquet, Avro, SQLite, or NeDB file.');
+      return;
+    }
+
+    setEditingConnection(null);
+    setDroppedFile(file);
+    setActiveDbType(fileType);
   };
 
   const handleTestConnection = async (dbType, config) => {
@@ -242,7 +294,7 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
     const isEditing = Boolean(connectionId);
     const isFileConnection = connectionData.connectionType === 'file';
 
-    if (!isLoggedIn() || isFileConnection) {
+    // if (!isLoggedIn() || isFileConnection) {
       try {
         if (connectionData.connectionType === 'database' && connectionData.dbConfig && window.electronAPI?.dbCredentials) {
           const { dbConfig, ...connectionDataWithoutConfig } = connectionData;
@@ -299,32 +351,33 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
         message.error(`Failed to ${isEditing ? 'update' : 'save'} connection.`);
       }
       return;
-    }
+    // }
 
-    try {
-      const payload = isEditing
-        ? { ...connectionData, status: 'untested', connectionId }
-        : { ...connectionData, status: 'untested' };
-      const endpoint = isEditing ? '/workflow/connection-update' : '/workflow/connection-save';
-      const response = await axios.post(endpoint, payload, {
-        headers: { 'auth-token': localStorage.getItem('auth-token') },
-      });
-      if (response.data.success) {
-        await fetchConnections();
-        setActiveDbType(null);
-        setEditingConnection(null);
-        message.success(isEditing ? 'Connection updated.' : 'Connection saved.');
-      } else {
-        message.error(response.data.error || `Failed to ${isEditing ? 'update' : 'save'} connection.`);
-      }
-    } catch (err) {
-      if (handleAuthError(err)) return;
-      message.error(`Failed to ${isEditing ? 'update' : 'save'} connection.`);
-    }
+    // try {
+    //   const payload = isEditing
+    //     ? { ...connectionData, status: 'untested', connectionId }
+    //     : { ...connectionData, status: 'untested' };
+    //   const endpoint = isEditing ? '/workflow/connection-update' : '/workflow/connection-save';
+    //   const response = await axios.post(endpoint, payload, {
+    //     headers: { 'auth-token': localStorage.getItem('auth-token') },
+    //   });
+    //   if (response.data.success) {
+    //     await fetchConnections();
+    //     setActiveDbType(null);
+    //     setEditingConnection(null);
+    //     message.success(isEditing ? 'Connection updated.' : 'Connection saved.');
+    //   } else {
+    //     message.error(response.data.error || `Failed to ${isEditing ? 'update' : 'save'} connection.`);
+    //   }
+    // } catch (err) {
+    //   if (handleAuthError(err)) return;
+    //   message.error(`Failed to ${isEditing ? 'update' : 'save'} connection.`);
+    // }
   };
 
   const handleEditConnection = (connection) => {
     setEditingConnection(connection);
+    setDroppedFile(null);
     onContextChange({
       kind: 'connection',
       id: connection.id || connection._id,
@@ -354,7 +407,7 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
       okText: 'Delete', okType: 'danger', cancelText: 'Cancel',
       async onOk() {
         const connectionId = connection.id || connection._id;
-        if (!isLoggedIn()) {
+        // if (!isLoggedIn()) {
           await connectionsDb.delete(connectionId);
           if (connection.connectionType === 'database' && window.electronAPI?.dbCredentials) {
             await window.electronAPI.dbCredentials.delete(connectionId);
@@ -362,7 +415,7 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
           setConnections(prev => prev.filter(c => (c.id || c._id) !== connectionId));
           message.success('Connection deleted.');
           return;
-        }
+        // }
         try {
           const response = await axios.post('/workflow/connection-action',
             { action: 'delete', connectionId },
@@ -406,7 +459,13 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
         const hide = message.loading('Reading local database…', 0);
         try {
           const storageType = connection.dbType;
-          const result = await window.electronAPI.db.readLocalCollection(filePath, 1000, storageType, null, null);
+          // CSV/Excel imports all share one app-wide SQLite db; each connection
+          // owns a specific table recorded in fileInfo.tables. Without this, a
+          // null tableName reads the first table in the shared db, which can
+          // belong to an unrelated file. Direct SQLite files leave tables
+          // undefined, so we fall back to null (read the first/only table).
+          const ownTableName = connection.fileInfo?.tables?.[0] || null;
+          const result = await window.electronAPI.db.readLocalCollection(filePath, 1000, storageType, null, ownTableName);
           hide();
           if (!result.success) { message.error('Failed to read database: ' + result.message); return; }
           const rows = result.rows || [];
@@ -514,8 +573,9 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
       return () => (
         <LocalFileConnectionForm
           fileType={activeDbType}
+          initialFile={droppedFile}
           onSave={handleSaveDbConnection}
-          onCancel={() => { setActiveDbType(null); setEditingConnection(null); }}
+          onCancel={() => { setActiveDbType(null); setEditingConnection(null); setDroppedFile(null); }}
           editingConnection={editingConnection}
         />
       );
@@ -538,7 +598,12 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
   const ActiveForm = getActiveFormComponent();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: C.surface }}>
+    <div
+      style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: C.surface, position: 'relative' }}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <PageHeader
         title="Data Source Connections"
         sub="Manage spreadsheet uploads and database connections"
@@ -548,6 +613,31 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
           </Btn>,
         ]}
       />
+
+      {isDragOver && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: 'rgba(37, 99, 235, 0.08)',
+          border: '2px dashed #2563eb',
+          zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            textAlign: 'center', backgroundColor: '#fff', padding: 28,
+            border: '1px solid #e2e6eb', borderRadius: 8,
+            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.12)',
+          }}>
+            {I('import', '#2563eb', 40)}
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#111827', margin: '12px 0 6px', letterSpacing: '-0.01em' }}>
+              Drop a file to create a data source
+            </div>
+            <div style={{ fontSize: 11, color: '#5a6678', fontFamily: MONO }}>
+              CSV · Excel · JSON · Parquet · Avro · SQLite · NeDB
+            </div>
+          </div>
+        </div>
+      )}
 
       <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>
         {connections.length === 0 ? (
@@ -621,6 +711,7 @@ const ConnectionsTab = ({ onContextChange = () => {} }) => {
             if (window.electronAPI?.oauth?.cancelServer) window.electronAPI.oauth.cancelServer(3000);
             setActiveDbType(null);
             setEditingConnection(null);
+            setDroppedFile(null);
           }}
           footer={null}
           width={640}

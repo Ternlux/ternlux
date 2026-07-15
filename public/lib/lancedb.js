@@ -14,7 +14,7 @@ const { app } = require('electron');
  * @returns {String} Database path
  */
 function getLanceDBPath(customPath) {
-  if (customPath) {
+  if (customPath && !isInvalidLanceDir(customPath)) {
     return customPath;
   }
 
@@ -26,6 +26,23 @@ function getLanceDBPath(customPath) {
   }
 
   return dbPath;
+}
+
+/**
+ * LanceDB needs a *directory*. A NeDB/SQLite file path (e.g. *.db) or any
+ * existing regular file would make LanceDB try to create a table inside a file
+ * ("Unable to walk dir: ... Not a directory"). Detect those so callers can fall
+ * back to the default LanceDB directory instead of crashing — this guards
+ * against stored node configs whose targetLocalPath still points at a source
+ * NeDB file.
+ */
+function isInvalidLanceDir(customPath) {
+  if (/\.(db|sqlite|nedb)$/i.test(customPath)) return true;
+  try {
+    return fs.existsSync(customPath) && fs.statSync(customPath).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -61,7 +78,7 @@ async function executeLanceDBOperation({ operation, data, config }) {
   try {
     switch (operation) {
       case 'upsert':
-        return await upsertVectors(db, tableName, data);
+        return await upsertVectors(db, tableName, data, { overwrite: config.overwrite === true });
 
       case 'query':
         return await queryVectors(db, tableName, config);
@@ -87,7 +104,7 @@ async function executeLanceDBOperation({ operation, data, config }) {
  * @param {Array} data - Array of vector records with { id, vector, ...metadata }
  * @returns {Promise<Object>} Result
  */
-async function upsertVectors(db, tableName, data) {
+async function upsertVectors(db, tableName, data, opts = {}) {
   if (!data || data.length === 0) {
     throw new Error('No data provided for upsert');
   }
@@ -98,6 +115,31 @@ async function upsertVectors(db, tableName, data) {
       throw new Error(`Invalid vector in record: ${JSON.stringify(record)}`);
     }
   }
+
+  // Overwrite: drop any existing table first so a "new_table" write is fully
+  // idempotent. Without this, re-runs APPEND — which both duplicates rows and
+  // can fail when the freshly-inferred batch schema differs from the existing
+  // table's (e.g. similar_1_id was Utf8 last run because of gaps, but is Float64
+  // this run because every row matched → "Append with different schema").
+  if (opts.overwrite) {
+    try {
+      const names = await db.tableNames();
+      if (Array.isArray(names) && names.includes(tableName)) {
+        await db.dropTable(tableName);
+        console.log(`Dropped existing LanceDB table ${tableName} (overwrite)`);
+      }
+    } catch (dropErr) {
+      console.warn(`Could not drop table ${tableName} for overwrite: ${dropErr.message}`);
+    }
+  }
+
+  // Normalize so every column has ONE consistent Arrow type across ALL records.
+  // The AI-generated join can emit columns that are numeric for some rows and
+  // missing/empty for others (e.g. similar_3_id is a number when a match exists
+  // and '' when it doesn't). Arrow rejects such mixed columns ("Unable to infer
+  // Vector type") and also can't infer an all-missing column. Resolving the type
+  // from the WHOLE batch (not just data[0]) and coercing accordingly fixes both.
+  const { records, schema } = normalizeRecordsForArrow(data);
 
   let table;
   let isNewTable = false;
@@ -111,34 +153,130 @@ async function upsertVectors(db, tableName, data) {
     console.log(`Creating new LanceDB table: ${tableName} with explicit schema`);
 
     try {
-      // Build explicit schema from first record
-      const schema = buildLanceDBSchema(data[0]);
-      console.log('schema: ', schema)
       // Try to create table with schema (v0.4.0+ API)
-      table = await db.createTable(tableName, data, { schema });
+      table = await db.createTable(tableName, records, { schema });
       isNewTable = true;
     } catch (schemaErr) {
-      // Fallback: create without explicit schema if schema API not supported
+      // Fallback: create without explicit schema if schema API not supported.
+      // The normalized records are already type-consistent, so plain inference
+      // works here too.
       console.warn('Could not create table with explicit schema, falling back to default:', schemaErr.message);
-      table = await db.createTable(tableName, data);
+      table = await db.createTable(tableName, records);
       isNewTable = true;
     }
   }
 
   if (!isNewTable) {
     // Add new vectors to existing table
-    await table.add(data);
-    console.log(`Added ${data.length} vectors to existing table ${tableName}`);
+    await table.add(records);
+    console.log(`Added ${records.length} vectors to existing table ${tableName}`);
   }
 
   return {
     success: true,
-    data: data,
-    recordCount: data.length,
+    data: records,
+    recordCount: records.length,
     message: isNewTable
-      ? `Created new table '${tableName}' with ${data.length} vectors`
-      : `Added ${data.length} vectors to table '${tableName}'`
+      ? `Created new table '${tableName}' with ${records.length} vectors`
+      : `Added ${records.length} vectors to table '${tableName}'`
   };
+}
+
+/**
+ * Normalize a batch of vector records into Arrow-safe rows + an explicit schema.
+ *
+ * Resolves ONE column type from the whole batch (not a single sample row), then
+ * coerces every row to it so a column is never a mix of e.g. numbers and empty
+ * strings — the case that makes Arrow throw "Unable to infer Vector type from
+ * input values". Empty string / null / undefined are all treated as "missing".
+ *
+ * Type resolution per column:
+ *   - any string value present      → Utf8   (missing → '')
+ *   - else any number present       → Float64 (missing → null)
+ *   - else any boolean present      → Bool    (missing → null)
+ *   - all values missing            → Utf8   (all '')  — keeps the column writable
+ * The `vector` column stays a non-nullable FixedSizeList<Float32>.
+ *
+ * @param {Array<Object>} data - records with { id, vector, ...scalars }
+ * @returns {{ records: Array<Object>, schema: arrow.Schema }}
+ */
+function normalizeRecordsForArrow(data) {
+  const isMissing = (v) => v === null || v === undefined || v === '';
+  const total = data.length;
+
+  // 1. Walk the WHOLE batch to record every column in first-seen order and, per
+  //    scalar column, the concrete types seen + how many rows actually have a
+  //    value. Preserving column ORDER matters: LanceDB's table.add() requires an
+  //    appended batch's fields to be in the SAME order as the existing table, so
+  //    we must NOT reorder (e.g. hoisting `vector` to the front breaks append).
+  const order = [];                 // all column keys (incl. 'vector') in first-seen order
+  const seen = new Set();
+  const typesSeen = new Map();       // scalar key -> Set<'number'|'boolean'|'string'>
+  const presentCount = new Map();    // scalar key -> # rows with a non-missing value
+  let vectorKey = null;
+  let vectorLen = 0;
+  for (const rec of data) {
+    if (!rec) continue;
+    for (const [k, v] of Object.entries(rec)) {
+      if (!seen.has(k)) { seen.add(k); order.push(k); }
+      if (k === 'vector' && Array.isArray(v)) { vectorKey = 'vector'; vectorLen = v.length; continue; }
+      if (typeof v === 'object' && v !== null) continue; // skip nested (should already be flattened)
+      if (!typesSeen.has(k)) { typesSeen.set(k, new Set()); presentCount.set(k, 0); }
+      if (isMissing(v)) continue;
+      typesSeen.get(k).add(typeof v === 'number' ? 'number' : typeof v === 'boolean' ? 'boolean' : 'string');
+      presentCount.set(k, presentCount.get(k) + 1);
+    }
+  }
+
+  // 2. Resolve ONE type per scalar column. A column keeps a numeric/boolean type
+  //    ONLY when it is fully populated (every row has a value) and that type is
+  //    unambiguous — otherwise it becomes Utf8 with '' for the gaps. This is
+  //    deliberate: LanceDB rejects nulls in a column it derives as non-nullable
+  //    ("declared as non-nullable but contains null values"), so we emit NO
+  //    nulls at all — missing cells are empty strings in a string column.
+  const colType = new Map();
+  for (const k of typesSeen.keys()) {
+    const set = typesSeen.get(k);
+    const full = presentCount.get(k) === total;
+    colType.set(k, (full && set.size === 1) ? [...set][0] : 'string');
+  }
+
+  // Emit columns in their original order; drop skipped nested-object keys.
+  const cols = order.filter((k) => k === vectorKey || colType.has(k));
+
+  // 3. Coerce every record to the resolved per-column type, filling missing keys.
+  //    number/boolean columns are fully populated by construction, so they never
+  //    receive a missing value; string columns turn missing into '' (never null).
+  const coerce = (v, t) => {
+    if (t === 'number') { const n = typeof v === 'number' ? v : Number(v); return Number.isNaN(n) ? 0 : n; }
+    if (t === 'boolean') return typeof v === 'boolean' ? v : Boolean(v);
+    return isMissing(v) ? '' : (typeof v === 'string' ? v : String(v));
+  };
+  const records = data.map((rec) => {
+    const out = {};
+    for (const k of cols) {
+      out[k] = (k === vectorKey) ? (rec ? rec[k] : undefined) : coerce(rec ? rec[k] : undefined, colType.get(k));
+    }
+    return out;
+  });
+
+  // 4. Build the explicit Arrow schema from the resolved types, same order.
+  //    Explicit Utf8 (not Dictionary) avoids LanceDB IPC/dictionary-encoding issues.
+  const fields = cols.map((k) => {
+    if (k === vectorKey) {
+      return new arrow.Field(
+        k,
+        new arrow.FixedSizeList(vectorLen, new arrow.Field('item', new arrow.Float32())),
+        false,
+      );
+    }
+    const t = colType.get(k);
+    const type = t === 'number' ? new arrow.Float64()
+      : t === 'boolean' ? new arrow.Bool()
+      : new arrow.Utf8();
+    return new arrow.Field(k, type, true);
+  });
+  return { records, schema: new arrow.Schema(fields) };
 }
 
 /**

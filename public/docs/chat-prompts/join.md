@@ -33,7 +33,7 @@ similarity, the assistant decides which of two scenarios applies:
   want embeddings to participate in the join logic itself, e.g. "for
   each customer match the five most similar articles". The assistant
   expresses the entire embedding plus search plus match flow inside a
-  JavaScript join function, which DagFlux runs in the background
+  JavaScript join function, which Ternlux runs in the background
   engine.
 
 The assistant asks only the questions Scenario B actually needs:
@@ -47,10 +47,10 @@ The assistant emits a different shape depending on what kind of
 destination you chose:
 
 - **Relational destination** — generates per-source SQL or operations
-  that DagFlux uses to load each external source into a temporary
+  that Ternlux uses to load each external source into a temporary
   table, plus the final SQL that joins the temp tables and any tables
   already in the destination. Every per-source query includes a marker
-  that DagFlux replaces with the destination's preferred pagination
+  that Ternlux replaces with the destination's preferred pagination
   syntax, and the column order across the create-table statement,
   the select, and the explicit column list always matches.
 - **Document destination** — generates per-source fetch operations and

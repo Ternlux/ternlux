@@ -1,5 +1,5 @@
 /**
- * Google Drive Storage Connector Plugin for DagFlux
+ * Google Drive Storage Connector Plugin for Ternlux
  * Handles all Google Drive storage operations
  */
 

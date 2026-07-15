@@ -34,13 +34,33 @@ async function generateEmbeddings({ data, columnToEmbed, provider, model, apiKey
     throw new Error('API key is required for embedding generation');
   }
 
+  // Resolve a column that may be a flat key ("channel") or a dotted path into a
+  // nested object ("properties.channel"). Prefer an exact own-key match so a
+  // literal key containing a dot still works, then fall back to path traversal.
+  const getByPath = (obj, pathStr) => {
+    if (obj == null) return undefined;
+    if (Object.prototype.hasOwnProperty.call(obj, pathStr)) return obj[pathStr];
+    return pathStr.split('.').reduce(
+      (acc, key) => (acc == null ? undefined : acc[key]),
+      obj
+    );
+  };
+
   // Extract and validate texts from specified column
   const validRows = [];
   const texts = [];
 
   for (const row of data) {
-    const text = row[columnToEmbed];
-    if (text != null && typeof text === 'string' && text.trim().length > 0) {
+    const raw = getByPath(row, columnToEmbed);
+    // Accept strings directly; coerce other non-null primitives (numbers,
+    // booleans) to string. Skip null/undefined, objects/arrays, and empties.
+    let text = null;
+    if (typeof raw === 'string') {
+      text = raw;
+    } else if (raw != null && typeof raw !== 'object') {
+      text = String(raw);
+    }
+    if (text != null && text.trim().length > 0) {
       validRows.push(row);
       texts.push(text.trim());
     }

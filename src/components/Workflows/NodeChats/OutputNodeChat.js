@@ -359,14 +359,14 @@ const OutputNodeChat = ({
     // Load all database connections for connection output option
     const token = localStorage.getItem('auth-token');
     let allConnections = [];
-    if (!token) {
+    // if (!token) {
       allConnections = await connectionsDb.getAll();
-    } else {
-      const res = await axios.post('/workflow/connections', { transformer: false }, {
-        headers: { 'auth-token': token },
-      });
-      allConnections = res.data || [];
-    }
+    // } else {
+    //   const res = await axios.post('/workflow/connections', { transformer: false }, {
+    //     headers: { 'auth-token': token },
+    //   });
+    //   allConnections = res.data || [];
+    // }
 
     // Load plugins to get dbCategory for each connection
     let pluginsMap = new Map();
