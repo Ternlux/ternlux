@@ -40,7 +40,7 @@ description or the node's configuration.
 
 ## Execution order
 
-When a workflow runs, DagFlux follows the saved execution order, calling
+When a workflow runs, Ternlux follows the saved execution order, calling
 each node's handler in turn. Each node logs its result, the records
 processed, the duration, and any error to the execution history. If any
 node fails, the run stops and the failure is recorded.

@@ -9,7 +9,7 @@ You choose where the transformed data should live:
 
 - **Database** — generated and stored inside the same database the
   source comes from.
-- **Local** — pulled from the source and stored in DagFlux's local
+- **Local** — pulled from the source and stored in Ternlux's local
   workspace. This is automatically the only option when the source is
   already local — you can't choose "database" when the source is a
   local file.
@@ -57,7 +57,7 @@ The shape of the generated operation depends on the source:
   `DELETE`, or both. Filtering intent like "keep only X" becomes a
   delete of the records that don't match.
 - **Document source, new collection** — an aggregation pipeline, a
-  filter operation, or a custom JavaScript function (DagFlux picks
+  filter operation, or a custom JavaScript function (Ternlux picks
   the best fit for the request).
 - **Document source, in place** — an update, delete, or in-place
   JavaScript transformation. JavaScript transformations are processed
@@ -96,7 +96,7 @@ you want.
 ## Placeholders
 
 Generated operations may include placeholders like `{{current_date}}`
-and `{{current_timestamp}}` that DagFlux substitutes with the actual
+and `{{current_timestamp}}` that Ternlux substitutes with the actual
 runtime values at execution time. This makes it easy to write
 transformations like "set archived_date to today" once and have them
 work for every future run.

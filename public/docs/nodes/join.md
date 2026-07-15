@@ -34,7 +34,7 @@ The mode options shown depend on the destination type:
   pick one (or type a custom name when nothing matches).
 - **Document destination (MongoDB / NeDB)** — only "new table" is
   available. Document stores don't support upsert semantics for
-  arbitrary documents, so DagFlux always creates a fresh collection.
+  arbitrary documents, so Ternlux always creates a fresh collection.
 - **Vector destination** — always "new table" (the upsert into the
   index is what the vector skill does for you).
 
@@ -45,8 +45,8 @@ chose:
 
 ### Relational destination
 
-DagFlux makes the destination database the venue of the join. For
-each source that lives outside the destination database, DagFlux
+Ternlux makes the destination database the venue of the join. For
+each source that lives outside the destination database, Ternlux
 creates a temporary table inside the destination, loads the source's
 rows into it (in batches, with chunked inserts), and then runs the
 AI-generated join SQL against the temp tables and any tables already
@@ -62,20 +62,20 @@ join runs there.
 
 ### Document destination
 
-DagFlux loads every source's rows into memory in the background
+Ternlux loads every source's rows into memory in the background
 engine, then runs an AI-generated JavaScript join function over them.
 The function's return value (an array of joined documents) is
 bulk-inserted into the destination collection. The destination
 collection is dropped first.
 
-This is what lets DagFlux join data that lives in entirely different
+This is what lets Ternlux join data that lives in entirely different
 systems — a relational source with a document source, for example —
 into a single document collection.
 
 ### Vector destination
 
 Similar to document destinations, but with one additional step:
-after the join function produces the joined rows, DagFlux delegates
+after the join function produces the joined rows, Ternlux delegates
 to the [Vector Database Executor](../plugins/skills/vector-db-executor.md)
 skill, which embeds the column you nominated and upserts the
 resulting vectors into the destination index. The rest of each row
@@ -94,7 +94,7 @@ distinct intents:
   join.
 - **You want similarity search to participate in the join itself.**
   For example, "for each customer, find the five most similar
-  articles". DagFlux generates a JavaScript join function that embeds
+  articles". Ternlux generates a JavaScript join function that embeds
   the driving values once per unique value, then performs per-row
   similarity searches against the vector source. The join function's
   output is then routed to the destination using the appropriate
