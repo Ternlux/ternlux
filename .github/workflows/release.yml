@@ -1,0 +1,64 @@
+name: Release (Windows & Linux)
+
+# Builds the unsigned Windows (NSIS) and Linux (AppImage) artifacts on their
+# native runners and publishes them + the electron-updater manifests to the
+# Ternlux/releases repo. macOS is intentionally excluded — it is built and
+# notarized locally, and the macOS runner is 10x the Actions minute cost.
+#
+# Trigger: push a version tag (e.g. `v1.0.1`), or run manually from the
+# Actions tab (workflow_dispatch) for ad-hoc test builds.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# The built-in token only needs to read THIS repo for checkout. Publishing
+# goes to a different repo (Ternlux/releases) using the GH_TOKEN secret, so
+# no write permission is required on the workflow token itself.
+permissions:
+  contents: read
+
+# A newer run for the same ref supersedes an in-progress one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # npm ci installs the platform-matching native prebuilts (sqlite3 and
+      # the correct @lancedb/lancedb-* package) on each runner, so no
+      # cross-compilation or ensure-*-prebuilts step is needed here.
+      - name: Install dependencies
+        run: npm ci
+
+      # Reuses the existing release:win / release:linux scripts, which run
+      # react-scripts build -> minify-dist -> electron-builder --publish always.
+      # electron-builder reads GH_TOKEN from the env to upload to Ternlux/releases.
+      # CI is forced false so react-scripts does not treat lint warnings as
+      # build-breaking errors (GitHub Actions sets CI=true by default).
+      - name: Build & publish ${{ matrix.platform }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          CI: "false"
+        run: npm run release:${{ matrix.platform }}
