@@ -51,11 +51,16 @@ jobs:
           node-version: "24"
           cache: npm
 
-      # npm ci installs the platform-matching native prebuilts (sqlite3 and
-      # the correct @lancedb/lancedb-* package) on each runner, so no
-      # cross-compilation or ensure-*-prebuilts step is needed here.
+      # `npm install` (not `npm ci`) is used deliberately. This project's tree
+      # (2000+ packages, react peer-dependency conflicts, duplicate ws
+      # versions) triggers a known npm quirk where `npm install` and `npm ci`
+      # disagree on hoisting, so `npm ci` rejects an otherwise-valid lockfile
+      # with spurious "Missing: <pkg> from lock file" errors. `npm install`
+      # resolves and installs against package.json directly and tolerates that
+      # drift. It still installs the platform-matching native prebuilts
+      # (sqlite3 and the correct @lancedb/lancedb-* package) on each runner.
       - name: Install dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       # Reuses the existing release:win / release:linux scripts, which run
       # react-scripts build -> minify-dist -> electron-builder --publish always.
