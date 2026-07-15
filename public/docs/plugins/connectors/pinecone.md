@@ -1,13 +1,13 @@
 # Pinecone connector
 
 Cloud vector database from Pinecone. Marked as a vector store, which
-unlocks the vector-aware code paths throughout DagFlux. Most embedding
+unlocks the vector-aware code paths throughout Ternlux. Most embedding
 and similarity-search operations on Pinecone go through the
 [Vector Database Executor](../skills/vector-db-executor.md) skill.
 
 ## What it lets you do
 
-- Test that DagFlux can reach Pinecone with your API key.
+- Test that Ternlux can reach Pinecone with your API key.
 - List every index in your account along with each index's
   namespaces. Each index/namespace combination shows up as a separate
   "table" in the picker, with metadata like dimension, metric, vector
@@ -39,12 +39,12 @@ sufficient for evaluation.
 
 ### Step 2 — Create at least one index
 
-DagFlux does not create Pinecone indexes for you — they must exist
+Ternlux does not create Pinecone indexes for you — they must exist
 before you can write to them.
 
 1. From the Pinecone console, click **Create Index**.
 2. Pick a name. Pinecone names must be lowercase letters, numbers,
-   and hyphens only — DagFlux will sanitise any name you provide
+   and hyphens only — Ternlux will sanitise any name you provide
    later, but creating the index with a clean name is easier.
 3. Set the **dimension** to match the embedding model you plan to
    use:
@@ -60,12 +60,12 @@ before you can write to them.
 
 1. From the Pinecone console, open **API Keys** in the left nav.
 2. Click **Create API Key**.
-3. Give it a name (e.g. `dagflux`).
+3. Give it a name (e.g. `ternlux`).
 4. Copy the key — it's shown only once.
 
-### Step 4 — Enter the API key in DagFlux
+### Step 4 — Enter the API key in Ternlux
 
-Paste the key into the **API Key** field. DagFlux will list every
+Paste the key into the **API Key** field. Ternlux will list every
 index in your account along with their namespaces.
 
 ## Vector operations
@@ -83,7 +83,7 @@ Pinecone supports the full set of vector operations:
 ## Index naming rules
 
 Pinecone has strict naming rules: lowercase letters, numbers, and
-hyphens only — no underscores, no uppercase. DagFlux automatically
+hyphens only — no underscores, no uppercase. Ternlux automatically
 sanitises the index names you provide:
 
 - Uppercase becomes lowercase.
@@ -91,17 +91,17 @@ sanitises the index names you provide:
 - Sequences of hyphens collapse to a single hyphen.
 - Leading or trailing hyphens are stripped.
 
-If a rename happens, DagFlux logs the original name and the
+If a rename happens, Ternlux logs the original name and the
 sanitised name so you can spot it.
 
 ## Behaviour notes
 
 - **Each (index, namespace) pair is a separate table.** Pinecone has
-  one extra dimension over a regular database: namespaces. DagFlux
+  one extra dimension over a regular database: namespaces. Ternlux
   surfaces each one as its own table in pickers, with the namespace
   shown as the schema and the index as the name. Stats include
   dimension, metric, vector count, pod count, replicas, and pod type.
-- **Indexes must be pre-created in the Pinecone dashboard.** DagFlux
+- **Indexes must be pre-created in the Pinecone dashboard.** Ternlux
   does not create them for you — and the index dimension must match
   the embedding model dimension you plan to use.
 - **Vectors as joinable rows.** When you use a Pinecone source in a
@@ -110,7 +110,7 @@ sanitised name so you can spot it.
   vector itself is dropped. From there the join treats it like any
   tabular source.
 - **In-place transformations.** When you use a Pinecone source in a
-  Transformer node, DagFlux automatically routes the operation
+  Transformer node, Ternlux automatically routes the operation
   through the Vector Database Executor skill, which lets you find
   records (by similarity search or metadata filter) and apply a
   per-record transform that updates, deletes, or skips each one.

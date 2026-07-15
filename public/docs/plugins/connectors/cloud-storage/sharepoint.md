@@ -23,13 +23,13 @@ of expiry.
 | Site ID | No | No | (empty — root site) |
 | Redirect URI | No | No | `http://localhost:3000/oauth/callback` |
 
-If you don't specify a site id, DagFlux uses the root site of the
+If you don't specify a site id, Ternlux uses the root site of the
 tenant. For non-root sites, supply the site id (Microsoft Graph
 provides helpers to look it up from a site URL).
 
 ## Setting up credentials
 
-You register an Azure AD application in the Azure portal so DagFlux
+You register an Azure AD application in the Azure portal so Ternlux
 can authorise on your behalf.
 
 ### Step 1 — Register the app in Azure
@@ -69,7 +69,7 @@ the root site:
 3. Or call Microsoft Graph at `/sites/contoso.sharepoint.com:/sites/Marketing`
    and copy the `id` from the response.
 
-### Step 4 — Enter the credentials in DagFlux
+### Step 4 — Enter the credentials in Ternlux
 
 - **Application (client) ID** — from app registration.
 - **Client Secret** — from Certificates & secrets.
@@ -81,13 +81,13 @@ the root site:
 ### Step 5 — Authorise
 
 Click **Authorize**, sign in with a Microsoft account that has
-access to the SharePoint site, and consent. DagFlux saves the
+access to the SharePoint site, and consent. Ternlux saves the
 tokens encrypted.
 
 ## Behaviour notes
 
 - A SharePoint site has multiple drives (each library is a drive).
-  DagFlux exposes them as separate containers in the picker.
+  Ternlux exposes them as separate containers in the picker.
 - Authorised scopes cover sites and files read/write, plus offline
   access (so the refresh token works).
 - Files are addressed by path inside the chosen drive.

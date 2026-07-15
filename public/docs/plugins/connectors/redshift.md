@@ -5,7 +5,7 @@ SQL idioms carry over, but the metadata catalog is Redshift-specific.
 
 ## What it lets you do
 
-- Test that DagFlux can reach your Redshift cluster.
+- Test that Ternlux can reach your Redshift cluster.
 - List schemas, tables, and views.
 - List columns with type, nullability, and primary-key flag.
 - Run any Redshift SQL query.
@@ -39,33 +39,33 @@ Redshift query editor or any PostgreSQL client.
 ### Step 2 — Create a dedicated user
 
 ```sql
-CREATE USER dagflux PASSWORD 'Choose-A-Strong-Password!';
+CREATE USER ternlux PASSWORD 'Choose-A-Strong-Password!';
 ```
 
 ### Step 3 — Grant read + write access
 
 ```sql
 -- Allow connecting and using the schema
-GRANT USAGE ON SCHEMA public TO dagflux;
+GRANT USAGE ON SCHEMA public TO ternlux;
 
 -- Read + write on existing tables
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO dagflux;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ternlux;
 
 -- Same permissions on tables created in the future
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO dagflux;
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ternlux;
 
 -- Allow creating new tables (needed for new-table transformations and joins)
-GRANT CREATE ON SCHEMA public TO dagflux;
+GRANT CREATE ON SCHEMA public TO ternlux;
 ```
 
 ### Step 4 — Read-only variant
 
 ```sql
-GRANT USAGE ON SCHEMA public TO dagflux;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO dagflux;
+GRANT USAGE ON SCHEMA public TO ternlux;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ternlux;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO dagflux;
+  GRANT SELECT ON TABLES TO ternlux;
 ```
 
 ### Step 5 — Allow network access
@@ -77,7 +77,7 @@ your machine's IP. For VPC-only clusters, ensure your machine can
 reach the VPC (over a VPN, Direct Connect, or with the cluster set
 to publicly accessible).
 
-### Step 6 — Enter the credentials in DagFlux
+### Step 6 — Enter the credentials in Ternlux
 
 - **Cluster Endpoint** — the full hostname from the AWS console
   (e.g. `my-cluster.abc123.us-east-1.redshift.amazonaws.com`).

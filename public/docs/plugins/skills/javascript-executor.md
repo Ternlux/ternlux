@@ -20,7 +20,7 @@ The assistant offers this skill when:
 
 The script runs in the background engine with a small, predictable
 set of helpers — the same surface every AI-generated function in
-DagFlux sees. From inside the script you can:
+Ternlux sees. From inside the script you can:
 
 - Look up your saved connections by name or id.
 - Read from any saved connection or any local file with a single

@@ -7,7 +7,7 @@ supports nested and repeated fields.
 
 ## What it lets you do
 
-- Test that DagFlux can reach BigQuery with your credentials.
+- Test that Ternlux can reach BigQuery with your credentials.
 - List datasets and the tables and views inside each.
 - List columns of any table.
 - Run any BigQuery SQL query.
@@ -46,7 +46,7 @@ services**, search for "BigQuery API", and enable it.
 
 1. Go to **IAM & Admin → Service Accounts**.
 2. Click **+ Create Service Account**.
-3. Give it a name (e.g. `dagflux-bq`) and an optional description.
+3. Give it a name (e.g. `ternlux-bq`) and an optional description.
 4. Click **Create and Continue**.
 
 ### Step 4 — Grant the right roles
@@ -75,10 +75,10 @@ dataset alone.
 5. The browser downloads the JSON key file. Open it and copy the
    entire contents.
 
-### Step 6 — Enter the credentials in DagFlux
+### Step 6 — Enter the credentials in Ternlux
 
 - **Project ID** — your GCP project id (e.g. `my-gcp-project`).
-- **Dataset** — the dataset DagFlux should default to.
+- **Dataset** — the dataset Ternlux should default to.
 - **Service Account JSON** — paste the entire JSON key file
   contents.
 - **Location** — the BigQuery region of your dataset (e.g. `US`,

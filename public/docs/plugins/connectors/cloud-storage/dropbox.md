@@ -36,7 +36,7 @@ and click **Create app**.
 2. Pick the access type:
    - **App folder** — only the app's own folder. Safer for testing.
    - **Full Dropbox** — access to all of the user's files.
-3. Name the app (e.g. `DagFlux`).
+3. Name the app (e.g. `Ternlux`).
 4. Click **Create app**.
 
 ### Step 3 — Set permissions
@@ -61,7 +61,7 @@ Still in **Settings**, copy:
 - **App key** — this is the client id.
 - **App secret** — click **Show** to reveal it.
 
-### Step 6 — Enter the credentials in DagFlux
+### Step 6 — Enter the credentials in Ternlux
 
 Paste the **App Key** and **App Secret** into the form. Leave the
 redirect URI as the default unless you changed it in step 4.
@@ -69,7 +69,7 @@ redirect URI as the default unless you changed it in step 4.
 ### Step 7 — Authorise
 
 Click **Authorize** in the form, sign in to Dropbox, and consent.
-DagFlux saves the tokens encrypted.
+Ternlux saves the tokens encrypted.
 
 ## Behaviour notes
 

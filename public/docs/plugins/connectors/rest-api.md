@@ -42,7 +42,7 @@ documentation for the canonical instructions.
 3. Generate a new token. Scope it as narrowly as possible (read-only
    if you don't need to write).
 4. Copy the token — most services show it only once.
-5. In DagFlux, pick **Bearer Token** as the auth type and paste the
+5. In Ternlux, pick **Bearer Token** as the auth type and paste the
    token.
 
 ### API key (header)
@@ -51,14 +51,14 @@ documentation for the canonical instructions.
 2. Confirm what header name the API expects (often `X-API-Key`,
    `Authorization`, or the service's custom name like
    `X-RapidAPI-Key`).
-3. In DagFlux, pick **API Key (header)**, set the header name, and
+3. In Ternlux, pick **API Key (header)**, set the header name, and
    paste the key value.
 
 ### HTTP basic
 
 1. The third party gives you a username and password (or a username
    plus an "API password").
-2. In DagFlux, pick **Basic Auth** and enter both fields. DagFlux
+2. In Ternlux, pick **Basic Auth** and enter both fields. Ternlux
    handles the base64 encoding required by the protocol — you don't
    need to encode anything yourself.
 
@@ -102,7 +102,7 @@ and saved workflows contain no secrets even if shared.
   API from looping forever.
 - Sensible defaults are baked into generated functions: GET method,
   JSON Accept header, a request timeout, and a reasonable page size.
-- If the API returns nothing, DagFlux still creates an empty
+- If the API returns nothing, Ternlux still creates an empty
   collection so downstream nodes have a defined source.
-- If the API returns a single object, DagFlux wraps it as a
+- If the API returns a single object, Ternlux wraps it as a
   single-element array.

@@ -1,6 +1,6 @@
 # Cloud storage connectors
 
-Cloud storage connectors give DagFlux access to bucket-style storage
+Cloud storage connectors give Ternlux access to bucket-style storage
 systems: object stores like S3, file-sharing services like Drive and
 OneDrive, and document libraries like SharePoint.
 
@@ -15,6 +15,10 @@ They share a common surface:
 - **Upload** — write an object's contents.
 - **Delete** — remove an object.
 - **Get metadata** — size, modified time, content type.
+
+> **Note:** Cloud storage cannot be added to workflows through the
+> chat assistant for now. You configure and use cloud storage
+> connectors directly through the node UI.
 
 ## How they're used by nodes
 
@@ -43,6 +47,5 @@ They share a common surface:
 ## OAuth auto-refresh
 
 For OAuth-based connectors (Drive, OneDrive, SharePoint, Dropbox),
-DagFlux refreshes the access token automatically within a five-minute
+Ternlux refreshes the access token automatically within a five-minute
 buffer of expiry, so a workflow run never lands on a stale token.
-Slack tokens are long-lived and are not refreshed.

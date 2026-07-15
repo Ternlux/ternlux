@@ -5,7 +5,7 @@ Express, Azure SQL Database, and Azure SQL Managed Instance).
 
 ## What it lets you do
 
-- Test that DagFlux can reach your SQL Server instance.
+- Test that Ternlux can reach your SQL Server instance.
 - List schemas, tables, and views.
 - List columns with type, nullability, and primary-key flag.
 - Run any T-SQL query.
@@ -41,11 +41,11 @@ Open SQL Server Management Studio (SSMS) or `sqlcmd` connected as
 ```sql
 -- Server-level login (in master)
 USE master;
-CREATE LOGIN dagflux WITH PASSWORD = 'Choose-A-Strong-Password!';
+CREATE LOGIN ternlux WITH PASSWORD = 'Choose-A-Strong-Password!';
 
 -- Map it to a database user inside your target database
 USE mydb;
-CREATE USER dagflux FOR LOGIN dagflux;
+CREATE USER ternlux FOR LOGIN ternlux;
 ```
 
 ### Step 3 — Grant read + write access
@@ -54,11 +54,11 @@ CREATE USER dagflux FOR LOGIN dagflux;
 USE mydb;
 
 -- Read + write on every existing object
-ALTER ROLE db_datareader ADD MEMBER dagflux;
-ALTER ROLE db_datawriter ADD MEMBER dagflux;
+ALTER ROLE db_datareader ADD MEMBER ternlux;
+ALTER ROLE db_datawriter ADD MEMBER ternlux;
 
 -- Allow creating new tables (needed for new-table transformations and joins)
-ALTER ROLE db_ddladmin ADD MEMBER dagflux;
+ALTER ROLE db_ddladmin ADD MEMBER ternlux;
 ```
 
 ### Step 4 — Read-only variant
@@ -67,7 +67,7 @@ If you'll only use the connection for sources:
 
 ```sql
 USE mydb;
-ALTER ROLE db_datareader ADD MEMBER dagflux;
+ALTER ROLE db_datareader ADD MEMBER ternlux;
 ```
 
 ### Step 5 — Allow network access
@@ -78,7 +78,7 @@ ALTER ROLE db_datareader ADD MEMBER dagflux;
 - For Azure SQL Database, add your machine's IP under "Set server
   firewall" in the Azure portal.
 
-### Step 6 — Enter the credentials in DagFlux
+### Step 6 — Enter the credentials in Ternlux
 
 - **Server** — hostname or IP. For Azure SQL Database, this is
   `<servername>.database.windows.net`.
