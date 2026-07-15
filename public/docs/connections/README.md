@@ -27,7 +27,7 @@ Every connection has:
 
 ## How forms are built
 
-DagFlux generates the connection form from the connector's own
+Ternlux generates the connection form from the connector's own
 configuration schema. Each field has a name, a type (text, number,
 password, boolean), a label, an optional default value, and a flag
 indicating whether it's sensitive. Sensitive fields go to the encrypted
@@ -35,7 +35,7 @@ credential store; everything else is saved with the public connection
 record.
 
 For a few connectors with richer setup needs (e.g. Postgres, MySQL,
-MSSQL, MongoDB, spreadsheet uploads, local file imports), DagFlux uses
+MSSQL, MongoDB, spreadsheet uploads, local file imports), Ternlux uses
 hand-tailored forms instead of the generic builder. The end result is
 the same: a saved connection with public + secret parts.
 
