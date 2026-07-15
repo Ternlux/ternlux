@@ -40,10 +40,15 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # Node 24 matches the local dev/build environment. This matters: npm 11
+      # (bundled with Node 24) resolves electron-updater's dependency tree
+      # differently from npm 10 (Node 22), so the committed package-lock.json
+      # must be produced and consumed by the same npm major or `npm ci` fails
+      # the sync check.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
 
       # npm ci installs the platform-matching native prebuilts (sqlite3 and
