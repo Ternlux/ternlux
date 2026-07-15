@@ -62,6 +62,17 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      # parquetjs's optional `lzo` dependency (the LZO parquet codec) uses a V8
+      # API removed in Electron 40 and cannot compile against it on any platform.
+      # The local macOS build already runs without it: npm prunes the failed
+      # optional so node_modules/lzo never exists there. On the CI runners the
+      # directory lingers after install, so electron-builder's @electron/rebuild
+      # finds its binding.gyp and hard-fails the compile. Remove it first — this
+      # just replicates the mac state. parquetjs requires lzo lazily (only when
+      # the LZO codec is actually used), so the app loads and runs fine without it.
+      - name: Drop incompatible optional native dep (lzo)
+        run: node -e "require('fs').rmSync('node_modules/lzo',{recursive:true,force:true})"
+
       # Reuses the existing release:win / release:linux scripts, which run
       # react-scripts build -> minify-dist -> electron-builder --publish always.
       # electron-builder reads GH_TOKEN from the env to upload to Ternlux/releases.
