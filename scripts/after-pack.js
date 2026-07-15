@@ -67,14 +67,18 @@ exports.default = async function afterPack(context) {
     console.warn('[after-pack] cleanup failed:', err.message);
   }
 
-  console.log(`[after-pack] ad-hoc signing ${appPath}`);
-  try {
-    execFileSync(
-      'codesign',
-      ['--force', '--deep', '--sign', '-', '--timestamp=none', appPath],
-      { stdio: 'inherit' }
-    );
-  } catch (err) {
-    console.warn('[after-pack] ad-hoc codesign failed:', err.message);
-  }
+  // Ad-hoc signing disabled — we now sign with a real Developer ID cert
+  // (Developer ID Application: Ternlux Inc). electron-builder runs afterPack
+  // BEFORE its own signing, so any ad-hoc sign here would just be overwritten
+  // (or leave stray --deep signatures). Kept for reference / unsigned dev builds.
+  // console.log(`[after-pack] ad-hoc signing ${appPath}`);
+  // try {
+  //   execFileSync(
+  //     'codesign',
+  //     ['--force', '--deep', '--sign', '-', '--timestamp=none', appPath],
+  //     { stdio: 'inherit' }
+  //   );
+  // } catch (err) {
+  //   console.warn('[after-pack] ad-hoc codesign failed:', err.message);
+  // }
 };
