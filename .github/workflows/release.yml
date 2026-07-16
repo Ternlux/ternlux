@@ -62,6 +62,28 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      # Each connector/skill under plugins/ is a self-contained package with its
+      # own package.json and its own node_modules (gitignored, so absent on a
+      # fresh checkout). The root `npm install` above does NOT reach them — they
+      # are outside the root dependency tree — so without this step the packaged
+      # app ships every connector WITHOUT its runtime dependency (mssql, pg,
+      # mongoose, @aws-sdk, @google-cloud/*, snowflake-sdk, ...). The plugin
+      # loader try/catches a failed require, so the app still launches but the
+      # connectors silently fail to load. The local macOS build avoids this only
+      # because those node_modules happen to be installed on the dev machine.
+      # --omit=dev keeps only runtime deps; all plugin deps are pure JS (no
+      # binding.gyp), so this installs no native modules and needs no rebuild.
+      # shell: bash works on windows-latest too (Git Bash is preinstalled).
+      - name: Install plugin dependencies
+        shell: bash
+        run: |
+          for d in plugins/connectors/* plugins/skills/*; do
+            if [ -f "$d/package.json" ]; then
+              echo "== installing deps for $d =="
+              ( cd "$d" && npm install --omit=dev --no-audit --no-fund )
+            fi
+          done
+
       # parquetjs's optional `lzo` dependency (the LZO parquet codec) uses a V8
       # API removed in Electron 40 and cannot compile against it on any platform.
       # The local macOS build already runs without it: npm prunes the failed
