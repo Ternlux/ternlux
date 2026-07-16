@@ -241,7 +241,7 @@ function patchIpcMain(ipcMain) {
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = function patchedHandle(channel, listener) {
 
-    console.log('channel, listener: ', channel, listener)
+    // console.log('channel, listener: ', channel, listener)
     if (!TRACK_CHANNELS.has(channel)) {
       return originalHandle(channel, listener);
     }
