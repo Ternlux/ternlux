@@ -20,6 +20,11 @@ const {
   stopAllCodeWatchers,
 } = require('./lib/workflowCodeWatcher');
 
+// Ternlux API. Packaged builds never have BACKEND_URL set, so the fallback is
+// what ships; override it to run against a local backend:
+//   BACKEND_URL=http://localhost:8000 npm run electron-dev
+const BACKEND_URL = process.env.BACKEND_URL || 'https://api.ternlux.com';
+
 // Patch ipcMain.handle FIRST so every IPC handler registered below is
 // automatically wrapped with anonymous analytics tracking (channel name,
 // duration, success). Opt-in is OFF until the renderer pushes the user's
@@ -1740,7 +1745,7 @@ ipcMain.handle('auth:google-login', async () => {
 
   try {
     // The backend owns the OAuth client configuration.
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
+    const backendUrl = BACKEND_URL;
     let config;
     try {
       ({ data: config } = await axios.get(`${backendUrl}/api/auth/google/config`));
@@ -1849,7 +1854,7 @@ ipcMain.handle('auth:apple-login', async () => {
   const crypto = require('crypto');
 
   try {
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
+    const backendUrl = BACKEND_URL;
     try {
       await axios.get(`${backendUrl}/api/auth/apple/config`);
     } catch (err) {
@@ -1956,7 +1961,7 @@ ipcMain.handle('plugins:install', async (_event, { pluginId }) => {
     const AdmZip = require('adm-zip');
 
     // Plugin download URL
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
+    const backendUrl = BACKEND_URL;
     const downloadUrl = `${backendUrl}/api/plugins/download/${pluginId}`;
 
     console.log(`Downloading plugin ${pluginId} from ${downloadUrl}`);

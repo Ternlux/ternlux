@@ -6,7 +6,9 @@ import axios from 'axios';
  * and the user profile under 'auth-user'.
  */
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000';
+// Inlined by react-scripts at build time from .env; the fallback ships if that
+// file is absent, so it points at production rather than a dev machine.
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'https://api.ternlux.com';
 
 const api = axios.create({ baseURL: `${BACKEND_URL}/api/auth` });
 
