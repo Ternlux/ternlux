@@ -88,16 +88,38 @@ let sqlitePool = null;
 // single instance per path serializes operations through NeDB's executor.
 const nedbInstanceCache = new Map();
 async function getOrLoadNedb(filePath) {
+  // Bust the cache when the file changed on disk since we loaded it. A cached
+  // instance holds an in-memory snapshot from its first load and never sees
+  // writes made through a *different* Datastore instance — e.g. saveToLocalNeDB
+  // (which in new_table mode deletes+recreates the file) or transformNeDB. Left
+  // stale, reads (preview, downstream nodes) keep returning the old/empty
+  // contents even though targetLocalPath on disk now has the transformed rows.
+  let diskMtimeMs = null;
+  try {
+    diskMtimeMs = fs.statSync(filePath).mtimeMs;
+  } catch (_) {
+    // File may not exist yet; nothing to invalidate against.
+  }
+
   let entry = nedbInstanceCache.get(filePath);
+  if (entry && diskMtimeMs !== null && entry.mtimeMs !== diskMtimeMs) {
+    nedbInstanceCache.delete(filePath);
+    entry = undefined;
+  }
+
   if (!entry) {
     const db = new Datastore({ filename: filePath, autoload: false });
     const loaded = new Promise((resolve, reject) => {
       db.loadDatabase((err) => (err ? reject(err) : resolve(db)));
     });
-    entry = { db, loaded };
+    entry = { db, loaded, mtimeMs: diskMtimeMs };
     nedbInstanceCache.set(filePath, entry);
     try {
       await loaded;
+      // loadDatabase compacts (rewrites) the file, bumping its mtime. Capture
+      // the post-load value so our own load isn't mistaken for an external
+      // write on the next call.
+      try { entry.mtimeMs = fs.statSync(filePath).mtimeMs; } catch (_) {}
     } catch (err) {
       nedbInstanceCache.delete(filePath);
       throw err;
@@ -1475,6 +1497,20 @@ ipcMain.handle('dbconn:generate-transform-prompt', async (_event, {
           let sourceSchemaClean = operationMode === 'in_place' ? (sourceSchema || targetSchema) : (targetSchema)
           sourceSchemaClean = sourceSchemaClean ? sourceSchemaClean : targetTableName.split('.').length > 1 ? targetTableName.split('.')[0] : null;
           // console.log('sourceSchemaClean: ', sourceSchemaClean)
+          // Ask the connector for its server version so the prompt can gate
+          // version-sensitive operators. Best-effort: getServerVersion never
+          // throws, and a missing version just means the prompt assumes a
+          // conservative baseline. Passed as a trailing arg — plugins that
+          // don't declare it simply ignore it.
+          let serverVersion = null;
+          if (typeof connector.getServerVersion === 'function') {
+            const versionConnId = sourceConnection?.id || null;
+            const versionBaseConfig = sourceConnection?.dbConfig || sourceConnection || {};
+            const fullConfig = await getFullConfig(versionConnId, versionBaseConfig);
+            const versionResult = await connector.getServerVersion(fullConfig, versionConnId);
+            serverVersion = versionResult?.version || null;
+          }
+
           // Execute prompt function in main process with provided parameters
           // For in-place mode, use source table/schema; for new-table mode, use target table/schema
           const prompt = promptFn(
@@ -1483,7 +1519,8 @@ ipcMain.handle('dbconn:generate-transform-prompt', async (_event, {
             settingsContext,
             sourceConnection || sourceTableSchema,
             sourceSchemaClean,
-            operationMode === 'in_place' ? (sourceFullTableName || sourceTableSchema?.tableName) : (fullTableName || targetTableName)
+            operationMode === 'in_place' ? (sourceFullTableName || sourceTableSchema?.tableName) : (fullTableName || targetTableName),
+            serverVersion
           );
 
           return {

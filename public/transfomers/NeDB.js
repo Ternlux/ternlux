@@ -7,8 +7,15 @@ const { app } = require('electron');
  * Helper function to save documents to local NeDB file
  * Sanitizes MongoDB ObjectIds and Dates for NeDB compatibility
  */
-async function saveToLocalNeDB(targetCollection, documents, operationMode, totalProcessed) {
-  const localDbPath = path.join(app.getPath('userData'), 'local-collections', `${targetCollection}.db`);
+async function saveToLocalNeDB(targetCollection, documents, operationMode, totalProcessed, targetLocalPath = null) {
+  // Honor the caller's configured target path so the writer and every reader
+  // (preview via db:read-local-collection, downstream output/join nodes) all
+  // point at the same file. Fall back to the userData default only when no
+  // path was configured. Without this, a targetLocalPath outside
+  // userData/local-collections leaves the data here while readers look there.
+  // console.log("saveToLocalNeDB: ", targetCollection, targetLocalPath, )
+  const localDbPath = targetLocalPath
+    || path.join(app.getPath('userData'), 'local-collections', `${targetCollection}.db`);
   const localDbDir = path.dirname(localDbPath);
 
   // Ensure directory exists
@@ -114,11 +121,20 @@ async function saveToLocalNeDB(targetCollection, documents, operationMode, total
 async function transformNeDB({
     sourceLocalPath,
     targetCollection,
+    targetLocalPath = null,
     operationType,
     nosqlOperation,
     transformFunction,
     operationMode
   }) {
+    console.log({
+      sourceLocalPath,
+      targetCollection,
+      operationType,
+      nosqlOperation,
+      transformFunction,
+      operationMode
+    })
     try {
       if (!sourceLocalPath || !fs.existsSync(sourceLocalPath)) {
         return { success: false, message: 'Source NeDB file not found' };
@@ -256,7 +272,8 @@ async function transformNeDB({
                 targetCollection,
                 transformedDocs,
                 operationMode,
-                docs.length
+                docs.length,
+                targetLocalPath
               );
               resolve(result);
             });

@@ -821,7 +821,34 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     const isMongoSourceToLocal =
       sourceDbType === 'mongodb' && dbType !== 'mongodb' && (isNeDB || isLocalStorage);
 
+    // Diagnostic: the exact inputs that drive transformer routing. If the
+    // running main process predates the isMongoSourceToLocal guard, this line
+    // will be ABSENT from the logs even though the code above has it — that
+    // absence is itself the signal that Electron needs a restart.
+    // console.log('[Transformer Routing]', JSON.stringify({
+    //   nodeId: node.id,
+    //   label: node.data?.label,
+    //   sourceNodeId: config.sourceNodeId,
+    //   dbType,                         // target db (config.targetDbType || config.dbType)
+    //   sourceDbType,                   // source db (config.sourceDbType || config.sourceType)
+    //   storageLocation: config.transformationSettings?.storageLocation,
+    //   operationMode: config.transformationSettings?.operationMode,
+    //   operationType: config.operationType,
+    //   sourceCollection: config.sourceCollection,
+    //   targetCollection: config.targetCollection,
+    //   sourceConnectionId: config.sourceConnectionId,
+    //   targetConnectionId: config.targetConnectionId,
+    //   targetLocalPath: config.targetLocalPath,
+    //   flags: { isNeDB, isLocalStorage, isInPlace, isMongoSourceToLocal },
+    //   route: isMongoSourceToLocal
+    //     ? 'mongo-source-to-local (handleTransformNoSQL dbType=mongodb)'
+    //     : (['mongodb', 'nedb'].includes(dbType)
+    //         ? `nosql (handleTransformNoSQL dbType=${dbType})`
+    //         : 'sql (handleTransformSQL)')
+    // }, null, 2));
+
     if (isMongoSourceToLocal) {
+      console.log('[Transformer Routing] -> mongo-source-to-local: aggregating on MongoDB, writing result to local NeDB');
       const result = await handleTransformNoSQL({
         dbType: 'mongodb',
         config: config.sourceDbConfig || config.dbConfig,
@@ -829,6 +856,7 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
         sourceLocalPath: null,
         sourceCollection: config.sourceCollection,
         targetCollection: config.targetCollection,
+        targetLocalPath: config.targetLocalPath,
         operationType: config.operationType,
         nosqlOperation: config.nosqlOperation,
         transformFunction: config.transformFunction,
@@ -860,6 +888,10 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
 
     // NoSQL transformations (MongoDB, NeDB)
     if (['mongodb', 'nedb'].includes(dbType)) {
+      console.log(`[Transformer Routing] -> nosql branch dbType=${dbType}, sourceLocalPath=${sourceLocalPath}` +
+        (dbType === 'nedb' && sourceDbType === 'mongodb'
+          ? '  ⚠️ NeDB branch with a MongoDB source — this yields "Source NeDB file not found". Restart Electron to pick up the mongo-source guard.'
+          : ''));
       const result = await handleTransformNoSQL({
         dbType,
         config: config.targetDbConfig || config.dbConfig,
@@ -867,6 +899,7 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
         sourceLocalPath: sourceLocalPath,
         sourceCollection: config.sourceCollection,
         targetCollection: config.targetCollection,
+        targetLocalPath: config.targetLocalPath,
         operationType: config.operationType,
         nosqlOperation: config.nosqlOperation,
         transformFunction: config.transformFunction,
@@ -1060,20 +1093,28 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
   try {
 
 
-    const sourceConfig = sourceNode.data?.config
-    const sourceConnectionId = sourceConfig?.sourceConnectionId || sourceConfig?.targetConnectionId;
-    
+    // This node's own source* fields already hold the upstream connection,
+    // resolved when the node was configured (OutputNodeChat.js:305). Prefer
+    // them. Deriving from the parent instead mixes its source* and target*
+    // sides — for a transformer that yields dbType from its source (mongodb)
+    // beside localPath from its target (a NeDB file), a pair that matches no
+    // read branch in executeOutput. Parent target* comes next, since a
+    // transformer/join writes to its target; parent source* is last, covering
+    // a datasource parent, which has no target side.
+    const sourceConfig = sourceNode.data?.config || {};
 
     const connection = {
-      id: sourceConfig.sourceConnectionId || sourceConfig.targetConnectionId,
-      name: sourceConfig.sourceConnectionName || sourceConfig.targetConnectionName,
-      connectionType: sourceConfig.sourceConnectionType || sourceConfig.targetConnectionType,
-      dbType: sourceConfig.sourceDbType || sourceConfig.targetDbType,
-      dbConfig: sourceConfig.sourceDbConfig || sourceConfig.targetDbConfig,
-      localPath:  sourceConfig.sourceLocalPath || sourceConfig.targetLocalPath,
-      dbCategory:  sourceConfig.sourceDbCategory || sourceConfig.targetDbCategory,
-      indexName: sourceConfig.sourceIndexName || sourceConfig.targetIndexName // For Pinecone
+      id: config.sourceConnectionId || sourceConfig.targetConnectionId || sourceConfig.sourceConnectionId,
+      name: config.sourceConnectionName || sourceConfig.targetConnectionName || sourceConfig.sourceConnectionName,
+      connectionType: config.sourceConnectionType || sourceConfig.targetConnectionType || sourceConfig.sourceConnectionType,
+      dbType: config.sourceDbType || sourceConfig.targetDbType || sourceConfig.sourceDbType,
+      dbConfig: config.sourceDbConfig || sourceConfig.targetDbConfig || sourceConfig.sourceDbConfig,
+      localPath: config.sourceLocalPath || sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath,
+      dbCategory: config.sourceDbCategory || sourceConfig.targetDbCategory || sourceConfig.sourceDbCategory,
+      indexName: config.sourceIndexName || sourceConfig.targetIndexName || sourceConfig.sourceIndexName // For Pinecone
     };
+
+    const sourceConnectionId = connection.id;
 
     const sourceConnection = await getFullConfig(sourceConnectionId, connection);
     

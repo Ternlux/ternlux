@@ -114,6 +114,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
     transformFunction = null,
     storageLocation = null,
     operationMode = null,
+    targetLocalPath = null,
 
     // Optional callbacks
     onSuccess = null,
@@ -143,7 +144,8 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
           nosqlOperation,
           transformFunction,
           storageLocation,
-          operationMode
+          operationMode,
+          targetLocalPath
         );
 
         if (result.success && onDataPreviewRefresh) {
@@ -483,6 +485,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
       transformFunction: config.transformFunction,
       storageLocation: config.transformationSettings?.storageLocation,
       operationMode: config.transformationSettings?.operationMode,
+      targetLocalPath: config.targetLocalPath,
     });
 
     if (result.success) {

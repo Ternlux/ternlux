@@ -147,7 +147,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     //   }),
 
     /** Unified NoSQL transformation (routes to MongoDB or NeDB based on dbType). */
-    transformNoSQL: (dbType, config, connectionId, sourceLocalPath, sourceCollection, targetCollection, operationType, nosqlOperation, transformFunction, storageLocation, operationMode) =>
+    transformNoSQL: (dbType, config, connectionId, sourceLocalPath, sourceCollection, targetCollection, operationType, nosqlOperation, transformFunction, storageLocation, operationMode, targetLocalPath = null) =>
       ipcRenderer.invoke('dbconn:transform-nosql', {
         dbType,
         config,
@@ -159,7 +159,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
         nosqlOperation,
         transformFunction,
         storageLocation,
-        operationMode
+        operationMode,
+        targetLocalPath
       }),
 
     /** SQL transformation (for PostgreSQL, MySQL, MSSQL, SQLite, CSV/Excel files). */

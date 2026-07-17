@@ -323,18 +323,31 @@ async function handleTransformNoSQL({
     sourceLocalPath,
     sourceCollection,
     targetCollection,
+    targetLocalPath = null,
     operationType,
     nosqlOperation,
     transformFunction,
     storageLocation,
     operationMode
   }) {
+    console.log('[handleTransformNoSQL] input', JSON.stringify({
+      dbType,
+      connectionId,
+      sourceLocalPath,
+      sourceCollection,
+      targetCollection,
+      operationType,
+      storageLocation,
+      operationMode
+    }));
     try {
       if (dbType === 'nedb') {
+        console.log(`[handleTransformNoSQL] -> transformNeDB (reads local file sourceLocalPath=${sourceLocalPath}), ${targetLocalPath}`);
         // Use native NeDB transformation (local file operations)
         return await transformNeDB({
           sourceLocalPath,
           targetCollection,
+          targetLocalPath,
           operationType,
           nosqlOperation,
           transformFunction,
@@ -369,7 +382,8 @@ async function handleTransformNoSQL({
             targetCollection,
             result.transformedDocs,
             operationMode,
-            result.totalProcessed
+            result.totalProcessed,
+            targetLocalPath
           );
         }
   
