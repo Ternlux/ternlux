@@ -63,6 +63,43 @@ module.exports = {
   /**
    * Get list of collections
    */
+  /**
+   * Resolve the server's version across every MongoDB version and privilege
+   * level. buildInfo is the one universally available, privilege-exempt command
+   * (a readWrite-scoped user can call it; serverStatus/listDatabases cannot),
+   * and admin() is a free Db handle — the privilege check is on the command,
+   * not the handle. Prefer versionArray ([major, minor, patch, ...]) over the
+   * version string, which can carry -alpha / -gitHash suffixes. Never throws —
+   * an unknown version is a prompt-quality problem, not a reason to block the
+   * caller — so it returns version: null and lets the caller degrade. Note the
+   * value is advisory: Mongo-compatible emulations (DocumentDB, Cosmos) report
+   * an emulated version they don't fully implement.
+   */
+  getServerVersion: async (config, connectionId = null) => {
+    try {
+      const connection = await getConnection(config, connectionId);
+      const db = connection.db;
+      if (!db) return { success: false, version: null, versionArray: null };
+
+      const info = await db.admin().command({ buildInfo: 1 });
+
+      const arr = Array.isArray(info?.versionArray)
+        ? info.versionArray
+        : (typeof info?.version === 'string'
+            ? info.version.split(/[.\-+]/).map(Number).filter(n => !Number.isNaN(n))
+            : null);
+
+      return {
+        success: true,
+        version: info?.version || (arr ? arr.slice(0, 3).join('.') : null),
+        versionArray: arr,
+      };
+    } catch (err) {
+      console.warn('[mongodb:getServerVersion]', err.message);
+      return { success: false, version: null, versionArray: null, message: err.message };
+    }
+  },
+
   getTables: async (config, connectionId = null) => {
     try {
       const connection = await getConnection(config, connectionId);
@@ -573,7 +610,7 @@ module.exports = {
    * Returns prompts for generating transformations specific to MongoDB
    */
   getTransformPrompts: () => ({
-    newTable: (settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName) => `You are a MongoDB expert helping create a new transformed collection.
+    newTable: (settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName, _fullTableName, serverVersion) => `You are a MongoDB expert helping create a new transformed collection.
 
     User's transformation request: "${settings.userRequest}"
 
@@ -584,6 +621,7 @@ module.exports = {
     Source Collection: ${sourceTableSchema.tableName}
     Target Collection: ${targetTableName}
     Storage Location: ${settings.storageLocation === 'database' ? 'MongoDB database' : 'Local file'}
+    MongoDB server version: ${serverVersion || 'unknown — assume a MongoDB 4.0 baseline and use only widely-supported operators'}
 
     **Instructions**:
 
@@ -594,6 +632,7 @@ module.exports = {
        - Most efficient for complex transformations
        - Returns aggregation pipeline as JSON array
        - The $out stage is injected automatically, don't include it
+       - Only use operators available on the server version above. As a guide: $regexMatch requires 4.2, $getField / $setField require 5.0, and $function / $accumulator require 4.4 (but see the ban below — do not use them regardless).
 
     2. **Filter Operation**:
        - Simple document filtering based on criteria
@@ -605,6 +644,11 @@ module.exports = {
        - Returns a JavaScript function that transforms each document
        - Function signature: function transformDocument(doc) { return transformedDoc; }
        - Return null to exclude a document from the output
+       - This runs in Node.js, so require('crypto') and other Node modules ARE available here — unlike inside the aggregation pipeline.
+
+    **CRITICAL — never use server-side JavaScript operators in the aggregation pipeline**:
+    - Do NOT emit $function, $accumulator, $where, or mapReduce. They are rejected outright on Atlas shared tiers (M0/M2/M5) and any server started with --noscripting, and even where enabled their JS scope has NO require() and no Node modules — so require('crypto') inside a $function body always fails.
+    - If the transformation needs logic aggregation operators cannot express — hashing, cryptographic digests, arbitrary string algorithms — do NOT reach for $function. Instead return "operationType": "javascript" with a transformFunction, which runs server-side of this app in Node.js where require('crypto') works. Example: to build a stable id, hash inside transformDocument with require('crypto').createHash('sha256').
 
     **Important Notes**:
     - You are creating a NEW collection, not modifying the source
@@ -648,7 +692,7 @@ module.exports = {
 
     Provide working MongoDB operations.`,
 
-    inPlace: (settings, sourceTableInfo, settingsContext, sourceTableSchema) => `You are a MongoDB expert helping modify data in-place.
+    inPlace: (settings, sourceTableInfo, settingsContext, sourceTableSchema, _targetSchema, _fullTableName, serverVersion) => `You are a MongoDB expert helping modify data in-place.
 
     User's transformation request: "${settings.userRequest}"
 
@@ -658,6 +702,7 @@ module.exports = {
 
     Source Collection: ${sourceTableSchema.tableName}
     Operation Mode: In-Place (modifying source collection directly)
+    MongoDB server version: ${serverVersion || 'unknown — assume a MongoDB 4.0 baseline and use only widely-supported operators'}
 
     **Instructions**:
 
@@ -673,6 +718,7 @@ module.exports = {
        - Returns filter object and update operations
        - Uses MongoDB update operators like $set, $unset, $inc, etc.
        - Best for simple updates (setting values, incrementing, removing fields)
+       - If you use an aggregation-pipeline update, only use operators available on the server version above, and never $function / $accumulator / $where (see the ban below).
 
     3. **JavaScript Transformation** (for complex logic):
        - Use when update operators cannot handle the transformation
@@ -682,6 +728,10 @@ module.exports = {
        - Documents are processed in batches of 10,000 for efficiency
        - Return the modified document (do NOT return null to skip - that's not supported for in-place updates)
        - nosqlOperation should contain the filter to select documents to transform
+       - This runs in Node.js, so require('crypto') and other Node modules ARE available here — reach for this (not $function) whenever the logic needs hashing or other Node-only capabilities.
+
+    **CRITICAL — never use server-side JavaScript operators**:
+    - Do NOT emit $function, $accumulator, $where, or mapReduce. They are rejected on Atlas shared tiers and any --noscripting server, and their JS scope has no require()/Node modules. For hashing/crypto/arbitrary algorithms use operationType "javascript" (runs in Node) instead.
 
     **Important Notes**:
     - You are MODIFYING the source collection "${sourceTableSchema.tableName}" directly
