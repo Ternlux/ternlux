@@ -1287,18 +1287,38 @@ async function applySkillResultTransformer({ stepPrompt, upstreamNode, helpers, 
     }
   }
 
+  // Non-vector skills that write to a local NeDB collection (javascript-executor
+  // with outputType "nedb") must target NeDB — not the source's dbType. Mirrors
+  // the live skill path in buildTransformerConfig so a skill that converges via
+  // the subagent round-trip lands the same config (local-nedb target + recorded
+  // targetLocalPath) as one that resolves inline. Without it, targetConn stays
+  // null, the assembler defaults the target to the Mongo source, and the NeDB
+  // output is left with no locatable path → "No data found in source table".
+  const skillOutputType = String(ep.outputType || '').toLowerCase();
+  const isNeDBSkill = !isVectorSkill && skillOutputType === 'nedb';
+  if (isNeDBSkill && !targetConn) {
+    targetConn = {
+      id: ep.targetConnectionId || 'local-nedb',
+      name: ep.targetConnectionName || 'Local NeDB',
+      type: 'file',
+      dbType: 'nedb',
+      config: {},
+    };
+  }
+  const skillIsNoSQL = isNeDBSkill ? true : isNoSQL;
+
   const skillGen = {
     explanation: skillResult.explanation || ep.explanation || `Built via ${skillResult.skillId}.`,
     ddl: ep.ddl || '',
     sql: ep.sql || '',
     insertSql: ep.insertSql || null,
     previewSql: ep.previewSql || null,
-    operationType: ep.operationType || (isVectorSkill ? null : (isNoSQL ? 'aggregation' : null)),
+    operationType: ep.operationType || (isVectorSkill ? null : (isNeDBSkill ? 'transform' : (isNoSQL ? 'aggregation' : null))),
     nosqlOperation: ep.nosqlOperation || null,
     transformFunction: ep.transformFunction || null,
   };
   return assembleTransformerConfig({
-    base, dbType, isNoSQL, helpers,
+    base, dbType, isNoSQL: skillIsNoSQL, helpers,
     operationMode, storageLocation, targetTableName, targetConn,
     transformationSettings, stepPrompt, chat,
     gen: skillGen,
@@ -1679,11 +1699,21 @@ function assembleTransformerConfig({
       ? (base.sourceCollection || base.sourceTableName)
       : targetTableName;
     config.targetPreviewSql = nosqlPreviewQuery(config.targetCollection);
-    if (storageLocation === 'local' || dbType === 'nedb') {
+    // Record targetLocalPath whenever the *resolved target* is NeDB — not just
+    // when the user asked for local storage or the source is NeDB. A NeDB-output
+    // skill (e.g. javascript-executor with outputType "nedb") can force a
+    // `local-nedb` target even when storageLocation is "database" and the source
+    // is a remote DB like MongoDB; config.targetDbType (== targetConn.dbType) is
+    // already 'nedb' here. Without consulting it, the data lands in a local NeDB
+    // file the config has no pointer to, and downstream nodes/previews that
+    // inherit sourceLocalPath from this target get nothing → "No data found in
+    // source table".
+    if (storageLocation === 'local' || dbType === 'nedb' || config.targetDbType === 'nedb') {
       // "Modify locally" (in-place) keeps the data in the source's own file, so
       // inherit its path. A new local collection is written to a fresh
-      // per-collection NeDB file by saveToLocalNeDB; record that deterministic
-      // path so downstream nodes and previews can locate it (the source may be a
+      // per-collection NeDB file by saveToLocalNeDB (or the NeDB-output skill,
+      // which honors this explicit path); record that deterministic path so
+      // downstream nodes and previews can locate it (the source may be a
       // remote DB like MongoDB with no local path to inherit).
       config.targetLocalPath = operationMode === 'in_place'
         ? (base.sourceLocalPath || null)
@@ -2644,6 +2674,58 @@ contract — it says exactly what each step's 'prompt' must convey. The per-node
 builders own all the generation details (SQL vs NoSQL vs JS, dialect quoting,
 REST fetch code, vector embedding) and sample live tables themselves, so you
 never restate those here.
+
+# Output-type expectations — match the DESTINATION type to what actually runs
+
+Each node/skill produces its result through a specific execution path, and some
+destination TYPES cannot run some KINDS of logic. Pick the destination that fits
+the work; a mismatch does not error loudly — the builder silently degrades (e.g.
+emits NULL columns, or writes to a place the next node can't read). Rules:
+
+- dataSource → no destination choice; it only materialises rows. Remote SQL/doc
+  DBs read live; a vector source returns flattened id+metadata rows; API /
+  imported-file / picker sources land locally as SQLite (tabular) or NeDB
+  (document).
+
+- transformer → writes exactly ONE reshaped table, and the destination type is
+  constrained by HOW it computes:
+    • Plain reshape (filter / map / aggregate / rename / cast / derive, or a
+      MongoDB aggregation pipeline) → stays in the SAME engine: write back to
+      the source DB (storageLocation='database'), or to a local SQLite (tabular)
+      / NeDB (document) file (storageLocation='local'). A Mongo→Mongo aggregate
+      is fully expressible here — do NOT route it through a skill.
+    • Per-row Node.js / crypto / SHA-256 / arbitrary JS logic → routed to the
+      javascript-executor skill, whose output is LOCAL-ONLY: nedb or lancedb. It
+      CANNOT write back to a SQL or Mongo server. So if you require a hash/JS
+      step AND the result must live in Mongo/SQL, that's two steps, or accept a
+      local (nedb) result. Never plan a JS-transform step that "writes back to
+      MongoDB".
+    • Embed / vectorise a column → routed to the vector-db-executor skill;
+      output is a VECTOR table (local-lancedb, or a saved vector connection).
+
+- join → writes merged rows to 'connectionId'; the destination TYPE must match
+  the join KIND:
+    • Plain keyed / equality join (Scenario A, incl. reading a vector source as
+      a normal id+metadata table) → ANY destination: a saved connection,
+      local-sqlite, local-nedb, or local-lancedb.
+    • Similarity / embedding join (Scenario B: "for each row find the most
+      similar…", per-row embed + vector search) → the match runs as a JS
+      function in Node, and the executor ONLY runs that function for a NoSQL or
+      VECTOR destination. Scenario B MUST use local-nedb, local-lancedb, or a
+      saved NoSQL/vector connection — NEVER local-sqlite or a SQL connection. A
+      SQL destination forces a static-SQL join that cannot embed or search, so
+      the similarity columns come back NULL. If the user wants the FINAL match
+      result in SQLite / CSV, still write the join to local-nedb, then add an
+      Output node to export that file/format.
+
+- output → delivery only; it never computes. A file export (csv / json / excel /
+  parquet / avro / nedb / sqlite / lancedb) or a DIFFERENT connection/table than
+  the upstream already wrote to.
+
+Rule of thumb: choose the destination from the KIND of execution, not just the
+data — "similarity / find-similar / semantic match" ⇒ nedb / lancedb / vector
+destination; "hash / per-row JS in a transformer" ⇒ nedb / lancedb; a plain SQL
+or Mongo reshape ⇒ that same engine or local-sqlite / local-nedb.
 ${skillDocs ? `\n# Skills (optional execution paths a transformer/join may route through instead of plain SQL/NoSQL — only the ones relevant to this request are loaded)\n${skillDocs}\n` : ''}
 ${systemContext ? `# System & file-path context
 This is the user's actual machine and Ternlux's on-disk layout. When a step
@@ -2827,7 +2909,12 @@ object / sheet, which only exists in the editor. The AI cannot set that path. So
     that silently drops the embeddings. (A SAVED vector connection such as
     Pinecone is referenced by its connection id, not a local-* token.)
   - The user wants a relational / scratch table, or didn't mention
-    vectors → "local-sqlite".
+    vectors → "local-sqlite". EXCEPTION: a SIMILARITY / embedding join
+    (Scenario B — "for each row find the most similar", per-row vector
+    search) must NEVER use "local-sqlite" even though its output looks
+    tabular; a SQL destination can't run the per-row search and the match
+    columns come back NULL. Use "local-nedb" for it (then an Output node if
+    the user wants a CSV/SQLite file of the result).
   - The user wants a local document / NoSQL collection → "local-nedb".
   This is the join's counterpart to 'connectionId' on dataSource —
   the builder reads it directly and does NOT re-pick the destination
