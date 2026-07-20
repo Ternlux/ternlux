@@ -393,8 +393,12 @@ module.exports = {
         }
 
       } else if (operationType === 'javascript') {
-        // JavaScript transformation with optional filter
-        const filter = nosqlOperation ? JSON.parse(nosqlOperation) : {};
+        // JavaScript transformation. `nosqlOperation` may be a plain filter
+        // object OR an aggregation pipeline array (e.g. $group for DISTINCT
+        // before the per-doc transform). In-place mode only supports a filter.
+        const parsedOp = nosqlOperation ? JSON.parse(nosqlOperation) : {};
+        const isPipeline = Array.isArray(parsedOp);
+        const filter = isPipeline ? {} : parsedOp;
 
         // For in-place mode with JavaScript transformation, process in batches
         if (operationMode === 'in_place' && transformFn) {
@@ -453,10 +457,20 @@ module.exports = {
           };
         }
 
-        // For new_table mode, collect all transformed documents
-        const cursor = sourceColl.find(filter);
+        // For new_table mode, fetch source docs via the connector's own
+        // runQuery — it already routes a filter object → find() and a pipeline
+        // array → aggregate(), so we don't duplicate that branching here.
+        const sourceQuery = isPipeline
+          ? { collection: sourceCollection, operation: 'aggregate', pipeline: parsedOp }
+          : { collection: sourceCollection, filter, limit: Number.MAX_SAFE_INTEGER };
 
-        for await (const doc of cursor) {
+        const sourceResult = await module.exports.runQuery(config, connectionId, sourceQuery);
+        if (!sourceResult.success) {
+          await connection.close();
+          return { success: false, message: `Failed to read source documents: ${sourceResult.message}` };
+        }
+
+        for (const doc of (sourceResult.rows || [])) {
           totalProcessed++;
 
           if (transformFn) {
