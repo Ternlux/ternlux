@@ -3854,7 +3854,38 @@ function setupAutoUpdates() {
     console.log('[updater] update check failed:', err?.message || err);
   });
 
+  // Let the user know a download has started, so the "Update ready" dialog
+  // (which only fires once the full installer has downloaded) isn't a surprise.
+  autoUpdater.on('update-available', (info) => {
+    console.log('[updater] update available:', info?.version);
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'Ternlux - Update available',
+        body: `Downloading Ternlux ${info?.version} in the background…`,
+        silent: true,
+      }).show();
+    }
+  });
+
+  // download-progress fires many times per second — throttle to 25% milestones
+  // and keep the toasts silent so we don't spam the notification center.
+  let lastProgressMilestone = 0;
+  autoUpdater.on('download-progress', (progress) => {
+    const percent = Math.floor(progress?.percent || 0);
+    if (percent >= lastProgressMilestone + 25 && percent < 100) {
+      lastProgressMilestone = percent - (percent % 25);
+      if (Notification.isSupported()) {
+        new Notification({
+          title: 'Ternlux - Downloading update',
+          body: `Update download ${lastProgressMilestone}% complete…`,
+          silent: true,
+        }).show();
+      }
+    }
+  });
+
   autoUpdater.on('update-downloaded', async (info) => {
+    lastProgressMilestone = 0;
     const { response } = await dialog.showMessageBox({
       type: 'info',
       buttons: ['Restart Now', 'Later'],
