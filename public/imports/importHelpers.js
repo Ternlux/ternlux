@@ -1,804 +1,604 @@
+/**
+ * File → local store importers.
+ *
+ * All of these stream: rows are pulled from the source in chunks, written to
+ * SQLite/NeDB in transactional batches, and the event loop is released between
+ * batches. Nothing builds an array of every row in the file, so import cost is
+ * bounded by the batch size rather than the file size — a 5 GB CSV imports in
+ * the same memory as a 5 MB one, and the window stays responsive throughout.
+ *
+ * Column types are inferred from the first `TYPE_SAMPLE_ROWS` rows. A streamed
+ * read cannot rewind, so that sample is all we get; values that later
+ * contradict it are stored as text rather than dropped (see coerceValue).
+ */
+
+const fs = require('fs');
+const path = require('path');
 const parquet = require('parquetjs');
 const avro = require('avsc');
 const XLSX = require('xlsx');
-const fs = require('fs');
+const Papa = require('papaparse');
+
+const {
+  SampledTableWriter,
+  buildHeaders,
+  buildSchemaFromInferredTypes,
+  dedupeHeaders,
+  fileSizeOf,
+  normalizeHeader,
+  yieldToEventLoop,
+} = require('./chunkedWriter');
+
+// Bytes of CSV text Papa hands us per chunk callback.
+const CSV_CHUNK_BYTES = 1024 * 1024;
+
+// Rows pulled from a sheet/record stream between event-loop yields.
+const STREAM_YIELD_ROWS = 5000;
+
+// XLSX names the single sheet of a CSV workbook "Sheet1"; the CSV fast path
+// keeps that name so table names match what the workbook path would produce.
+const CSV_SHEET_NAME = 'Sheet1';
+
+const DELIMITED_EXTENSIONS = new Set(['.csv', '.tsv', '.txt']);
+
+/** Wrap a caller's progress callback so every event carries file-level context. */
+const progressReporter = (onProgress, base, getDynamic) => {
+  if (typeof onProgress !== 'function') return null;
+  return (info) => {
+    try {
+      onProgress({ ...base, ...(getDynamic ? getDynamic() : {}), ...info });
+    } catch {
+      // Never let a progress listener break an import.
+    }
+  };
+};
 
 /**
- * Get sample data from SQLite table and build schema
- * @param {string} tableName - Name of the table
- * @param {object} db - SQLite database instance
- * @param {Array<string>} headers - Column names
- * @param {Array<string>} columnTypes - Inferred column types
- * @param {number} sampleLimit - Number of sample rows to fetch (default: 5)
- * @returns {Promise<Object>} Schema object with columns and sampleData
+ * Import a delimited text file (CSV/TSV) into SQLite.
+ *
+ * Papa parses off a read stream a megabyte at a time; each chunk is paused
+ * while its rows are written, so the reader never runs ahead of the writer.
  */
-async function buildSchemaFromInferredTypes(tableName, db, headers, columnTypes, sampleLimit = 5) {
-  return new Promise((resolve, reject) => {
-    // Get sample data
-    db.all(`SELECT * FROM "${tableName}" LIMIT ${sampleLimit}`, (dataErr, dataRows) => {
-      if (dataErr) {
-        reject(dataErr);
-        return;
-      }
+async function importCsvToSqlite(filePath, sanitizedTableName, db, dbPath, options = {}) {
+  const { onProgress = null, sampleSize, batchSize } = options;
+  const totalBytes = fileSizeOf(filePath);
+  const readStream = fs.createReadStream(filePath);
 
-      // Build column schema from inferred types
-      const columns = headers.map((header, index) => ({
-        name: header,
-        type: columnTypes[index],
-        nullable: true,
-        isPrimary: false
-      }));
+  const report = progressReporter(
+    onProgress,
+    { phase: 'writing', file: path.basename(filePath), totalBytes },
+    () => ({ bytesRead: readStream.bytesRead }),
+  );
 
-      // Trim long text fields in sample data
-      const sampleData = dataRows.map(row => {
-        const trimmedRow = {};
-        Object.keys(row).forEach(key => {
-          let value = row[key];
-          if (typeof value === 'string' && value.length > 100) {
-            value = value.substring(0, 100) + '...';
+  const table = new SampledTableWriter(db, {
+    tableName: sanitizedTableName,
+    sampleSize,
+    batchSize,
+    onProgress: report,
+  });
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let sawHeaderRow = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const fail = (message) => {
+      readStream.destroy();
+      finish({ success: false, message });
+    };
+
+    readStream.on('error', (err) => fail(`Failed to read CSV: ${err.message}`));
+
+    Papa.parse(readStream, {
+      header: false,
+      skipEmptyLines: 'greedy',
+      chunkSize: CSV_CHUNK_BYTES,
+
+      chunk: (results, parser) => {
+        if (settled) { parser.abort(); return; }
+        parser.pause();
+        (async () => {
+          const rows = results.data || [];
+          let start = 0;
+          if (!sawHeaderRow) {
+            if (rows.length === 0) return;
+            table.setHeaders(buildHeaders(rows[0]));
+            sawHeaderRow = true;
+            start = 1;
           }
-          trimmedRow[key] = value;
-        });
-        return trimmedRow;
-      });
+          for (let i = start; i < rows.length; i++) {
+            await table.addRow(rows[i]);
+          }
+        })().then(
+          () => { if (!settled) parser.resume(); },
+          (err) => fail(`Failed to import CSV: ${err.message}`),
+        );
+      },
 
-      resolve({
-        tableName,
-        columns,
-        sampleData
-      });
+      complete: () => {
+        if (settled) return;
+        (async () => {
+          if (!sawHeaderRow) {
+            finish({ success: false, message: 'No data found in CSV file' });
+            return;
+          }
+          const { rowCount, schema } = await table.finish();
+          finish({
+            success: true,
+            dbPath,
+            tableName: sanitizedTableName,
+            tables: [sanitizedTableName],
+            rowCount,
+            message: `Imported ${rowCount} rows from CSV file`,
+            schema,
+          });
+        })().catch((err) => finish({ success: false, message: `Failed to import CSV: ${err.message}` }));
+      },
+
+      error: (err) => fail(`Failed to read CSV: ${err.message}`),
     });
   });
 }
 
 /**
- * Import Parquet file to SQLite
+ * Import one worksheet into its own table, streaming rows out of the sheet
+ * rather than materialising them as one array.
  */
-async function importParquetToSqlite(filePath, sanitizedTableName, db, dbPath) {
-  return new Promise(async (resolve) => {
-    try {
-      // Open Parquet file
-      const reader = await parquet.ParquetReader.openFile(filePath);
-      const schema = reader.schema;
+async function importWorksheet(worksheet, tableName, db, { onProgress, sampleSize, batchSize }) {
+  const table = new SampledTableWriter(db, { tableName, sampleSize, batchSize, onProgress });
 
-      // Get cursor to read all rows
-      const cursor = reader.getCursor();
-      const rows = [];
-      let record = null;
+  const rowStream = XLSX.stream.to_json(worksheet, { header: 1, defval: null, raw: false });
+  let sawHeaderRow = false;
+  let sinceYield = 0;
 
-      while (record = await cursor.next()) {
-        rows.push(record);
-      }
-
-      await reader.close();
-
-      if (rows.length === 0) {
-        resolve({
-          success: false,
-          message: 'No data found in Parquet file'
-        });
-        return;
-      }
-
-      // Extract column names from schema
-      const rawHeaders = schema.fieldList.map(field =>
-        field.name.replace(/[^a-zA-Z0-9_]/g, '_')
-      );
-
-      // Deduplicate column names
-      const headers = [];
-      const headerCounts = new Map();
-
-      for (const header of rawHeaders) {
-        const count = headerCounts.get(header) || 0;
-        headerCounts.set(header, count + 1);
-
-        if (count === 0) {
-          headers.push(header);
-        } else {
-          headers.push(`${header}_${count + 1}`);
-        }
-      }
-
-      console.log('[importParquetToSqlite] Deduplicated headers:', headers);
-
-      // Infer column types from data
-      const inferColumnType = (columnData) => {
-        const validValues = columnData.filter(v => v !== null && v !== undefined);
-        if (validValues.length === 0) return 'TEXT';
-
-        const firstValue = validValues[0];
-        if (typeof firstValue === 'boolean') return 'INTEGER'; // SQLite boolean as integer
-        if (typeof firstValue === 'number') {
-          const allIntegers = validValues.every(v => Number.isInteger(v));
-          return allIntegers ? 'INTEGER' : 'REAL';
-        }
-        return 'TEXT';
-      };
-
-      const columnTypes = headers.map((header) => {
-        const columnData = rows.map(row => row[header]);
-        return inferColumnType(columnData);
-      });
-
-      // console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
-
-      const tableNameForFile = sanitizedTableName;
-
-      db.serialize(() => {
-        // Drop existing table
-        db.run(`DROP TABLE IF EXISTS "${tableNameForFile}"`, (dropErr) => {
-          if (dropErr) {
-            console.error('Drop table error:', dropErr);
-            resolve({ success: false, message: 'Failed to drop existing table' });
-            return;
-          }
-
-          // Create table
-          const columnDefs = headers.map((h, i) => `"${h}" ${columnTypes[i]}`).join(', ');
-          const createTableSQL = `CREATE TABLE "${tableNameForFile}" (${columnDefs})`;
-
-          db.run(createTableSQL, (createErr) => {
-            if (createErr) {
-              console.error('Create table error:', createErr);
-              resolve({ success: false, message: 'Failed to create table' });
-              return;
-            }
-
-            // Insert data
-            const placeholders = headers.map(() => '?').join(', ');
-            const insertSQL = `INSERT INTO "${tableNameForFile}" (${headers.map(h => `"${h}"`).join(', ')}) VALUES (${placeholders})`;
-
-            const stmt = db.prepare(insertSQL);
-            rows.forEach(row => {
-              const values = headers.map((header, i) => {
-                const val = row[header];
-                if (val === null || val === undefined) return null;
-
-                const colType = columnTypes[i];
-                if (colType === 'INTEGER') {
-                  return typeof val === 'boolean' ? (val ? 1 : 0) : Math.floor(Number(val));
-                } else if (colType === 'REAL') {
-                  return Number(val);
-                } else {
-                  return String(val);
-                }
-              });
-              stmt.run(values);
-            });
-
-            stmt.finalize(async () => {
-              // Build schema from inferred types
-              try {
-                const schema = await buildSchemaFromInferredTypes(tableNameForFile, db, headers, columnTypes, 5);
-                resolve({
-                  success: true,
-                  dbPath,
-                  tableName: sanitizedTableName,
-                  tables: [tableNameForFile],
-                  rowCount: rows.length,
-                  message: `Imported ${rows.length} rows from Parquet file`,
-                  schema: schema
-                });
-              } catch (schemaErr) {
-                console.error('Failed to build schema:', schemaErr);
-                // Still resolve successfully, just without schema
-                resolve({
-                  success: true,
-                  dbPath,
-                  tableName: sanitizedTableName,
-                  tables: [tableNameForFile],
-                  rowCount: rows.length,
-                  message: `Imported ${rows.length} rows from Parquet file`
-                });
-              }
-            });
-          });
-        });
-      });
-    } catch (error) {
-      console.error('Parquet import error:', error);
-      resolve({
-        success: false,
-        message: `Failed to import Parquet: ${error.message}`
-      });
+  for await (const row of rowStream) {
+    if (!sawHeaderRow) {
+      table.setHeaders(buildHeaders(row));
+      sawHeaderRow = true;
+      continue;
     }
-  });
+    await table.addRow(row);
+    if (++sinceYield >= STREAM_YIELD_ROWS) {
+      sinceYield = 0;
+      await yieldToEventLoop();
+    }
+  }
+
+  if (!sawHeaderRow) return null;
+  return table.finish();
 }
 
 /**
- * Import Avro file to SQLite
+ * Import a CSV/Excel file into SQLite, one table per sheet.
+ *
+ * CSV takes the streaming text path; only real workbooks go through XLSX,
+ * which has to parse the container up front. Each sheet is released as soon as
+ * it is written so a many-sheet workbook does not hold them all at once.
+ *
+ * @param {string[]} sheets - sheet names to import; empty means all of them.
  */
-async function importAvroToSqlite(filePath, sanitizedTableName, db, dbPath) {
-  return new Promise((resolve) => {
-    try {
-      // Read Avro file
-      const fileStream = fs.createReadStream(filePath);
-      const decoder = avro.createFileDecoder(fileStream);
-      const rows = [];
+async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets = [], options = {}) {
+  const { onProgress = null, sampleSize, batchSize } = options;
 
-      decoder.on('data', (record) => {
-        rows.push(record);
-      });
-
-      decoder.on('end', () => {
-        if (rows.length === 0) {
-          resolve({
-            success: false,
-            message: 'No data found in Avro file'
-          });
-          return;
-        }
-
-        // Extract column names
-        const rawHeaders = Object.keys(rows[0]).map(h =>
-          h.replace(/[^a-zA-Z0-9_]/g, '_')
-        );
-
-        // Deduplicate column names
-        const headers = [];
-        const headerCounts = new Map();
-
-        for (const header of rawHeaders) {
-          const count = headerCounts.get(header) || 0;
-          headerCounts.set(header, count + 1);
-
-          if (count === 0) {
-            headers.push(header);
-          } else {
-            headers.push(`${header}_${count + 1}`);
-          }
-        }
-
-        console.log('[importAvroToSqlite] Deduplicated headers:', headers);
-
-        // Infer column types
-        const inferColumnType = (columnData) => {
-          const validValues = columnData.filter(v => v !== null && v !== undefined);
-          if (validValues.length === 0) return 'TEXT';
-
-          const firstValue = validValues[0];
-          if (typeof firstValue === 'boolean') return 'INTEGER';
-          if (typeof firstValue === 'number') {
-            const allIntegers = validValues.every(v => Number.isInteger(v));
-            return allIntegers ? 'INTEGER' : 'REAL';
-          }
-          return 'TEXT';
-        };
-
-        const columnTypes = headers.map((header) => {
-          const columnData = rows.map(row => row[header]);
-          return inferColumnType(columnData);
-        });
-
-        // console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
-
-        const tableNameForFile = sanitizedTableName;
-
-        db.serialize(() => {
-          // Drop existing table
-          db.run(`DROP TABLE IF EXISTS "${tableNameForFile}"`, (dropErr) => {
-            if (dropErr) {
-              console.error('Drop table error:', dropErr);
-              resolve({ success: false, message: 'Failed to drop existing table' });
-              return;
-            }
-
-            // Create table
-            const columnDefs = headers.map((h, i) => `"${h}" ${columnTypes[i]}`).join(', ');
-            const createTableSQL = `CREATE TABLE "${tableNameForFile}" (${columnDefs})`;
-
-            db.run(createTableSQL, (createErr) => {
-              if (createErr) {
-                console.error('Create table error:', createErr);
-                resolve({ success: false, message: 'Failed to create table' });
-                return;
-              }
-
-              // Insert data
-              const placeholders = headers.map(() => '?').join(', ');
-              const insertSQL = `INSERT INTO "${tableNameForFile}" (${headers.map(h => `"${h}"`).join(', ')}) VALUES (${placeholders})`;
-
-              const stmt = db.prepare(insertSQL);
-              rows.forEach(row => {
-                const values = headers.map((header, i) => {
-                  const val = row[header];
-                  if (val === null || val === undefined) return null;
-
-                  const colType = columnTypes[i];
-                  if (colType === 'INTEGER') {
-                    return typeof val === 'boolean' ? (val ? 1 : 0) : Math.floor(Number(val));
-                  } else if (colType === 'REAL') {
-                    return Number(val);
-                  } else {
-                    return String(val);
-                  }
-                });
-                stmt.run(values);
-              });
-
-              stmt.finalize(async () => {
-                // Build schema from inferred types
-                try {
-                  const schema = await buildSchemaFromInferredTypes(tableNameForFile, db, headers, columnTypes, 5);
-                  resolve({
-                    success: true,
-                    dbPath,
-                    tableName: sanitizedTableName,
-                    tables: [tableNameForFile],
-                    rowCount: rows.length,
-                    message: `Imported ${rows.length} rows from Avro file`,
-                    schema: schema
-                  });
-                } catch (schemaErr) {
-                  console.error('Failed to build schema:', schemaErr);
-                  // Still resolve successfully, just without schema
-                  resolve({
-                    success: true,
-                    dbPath,
-                    tableName: sanitizedTableName,
-                    tables: [tableNameForFile],
-                    rowCount: rows.length,
-                    message: `Imported ${rows.length} rows from Avro file`
-                  });
-                }
-              });
-            });
-          });
-        });
-      });
-
-      decoder.on('error', (error) => {
-        console.error('Avro read error:', error);
-        resolve({
-          success: false,
-          message: `Failed to read Avro file: ${error.message}`
-        });
-      });
-    } catch (error) {
-      console.error('Avro import error:', error);
-      resolve({
-        success: false,
-        message: `Failed to import Avro: ${error.message}`
-      });
+  // A CSV is a single-sheet workbook as far as XLSX is concerned, so route it
+  // to the streaming reader while keeping the table name the same.
+  if (DELIMITED_EXTENSIONS.has(path.extname(filePath).toLowerCase())) {
+    if (sheets.length > 0 && !sheets.includes(CSV_SHEET_NAME)) {
+      return { success: false, message: 'No data found in spreadsheet' };
     }
-  });
+    const result = await importCsvToSqlite(
+      filePath,
+      `${sanitizedTableName}_${CSV_SHEET_NAME}`,
+      db,
+      dbPath,
+      options,
+    );
+    if (!result.success) return result;
+    return {
+      ...result,
+      tableName: sanitizedTableName,
+      message: `Imported ${result.rowCount} rows into 1 table(s)`,
+      schemas: result.schema ? [result.schema] : [],
+    };
+  }
+
+  try {
+    const report = progressReporter(onProgress, { file: path.basename(filePath), totalBytes: fileSizeOf(filePath) });
+    if (report) report({ phase: 'reading', rows: 0 });
+
+    // `dense` keeps the parsed workbook in packed arrays instead of one object
+    // per cell — a large sheet costs a fraction of the memory that way.
+    const workbook = XLSX.readFile(filePath, { cellDates: true, raw: false, dense: true });
+    await yieldToEventLoop();
+
+    // A sheet with no dimension reference has no cells; checking `!ref` avoids
+    // converting every sheet to JSON just to find out whether it is empty.
+    let sheetsToProcess = workbook.SheetNames.filter((name) => Boolean(workbook.Sheets[name]?.['!ref']));
+    if (sheets && sheets.length > 0) {
+      sheetsToProcess = sheetsToProcess.filter((name) => sheets.includes(name));
+      console.log('[importSpreadsheetToSqlite] Importing only selected sheets:', sheets);
+    } else {
+      console.log('[importSpreadsheetToSqlite] Importing all sheets:', sheetsToProcess);
+    }
+
+    if (sheetsToProcess.length === 0) {
+      return { success: false, message: 'No data found in spreadsheet' };
+    }
+
+    const tables = [];
+    const schemas = [];
+    let totalRows = 0;
+
+    for (const sheetName of sheetsToProcess) {
+      const sanitizedSheetName = String(sheetName)
+        .replace(/[^a-zA-Z0-9_]/g, '_')
+        .replace(/^[0-9]/, '_$&')
+        .substring(0, 64);
+      const tableNameForSheet = `${sanitizedTableName}_${sanitizedSheetName}`;
+
+      const sheetReport = report
+        ? (info) => report({ ...info, phase: 'writing', sheet: sheetName })
+        : null;
+
+      try {
+        const result = await importWorksheet(workbook.Sheets[sheetName], tableNameForSheet, db, {
+          onProgress: sheetReport,
+          sampleSize,
+          batchSize,
+        });
+        if (!result) continue; // header-less sheet — nothing to import
+        tables.push(tableNameForSheet);
+        totalRows += result.rowCount;
+        if (result.schema) schemas.push(result.schema);
+      } catch (sheetErr) {
+        console.error(`[importSpreadsheetToSqlite] Sheet "${sheetName}" failed:`, sheetErr);
+      } finally {
+        // Release the sheet before moving to the next one.
+        delete workbook.Sheets[sheetName];
+        await yieldToEventLoop();
+      }
+    }
+
+    if (tables.length === 0) {
+      return { success: false, message: 'No data found in spreadsheet' };
+    }
+
+    return {
+      success: true,
+      dbPath,
+      tableName: sanitizedTableName,
+      tables,
+      rowCount: totalRows,
+      message: `Imported ${totalRows} rows into ${tables.length} table(s)`,
+      schemas,
+    };
+  } catch (error) {
+    console.error('Import to SQLite error:', error);
+    return { success: false, message: `Failed to import spreadsheet: ${error.message}` };
+  }
 }
 
 /**
- * Import CSV/Excel (spreadsheet) file to SQLite
+ * Import a Parquet file into SQLite, reading through the row cursor instead of
+ * collecting every record first.
  */
-async function importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets = []) {
-  return new Promise((resolve) => {
-    try {
-      // Read the Excel/CSV file
-      const workbook = XLSX.readFile(filePath, { cellDates: true, raw: false });
+async function importParquetToSqlite(filePath, sanitizedTableName, db, dbPath, options = {}) {
+  const { onProgress = null, sampleSize, batchSize } = options;
+  let reader = null;
 
-      // Process all sheets
-      let totalRows = 0;
-      const tables = [];
+  try {
+    reader = await parquet.ParquetReader.openFile(filePath);
 
-      // Filter out empty sheets
-      let sheetsToProcess = workbook.SheetNames.filter(sheetName => {
-        const ws = workbook.Sheets[sheetName];
-        const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: false });
-        return rawRows.length > 0;
-      });
+    // Leaf field names double as the row keys, but the sanitized version is
+    // what SQL sees — look values up by the original path, write them under
+    // the safe name.
+    const fields = reader.schema.fieldList.map((field) => ({
+      path: Array.isArray(field.path) ? field.path : [field.name],
+      name: field.name,
+    }));
+    const headers = dedupeHeaders(fields.map((field, index) => normalizeHeader(field.name, index)));
 
-      // If specific sheets are requested, filter to only those sheets
-      if (sheets && sheets.length > 0) {
-        sheetsToProcess = sheetsToProcess.filter(sheetName => sheets.includes(sheetName));
-        console.log(`[importSpreadsheetToSqlite] Importing only selected sheets:`, sheets);
-      } else {
-        console.log(`[importSpreadsheetToSqlite] Importing all sheets:`, sheetsToProcess);
-      }
-
-      if (sheetsToProcess.length === 0) {
-        resolve({
-          success: false,
-          message: 'No data found in spreadsheet'
-        });
-        return;
-      }
-
-      let sheetsProcessed = 0;
-      const schemas = []; // Collect schemas for all sheets
-
-      const finishImport = () => {
-        resolve({
-          success: true,
-          dbPath,
-          tableName: sanitizedTableName,
-          tables,
-          rowCount: totalRows,
-          message: `Imported ${totalRows} rows into ${tables.length} table(s)`,
-          schemas: schemas // Return all schemas
-        });
-      };
-
-      // Helper function to infer column type from data
-      const inferColumnType = (columnData, maxSamples = 10000) => {
-        // Filter out null/undefined/empty values
-        const validValues = columnData
-          .slice(0, maxSamples)
-          .filter(val => val !== null && val !== undefined && val !== '');
-
-        if (validValues.length === 0) {
-          return 'TEXT'; // Default if all values are null/empty
-        }
-
-        let allInteger = true;
-        let allNumeric = true;
-
-        for (const val of validValues) {
-          const strVal = String(val).trim();
-
-          // Check if it's a number
-          if (strVal === '' || isNaN(strVal)) {
-            allInteger = false;
-            allNumeric = false;
-            break;
-          }
-
-          // Check if it's an integer
-          if (!Number.isInteger(Number(strVal))) {
-            allInteger = false;
-          }
-        }
-
-        if (allInteger) {
-          return 'INTEGER';
-        } else if (allNumeric) {
-          return 'REAL';
-        } else {
-          return 'TEXT';
-        }
-      };
-
-      db.serialize(() => {
-        sheetsToProcess.forEach((sheetName) => {
-          const ws = workbook.Sheets[sheetName];
-          const rawRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: false });
-
-          // Get headers
-          const rawHeaders = (rawRows[0] || []).map((h, i) =>
-            h !== null && h !== undefined && String(h).trim() !== ''
-              ? String(h).replace(/[^a-zA-Z0-9_]/g, '_')
-              : `column_${i + 1}`
-          );
-
-          // Deduplicate column names
-          const headers = [];
-          const headerCounts = new Map();
-
-          for (const header of rawHeaders) {
-            const count = headerCounts.get(header) || 0;
-            headerCounts.set(header, count + 1);
-
-            if (count === 0) {
-              headers.push(header);
-            } else {
-              headers.push(`${header}_${count + 1}`);
-            }
-          }
-
-          // console.log(`[importSpreadsheetToSqlite] Sheet "${sheetName}" - Deduplicated headers:`, headers);
-
-          // Get data rows for type inference
-          const dataRows = rawRows.slice(1);
-
-          // Infer types for each column by examining up to 10,000 rows
-          const columnTypes = headers.map((header, colIndex) => {
-            const columnData = dataRows.map(row => row[colIndex]);
-            return inferColumnType(columnData, 10000);
-          });
-
-          // console.log('Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
-
-          // Sanitize sheet name for SQLite table naming
-          const sanitizedSheetName = String(sheetName)
-            .replace(/[^a-zA-Z0-9_]/g, '_')
-            .replace(/^[0-9]/, '_$&') // Prefix with underscore if starts with number
-            .substring(0, 64); // Limit length
-
-          // Always prefix table name with the base file name
-          const tableNameForSheet = `${sanitizedTableName}_${sanitizedSheetName}`;
-
-          tables.push(tableNameForSheet);
-          console.log("tableNameForSheet: ", tableNameForSheet)
-          // Drop existing table if it exists (re-importing data)
-          db.run(`DROP TABLE IF EXISTS "${tableNameForSheet}"`, (dropErr) => {
-            if (dropErr) {
-              console.error('Drop table error:', dropErr);
-              sheetsProcessed++;
-              if (sheetsProcessed === sheetsToProcess.length) {
-                finishImport();
-              }
-              return;
-            }
-
-            // Create table with inferred types
-            const columnDefs = headers.map((h, i) => `"${h}" ${columnTypes[i]}`).join(', ');
-            const createTableSQL = `CREATE TABLE "${tableNameForSheet}" (${columnDefs})`;
-
-            db.run(createTableSQL, (createErr) => {
-              if (createErr) {
-                console.error('Create table error:', createErr);
-                sheetsProcessed++;
-                if (sheetsProcessed === sheetsToProcess.length) {
-                  finishImport();
-                }
-                return;
-              }
-
-              // Insert data with type conversion
-              const placeholders = headers.map(() => '?').join(', ');
-              const insertSQL = `INSERT INTO "${tableNameForSheet}" (${headers.map(h => `"${h}"`).join(', ')}) VALUES (${placeholders})`;
-
-              const stmt = db.prepare(insertSQL);
-              dataRows.forEach(row => {
-                const values = headers.map((_, i) => {
-                  let val = row[i];
-
-                  // Handle undefined/null
-                  if (val === undefined || val === null || val === '') {
-                    return null;
-                  }
-
-                  // Convert based on inferred type
-                  const colType = columnTypes[i];
-                  if (colType === 'INTEGER') {
-                    const num = Number(val);
-                    return isNaN(num) ? null : Math.floor(num);
-                  } else if (colType === 'REAL') {
-                    const num = Number(val);
-                    return isNaN(num) ? null : num;
-                  } else {
-                    // TEXT - keep as string
-                    return String(val);
-                  }
-                });
-
-                stmt.run(values);
-                totalRows++;
-              });
-
-              // Wait for finalize to complete before moving to next sheet
-              stmt.finalize(async (finalizeErr) => {
-                if (finalizeErr) {
-                  console.error('Finalize error:', finalizeErr);
-                } else {
-                  // Build schema for this sheet
-                  try {
-                    const schema = await buildSchemaFromInferredTypes(tableNameForSheet, db, headers, columnTypes, 5);
-                    schemas.push(schema);
-                  } catch (schemaErr) {
-                    console.error(`Failed to build schema for sheet ${tableNameForSheet}:`, schemaErr);
-                  }
-                }
-
-                sheetsProcessed++;
-                if (sheetsProcessed === sheetsToProcess.length) {
-                  finishImport();
-                }
-              });
-            });
-          });
-        });
-      });
-    } catch (error) {
-      console.error('Import to SQLite error:', error);
-      resolve({
-        success: false,
-        message: `Failed to import spreadsheet: ${error.message}`
-      });
+    if (headers.length === 0) {
+      return { success: false, message: 'No columns found in Parquet file' };
     }
-  });
+
+    const report = progressReporter(onProgress, {
+      phase: 'writing',
+      file: path.basename(filePath),
+      totalBytes: fileSizeOf(filePath),
+    });
+
+    const table = new SampledTableWriter(db, {
+      tableName: sanitizedTableName,
+      sampleSize,
+      batchSize,
+      onProgress: report,
+    });
+    table.setHeaders(headers);
+
+    const valueAt = (record, fieldPath) => {
+      let value = record;
+      for (const key of fieldPath) {
+        if (value === null || value === undefined) return null;
+        value = value[key];
+      }
+      return value === undefined ? null : value;
+    };
+
+    const cursor = reader.getCursor();
+    let sawRow = false;
+    let sinceYield = 0;
+    let record = await cursor.next();
+
+    while (record) {
+      sawRow = true;
+      await table.addRow(fields.map((field) => valueAt(record, field.path)));
+      if (++sinceYield >= STREAM_YIELD_ROWS) {
+        sinceYield = 0;
+        await yieldToEventLoop();
+      }
+      record = await cursor.next();
+    }
+
+    if (!sawRow) {
+      return { success: false, message: 'No data found in Parquet file' };
+    }
+
+    const { rowCount, schema } = await table.finish();
+    return {
+      success: true,
+      dbPath,
+      tableName: sanitizedTableName,
+      tables: [sanitizedTableName],
+      rowCount,
+      message: `Imported ${rowCount} rows from Parquet file`,
+      schema,
+    };
+  } catch (error) {
+    console.error('Parquet import error:', error);
+    return { success: false, message: `Failed to import Parquet: ${error.message}` };
+  } finally {
+    if (reader) await reader.close().catch(() => {});
+  }
 }
 
 /**
- * Import CSV file to SQLite
- * Dedicated function for CSV files to avoid multi-sheet processing
+ * Import an Avro file into SQLite, consuming the decoder as an async iterable
+ * so records are written as fast as they are read and no faster.
  */
-async function importCsvToSqlite(filePath, sanitizedTableName, db, dbPath) {
-  return new Promise((resolve) => {
-    try {
-      // Read CSV file using XLSX (it handles CSV well)
-      const workbook = XLSX.readFile(filePath, { cellDates: true, raw: false });
+async function importAvroToSqlite(filePath, sanitizedTableName, db, dbPath, options = {}) {
+  const { onProgress = null, sampleSize, batchSize } = options;
 
-      // Get the first (and only) sheet
-      const firstSheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[firstSheetName];
+  try {
+    const report = progressReporter(onProgress, {
+      phase: 'writing',
+      file: path.basename(filePath),
+      totalBytes: fileSizeOf(filePath),
+    });
 
-      // Convert to array of arrays
-      const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null, raw: false });
+    const table = new SampledTableWriter(db, {
+      tableName: sanitizedTableName,
+      sampleSize,
+      batchSize,
+      onProgress: report,
+    });
 
-      if (rawRows.length === 0) {
-        resolve({
-          success: false,
-          message: 'No data found in CSV file'
-        });
-        return;
+    // createFileDecoder opens the path itself — handing it a stream throws.
+    const decoder = avro.createFileDecoder(filePath);
+    let fieldNames = null;
+    let sinceYield = 0;
+
+    for await (const record of decoder) {
+      if (!fieldNames) {
+        fieldNames = Object.keys(record);
+        if (fieldNames.length === 0) {
+          return { success: false, message: 'No columns found in Avro file' };
+        }
+        table.setHeaders(dedupeHeaders(fieldNames.map(normalizeHeader)));
       }
-
-      // Get headers from first row
-      const rawHeaders = (rawRows[0] || []).map((h, i) =>
-        h !== null && h !== undefined && String(h).trim() !== ''
-          ? String(h).replace(/[^a-zA-Z0-9_]/g, '_')
-          : `column_${i + 1}`
-      );
-
-      // Deduplicate column names
-      const headers = [];
-      const headerCounts = new Map();
-
-      for (const header of rawHeaders) {
-        const count = headerCounts.get(header) || 0;
-        headerCounts.set(header, count + 1);
-
-        if (count === 0) {
-          headers.push(header);
-        } else {
-          headers.push(`${header}_${count + 1}`);
-        }
+      await table.addRow(fieldNames.map((name) => record[name]));
+      if (++sinceYield >= STREAM_YIELD_ROWS) {
+        sinceYield = 0;
+        await yieldToEventLoop();
       }
-
-      console.log('[importCsvToSqlite] Deduplicated headers:', headers);
-
-      // Get data rows
-      const dataRows = rawRows.slice(1);
-
-      // Helper function to infer column type from data
-      const inferColumnType = (columnData, maxSamples = 10000) => {
-        const validValues = columnData
-          .slice(0, maxSamples)
-          .filter(val => val !== null && val !== undefined && val !== '');
-
-        if (validValues.length === 0) {
-          return 'TEXT';
-        }
-
-        let allInteger = true;
-        let allNumeric = true;
-
-        for (const val of validValues) {
-          const strVal = String(val).trim();
-
-          if (strVal === '' || isNaN(strVal)) {
-            allInteger = false;
-            allNumeric = false;
-            break;
-          }
-
-          if (!Number.isInteger(Number(strVal))) {
-            allInteger = false;
-          }
-        }
-
-        if (allInteger) {
-          return 'INTEGER';
-        } else if (allNumeric) {
-          return 'REAL';
-        } else {
-          return 'TEXT';
-        }
-      };
-
-      // Infer types for each column
-      const columnTypes = headers.map((header, colIndex) => {
-        const columnData = dataRows.map(row => row[colIndex]);
-        return inferColumnType(columnData, 10000);
-      });
-
-      // console.log('[CSV Import] Inferred column types:', headers.map((h, i) => `${h}: ${columnTypes[i]}`));
-
-      // Use the sanitized table name directly (no sheet suffix for CSV)
-      const tableNameForFile = sanitizedTableName;
-
-      db.serialize(() => {
-        // Drop existing table
-        db.run(`DROP TABLE IF EXISTS "${tableNameForFile}"`, (dropErr) => {
-          if (dropErr) {
-            console.error('[CSV Import] Drop table error:', dropErr);
-            resolve({ success: false, message: 'Failed to drop existing table' });
-            return;
-          }
-
-          // Create table with inferred types
-          const columnDefs = headers.map((h, i) => `"${h}" ${columnTypes[i]}`).join(', ');
-          const createTableSQL = `CREATE TABLE "${tableNameForFile}" (${columnDefs})`;
-
-          console.log('[CSV Import] Creating table:', createTableSQL);
-
-          db.run(createTableSQL, (createErr) => {
-            if (createErr) {
-              console.error('[CSV Import] Create table error:', createErr);
-              resolve({ success: false, message: 'Failed to create table' });
-              return;
-            }
-
-            // Insert data with type conversion
-            const placeholders = headers.map(() => '?').join(', ');
-            const insertSQL = `INSERT INTO "${tableNameForFile}" (${headers.map(h => `"${h}"`).join(', ')}) VALUES (${placeholders})`;
-
-            const stmt = db.prepare(insertSQL);
-            let insertedRows = 0;
-
-            dataRows.forEach(row => {
-              const values = headers.map((_, i) => {
-                let val = row[i];
-
-                if (val === undefined || val === null || val === '') {
-                  return null;
-                }
-
-                const colType = columnTypes[i];
-                if (colType === 'INTEGER') {
-                  const num = Number(val);
-                  return isNaN(num) ? null : Math.floor(num);
-                } else if (colType === 'REAL') {
-                  const num = Number(val);
-                  return isNaN(num) ? null : num;
-                } else {
-                  return String(val);
-                }
-              });
-
-              stmt.run(values);
-              insertedRows++;
-            });
-
-            stmt.finalize((finalizeErr) => {
-              if (finalizeErr) {
-                console.error('[CSV Import] Finalize error:', finalizeErr);
-                resolve({ success: false, message: 'Failed to finalize import' });
-                return;
-              }
-
-              console.log(`[CSV Import] Successfully imported ${insertedRows} rows to table "${tableNameForFile}"`);
-
-              // Build schema from inferred types
-              buildSchemaFromInferredTypes(tableNameForFile, db, headers, columnTypes, 5)
-                .then(schema => {
-                  resolve({
-                    success: true,
-                    dbPath,
-                    tableName: sanitizedTableName,
-                    tables: [tableNameForFile],
-                    rowCount: insertedRows,
-                    message: `Imported ${insertedRows} rows from CSV file`,
-                    schema: schema
-                  });
-                })
-                .catch(schemaErr => {
-                  console.error('[CSV Import] Failed to build schema:', schemaErr);
-                  // Still resolve successfully, just without schema
-                  resolve({
-                    success: true,
-                    dbPath,
-                    tableName: sanitizedTableName,
-                    tables: [tableNameForFile],
-                    rowCount: insertedRows,
-                    message: `Imported ${insertedRows} rows from CSV file`
-                  });
-                });
-            });
-          });
-        });
-      });
-    } catch (error) {
-      console.error('[CSV Import] Error:', error);
-      resolve({
-        success: false,
-        message: `Failed to import CSV: ${error.message}`
-      });
     }
+
+    if (!fieldNames) {
+      return { success: false, message: 'No data found in Avro file' };
+    }
+
+    const { rowCount, schema } = await table.finish();
+    return {
+      success: true,
+      dbPath,
+      tableName: sanitizedTableName,
+      tables: [sanitizedTableName],
+      rowCount,
+      message: `Imported ${rowCount} rows from Avro file`,
+      schema,
+    };
+  } catch (error) {
+    console.error('Avro import error:', error);
+    return { success: false, message: `Failed to import Avro: ${error.message}` };
+  }
+}
+
+/**
+ * Read just the first `limit` data rows of a delimited file.
+ *
+ * Previews only ever show the head of a file, so this aborts the read as soon
+ * as it has enough rows — a 5 GB CSV costs the same as a small one. XLSX's
+ * reader can't do that for text files: it pulls the whole thing into memory
+ * before `sheetRows` gets a chance to limit anything.
+ *
+ * @returns {Promise<{ columns: string[], rows: object[] }>}
+ */
+function readDelimitedHead(filePath, limit = 1000) {
+  return new Promise((resolve, reject) => {
+    const readStream = fs.createReadStream(filePath);
+    let columns = null;
+    const rows = [];
+    let settled = false;
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      readStream.destroy();
+      resolve({ columns: columns || [], rows });
+    };
+
+    readStream.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+
+    Papa.parse(readStream, {
+      header: false,
+      skipEmptyLines: 'greedy',
+      preview: limit + 1, // header row plus the rows we want
+      chunkSize: CSV_CHUNK_BYTES,
+      chunk: (results, parser) => {
+        for (const row of results.data || []) {
+          if (!columns) {
+            columns = (row || []).map((cell, index) => {
+              const text = cell === null || cell === undefined ? '' : String(cell).replace(/^\uFEFF/, '').trim();
+              return text === '' ? `Column ${index + 1}` : text;
+            });
+            continue;
+          }
+          const record = {};
+          columns.forEach((name, index) => { record[name] = row ? row[index] : null; });
+          rows.push(record);
+        }
+        if (rows.length >= limit) {
+          parser.abort();
+          done();
+        }
+      },
+      complete: done,
+      error: (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      },
+    });
   });
+}
+
+/** First non-whitespace character of a file, used to tell `[...]` from `{...}`. */
+function firstMeaningfulChar(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(4096);
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const text = buffer.slice(0, bytes).toString('utf8').replace(/^\uFEFF/, '');
+    const match = text.match(/\S/);
+    return match ? match[0] : '';
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Import a JSON file into a NeDB datastore.
+ *
+ * A top-level array is parsed incrementally with stream-json and inserted in
+ * batches, so the documents are never all held as one parsed array on top of
+ * the raw file text. Anything else (a single object) is small by nature and
+ * read whole.
+ *
+ * @param {object} db - an already-loaded NeDB Datastore
+ * @returns {Promise<{ success: boolean, docCount?: number, message: string }>}
+ */
+async function importJsonToNeDB(filePath, db, options = {}) {
+  const { onProgress = null, batchSize = 1000 } = options;
+
+  try {
+    const totalBytes = fileSizeOf(filePath);
+    const leading = firstMeaningfulChar(filePath);
+
+    if (leading !== '[') {
+      // Single document (or a non-array literal) — no streaming to be had.
+      let parsed;
+      try {
+        parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch (parseErr) {
+        return { success: false, message: `Invalid JSON format: ${parseErr.message}` };
+      }
+      const documents = Array.isArray(parsed) ? parsed : [parsed];
+      if (documents.length === 0) {
+        return { success: false, message: 'No documents found in JSON file' };
+      }
+      const inserted = await db.insertAsync(documents);
+      const docCount = Array.isArray(inserted) ? inserted.length : 1;
+      return { success: true, docCount, message: `Imported ${docCount} documents to NeDB` };
+    }
+
+    const { parser } = require('stream-json');
+    const { streamArray } = require('stream-json/streamers/StreamArray');
+    const { pipeline } = require('stream');
+
+    const readStream = fs.createReadStream(filePath);
+    const documents = streamArray();
+    // pipeline (rather than .pipe chaining) so a syntax error part-way through
+    // the file lands on the stream we are iterating instead of being thrown as
+    // an unhandled 'error' event by the parser.
+    pipeline(readStream, parser(), documents, () => {});
+
+    const report = progressReporter(onProgress, { phase: 'writing', file: path.basename(filePath), totalBytes });
+    let lastReportAt = 0;
+
+    let batch = [];
+    let docCount = 0;
+
+    const flush = async () => {
+      if (batch.length === 0) return;
+      const pending = batch;
+      batch = [];
+      await db.insertAsync(pending);
+      docCount += pending.length;
+      await yieldToEventLoop();
+      if (report && Date.now() - lastReportAt >= 250) {
+        lastReportAt = Date.now();
+        report({ rows: docCount, bytesRead: readStream.bytesRead });
+      }
+    };
+
+    try {
+      for await (const item of documents) {
+        batch.push(item.value);
+        if (batch.length >= batchSize) await flush();
+      }
+      await flush();
+    } catch (streamErr) {
+      readStream.destroy();
+      return { success: false, message: `Invalid JSON format: ${streamErr.message}` };
+    }
+
+    if (docCount === 0) {
+      return { success: false, message: 'No documents found in JSON file' };
+    }
+    if (report) report({ rows: docCount, bytesRead: totalBytes });
+
+    return { success: true, docCount, message: `Imported ${docCount} documents to NeDB` };
+  } catch (error) {
+    console.error('JSON import error:', error);
+    return { success: false, message: `Failed to import JSON: ${error.message}` };
+  }
 }
 
 module.exports = {
   importParquetToSqlite,
   importAvroToSqlite,
   importSpreadsheetToSqlite,
-  importCsvToSqlite
+  importCsvToSqlite,
+  importJsonToNeDB,
+  buildSchemaFromInferredTypes,
+  readDelimitedHead,
+  DELIMITED_EXTENSIONS,
 };
