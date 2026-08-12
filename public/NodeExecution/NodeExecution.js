@@ -1,7 +1,8 @@
 const pluginManager = require('../pluginManager');
 const { transformNeDB, saveToLocalNeDB } = require('../transfomers/NeDB');
 const Sqlite = require('../transfomers/Sqlite');
-const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, executeLocalSQLiteJoin } = require('../joins/joinExecutionHelpers');
+const DuckDB = require('../transfomers/DuckDB');
+const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, executeLocalSQLiteJoin, executeLocalDuckDBJoin } = require('../joins/joinExecutionHelpers');
 
 const VECTOR_DB_TYPES_SET = new Set(['lancedb', 'pinecone']);
 const isVectorConnection = (conn) =>
@@ -145,7 +146,11 @@ async function handleTransformSQL({
     targetSchema,
     targetTableName,
     sourceLocalPath = null,
-    insertSql = null
+    insertSql = null,
+    targetLocalPath = null,
+    sourceFormat = null,
+    workflowId = null,
+    nodeId = null
   }) {
     try {
       console.log('handleTransformSQL', {
@@ -160,9 +165,33 @@ async function handleTransformSQL({
         targetSchema,
         targetTableName,
         sourceLocalPath,
+        targetLocalPath,
         insertSql
       })
-      // LOCAL SQL
+
+      // LOCAL — the node's output is a table in its workflow's DuckDB database.
+      // The source is read where it lies (a file, or an upstream node's table
+      // in the same database). `in_place` runs the model's ALTER/UPDATE/DELETE
+      // against the table; anything else replaces it from the SELECT.
+      if (dbType === 'duckdb') {
+        const params = {
+          sourceLocalPath,
+          sql,
+          targetTableName,
+          targetLocalPath,
+          // What the source is called when it is another node's output — the
+          // name the model's `FROM …` refers to.
+          sourceTableName: config?.sourceTableName || config?.sourceTableSchema?.tableName || null,
+          sourceFormat,
+          workflowId,
+          nodeId,
+        };
+        return operationMode === 'in_place'
+          ? DuckDB.inPlaceLocalUpdate(params)
+          : DuckDB.createLocalTable(params);
+      }
+
+      // LOCAL SQL (legacy SQLite imports)
       if(dbType === 'sqlite'){
         if (operationMode === 'in_place') {
           // For SQLite in-place operations, execute DDL (ALTER TABLE) and/or UPDATE/DELETE on the app database
@@ -279,19 +308,30 @@ async function handleTransformSQL({
           };
   
         } else if (storageLocation === 'local') {
-          // Pull data from remote database and save to local SQLite app database
-          // This works for all SQL databases (PostgreSQL, MySQL, MSSQL)
+          // Pull data from a remote database into this node's table in the
+          // workflow database. The SELECT has to run on the source through its
+          // own plugin — DuckDB can't reach a Postgres table — so rows are
+          // streamed across and written here.
           const fullConfig = await getFullConfig(connectionId, config);
-  
+
           if (!pluginManager.hasConnector(dbType)) {
             return {
               success: false,
               message: `Database type ${dbType} is not supported. Cannot pull data to local storage.`
             };
           }
-  
+
           const plugin = pluginManager.getConnector(dbType);
-          return Sqlite.databaseToLocal(fullConfig, plugin, connectionId, sql, ddl, insertSql, targetTableName, appSqliteDbPath, sqlitePool)
+          return DuckDB.databaseToLocal({
+            fullConfig,
+            plugin,
+            connectionId,
+            sql,
+            targetTableName,
+            targetLocalPath,
+            workflowId,
+            nodeId,
+          });
         }
   
   
@@ -328,7 +368,10 @@ async function handleTransformNoSQL({
     nosqlOperation,
     transformFunction,
     storageLocation,
-    operationMode
+    operationMode,
+    // Optional scope for the local NeDB fallback path (see saveToLocalNeDB).
+    workflowId = null,
+    nodeId = null
   }) {
     // console.log('[handleTransformNoSQL] input', JSON.stringify({
     //   dbType,
@@ -341,9 +384,11 @@ async function handleTransformNoSQL({
     //   operationMode
     // }));
     try {
+      // NoSQL now means a remote document store. Local files — JSON included —
+      // are read as SQL by DuckDB and go through handleTransformSQL, so a
+      // local target arriving here is a stale config from before the switch.
       if (dbType === 'nedb') {
-        // console.log(`[handleTransformNoSQL] -> transformNeDB (reads local file sourceLocalPath=${sourceLocalPath}), ${targetLocalPath}`);
-        // Use native NeDB transformation (local file operations)
+        console.warn('[handleTransformNoSQL] nedb target is legacy; local transforms now run on DuckDB');
         return await transformNeDB({
           sourceLocalPath,
           targetCollection,
@@ -353,7 +398,7 @@ async function handleTransformNoSQL({
           transformFunction,
           operationMode
         });
-  
+
       } else if (pluginManager.hasConnector(dbType)) {
         // Use NoSQL plugin for transformation (MongoDB, etc.)
         const fullConfig = await getFullConfig(connectionId, config);
@@ -383,7 +428,8 @@ async function handleTransformNoSQL({
             result.transformedDocs,
             operationMode,
             result.totalProcessed,
-            targetLocalPath
+            targetLocalPath,
+            { workflowId, nodeId }
           );
         }
   
@@ -412,13 +458,18 @@ async function handleTransformNoSQL({
 async function handleExecuteJoin({
     destinationConnection,
     joinConfig,
-    operationMode = 'new_table'
+    operationMode = 'new_table',
+    // Optional — used only to place a local NeDB result under
+    // local-collections/<workflowId>/<nodeId>.db. Absent for ad-hoc runs.
+    workflowId = null,
+    nodeId = null
   }) {
     try {
       const CHUNK_SIZE = 1000;
       const isVectorDestination = isVectorConnection(destinationConnection);
-      const isNoSQL = ['mongodb', 'nedb'].includes(destinationConnection.dbType);
-      const isLocalStorage = ['sqlite', 'nedb'].includes(destinationConnection.dbType);
+      // NoSQL means a remote document store. A local destination is DuckDB and
+      // takes the SQL path, whatever the shape of the data.
+      const isNoSQL = destinationConnection.dbType === 'mongodb';
       const targetTableName = joinConfig.targetTableName || joinConfig.targetCollection;
 
       console.log(`[Join] Starting ${isVectorDestination ? 'Vector' : (isNoSQL ? 'NoSQL' : 'SQL')} join operation`);
@@ -529,18 +580,8 @@ async function handleExecuteJoin({
   
         console.log(`Join_produced:`, destinationConnection);
   
-        // Step 3: Insert into destination
-        if (isLocalStorage) {
-          // Save to local NeDB
-          const result = await saveToLocalNeDB(
-            targetTableName,
-            joinedResults,
-            operationMode,
-            joinedResults.length
-          );
-          return result;
-        } else {
-          // Insert into remote NoSQL database
+        // Step 3: Insert into the destination document store
+        {
           if (!pluginManager.hasConnector(destinationConnection.dbType)) {
             return {
               success: false,
@@ -585,32 +626,32 @@ async function handleExecuteJoin({
         const joinSql = joinConfig.joinSql || joinConfig.sql;
         const tempTablesToCleanup = [];
   
-        // Check if destination is local SQLite
-        const isLocalSQLite = destinationConnection.dbType === 'sqlite';
+        // A local destination writes this node's own table in the workflow's
+        // DuckDB database.
+        const isLocalDestination = destinationConnection.dbType === 'duckdb';
         // console.log('sourcesConfig: ', joinSql, targetDdl, sourcesConfig)
-        if (isLocalSQLite) {
-          // Pre-resolve any vector sources via the skill before delegating to
-          // executeLocalSQLiteJoin (which only knows about SQL/NoSQL sources).
+        if (isLocalDestination) {
+          // Vector sources have no SQL surface, so resolve their rows via the
+          // skill first; the join then sees them like any other source.
           for (const sc of sourcesConfig) {
             const sconn = sc.connection || sc.sourceConnection;
             if (isVectorConnection(sconn)) {
               sc._preloadedRows = await pullJoinSourceRows(sconn, sc);
-              console.log(`[Local SQLite Join] Pre-loaded ${sc._preloadedRows.length} vector rows for ${sc.sourceNodeId}`);
+              console.log(`[DuckDB Join] Pre-loaded ${sc._preloadedRows.length} vector rows for ${sc.sourceNodeId}`);
             }
           }
 
-          // ===== LOCAL SQLITE JOIN =====
-          return await executeLocalSQLiteJoin(
-            appSqliteDbPath,
+          // ===== LOCAL DUCKDB JOIN =====
+          return await executeLocalDuckDBJoin({
             sourcesConfig,
-            targetDdl,
             joinSql,
             targetTableName,
-            operationMode,
+            targetLocalPath: joinConfig.targetLocalPath,
             pluginManager,
             getFullConfig,
-            sqlitePool
-          );
+            workflowId,
+            nodeId,
+          });
         }
   
         // ===== REMOTE DATABASE JOIN =====

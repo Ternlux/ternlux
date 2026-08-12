@@ -11,6 +11,57 @@ const { executeOutput } = require('./outputExecutionHelpers');
 const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, importCsvToSqlite } = require('../imports/importHelpers');
 
 /**
+ * Detect a node that was placed on the canvas but never configured (empty or
+ * near-empty config). Such a node would otherwise fail deep in execution with a
+ * vague message like "Database type not configured". Returns a clear per-node
+ * error result when unconfigured, or null when the node has real configuration.
+ *
+ * `kind` selects which fields count as "configured" for that node type.
+ */
+function checkNodeConfigured(node, kind) {
+  const config = node?.data?.config || {};
+  const label = node?.data?.label || node?.id || 'Node';
+  const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+
+  let configured = false;
+  switch (kind) {
+    case 'transformer':
+      configured = (config.usesSkill && config.skillId)
+        || nonEmpty(config.targetSql)
+        || nonEmpty(config.targetInsertSql)
+        || nonEmpty(config.nosqlOperation)
+        || nonEmpty(config.transformFunction)
+        || nonEmpty(config.operation)
+        || nonEmpty(config.targetDbType);
+      break;
+    case 'join':
+      configured = (config.usesSkill && config.skillId)
+        || nonEmpty(config.skillId)
+        || nonEmpty(config.joinSql)
+        || nonEmpty(config.targetSql)
+        || nonEmpty(config.transformFunction)
+        || nonEmpty(config.javascriptFunction);
+      break;
+    case 'output':
+      configured = nonEmpty(config.outputType)
+        || nonEmpty(config.outputFormat)
+        || nonEmpty(config.destinationType)
+        || nonEmpty(config.targetConnectionId)
+        || !!config.outputSettings;
+      break;
+    default:
+      configured = Object.keys(config).length > 0;
+  }
+
+  if (configured) return null;
+  return {
+    success: false,
+    message: `Node "${label}" is not configured. Open it and complete its setup before running the workflow.`,
+    recordsProcessed: 0,
+  };
+}
+
+/**
  * Helper function to add a log entry to an execution
  */
 async function addExecutionLog(executionsDb, executionId, level, message, nodeId = null) {
@@ -55,7 +106,7 @@ function getSourceLocalPath(targetNode, nodeMap, edges) {
     }
 
     // Only applicable for local file types
-    if (!['sqlite', 'nedb'].includes(dbType)) {
+    if (!['duckdb', 'sqlite', 'nedb'].includes(dbType)) {
       return null;
     }
 
@@ -126,6 +177,8 @@ async function executeDataSourceNode(node, helpers) {
         apiFetchCode: config.apiFetchCode,
         nedbCollection: collection,
         operationMode: 'new_table',
+        workflowId: helpers?.workflowId || null,
+        nodeId: node.id,
       });
 
       if (!fetchResult.success) {
@@ -365,170 +418,48 @@ async function executeDataSourceNode(node, helpers) {
 
   const filePath = await getOriginalFilePath(sourceConnectionId, config.sourceDbType, getDb)
   console.log("sourceFilePath: ", filePath)
-  // Check if it's a local file import
-  if (config.sourceLocalPath && config.sourceDbType === 'sqlite') {
-    try {
-      if (!sqlitePool) {
-        throw new Error('SQLite connection pool not available');
-      }
 
-      const tableName = config.tableName || config.sourceTableSchema?.tableName;
-
-      if (!tableName) {
-        return {
-          success: false,
-          message: 'Table name not found in configuration',
-          recordsProcessed: 0
-        };
-      }
-
-      const fileExt = path.extname(filePath).toLowerCase();
-
-      // Execute import using connection pool
-      const importResult = await sqlitePool.executeWrite(async (db) => {
-        // Determine import type based on file extension
-        // Note: Drop table logic is already handled within each import function
-        if (fileExt === '.parquet') {
-          return await importParquetToSqlite(filePath, tableName, db, appSqliteDbPath);
-        } else if (fileExt === '.avro') {
-          return await importAvroToSqlite(filePath, tableName, db, appSqliteDbPath);
-        } else if (['.xlsx', '.xls'].includes(fileExt)) {
-          // Pass empty array to import all sheets (default behavior for local files)
-          return await importSpreadsheetToSqlite(filePath, tableName, db, appSqliteDbPath, []);
-        } else if (fileExt === '.csv') {
-          return await importCsvToSqlite(filePath, tableName, db, appSqliteDbPath);
-        } else {
-          return {
-            success: false,
-            message: `Unsupported file type: ${fileExt}`
-          };
-        }
-      });
-
-      if (importResult.success) {
-        return {
-          success: true,
-          message: `Successfully imported ${importResult.rowCount || 0} rows from ${path.basename(filePath)}`,
-          recordsProcessed: importResult.rowCount || 0
-        };
-      } else {
-        return {
-          success: false,
-          message: importResult.message || 'Import failed',
-          recordsProcessed: 0
-        };
-      }
-    } catch (error) {
-      console.error('[Workflow Execution] Data source import error:', error);
+  // A local file source has nothing to execute. It used to be re-imported into
+  // SQLite or NeDB on every run — reading the whole file and rewriting a copy
+  // of it before the workflow could touch a single row. DuckDB reads the file
+  // in place when a downstream node queries it, so this step only has to
+  // confirm the file is still there and report how big it is.
+  if (config.sourceDbType === 'duckdb') {
+    const localPath = config.sourceFilePath || config.sourceLocalPath || filePath;
+    if (!localPath) {
+      return { success: false, message: 'No file path recorded for this data source', recordsProcessed: 0 };
+    }
+    if (!fs.existsSync(localPath)) {
       return {
         success: false,
-        message: error.message,
-        recordsProcessed: 0
+        message: `Source file no longer exists: ${localPath}`,
+        recordsProcessed: 0,
       };
     }
-  }
-
-  // Check if it's a NeDB JSON file import
-  if (config.sourceLocalPath && config.sourceDbType === 'nedb') {
     try {
-      const collectionName = config.sourceCollection || config.sourceTableSchema?.tableName || path.basename(filePath, '.json');
-      const fileExt = path.extname(filePath).toLowerCase();
-
-      // Only support JSON files for NeDB
-      if (fileExt !== '.json') {
-        return {
-          success: false,
-          message: `Unsupported file type for NeDB: ${fileExt}. Only .json files are supported.`,
-          recordsProcessed: 0
-        };
+      const duck = require('../duckdb');
+      // A workflow database holds the source as a TABLE (an upstream node's
+      // output); a data file is counted where it lies.
+      const isDb = /\.duckdb$/i.test(localPath);
+      const sourceTable = config.sourceTableName || config.sourceTableSchema?.tableName;
+      if (isDb && !sourceTable) {
+        return { success: false, message: 'No table recorded for this data source', recordsProcessed: 0 };
       }
-
-      // Use the existing NeDB database path from sourceLocalPath
-      const dbPath = config.sourceLocalPath;
-      console.log('[Workflow Execution] Using NeDB database at:', dbPath);
-      console.log('[Workflow Execution] Reading source file:', filePath);
-
-      // Read JSON file
-      const jsonContent = fs.readFileSync(filePath, 'utf8');
-      let documents;
-
-      try {
-        const parsed = JSON.parse(jsonContent);
-        // Handle both array of documents and single document
-        documents = Array.isArray(parsed) ? parsed : [parsed];
-      } catch (parseErr) {
-        return {
-          success: false,
-          message: `Invalid JSON format: ${parseErr.message}`,
-          recordsProcessed: 0
-        };
-      }
-
-      if (documents.length === 0) {
-        return {
-          success: false,
-          message: 'No documents found in JSON file',
-          recordsProcessed: 0
-        };
-      }
-
-      // Create NeDB datastore using the existing database path
-      const Datastore = require('@seald-io/nedb');
-      const db = new Datastore({ filename: dbPath, autoload: true });
-
-      // Remove all existing documents first (drop collection)
-      await new Promise((resolve, reject) => {
-        db.remove({}, { multi: true }, (err, numRemoved) => {
-          if (err) {
-            console.warn(`[Workflow Execution] Could not clear NeDB collection ${collectionName}:`, err);
-          } else {
-            console.log(`[Workflow Execution] Cleared ${numRemoved} existing documents from collection: ${collectionName}`);
-          }
-          resolve();
-        });
-      });
-
-      // Compact the database to reclaim space
-      db.persistence.compactDatafile();
-
-      // Insert documents
-      const insertResult = await new Promise((resolve, reject) => {
-        db.insert(documents, (err, newDocs) => {
-          if (err) {
-            resolve({
-              success: false,
-              message: `Failed to insert documents: ${err.message}`
-            });
-          } else {
-            resolve({
-              success: true,
-              dbPath,
-              collectionName,
-              docCount: newDocs.length
-            });
-          }
-        });
-      });
-
-      if (insertResult.success) {
-        return {
-          success: true,
-          message: `Successfully imported ${insertResult.docCount} documents to NeDB collection '${collectionName}'`,
-          recordsProcessed: insertResult.docCount
-        };
-      } else {
-        return {
-          success: false,
-          message: insertResult.message,
-          recordsProcessed: 0
-        };
-      }
+      const rowCount = isDb
+        ? await duck.tableRowCountAt(localPath, sourceTable)
+        : await duck.countRows(localPath, config.sourceFormat || null);
+      return {
+        success: true,
+        message: isDb
+          ? `${sourceTable} ready — ${rowCount} row(s)`
+          : `${path.basename(localPath)} ready — ${rowCount} row(s), read in place`,
+        recordsProcessed: rowCount,
+      };
     } catch (error) {
-      console.error('[Workflow Execution] NeDB import error:', error);
       return {
         success: false,
-        message: error.message,
-        recordsProcessed: 0
+        message: `Cannot read ${path.basename(localPath)}: ${error.message}`,
+        recordsProcessed: 0,
       };
     }
   }
@@ -624,6 +555,11 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
       recordsProcessed: 0
     };
   }
+
+  // Reject an unconfigured transformer up front with a clear, node-named
+  // message instead of failing later with "Database type not configured".
+  const notConfigured = checkNodeConfigured(node, 'transformer');
+  if (notConfigured) return notConfigured;
 
   // Find source node
   const sourceEdge = edges.find(e => e.target === node.id);
@@ -802,7 +738,7 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     if (!dbType) {
       return {
         success: false,
-        message: 'Database type not configured',
+        message: `Node "${node.data?.label || node.id}" is not fully configured (no target database). Open it and complete its setup before running.`,
         recordsProcessed: 0
       };
     }
@@ -881,10 +817,12 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     // app DB → "no such table: dbo.items". Mirrors isMongoSourceToLocal above.
     const isSqlSourceToLocal =
       isLocalStorage && !isInPlace &&
-      dbType === 'sqlite' &&
-      sourceDbType && !['sqlite', 'nedb', 'mongodb'].includes(sourceDbType);
+      (dbType === 'duckdb' || dbType === 'sqlite') &&
+      sourceDbType && !['duckdb', 'sqlite', 'nedb', 'mongodb'].includes(sourceDbType);
 
-    const sourceLocalPath = (isNeDB || isLocalStorage || isInPlace) ? getSourceLocalPath(node, nodeMap, edges) : null;
+    const sourceLocalPath = (isNeDB || isLocalStorage || isInPlace || dbType === 'duckdb')
+      ? getSourceLocalPath(node, nodeMap, edges)
+      : null;
 
     // NoSQL transformations (MongoDB, NeDB)
     if (['mongodb', 'nedb'].includes(dbType)) {
@@ -904,7 +842,9 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
         nosqlOperation: config.nosqlOperation,
         transformFunction: config.transformFunction,
         storageLocation: config.transformationSettings?.storageLocation,
-        operationMode: config.transformationSettings?.operationMode
+        operationMode: config.transformationSettings?.operationMode,
+        workflowId: helpers?.workflowId || null,
+        nodeId: node.id
       });
 
       return {
@@ -934,7 +874,13 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
       targetSchema: config.targetSchema || config.sourceSchema || config.schema,
       targetTableName: config.targetTableName || config.targetCollection,
       sourceLocalPath: sourceLocalPath,
-      insertSql: config.targetInsertSql
+      insertSql: config.targetInsertSql,
+      // A local DuckDB target writes one Parquet file per node, so it needs to
+      // know which node it is.
+      targetLocalPath: config.targetLocalPath,
+      sourceFormat: config.sourceFormat || null,
+      workflowId: helpers?.workflowId || null,
+      nodeId: node.id
     });
 
     return {
@@ -970,6 +916,10 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
       recordsProcessed: 0
     };
   }
+
+  // Reject an unconfigured join up front with a clear, node-named message.
+  const joinNotConfigured = checkNodeConfigured(node, 'join');
+  if (joinNotConfigured) return joinNotConfigured;
 
   // Find source nodes
   const sourceEdges = edges.filter(e => e.target === node.id);
@@ -1016,6 +966,9 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
       transformFunction: config.transformFunction,
       targetTableName: config.targetTableName,
       targetCollection: config.targetCollection,
+      // Carried so a local NeDB join writes to the file its readers already
+      // point at, rather than falling back to a derived path.
+      targetLocalPath: config.targetLocalPath,
       vectorDestination: config.vectorDestination
     };
 
@@ -1023,7 +976,9 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
     const result = await handleExecuteJoin({
       destinationConnection,
       joinConfig,
-      operationMode: config.joinSettings?.operationMode || 'new_table'
+      operationMode: config.joinSettings?.operationMode || 'new_table',
+      workflowId: helpers?.workflowId || null,
+      nodeId: node.id
     });
 
     return {
@@ -1061,6 +1016,10 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
       recordsProcessed: 0
     };
   }
+
+  // Reject an unconfigured output up front with a clear, node-named message.
+  const outputNotConfigured = checkNodeConfigured(node, 'output');
+  if (outputNotConfigured) return outputNotConfigured;
 
   // Find source node
   const sourceEdge = edges.find(e => e.target === node.id);

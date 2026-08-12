@@ -6,19 +6,23 @@
  *   - apiFetchCode — a JavaScript async function expression string produced
  *     by the AI. It may contain `{{PLACEHOLDER}}` tokens from a fixed
  *     vocabulary, placed inside string literals or template literals.
- *   - nedbCollection + operationMode (where to write the rows).
+ *   - nedbCollection + operationMode (what to name the rows and how to write them).
  *
  * We merge the public config with keychain-decrypted credentials via the
  * injected `getFullConfig(connectionId, baseConfig)` (same helper Postgres /
  * Slack use in the main process). We substitute placeholders into the code
  * string, evaluate the function, and invoke it with a configured `axios` so
  * it can perform any looping / pagination logic the user described. The
- * function returns an array of rows which we then write into NeDB via
- * saveToLocalNeDB.
+ * function returns an array of rows, which we materialise as this node's own
+ * output table in the workflow's database — the same place a transformer or
+ * join writes, so an API source is just another local table to everything
+ * downstream.
  */
 
 const axios = require('axios');
-const { saveToLocalNeDB } = require('../transfomers/NeDB');
+const duck = require('../duckdb');
+const { resolveOutputPath } = require('../transfomers/DuckDB');
+const { normaliseParams, buildParamTokens } = require('../lib/apiPlaceholders');
 
 // Wired by initialize() from electron.js main.
 let getFullConfig = null;
@@ -32,6 +36,14 @@ function initialize(configGetter) {
 /**
  * Build the placeholder map for the resolved connection config.
  * Called only after `getFullConfig` has merged in the decrypted secrets.
+ *
+ * Two sources feed the map:
+ *   - `apiParams` — the user's own key/value list (current connections). Each
+ *     key becomes a token via the shared normalisation in lib/apiPlaceholders,
+ *     so "X-API-Key" resolves `{{X_API_KEY}}`.
+ *   - the legacy authType fields, kept so connections saved before the
+ *     key/value editor existed keep resolving. Reserved tokens win over user
+ *     keys, which buildParamTokens already guarantees.
  */
 function buildPlaceholderMap(fullConfig) {
   const authType = fullConfig.authType || 'none';
@@ -53,7 +65,12 @@ function buildPlaceholderMap(fullConfig) {
     authHeaderValue = `Basic ${encoded}`;
   }
 
+  const paramMap = {};
+  buildParamTokens(normaliseParams(fullConfig.apiParams))
+    .forEach(({ token, value }) => { paramMap[token] = value; });
+
   return {
+    ...paramMap,
     BASE_URL: fullConfig.baseUrl ? String(fullConfig.baseUrl) : '',
     AUTH_HEADER_NAME: authHeaderName,
     AUTH_HEADER_VALUE: authHeaderValue,
@@ -81,7 +98,7 @@ function escapeForJsString(value) {
 
 function substituteCode(code, map) {
   if (typeof code !== 'string') return '';
-  return code.replace(/\{\{([A-Z_]+)\}\}/g, (_full, name) =>
+  return code.replace(/\{\{([A-Z0-9_]+)\}\}/g, (_full, name) =>
     Object.prototype.hasOwnProperty.call(map, name)
       ? escapeForJsString(map[name])
       : ''
@@ -91,7 +108,7 @@ function substituteCode(code, map) {
 // ── Main runner ─────────────────────────────────────────────────────────────
 
 /**
- * Execute the AI-authored fetch function and persist rows into NeDB.
+ * Execute the AI-authored fetch function and persist the rows it returns.
  *
  * @param {Object} params
  * @param {string} params.apiConnectionId
@@ -109,6 +126,10 @@ async function handleExecuteApiFetch({
   apiFetchCode,
   nedbCollection,
   operationMode = 'new_table',
+  // Optional — writes the fetched rows as a table in the workflow's own
+  // database instead of a standalone Parquet file.
+  workflowId = null,
+  nodeId = null,
 }) {
   try {
     if (!getFullConfig) {
@@ -143,7 +164,9 @@ async function handleExecuteApiFetch({
     if (typeof fetchFn !== 'function') {
       return { success: false, error: 'apiFetchCode did not resolve to a function' };
     }
-    console.log('fetchFn: ', String(fetchFn))
+    // NB: do not log `fetchFn` — at this point the placeholders have been
+    // replaced with the decrypted credentials, so printing the source puts the
+    // user's keys in the console/log output.
     // 4. Invoke it with axios. The function is responsible for any looping /
     //    pagination and returns either an array of rows or a single object.
     let rawResult;
@@ -155,35 +178,37 @@ async function handleExecuteApiFetch({
 
     const rows = normaliseRows(rawResult);
 
+    // Fetched rows are materialised as this node's output table in the
+    // workflow's database — the same place a transformer or join writes — so
+    // an API source is just another local table to everything downstream.
+    const localPath = resolveOutputPath(nedbCollection, { workflowId, nodeId });
+
     if (rows.length === 0) {
-      // Persist an empty collection so downstream nodes see a defined source.
-      const emptyResult = await saveToLocalNeDB(nedbCollection, [], operationMode, 0);
       return {
-        success: !!emptyResult.success,
+        success: true,
         rowCount: 0,
         collection: nedbCollection,
-        localPath: emptyResult.localPath,
+        localPath,
         sampleRow: null,
-        message: emptyResult.message || 'No rows returned by the API.',
+        message: 'No rows returned by the API.',
       };
     }
 
-    const saved = await saveToLocalNeDB(
-      nedbCollection,
-      rows,
-      operationMode,
-      rows.length
-    );
-    if (!saved.success) {
-      return { success: false, error: saved.message || 'Failed to write rows to NeDB' };
+    try {
+      await duck.withWorkflowLock(
+        workflowId,
+        () => duck.ingestRowsToTable(rows, workflowId, nedbCollection),
+      );
+    } catch (err) {
+      return { success: false, error: `Failed to write rows: ${err.message}` };
     }
 
     return {
       success: true,
-      rowCount: saved.documentsInserted || rows.length,
+      rowCount: rows.length,
       collection: nedbCollection,
-      localPath: saved.localPath,
-      sampleRow: stripNeDBInternals(rows[0]),
+      localPath,
+      sampleRow: rows[0],
     };
   } catch (err) {
     console.error('[handleExecuteApiFetch] error:', err);
@@ -198,11 +223,6 @@ function normaliseRows(value) {
   return [{ value }];
 }
 
-function stripNeDBInternals(row) {
-  if (!row || typeof row !== 'object') return row;
-  const { _id, ...rest } = row;
-  return rest;
-}
 
 module.exports = {
   initialize,

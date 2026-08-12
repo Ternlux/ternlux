@@ -415,7 +415,20 @@ async function executeOutput(
       const isLocalFile = sourceConnection.localPath;
 
       if (isLocalFile) {
-        if (sourceConnection.dbType === 'nedb') {
+        if (sourceConnection.dbType === 'duckdb') {
+          // Either the upstream node's output table in the workflow database,
+          // or a plain data file (the user's csv/json/parquet). DuckDB reads
+          // both directly; nothing was ever imported.
+          const duck = require('../duckdb');
+          const result = /\.duckdb$/i.test(sourceConnection.localPath)
+            ? await duck.readTableHeadAt(
+                sourceConnection.localPath,
+                sourceTableSchema?.tableName || sourceConnection.tableName,
+                1000000,
+              )
+            : await duck.readHead(sourceConnection.localPath, 1000000);
+          sourceData = result.rows;
+        } else if (sourceConnection.dbType === 'nedb') {
           // Local NeDB file
           const db = new Datastore({ filename: sourceConnection.localPath, autoload: false });
 
@@ -897,8 +910,16 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
       // SQL Server) don't break the CREATE TABLE. Without this the CREATE fails
       // with a syntax error that the try/catch below swallows, leaving the table
       // uncreated — which then resurfaces as an "Invalid object name" on insert.
+      // Quote columns BARE — pass neither schema nor config. quoteIdentifier
+      // can't tell a table from a column, and MySQL's impl prepends
+      // config.database as a qualifier: valid for a table name, but INVALID for a
+      // column in a CREATE TABLE / INSERT column list (`db`.`col` is a syntax
+      // error). Passing dbConfig here produced `CREATE TABLE `db`.`t`
+      // (`db`.`col` INT ...)`, which failed, got swallowed, and surfaced as
+      // "table doesn't exist" on insert. Only MySQL reads config; the other SQL
+      // connectors ignore it, so bare-quoting is safe for all of them.
       const quoteCol = (plugin && plugin.quoteIdentifier)
-        ? (c) => plugin.quoteIdentifier(c, null, targetConnection.dbConfig)
+        ? (c) => plugin.quoteIdentifier(c, null, null)
         : (c) => c;
       const columnDefs = columns.map(col => `${quoteCol(col)} ${columnTypes[col]}`).join(', ');
       console.log('tableName, schema, targetConnection.dbConfig: ', tableName, targetConnection.dbConfig)
