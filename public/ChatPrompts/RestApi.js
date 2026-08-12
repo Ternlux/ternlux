@@ -12,11 +12,17 @@
  * substitutes placeholders using credentials decrypted from the OS keychain
  * before evaluating the function.
  *
- * Placeholder vocabulary is scoped to the connection's authType so the prompt
- * only surfaces the tokens that are actually valid for this connection — a
- * Bearer connection won't see `{{BASIC_USERNAME}}`, a none-auth connection
- * won't see any auth header placeholders, etc.
+ * A connection carries an open-ended key/value list (`apiParams`); each key
+ * becomes one placeholder. The key NAMES are public — they live on the saved
+ * connection — while the values stay encrypted, so the prompt can name every
+ * token the user configured without ever revealing a secret.
+ *
+ * Legacy connections (saved before the key/value editor) still carry the old
+ * authType fields; their placeholder vocabulary is scoped to that authType so
+ * a Bearer connection won't see `{{BASIC_USERNAME}}`, etc.
  */
+
+const { buildParamTokens } = require('../lib/apiPlaceholders');
 
 // Placeholders common to every REST API request.
 const BASE_PLACEHOLDERS = ['{{BASE_URL}}'];
@@ -29,9 +35,34 @@ const AUTH_PLACEHOLDERS = {
   basic: ['{{AUTH_HEADER_NAME}}', '{{AUTH_HEADER_VALUE}}', '{{BASIC_USERNAME}}', '{{BASIC_PASSWORD}}'],
 };
 
-function placeholdersFor(authType) {
+function placeholdersFor(authType, paramKeys = []) {
   const auth = AUTH_PLACEHOLDERS[authType] || AUTH_PLACEHOLDERS.none;
-  return [...BASE_PLACEHOLDERS, ...auth];
+  const custom = buildParamTokens(paramKeys).map(p => `{{${p.token}}}`);
+  return [...BASE_PLACEHOLDERS, ...auth, ...custom];
+}
+
+// Describes the user's own key/value entries: what each token is called and
+// which key it came from, so the model can pick the right one by name.
+function paramGuidance(paramKeys) {
+  const tokens = buildParamTokens(paramKeys);
+  if (tokens.length === 0) return '';
+
+  const lines = tokens
+    .map(({ key, token }) => `- \`{{${token}}}\` — the value the user saved under "${key}"`)
+    .join('\n');
+
+  return `**Connection parameters**
+The user saved ${tokens.length} key/value entr${tokens.length === 1 ? 'y' : 'ies'} on this
+connection. You can read the key names but never the values — reference a value
+only through its placeholder:
+${lines}
+
+Decide from the key name and the user's request where each one belongs — a
+request header, a query-string parameter, or a field in the request body. A key
+that looks like a header name (\`Authorization\`, \`X-API-Key\`, anything with a
+dash) is almost always a header; a key like \`tenant_id\` or \`page_size\` is
+almost always a query parameter. Include only the entries the request actually
+needs. If you cannot tell where one belongs and it matters, ask.`;
 }
 
 // Auth-specific guidance the model needs in order to write correct headers.
@@ -85,19 +116,31 @@ credentials elsewhere, use \`{{BASIC_USERNAME}}\` and \`{{BASIC_PASSWORD}}\`.`;
     case 'none':
     default:
       return `**Authentication — None**
-This connection has no authentication configured. Do NOT add an
+This connection has no stored credentials at all. Do NOT add an
 \`Authorization\` header, an API key header, or any credential query-string
 parameters. Call the endpoint anonymously.`;
   }
 }
 
-// Example that matches the connection's auth type. Mirrors the same style
-// every example ships with — GET + axios + pagination guard — so the model
-// has one concrete pattern for this specific auth scheme.
-function authExample(authType) {
-  const headerLine = authType === 'none'
-    ? ''
-    : `      headers: { ['{{AUTH_HEADER_NAME}}']: '{{AUTH_HEADER_VALUE}}' },\n`;
+// Example that matches how this connection carries its credentials. Mirrors
+// the same style every example ships with — GET + axios + pagination guard —
+// so the model has one concrete pattern to follow.
+function authExample(authType, paramKeys = []) {
+  const tokens = buildParamTokens(paramKeys);
+  let headerLine = '';
+
+  if (tokens.length > 0) {
+    // Show the user's own entries in header position — the most common case,
+    // and paramGuidance already tells the model when to move one elsewhere.
+    const pairs = tokens
+      .map(({ key, token }) => `        ['${key.replace(/'/g, "\\'")}']: '{{${token}}}'`)
+      .join(',\n');
+    headerLine = '      // Illustrative only — keep the entries this endpoint expects as headers,\n'
+      + '      // and move the ones it expects in the query string or body to those places.\n'
+      + `      headers: {\n${pairs},\n      },\n`;
+  } else if (authType !== 'none') {
+    headerLine = `      headers: { ['{{AUTH_HEADER_NAME}}']: '{{AUTH_HEADER_VALUE}}' },\n`;
+  }
 
   return `\`\`\`javascript
 async function fetchData({ axios }) {
@@ -132,16 +175,23 @@ const RestApiPrompts = {
     connectionBaseUrl,
     connectionApiKeyName = '',
     connectionBasicUser = '',
+    connectionParamKeys = [],
     conversationHistory = '',
   }) => {
     const authType = connectionAuthType || 'none';
-    const vocabulary = placeholdersFor(authType);
-    const guidance = authGuidance({
+    const paramKeys = Array.isArray(connectionParamKeys) ? connectionParamKeys : [];
+    const vocabulary = placeholdersFor(authType, paramKeys);
+    const params = paramGuidance(paramKeys);
+    // The legacy authType block only applies to connections saved before the
+    // key/value editor. When the user has their own entries, those ARE the
+    // credentials — don't also tell the model the connection is unauthenticated.
+    const legacyAuth = (authType === 'none' && params) ? '' : authGuidance({
       authType,
       apiKeyName: connectionApiKeyName,
       basicUser: connectionBasicUser,
     });
-    const example = authExample(authType);
+    const guidance = [params, legacyAuth].filter(Boolean).join('\n\n');
+    const example = authExample(authType, paramKeys);
 
     return `
 You are a REST API integration expert helping a non-technical user pull data
@@ -151,7 +201,8 @@ you only use placeholder tokens in your output.
 
 **Connection context**
 - Base URL: ${connectionBaseUrl || '(not set — user must supply full URLs)'}
-- Auth type: ${authType}
+- Saved parameter keys: ${paramKeys.length ? paramKeys.map(k => `"${k}"`).join(', ') : '(none)'}
+- Legacy auth type: ${authType}
 
 **Current user request**
 "${userRequest}"
@@ -221,7 +272,7 @@ RULES:
    for the API at hand. Guard against infinite loops with an upper bound
    (e.g. 500 pages).
 
-**Example — paginated GET for this auth type**
+**Example — paginated GET for this connection**
 
 ${example}
 
