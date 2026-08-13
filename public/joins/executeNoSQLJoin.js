@@ -30,6 +30,10 @@ async function executeNoSQLJoin({
   targetCollection,
   operationMode = 'new_table',
   isLocalStorage = false,
+  // Optional — scopes the local NeDB result to this workflow/node.
+  targetLocalPath = null,
+  workflowId = null,
+  nodeId = null,
   onProgress = () => {}
 }) {
   try {
@@ -157,7 +161,9 @@ async function executeNoSQLJoin({
         targetCollection,
         joinedResults,
         operationMode,
-        joinedResults.length
+        joinedResults.length,
+        targetLocalPath,
+        { workflowId, nodeId }
       );
 
       if (!insertResult.success) {
