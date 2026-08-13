@@ -41,6 +41,54 @@ function readSavedSettings() {
   }
 }
 
+// ── Max Tokens ─────────────────────────────────────────────────────────────
+// The user's choice is the primary value everywhere; this static ladder only
+// supplies the options and the fallback when nothing is saved yet.
+export const DEFAULT_MAX_TOKENS = 16000;
+const TOKEN_LADDER = [2048, 4096, 8192, 16000, 32000, 64000, 128000];
+
+/**
+ * Max Tokens choices for a model, filtered to what it actually accepts.
+ * `cap` is the model's published output limit (from ai.listModels); without
+ * one the full ladder is offered and the provider rejects what it can't serve.
+ */
+export function buildTokenOptions(cap) {
+  const options = (cap ? TOKEN_LADDER.filter((n) => n < cap) : TOKEN_LADDER).map((n) => ({
+    value: n,
+    label: `${n.toLocaleString()}${n === DEFAULT_MAX_TOKENS ? ' - Recommended' : ''}`,
+  }));
+  if (cap) options.push({ value: cap, label: `${cap.toLocaleString()} - Model maximum` });
+  return options;
+}
+
+/** The user's saved Max Tokens, or the static fallback. */
+export function getMaxTokens() {
+  return readSavedSettings()?.maxTokens || DEFAULT_MAX_TOKENS;
+}
+
+/**
+ * Persist Max Tokens for both worlds: localStorage (renderer calls) and the
+ * main-process prefs file (backend calls — chat, planner, titles), so one
+ * setting governs every AI call. `cap` clamps to the model's published limit.
+ */
+export async function saveMaxTokens(maxTokens, cap = null) {
+  const value = cap ? Math.min(maxTokens, cap) : maxTokens;
+  try {
+    const current = JSON.parse(localStorage.getItem(PROVIDER_SETTINGS_KEY) || '{}');
+    localStorage.setItem(PROVIDER_SETTINGS_KEY, JSON.stringify({
+      ...current, maxTokens: value, updatedAt: new Date().toISOString(),
+    }));
+  } catch (e) {
+    console.warn('[aiProviders] Could not save max tokens:', e);
+  }
+  try {
+    await window.electronAPI?.ai?.setMaxTokens?.(value);
+  } catch (e) {
+    console.warn('[aiProviders] Could not persist max tokens to main:', e);
+  }
+  return value;
+}
+
 /**
  * Call any configured AI provider via IPC. Provider/model defaults come from
  * the user's saved UI settings; explicit options override them.
@@ -66,7 +114,7 @@ export async function callAI(prompt, options = {}) {
     // so the main process resolves them — we only forward an explicit override.
     model: options.model || (provider === saved.provider ? saved.model : undefined),
     ...(options.baseURL ? { baseURL: options.baseURL } : {}),
-    maxTokens: options.maxTokens || saved.maxTokens || 2048,
+    maxTokens: options.maxTokens || saved.maxTokens || DEFAULT_MAX_TOKENS,
     systemPrompt: options.systemPrompt || null,
     chatHistory: options.chatHistory || []
   };
