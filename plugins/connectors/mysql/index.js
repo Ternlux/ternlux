@@ -112,23 +112,82 @@ module.exports = {
   /**
    * Run SQL query
    */
-  runQuery: async (config, connectionId, queryObj) => {
-    try {
-      const pool = getPool(config, connectionId);
-      // Extract SQL query from the query object
-      const sqlQuery = queryObj.query;
-      const [rows, fields] = await pool.execute(sqlQuery);
-      const columns = fields ? fields.map(f => f.name) : [];
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRows] - Stop after this many rows.
+   *
+   * The cap is applied by reading the result as a stream and destroying it once
+   * enough rows have arrived, so the SQL the user wrote is the SQL MySQL runs —
+   * no LIMIT is appended and no subquery is wrapped around it. Rows past the cap
+   * are never buffered.
+   *
+   * The statement runs exactly ONCE on every path. A stream that fails is
+   * reported as a failure rather than retried unwrapped: re-running an
+   * arbitrary statement to work around a read problem is how an INSERT ends up
+   * applied twice.
+   */
+  runQuery: async (config, connectionId, queryObj, options = {}) => {
+    const maxRows = Number(options.maxRows);
+    const sqlQuery = queryObj.query;
 
-      return {
-        success: true,
-        rows,
-        columns,
-        rowCount: rows.length
-      };
+    if (!(maxRows > 0)) {
+      try {
+        const pool = getPool(config, connectionId);
+        const [rows, fields] = await pool.execute(sqlQuery);
+        return {
+          success: true,
+          rows,
+          columns: fields ? fields.map(f => f.name) : [],
+          rowCount: rows.length
+        };
+      } catch (error) {
+        return { success: false, message: error.message };
+      }
+    }
+
+    let connection;
+    try {
+      connection = await getPool(config, connectionId).getConnection();
     } catch (error) {
       return { success: false, message: error.message };
     }
+
+    return new Promise((resolve) => {
+      const rows = [];
+      let columns = [];
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        connection.release();
+        resolve(value);
+      };
+
+      try {
+        const q = connection.connection.query(sqlQuery);
+        q.on('fields', (fields) => { columns = (fields || []).map(f => f.name); });
+
+        const stream = q.stream();
+        stream.on('data', (row) => {
+          // One past the cap, so "is there more?" is observed rather than
+          // assumed. Destroying the stream stops MySQL sending the rest.
+          if (rows.length <= maxRows) rows.push(row);
+          if (rows.length > maxRows) stream.destroy();
+        });
+        stream.on('error', (err) => finish({ success: false, message: err.message }));
+        const done = () => finish({
+          success: true,
+          rows: rows.slice(0, maxRows),
+          columns: columns.length ? columns : Object.keys(rows[0] || {}),
+          rowCount: Math.min(rows.length, maxRows),
+          truncated: rows.length > maxRows,
+        });
+        stream.on('end', done);
+        stream.on('close', done);
+      } catch (error) {
+        finish({ success: false, message: error.message });
+      }
+    });
   },
 
   /**
@@ -522,5 +581,35 @@ module.exports = {
    */
   getPreviewQuery: (tableName, limit = 100) => {
     return `SELECT * FROM ${tableName} LIMIT ${limit}`;
+  },
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
+   * function lists are unioned with the shared ANSI baseline, so only what is
+   * distinctly MySQL belongs here.
+   */
+  explorer: {
+    language: 'sql',
+    sqlDialect: 'MySQL',
+    formatter: 'mysql',
+    // runQuery honours { maxRows } by streaming and stopping — see the note there.
+    maxRowsOption: true,
+    // MySQL has no schema layer above the database, so the tree's top level
+    // is the database itself.
+    container: 'Database',
+    objectLabel: 'Table',
+    quote: '`',
+    keywords: [
+      'ON DUPLICATE KEY UPDATE', 'REPLACE INTO', 'IGNORE', 'STRAIGHT_JOIN',
+      'SHOW TABLES', 'SHOW COLUMNS', 'DESCRIBE', 'EXPLAIN', 'USE', 'ENGINE',
+      'AUTO_INCREMENT', 'UNSIGNED', 'ZEROFILL', 'CHARACTER SET', 'COLLATE',
+      'SEPARATOR', 'REGEXP', 'RLIKE', 'LIMIT ? OFFSET ?',
+    ],
+    functions: [
+      'GROUP_CONCAT', 'JSON_EXTRACT', 'JSON_OBJECT', 'JSON_ARRAY', 'JSON_UNQUOTE',
+      'DATE_FORMAT', 'STR_TO_DATE', 'DATEDIFF', 'TIMESTAMPDIFF', 'DATE_ADD',
+      'DATE_SUB', 'NOW', 'CURDATE', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME',
+      'IFNULL', 'IF', 'FIND_IN_SET', 'SUBSTRING_INDEX', 'CONVERT',
+    ],
   }
 };
