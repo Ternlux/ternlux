@@ -141,22 +141,80 @@ module.exports = {
   /**
    * Run SQL query
    */
-  runQuery: async (config, connectionId, queryObj) => {
-    try {
-      const pool = getPool(config, connectionId);
-      // Extract SQL query from the query object
-      const sqlQuery = queryObj.query;
-      const result = await pool.query(sqlQuery);
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRows] - Stop after this many rows.
+   *
+   * The cap is applied through a cursor, so the SQL the user wrote is the SQL
+   * Postgres runs — no LIMIT is appended and no subquery is wrapped around it.
+   * A cursor reads a bounded number of rows and the rest of the result is never
+   * materialised on either side of the wire.
+   *
+   * The statement runs exactly ONCE on every path. A cursor that fails is
+   * reported as a failure rather than retried unwrapped: re-running an
+   * arbitrary statement to work around a read problem is how an INSERT ends up
+   * applied twice.
+   */
+  runQuery: async (config, connectionId, queryObj, options = {}) => {
+    const pool = getPool(config, connectionId);
+    const sqlQuery = queryObj.query;
+    const maxRows = Number(options.maxRows);
 
-      return {
-        success: true,
-        rows: result.rows,
-        columns: result.fields ? result.fields.map(f => f.name) : [],
-        rowCount: result.rowCount
-      };
+    if (!(maxRows > 0)) {
+      try {
+        const result = await pool.query(sqlQuery);
+        return {
+          success: true,
+          rows: result.rows,
+          columns: result.fields ? result.fields.map(f => f.name) : [],
+          rowCount: result.rowCount
+        };
+      } catch (error) {
+        return { success: false, message: error.message };
+      }
+    }
+
+    const Cursor = require('pg-cursor');
+    let client;
+    try {
+      client = await pool.connect();
     } catch (error) {
       return { success: false, message: error.message };
     }
+
+    return new Promise((resolve) => {
+      let cursor;
+      try {
+        cursor = client.query(new Cursor(sqlQuery));
+      } catch (error) {
+        client.release();
+        resolve({ success: false, message: error.message });
+        return;
+      }
+      // One past the cap, so "is there more?" is observed rather than assumed.
+      cursor.read(maxRows + 1, (err, rows, result) => {
+        cursor.close(() => client.release());
+        if (err) {
+          resolve({ success: false, message: err.message });
+          return;
+        }
+        const all = rows || [];
+        const capped = all.slice(0, maxRows);
+        const fields = (result && result.fields) || [];
+        resolve({
+          success: true,
+          rows: capped,
+          columns: fields.length
+            ? fields.map(f => f.name)
+            : Object.keys(capped[0] || {}),
+          // A statement that returns no rows (DDL, or an UPDATE without
+          // RETURNING) completes through the same path with an empty array —
+          // its command tag is the only count there is, so report that.
+          rowCount: capped.length || (result && result.rowCount) || 0,
+          truncated: all.length > maxRows,
+        });
+      });
+    });
   },
 
   /**
@@ -546,5 +604,32 @@ module.exports = {
    */
   getPreviewQuery: (tableName, limit = 100) => {
     return `SELECT * FROM ${tableName} LIMIT ${limit}`;
+  },
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
+   * function lists are unioned with the shared ANSI baseline, so only what is
+   * distinctly Redshift belongs here.
+   */
+  explorer: {
+    language: 'sql',
+    sqlDialect: 'Redshift',
+    formatter: 'redshift',
+    // runQuery honours { maxRows } via a cursor — see the note there.
+    maxRowsOption: true,
+    container: 'Schema',
+    objectLabel: 'Table',
+    quote: '"',
+    keywords: [
+      'ILIKE', 'DISTKEY', 'SORTKEY', 'DISTSTYLE', 'ENCODE', 'COPY', 'UNLOAD',
+      'VACUUM', 'ANALYZE', 'CREDENTIALS', 'IAM_ROLE', 'INTERLEAVED',
+      'COMPUPDATE', 'STATUPDATE', 'LATE BINDING', 'EXTERNAL TABLE', 'SPECTRUM',
+    ],
+    functions: [
+      'LISTAGG', 'DATE_TRUNC', 'DATEADD', 'DATEDIFF', 'GETDATE', 'CONVERT_TIMEZONE',
+      'NVL', 'NVL2', 'DECODE', 'SPLIT_PART', 'REGEXP_REPLACE', 'REGEXP_SUBSTR',
+      'JSON_EXTRACT_PATH_TEXT', 'JSON_ARRAY_LENGTH', 'APPROXIMATE COUNT',
+      'PERCENTILE_CONT', 'MEDIAN', 'RATIO_TO_REPORT',
+    ],
   }
 };
