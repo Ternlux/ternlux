@@ -32,6 +32,171 @@ async function getConnection(config, connectionId) {
   return connections.get(key);
 }
 
+// ── Data Explorer: shell-syntax parsing ────────────────────────────────────
+// The explorer's editor lets people write what they'd type in mongosh
+// (`db.events.find({ ts: { $gte: ISODate("...") } }).limit(50)`). runQuery
+// wants a params object, so these helpers bridge the two. Raw JSON params are
+// still accepted unchanged, which is what the AI-generated nodes emit.
+
+/** Methods we can execute, mapped to the operation runQuery understands. */
+const SHELL_METHODS = {
+  find: 'find',
+  findOne: 'find',
+  aggregate: 'aggregate',
+  count: 'count',
+  countDocuments: 'count',
+};
+
+/**
+ * Walk forward from an opening bracket to its match, skipping over anything
+ * inside string literals. Returns the index of the closing bracket, or -1.
+ */
+function matchBracket(text, openIndex) {
+  const open = text[openIndex];
+  const close = { '(': ')', '[': ']', '{': '}' }[open];
+  let depth = 0;
+
+  for (let i = openIndex; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i += 1;
+      while (i < text.length && text[i] !== ch) {
+        if (text[i] === '\\') i += 1;
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** Split an argument list on top-level commas only. */
+function splitArgs(text) {
+  const args = [];
+  let depth = 0;
+  let start = 0;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i += 1;
+      while (i < text.length && text[i] !== ch) {
+        if (text[i] === '\\') i += 1;
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+    else if (ch === ',' && depth === 0) {
+      args.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+
+  const tail = text.slice(start);
+  if (tail.trim()) args.push(tail);
+  return args.map((a) => a.trim()).filter(Boolean);
+}
+
+/**
+ * Parse a value written in shell syntax (unquoted keys, ISODate(...),
+ * ObjectId(...)) into plain JS. mongodb-query-parser is the same parser
+ * Compass uses, so anything valid there is valid here.
+ */
+function parseShellValue(text) {
+  const { parseFilter } = require('mongodb-query-parser');
+  return parseFilter(text);
+}
+
+/**
+ * Turn one statement of editor text into the params object runQuery expects.
+ * Accepts either a `db.<collection>.<method>(...)` chain or raw JSON params.
+ *
+ * @throws {Error} when the text is neither form, or an argument won't parse
+ */
+function parseExplorerQuery(text) {
+  const body = String(text || '').trim().replace(/;\s*$/, '');
+  if (!body) throw new Error('Nothing to run');
+
+  // Raw params object — `{ collection: "x", filter: {...} }`.
+  if (body.startsWith('{')) {
+    const params = parseShellValue(body);
+    if (!params.collection) {
+      throw new Error('A raw query object needs a "collection" field');
+    }
+    return params;
+  }
+
+  const head = /^db\s*\.\s*(?:getCollection\(\s*['"]([^'"]+)['"]\s*\)|([A-Za-z0-9_$][\w$.-]*))\s*\.\s*([A-Za-z]+)\s*\(/.exec(body);
+  if (!head) {
+    throw new Error('Expected db.<collection>.find(...) / .aggregate([...]), or a raw { collection: … } object');
+  }
+
+  const collection = head[1] || head[2];
+  const method = head[3];
+  const operation = SHELL_METHODS[method];
+  if (!operation) {
+    throw new Error(`Unsupported method ".${method}()" — use find, aggregate, or countDocuments`);
+  }
+
+  const openParen = body.indexOf('(', head[0].length - 1);
+  const closeParen = matchBracket(body, openParen);
+  if (closeParen === -1) throw new Error(`Unclosed "(" after .${method}`);
+
+  const args = splitArgs(body.slice(openParen + 1, closeParen));
+  const params = { collection };
+
+  if (operation === 'aggregate') {
+    if (!args.length) throw new Error('aggregate() needs a pipeline array');
+    const pipeline = parseShellValue(args[0]);
+    if (!Array.isArray(pipeline)) throw new Error('aggregate() expects an array pipeline');
+    params.operation = 'aggregate';
+    params.pipeline = pipeline;
+  } else if (operation === 'count') {
+    params.operation = 'count';
+    params.filter = args.length ? parseShellValue(args[0]) : {};
+  } else {
+    params.filter = args.length ? parseShellValue(args[0]) : {};
+    if (args.length > 1) params.projection = parseShellValue(args[1]);
+    if (method === 'findOne') params.limit = 1;
+  }
+
+  // Trailing chain: .sort({...}).limit(n).skip(n).project({...})
+  let rest = body.slice(closeParen + 1);
+  const CHAIN = /^\s*\.\s*(sort|limit|skip|project|projection)\s*\(/;
+  while (CHAIN.test(rest)) {
+    const call = CHAIN.exec(rest);
+    const open = rest.indexOf('(', call[0].length - 1);
+    const close = matchBracket(rest, open);
+    if (close === -1) throw new Error(`Unclosed "(" after .${call[1]}`);
+
+    const raw = rest.slice(open + 1, close).trim();
+    const name = call[1];
+    if (name === 'limit' || name === 'skip') {
+      const n = Number(raw);
+      if (!Number.isFinite(n)) throw new Error(`.${name}() expects a number`);
+      params[name] = n;
+    } else if (raw) {
+      params[name === 'projection' ? 'projection' : name] = parseShellValue(raw);
+    }
+
+    rest = rest.slice(close + 1);
+  }
+
+  if (rest.trim()) throw new Error(`Unexpected trailing input: ${rest.trim().slice(0, 40)}`);
+  return params;
+}
+
 module.exports = {
   type: 'connector',
   id: 'mongodb',
@@ -162,8 +327,19 @@ module.exports = {
    * Run MongoDB query (expects JSON with collection, filter, limit)
    * Also supports operation types: drop, insertMany
    */
-  runQuery: async (config, connectionId, query, limit=100) => {
+  /**
+   * @param {number|{maxRows:number}} [limitOrOptions] - Historically a plain
+   *   row limit, and still is for every existing caller. The Data Explorer
+   *   passes `{ maxRows }` instead, which additionally reports whether more
+   *   documents were waiting. Either way the cap is applied to the CURSOR —
+   *   the user's filter or pipeline is never edited.
+   */
+  runQuery: async (config, connectionId, query, limitOrOptions = 100) => {
     try {
+      const opts = (limitOrOptions && typeof limitOrOptions === 'object') ? limitOrOptions : null;
+      const limit = opts ? (Number(opts.maxRows) || 100) : limitOrOptions;
+      // Read one past the cap so "there is more" is observed, not guessed.
+      const probe = opts ? limit + 1 : null;
       const connection = await getConnection(config, connectionId);
       query = query?.query ? query.query : query;
       const params = typeof query === 'string' ? JSON.parse(query) : query;
@@ -225,9 +401,28 @@ module.exports = {
             if (!Array.isArray(params.pipeline)) {
               return { success: false, message: 'aggregate requires params.pipeline (array)' };
             }
-            const docs = await coll.aggregate(params.pipeline).toArray();
+            // Consume the cursor only as far as the cap, rather than appending
+            // a $limit stage — the pipeline stays exactly as the user wrote it.
+            let docs;
+            let more = false;
+            if (probe) {
+              const cursor = coll.aggregate(params.pipeline);
+              docs = [];
+              try {
+                // eslint-disable-next-line no-restricted-syntax
+                for await (const doc of cursor) {
+                  if (docs.length >= limit) { more = true; break; }
+                  docs.push(doc);
+                }
+              } finally {
+                await cursor.close().catch(() => {});
+              }
+            } else {
+              docs = await coll.aggregate(params.pipeline).toArray();
+            }
             const columns = docs.length ? Object.keys(docs[0]) : [];
             return {
+              truncated: more,
               success: true,
               rows: docs,
               columns,
@@ -249,10 +444,15 @@ module.exports = {
       let cursor = coll.find(params.filter || {});
       if (params.sort) cursor = cursor.sort(params.sort);
       if (params.projection) cursor = cursor.project(params.projection);
-      const docs = await cursor
-        .limit(params.limit || limit)
+      // The cursor does the limiting. When the explorer asked for a cap we read
+      // one extra document to tell whether more were waiting, then drop it.
+      const requested = params.limit || limit;
+      const fetched = await cursor
+        .limit(probe ? Math.min(requested, limit) + 1 : requested)
         .toArray();
 
+      const keep = probe ? Math.min(requested, limit) : requested;
+      const docs = probe ? fetched.slice(0, keep) : fetched;
       const columns = docs.length ? Object.keys(docs[0]) : [];
 
       return {
@@ -260,6 +460,7 @@ module.exports = {
         rows: docs,
         columns,
         rowCount: docs.length,
+        truncated: probe ? fetched.length > docs.length : undefined,
         json: true
       };
     } catch (error) {
@@ -799,5 +1000,93 @@ module.exports = {
     }
 
     Provide working MongoDB operations.`
-  })
+  }),
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js.
+   *
+   * Document stores start from an empty keyword baseline (SQL words would only
+   * pollute completions), so everything the editor offers is listed here.
+   */
+  explorer: {
+    language: 'json',
+    container: 'Database',
+    objectLabel: 'Collection',
+    quote: '"',
+    // runQuery accepts { maxRows } and caps the cursor with it — find() via
+    // .limit(), aggregate() by stopping the iteration. The query the user
+    // typed is never edited to add a limit.
+    maxRowsOption: true,
+    keywords: [
+      'db', 'find', 'findOne', 'aggregate', 'countDocuments', 'sort', 'limit',
+      'skip', 'project',
+      // pipeline stages
+      '$match', '$group', '$project', '$sort', '$limit', '$skip', '$unwind',
+      '$lookup', '$addFields', '$set', '$unset', '$replaceRoot', '$facet',
+      '$bucket', '$count', '$sample', '$sortByCount', '$graphLookup', '$merge',
+      // query operators
+      '$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$and', '$or',
+      '$not', '$nor', '$exists', '$type', '$regex', '$options', '$elemMatch',
+      '$size', '$all', '$expr',
+    ],
+    functions: [
+      // accumulators and expression operators worth completing
+      '$sum', '$avg', '$min', '$max', '$first', '$last', '$push', '$addToSet',
+      '$count', '$concat', '$substr', '$toLower', '$toUpper', '$dateToString',
+      '$dateFromString', '$dateTrunc', '$year', '$month', '$dayOfMonth',
+      '$cond', '$ifNull', '$switch', '$round', '$multiply', '$divide',
+      '$subtract', '$add', '$size', '$arrayElemAt', '$filter', '$map',
+      // shell constructors
+      'ISODate', 'ObjectId', 'NumberLong', 'NumberDecimal', 'Date',
+    ],
+
+    /** Editor text → the params object runQuery expects. */
+    parseQuery: parseExplorerQuery,
+
+    /**
+     * Preview a collection in the same shell syntax the editor teaches, so
+     * what opens in a new worksheet is something the user could have typed.
+     */
+    previewQuery: (schema, collection, limit = 100) =>
+      `db.${collection}.find({}).limit(${limit})`,
+
+    /**
+     * Syntax check. The generic JSON check can't help here — `db.x.find({…})`
+     * isn't JSON — so this parses the statement exactly the way running it
+     * would, and reports whatever that rejects.
+     *
+     * `handled: true` tells public/database/validate.js not to add its own
+     * findings on top.
+     */
+    validate: (text) => {
+      try {
+        parseExplorerQuery(text);
+        return { handled: true, issues: [] };
+      } catch (err) {
+        const msg = String(err.message || 'Invalid query');
+        // mongodb-query-parser reports (line:col) against a source it wraps in
+        // a leading newline, with 0-based columns. Correct both, and clamp so
+        // an end-of-input error still lands on a real line.
+        const at = /\((\d+):(\d+)\)/.exec(msg);
+        const lines = String(text || '').split('\n');
+        let line = 1;
+        let column = 1;
+        if (at) {
+          line = Math.min(Math.max(1, Number(at[1]) - 1), lines.length);
+          column = Math.min(Math.max(1, Number(at[2]) + 1), (lines[line - 1] || '').length + 1);
+        }
+        // The raw text is "Unexpected token (3:0) in (\n…source…\n)" — drop the
+        // echoed source and the position, both of which we report separately.
+        const clean = msg.split('\n')[0]
+          .replace(/\s*in\s*\($/, '')
+          .replace(/\s*\(\d+:\d+\)/, '')
+          .trim();
+
+        return {
+          handled: true,
+          issues: [{ line, column, message: clean || 'Invalid query', severity: 'error' }],
+        };
+      }
+    },
+  }
 };
