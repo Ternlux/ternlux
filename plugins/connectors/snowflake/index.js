@@ -164,27 +164,64 @@ module.exports = {
   /**
    * Run SQL query
    */
-  runQuery: async (config, connectionId, queryObj) => {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRows] - Stop after this many rows.
+   *
+   * The cap is expressed to the driver as a row RANGE on the result stream, so
+   * the SQL the user wrote is the SQL Snowflake runs — no LIMIT is appended and
+   * no subquery is wrapped around it.
+   *
+   * The statement runs exactly ONCE on every path. A stream that fails is
+   * reported as a failure rather than retried unwrapped: re-running an
+   * arbitrary statement to work around a read problem is how an INSERT ends up
+   * applied twice.
+   */
+  runQuery: async (config, connectionId, queryObj, options = {}) => {
+    const maxRows = Number(options.maxRows);
+    const sqlQuery = queryObj.query;
+
     try {
       const connectionObj = getConnection(config, connectionId);
       const connection = await ensureConnected(connectionObj);
-      // Extract SQL query from the query object
-      const sqlQuery = queryObj.query;
-      // console.log('sqlQuery: ', sqlQuery)
-      const { stmt, rows } = await executeAsync(connection, sqlQuery);
 
-      // Extract column names from statement metadata
-      const columns = stmt.getColumns().map(col => col.getName());
-      // console.log('connection, query: ', stmt.getColumns().map(col => col.getName()), rows, sqlQuery)
+      if (!(maxRows > 0)) {
+        const { stmt, rows } = await executeAsync(connection, sqlQuery);
+        return {
+          success: true,
+          rows,
+          columns: stmt.getColumns().map(col => col.getName()),
+          rowCount: rows.length
+        };
+      }
 
-      return {
-        success: true,
-        rows: rows,
-        columns: columns,
-        rowCount: rows.length
-      };
+      return await new Promise((resolve) => {
+        connection.execute({
+          sqlText: sqlQuery,
+          streamResult: true,
+          complete: (err, stmt) => {
+            if (err) {
+              resolve({ success: false, message: err.message });
+              return;
+            }
+            const columns = stmt.getColumns().map(col => col.getName());
+            const rows = [];
+            // One past the cap, so "is there more?" is observed rather than
+            // assumed. `end` is inclusive and zero-based.
+            const stream = stmt.streamRows({ start: 0, end: maxRows });
+            stream.on('data', (row) => rows.push(row));
+            stream.on('error', (streamErr) => resolve({ success: false, message: streamErr.message }));
+            stream.on('end', () => resolve({
+              success: true,
+              rows: rows.slice(0, maxRows),
+              columns,
+              rowCount: Math.min(rows.length, maxRows),
+              truncated: rows.length > maxRows,
+            }));
+          }
+        });
+      });
     } catch (error) {
-      console.log('error: ', error)
       return { success: false, message: error.message };
     }
   },
@@ -598,5 +635,32 @@ module.exports = {
    */
   getPreviewQuery: (tableName, limit = 100) => {
     return `SELECT * FROM ${tableName} LIMIT ${limit}`;
+  },
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
+   * function lists are unioned with the shared ANSI baseline, so only what is
+   * distinctly Snowflake belongs here.
+   */
+  explorer: {
+    language: 'sql',
+    sqlDialect: 'Snowflake',
+    formatter: 'snowflake',
+    // runQuery honours { maxRows } via streamRows({start,end}) — see the note there.
+    maxRowsOption: true,
+    container: 'Schema',
+    objectLabel: 'Table',
+    quote: '"',
+    keywords: [
+      'QUALIFY', 'ILIKE', 'LATERAL FLATTEN', 'PIVOT', 'UNPIVOT', 'SAMPLE',
+      'CLONE', 'WAREHOUSE', 'STAGE', 'FILE FORMAT', 'COPY INTO', 'MERGE',
+      'VARIANT', 'OBJECT', 'ARRAY', 'AT', 'BEFORE', 'CHANGES', 'STREAM', 'TASK',
+    ],
+    functions: [
+      'FLATTEN', 'PARSE_JSON', 'TO_JSON', 'OBJECT_CONSTRUCT', 'ARRAY_AGG',
+      'ARRAY_CONSTRUCT', 'GET_PATH', 'DATE_TRUNC', 'DATEADD', 'DATEDIFF',
+      'CURRENT_TIMESTAMP', 'TO_VARCHAR', 'TO_NUMBER', 'TO_DATE', 'TRY_CAST',
+      'IFF', 'NVL', 'ZEROIFNULL', 'LISTAGG', 'RATIO_TO_REPORT',
+    ],
   }
 };
