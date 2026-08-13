@@ -5,6 +5,47 @@
   background: #e8e8e8;
 }
 
+/* ── Pinned assistant rail ──────────────────────────────────────────────
+   ChatAssistant publishes its pinned width as --chat-rail-w and puts
+   `chat-pinned` on <body>. Everything below keeps full-screen overlays out
+   from under the rail: they are `position: fixed`, so they resolve against
+   the viewport and would otherwise stretch behind it. */
+:root { --chat-rail-w: 0px; }
+
+/* The app's own column, everything except the assistant. */
+.app-view {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Layout containment makes this column the containing block for the fixed
+   overlays rendered inside it (WorkflowEditor, connection forms, execution
+   detail, data preview), so `inset: 0` now means "this column". */
+body.chat-pinned .app-view {
+  contain: layout paint;
+}
+
+/* antd portals its overlays to <body>, outside that containing block, so they
+   have to be pulled in off the right edge by hand. */
+body.chat-pinned .ant-modal-wrap,
+body.chat-pinned .ant-modal-mask,
+body.chat-pinned .ant-drawer,
+body.chat-pinned .ant-drawer-mask,
+body.chat-pinned .ant-image-preview-wrap,
+body.chat-pinned .ant-image-preview-mask {
+  right: var(--chat-rail-w);
+}
+
+/* Toasts are laid out as a full-width centering strip, so they need the width
+   released before `right` can move them. */
+body.chat-pinned .ant-message {
+  right: var(--chat-rail-w);
+  width: auto;
+}
+
 /* Nav bar */
 .app-nav {
   display: flex;

@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Workflows from './components/Workflows/Workflows'
 import ChatBot from './components/Chat/ChatBot';
+import ChatAssistant from './components/Chat/ChatAssistant';
 import ApiKeySetup from './components/ApiKeySetup/ApiKeySetup';
 import TermsAndConditions from './components/TermsAndConditions/TermsAndConditions';
 import Settings from './components/Settings/Settings';
@@ -14,6 +15,22 @@ function App() {
   // null = still checking, false = not yet accepted/set, true = ready
   const [termsAccepted, setTermsAccepted] = useState(null);
   const [apiKeyReady, setApiKeyReady] = useState(null);
+
+  // ── Assistant wiring ───────────────────────────────────────────────────
+  // The assistant sits here rather than inside Workflows so that pinning it
+  // right makes it a sibling column of the entire app: the view reflows to
+  // the space left over instead of being covered by a floating panel.
+  // What the user last clicked, reported up by the tabs: { kind, id, name, summary }.
+  const [chatContext, setChatContext] = useState(null);
+  // Accept-plan result handed back down to Workflows. The bump counter makes
+  // the same workflow id re-open if it is built twice in a row.
+  const [builtWorkflow, setBuiltWorkflow] = useState(null); // { id, bump }
+
+  const handleWorkflowBuilt = useCallback(({ workflowId } = {}) => {
+    if (!workflowId) return;
+    setBuiltWorkflow((prev) => ({ id: workflowId, bump: (prev?.bump || 0) + 1 }));
+  }, []);
+  const handleChatContextChange = useCallback((ctx) => setChatContext(ctx || null), []);
 
   useEffect(() => {
     const init = async () => {
@@ -68,8 +85,20 @@ function App() {
   }
 
   return (
-    <div className="app">
-    <Workflows />
+    // Row layout: the app view, then the assistant. Floating or closed, the
+    // assistant is position:fixed and takes no space here; pinned, it becomes
+    // a real 440px column and the view shrinks to fit beside it.
+    <div className="app" style={{ flexDirection: 'row', height: '100vh', overflow: 'hidden' }}>
+      <div className="app-view">
+        <Workflows
+          onChatContextChange={handleChatContextChange}
+          builtWorkflow={builtWorkflow}
+        />
+      </div>
+      <ChatAssistant
+        activeContext={chatContext}
+        onWorkflowBuilt={handleWorkflowBuilt}
+      />
     </div>
     // <div className="app">
     //   <nav className="app-nav">
