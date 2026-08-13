@@ -127,22 +127,80 @@ ORDER BY c.ordinal_position
    * Run SQL query
    * Accepts a query object with a 'query' field containing the SQL string
    */
-  runQuery: async (config, connectionId, queryObj) => {
-    try {
-      const pool = getPool(config, connectionId);
-      // Extract SQL query from the query object
-      const sqlQuery = queryObj.query;
-      const result = await pool.query(sqlQuery);
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRows] - Stop after this many rows.
+   *
+   * The cap is applied through a cursor, so the SQL the user wrote is the SQL
+   * Postgres runs — no LIMIT is appended and no subquery is wrapped around it.
+   * A cursor reads a bounded number of rows and the rest of the result is never
+   * materialised on either side of the wire.
+   *
+   * The statement runs exactly ONCE on every path. A cursor that fails is
+   * reported as a failure rather than retried unwrapped: re-running an
+   * arbitrary statement to work around a read problem is how an INSERT ends up
+   * applied twice.
+   */
+  runQuery: async (config, connectionId, queryObj, options = {}) => {
+    const pool = getPool(config, connectionId);
+    const sqlQuery = queryObj.query;
+    const maxRows = Number(options.maxRows);
 
-      return {
-        success: true,
-        rows: result.rows,
-        columns: result.fields ? result.fields.map(f => f.name) : [],
-        rowCount: result.rowCount
-      };
+    if (!(maxRows > 0)) {
+      try {
+        const result = await pool.query(sqlQuery);
+        return {
+          success: true,
+          rows: result.rows,
+          columns: result.fields ? result.fields.map(f => f.name) : [],
+          rowCount: result.rowCount
+        };
+      } catch (error) {
+        return { success: false, message: error.message };
+      }
+    }
+
+    const Cursor = require('pg-cursor');
+    let client;
+    try {
+      client = await pool.connect();
     } catch (error) {
       return { success: false, message: error.message };
     }
+
+    return new Promise((resolve) => {
+      let cursor;
+      try {
+        cursor = client.query(new Cursor(sqlQuery));
+      } catch (error) {
+        client.release();
+        resolve({ success: false, message: error.message });
+        return;
+      }
+      // One past the cap, so "is there more?" is observed rather than assumed.
+      cursor.read(maxRows + 1, (err, rows, result) => {
+        cursor.close(() => client.release());
+        if (err) {
+          resolve({ success: false, message: err.message });
+          return;
+        }
+        const all = rows || [];
+        const capped = all.slice(0, maxRows);
+        const fields = (result && result.fields) || [];
+        resolve({
+          success: true,
+          rows: capped,
+          columns: fields.length
+            ? fields.map(f => f.name)
+            : Object.keys(capped[0] || {}),
+          // A statement that returns no rows (DDL, or an UPDATE without
+          // RETURNING) completes through the same path with an empty array —
+          // its command tag is the only count there is, so report that.
+          rowCount: capped.length || (result && result.rowCount) || 0,
+          truncated: all.length > maxRows,
+        });
+      });
+    });
   },
 
   /**
@@ -531,5 +589,35 @@ ORDER BY c.ordinal_position
    */
   getPreviewQuery: (tableName, limit = 100) => {
     return `SELECT * FROM ${tableName} LIMIT ${limit}`;
+  },
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
+   * function lists are unioned with the shared ANSI baseline, so only what is
+   * distinctly PostgreSQL belongs here.
+   */
+  explorer: {
+    language: 'sql',
+    sqlDialect: 'PostgreSQL',
+    formatter: 'postgresql',
+    // runQuery honours { maxRows } via a cursor, so the Data Explorer never
+    // pulls a whole table across the wire to show the first page of it. The
+    // statement itself is passed through untouched.
+    maxRowsOption: true,
+    container: 'Schema',
+    objectLabel: 'Table',
+    quote: '"',
+    keywords: [
+      'ILIKE', 'RETURNING', 'ON CONFLICT', 'DO NOTHING', 'DO UPDATE', 'LATERAL',
+      'DISTINCT ON', 'MATERIALIZED', 'REFRESH MATERIALIZED VIEW', 'RECURSIVE',
+      'WINDOW', 'FILTER', 'TABLESAMPLE', 'EXPLAIN', 'ANALYZE', 'VACUUM', 'COPY',
+      'GENERATED', 'IDENTITY', 'SERIAL', 'BIGSERIAL', 'JSONB', 'ARRAY', 'INTERVAL',
+    ],
+    functions: [
+      'ARRAY_AGG', 'STRING_AGG', 'JSONB_AGG', 'JSON_AGG', 'JSONB_BUILD_OBJECT',
+      'DATE_TRUNC', 'EXTRACT', 'AGE', 'NOW', 'TO_CHAR', 'TO_DATE', 'TO_TIMESTAMP',
+      'GENERATE_SERIES', 'UNNEST', 'SPLIT_PART', 'REGEXP_REPLACE', 'REGEXP_MATCHES',
+      'PERCENTILE_CONT', 'PERCENTILE_DISC', 'GREATEST', 'LEAST',
+    ],
   }
 };
