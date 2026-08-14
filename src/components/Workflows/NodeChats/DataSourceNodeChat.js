@@ -1,35 +1,55 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { Select, Modal, message as antdMessage } from 'antd';
-import { PlusOutlined } from '@ant-design/icons';
+import { Modal, message as antdMessage } from 'antd';
+import {
+  FileExcelOutlined,
+  FileTextOutlined,
+  FileOutlined,
+  DatabaseOutlined,
+  ApiOutlined,
+  CloudOutlined,
+  AppstoreOutlined,
+} from '@ant-design/icons';
 import { connectionsDb } from '../../../utils/localDb';
-import { getWorkflowAssistance, extractSQL } from '../../../utils/workflowAI';
-import ChatArea from '../../Chat/ChatArea';
-import { FileExcelOutlined, FileTextOutlined } from '@ant-design/icons';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
 import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
 import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
 import { ReactComponent as MongodbIcon } from '../../ConnectorImages/Mongodb.svg';
 import { ReactComponent as SqlliteIcon } from '../../ConnectorImages/Sqllite.svg';
+import { ReactComponent as ParquetIcon } from '../../ConnectorImages/Parquet.svg';
+import { ReactComponent as AvroIcon } from '../../ConnectorImages/Avro.svg';
 import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/GoogleCloudStorage.svg';
 import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
 import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
 import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
-import { buildChatPrompt } from '../../../utils/chatPrompts';
 import CloudStorageBrowser from '../CloudStorageBrowser';
 import GoogleDrivePicker from '../GoogleDrivePicker';
 import ConnectionTypeSelector from '../ConnectionTypeSelector';
 import DynamicConnectionForm from '../connections/DynamicConnectionForm';
 import LocalFileConnectionForm from '../connections/LocalFileConnectionForm';
+import {
+  FORM_ACCENT,
+  FormScope, FormBody, FormFooter, Card, Fields, Field,
+  SearchSelect, StaticValue, Note, Handoff, HandoffBody, Picked, CloudButton, EmptyState,
+  SearchBox, ConnList, ConnGroupToggle, ConnRow, NewConnButton, IconFolder, IconChat,
+  GROUP_COLOR,
+} from './_formShared';
 
-const { Option } = Select;
 // ─────────────────────────────────────────────────────────────────────────────
-// DataSource Node Chat Component
-// Handles database, file (CSV/Excel), and API (POS) connections
+// Data Source Node configuration form
+//
+// Step 1 is always "pick a saved connection". What comes next follows the
+// connection's category, and the form never asks the user to restate it:
+//   SQL           → schema + table            NoSQL  → collection
+//   Vector        → index                     Sheets → spreadsheet + sheet
+//   Cloud storage → file picker (gates Save)  API    → save, then the chat opens
+//
+// The source is picked, not queried — there is no filter or load-options step.
+// REST API requests are authored in the ChatAssistant (build_dataSource), which
+// this form hands off to on save.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Helper to get database icon component
 const getDbIcon = (dbType) => {
   const iconMap = {
     postgres: PostgresIcon,
@@ -37,6 +57,7 @@ const getDbIcon = (dbType) => {
     mssql: MssqlIcon,
     mongodb: MongodbIcon,
     sqlite: SqlliteIcon,
+    nedb: SqlliteIcon,
     gcs: GoogleCloudStorageIcon,
     dropbox: DropboxIcon,
     'google-drive': GoogleDriveIcon,
@@ -45,537 +66,739 @@ const getDbIcon = (dbType) => {
   return iconMap[dbType?.toLowerCase()] || null;
 };
 
-// Helper to get connection icon (database or file)
-const getConnectionIcon = (connection) => {
-  // File-based connections
-  if (connection.connectionType === 'file') {
-    const fileName = connection.fileInfo?.fileName?.toLowerCase() || '';
-    if (fileName.endsWith('.csv')) {
-      return <FileTextOutlined style={{ fontSize: 20 }} />;
-    }
-    // Excel files (.xlsx, .xls)
-    return <FileExcelOutlined style={{ fontSize: 20 }} />;
-  }
-
-  // Database connections
-  const IconComponent = getDbIcon(connection.dbType);
-  return IconComponent ? <IconComponent style={{ width: 20, height: 20 }} /> : null;
+/** Icon for a local file, keyed by the format it was added as. */
+const getFileIcon = (fileType) => {
+  const iconMap = {
+    csv: () => <FileTextOutlined style={{ fontSize: 16, color: '#16a34a' }} />,
+    excel: () => <FileExcelOutlined style={{ fontSize: 16, color: '#1d6f42' }} />,
+    json: () => <FileTextOutlined style={{ fontSize: 16, color: '#d97706' }} />,
+    parquet: ParquetIcon,
+    avro: AvroIcon,
+    sqlite: SqlliteIcon,
+    nedb: SqlliteIcon,
+  };
+  return iconMap[fileType] || null;
 };
 
+/** Which dataset step a connection leads to. Mirrors the old chat branching. */
+const connKindOf = (conn) => {
+  if (!conn) return null;
+  if (conn.dbType === 'rest-api' || conn.dbCategory === 'API') return 'api';
+  // Ahead of the CloudStorage check: Sheets has its own spreadsheet+sheet
+  // import path, not the generic file browser.
+  if (conn.dbType === 'google-sheets') return 'sheets';
+  if (conn.dbCategory === 'CloudStorage') return 'cloud';
+  if (conn.dbCategory === 'Vector' || conn.dbType === 'lancedb' || conn.dbType === 'pinecone') return 'vector';
+  // Only a remote document store is still NoSQL. Local files — including JSON —
+  // are read as SQL by DuckDB.
+  if (conn.dbType === 'mongodb' || conn.dbType === 'nedb') return 'nosql';
+  if (conn.connectionType === 'database' || conn.dbType === 'sqlite' || conn.dbType === 'duckdb') return 'sql';
+  return 'ready';
+};
 
-const formatTimestamp = (ts) => {
-  const diff = Math.floor((Date.now() - new Date(ts)) / 60000);
-  if (diff < 1) return 'Just now';
-  if (diff < 60) return `${diff}m`;
-  return `${Math.floor(diff / 60)}h`;
+// A local file is registered by path and read in place by DuckDB, so `dbType`
+// records the reader ('duckdb'), not the format the user actually added. The
+// original file name is where that survives — recover it from the extension.
+const EXT_FILE_TYPE = {
+  '.csv': 'csv', '.tsv': 'csv',
+  '.xlsx': 'excel', '.xls': 'excel', '.xlsm': 'excel',
+  '.json': 'json', '.ndjson': 'json',
+  '.parquet': 'parquet',
+  '.avro': 'avro',
+  '.sqlite': 'sqlite', '.sqlite3': 'sqlite', '.db': 'sqlite',
+  '.nedb': 'nedb',
+};
+
+const FILE_TYPE_LABEL = {
+  csv: 'CSV',
+  excel: 'Excel',
+  json: 'JSON',
+  parquet: 'Parquet',
+  avro: 'Avro',
+  sqlite: 'SQLite',
+  nedb: 'NeDB',
+  lancedb: 'LanceDB',
+};
+
+const extensionOf = (name) => {
+  // A cloud import of a workbook appends the sheet — "sales.xlsx (Sheet1)".
+  const base = String(name || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const dot = base.lastIndexOf('.');
+  return dot >= 0 ? base.slice(dot).toLowerCase() : '';
+};
+
+/** What the user added, not what it is stored as. Null for non-file sources. */
+const fileTypeOf = (conn) => {
+  if (!conn || conn.connectionType !== 'file') return null;
+  // Local uploads keep `originalName`; cloud imports name the file `fileName`.
+  const name = conn.fileInfo?.originalName
+    || conn.fileInfo?.fileName
+    || conn.fileInfo?.sourceFilePath
+    || '';
+  const byExt = EXT_FILE_TYPE[extensionOf(name)];
+  if (byExt) return byExt;
+  // No usable name: fall back to how it was added, then to how it is read.
+  // 'spreadsheet' covers both CSV and Excel, so let the format decide instead.
+  if (conn.fileType && conn.fileType !== 'spreadsheet') return conn.fileType;
+  if (conn.fileInfo?.format) return conn.fileInfo.format; // csv | json | parquet
+  return conn.dbType === 'duckdb' ? null : conn.dbType || null;
+};
+
+/** The name of the file behind a local source, sheet suffix and all. */
+const fileNameOf = (conn) => conn?.fileInfo?.originalName
+  || conn?.fileInfo?.fileName
+  || (conn?.fileInfo?.sourceFilePath || '').split(/[\\/]/).pop()
+  || null;
+
+const KIND_LABEL = {
+  api: 'API',
+  cloud: 'Cloud storage',
+  sheets: 'Google Sheets',
+  vector: 'Vector',
+  nosql: 'NoSQL',
+  sql: 'SQL',
+  ready: 'File',
+};
+
+/** Category heading a connection is filed under in the picker. */
+const groupOf = (conn) => {
+  const kind = connKindOf(conn);
+  if (kind === 'api') return 'APIs';
+  if (kind === 'cloud' || kind === 'sheets') return 'Cloud Storage';
+  if (kind === 'vector') return 'Vector';
+  if (conn.connectionType === 'database') return 'Databases';
+  if (conn.connectionType === 'file') return 'Local Files';
+  return 'Other';
+};
+
+const GROUP_ORDER = ['Databases', 'Vector', 'Cloud Storage', 'APIs', 'Local Files', 'Other'];
+
+// Case-insensitive, digit-aware ordering — "table2" sorts before "table10".
+const byName = (a, b) => String(a).localeCompare(String(b), undefined, {
+  sensitivity: 'base', numeric: true,
+});
+
+const getConnectionIcon = (connection) => {
+  if (!connection) return null;
+  const kind = connKindOf(connection);
+  if (kind === 'api') return <ApiOutlined style={{ fontSize: 16 }} />;
+  if (kind === 'vector') {
+    const IconComponent = getDbIcon(connection.dbType);
+    return IconComponent ? <IconComponent /> : <AppstoreOutlined style={{ fontSize: 16 }} />;
+  }
+  if (kind === 'cloud') {
+    const IconComponent = getDbIcon(connection.dbType);
+    return IconComponent ? <IconComponent /> : <CloudOutlined style={{ fontSize: 16 }} />;
+  }
+  if (connection.connectionType === 'file') {
+    // Keyed off the format the user added, not the store it landed in — every
+    // CSV/Excel/JSON file is `dbType: 'duckdb'` and would otherwise share one
+    // icon.
+    const FileIcon = getFileIcon(fileTypeOf(connection));
+    if (FileIcon) return <FileIcon />;
+    const IconComponent = getDbIcon(connection.dbType);
+    return IconComponent ? <IconComponent /> : <FileOutlined style={{ fontSize: 16 }} />;
+  }
+  const IconComponent = getDbIcon(connection.dbType);
+  return IconComponent ? <IconComponent /> : <DatabaseOutlined style={{ fontSize: 16 }} />;
+};
+
+/**
+ * The line under a connection's name: what it is, then what it leads to.
+ * For a local file that first half is the format the user added — `dbType` is
+ * 'duckdb' for every CSV, Excel, JSON and Parquet source alike, which told the
+ * user nothing about which file they were picking.
+ */
+const connMeta = (conn) => {
+  const kind = connKindOf(conn);
+  const fileType = fileTypeOf(conn);
+  if (fileType) {
+    // "SQL" is true of every local file (DuckDB reads them all) and so says
+    // nothing; the format already carries the useful half.
+    const kindLabel = kind === 'sql' || kind === 'ready' ? 'Local file' : (KIND_LABEL[kind] || 'File');
+    return `${FILE_TYPE_LABEL[fileType] || fileType} · ${kindLabel}`;
+  }
+  return `${conn.dbType || conn.connectionType} · ${KIND_LABEL[kind] || 'Other'}`;
+};
+
+const sanitizeCollectionName = (raw, fallback) => {
+  const base = String(raw || fallback || 'api_response')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return base || 'api_response';
+};
+
+const inferColumnType = (value) => {
+  if (value === null || value === undefined) return 'string';
+  if (typeof value === 'number') return 'number';
+  if (typeof value === 'boolean') return 'boolean';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'string' && value.includes('[') && value.includes('dims]')) return 'vector';
+  return 'string';
 };
 
 const DataSourceNodeChat = ({
   node,
-  initialChat,
+  initialConfig,
   onSave,
+  onCancel,
+  onDirtyChange,
+  onRequestChatHandoff,
   onLoadDatabaseTables,
-  onConfigUpdate,
   onPreviewConfigUpdate,
-  executing = false
 }) => {
-
-  const messagesEndRef = useRef(null);
-  const chatContainerRef = useRef(null);
-  const inputRef = useRef(null);
   const initialized = useRef(false);
 
-  const [chat, setChat] = useState(initialChat);
-  const [inputValue, setInputValue] = useState('');
   const [connections, setConnections] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [aiLoading, setAiLoading] = useState(false);
-
-  // Database specific state
+  const [search, setSearch] = useState('');
   const [selConn, setSelConn] = useState(null);
-  const [dbTables, setDbTables] = useState([]); // Array of table names for AI
-  const [dbTableObjects, setDbTableObjects] = useState([]); // Full table objects with schema info
-  const [aiSelectedTables, setAiSelectedTables] = useState([]);
-  const [selectedTableSchemas, setSelectedTableSchemas] = useState({});
-  const [connectionComplete, setconnectionComplete] = useState(false);
-  const [latestWithSQL, setLatestWithSQL] = useState(null);
-  const [saveState, setSaveState] = useState(false);
-  const [selectedChoice, setSelectedChoice] = useState({});
-  const [tableAnalysisContext, setTableAnalysisContext] = useState(null); // Store initial analysis for context
-  const [disableInput, setDisableInput] = useState(false); // Store initial analysis for context
-  const [processingEnvironment, setProcessingEnvironment] = useState(null); // 'database' or 'local'
-  const [tableSchema, setTableSchema] = useState(null); // { tableName, columns, sampleData }
+  const [loading, setLoading] = useState(true);
+  const [tablesLoading, setTablesLoading] = useState(false);
 
-  // Cloud Storage Browser state
+  // Dataset selection
+  const [dbTableObjects, setDbTableObjects] = useState([]);
+  const [selectedSchema, setSelectedSchema] = useState(initialConfig?.sourceSchema || '');
+  const [selectedTableName, setSelectedTableName] = useState('');
+  const [tableSchema, setTableSchema] = useState(initialConfig?.sourceTableSchema || null);
+  const [latestWithSQL, setLatestWithSQL] = useState(null);
+
+  // Google Sheets: the spreadsheet's tabs, then the import result. selConn
+  // stays the Google Sheets connection so the picker keeps rendering; the
+  // imported SQLite file is what buildConfig actually points downstream at.
+  const [sheets, setSheets] = useState([]);
+  const [selectedSheet, setSelectedSheet] = useState('');
+  const [sheetsLoading, setSheetsLoading] = useState(false);
+  const [sheetImport, setSheetImport] = useState(null); // { tableName, localPath, sheetName }
+
+  // Cloud storage import
   const [cloudStorageBrowserOpen, setCloudStorageBrowserOpen] = useState(false);
   const [cloudStorageConnection, setCloudStorageConnection] = useState(null);
+  const [importedFile, setImportedFile] = useState(null);
   const [pluginManager, setPluginManager] = useState(null);
 
-  // Connection Type Selector state
+  // "New connection" modals
   const [isConnectionTypeSelectorOpen, setIsConnectionTypeSelectorOpen] = useState(false);
   const [activeDbType, setActiveDbType] = useState(null);
   const [installedPlugins, setInstalledPlugins] = useState([]);
 
-  // Connections Tab modal state
-  const [isConnectionsTabOpen, setIsConnectionsTabOpen] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [attempted, setAttempted] = useState(false);
+  // Saving here is synchronous, so a "saving…" flag can't guard a double
+  // click — going not-dirty after a save does, and says something truer.
+  const [hasSaved, setHasSaved] = useState(!!initialConfig?.nodeType);
 
-  // REST API DataSource state
-  //   apiFetchPrompt       — user's last natural-language request
-  //   apiFetchCode         — async JS function expression (with placeholders)
-  //                          that the main process evaluates and runs
-  //   apiFetchExplanation  — one-line summary from the AI
-  //   apiFetchResult       — result of the most recent live fetch (rowCount/localPath)
-  const [apiFetchPrompt, setApiFetchPrompt] = useState(null);
-  const [apiFetchCode, setApiFetchCode] = useState(null);
-  const [apiFetchExplanation, setApiFetchExplanation] = useState(null);
-  const [apiFetchResult, setApiFetchResult] = useState(null);
-  const [apiRunning, setApiRunning] = useState(false);
-  // True when the AI has produced a fetch function that has not yet been
-  // executed against the live endpoint. Drives the Run & Save button so a
-  // saved node reopened later does not prompt the user to re-run unless
-  // they have refined the request.
-  const [apiFetchDirty, setApiFetchDirty] = useState(false);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
-  // console.log('node: ', node)
-  // console.log('initialChat: ', initialChat)
-  // console.log('chat: ', chat)
-  // ─────────────────────────────────────────────────────────────────────────
-  // Initialize
-  // ─────────────────────────────────────────────────────────────────────────
+  const connKind = connKindOf(selConn);
 
-  useEffect(() => {
-    if (!initialized.current) {
-      initialized.current = true;
-      
-      console.log('DataSourceNodeChat initializing. initialChat length:', initialChat.length);
+  // ── Connection loading ───────────────────────────────────────────────────
 
-      // Restore state from saved config if reopening a saved node
-      const savedConfig = node?.data?.config;
-      if (savedConfig && initialChat.length > 0) {
-        // console.log('Restoring saved config:', savedConfig);
-
-        // Restore connection info
-        if (savedConfig.connectionId || savedConfig.sourceConnectionId || savedConfig.sourceApiConnectionId) {
-          const conn = {
-            id: savedConfig.sourceConnectionId,
-            name: savedConfig.sourceConnectionName,
-            connectionType: savedConfig.sourceConnectionType,
-            dbType: savedConfig.sourceDbType,
-            dbConfig: savedConfig.sourceDbConfig,
-            dbCategory: savedConfig.sourceDbCategory,
-            fileType: savedConfig.sourceType,
-            apiType: savedConfig.sourceType
-          };
-          setSelConn(conn);
-          setconnectionComplete(true);
-
-          // Restore selectedChoice with connection data
-          setSelectedChoice({
-            label: conn.name,
-            value: conn.id,
-            _data: conn
-          });
-
-          // Reload database tables for database connections (silent mode - don't add messages)
-          if (savedConfig.connectionType === 'database') {
-            loadDatabaseTables(conn, true);
-
-            // Restore selected tables/indexes
-            if (savedConfig.selectedTables) {
-              setAiSelectedTables(savedConfig.selectedTables);
-            } else if (savedConfig.sourceIndexName) {
-              // For vector databases, restore from sourceIndexName
-              const indexWithNamespace = savedConfig.sourceNamespace
-                ? `${savedConfig.sourceIndexName}/${savedConfig.sourceNamespace}`
-                : savedConfig.sourceIndexName;
-              setAiSelectedTables([indexWithNamespace]);
-            } else if (savedConfig.sourceTableName) {
-              // Fallback to sourceTableName
-              setAiSelectedTables([savedConfig.sourceTableName]);
-            } else if (savedConfig.sourceCollection) {
-              // Fallback to sourceCollection for NoSQL
-              setAiSelectedTables([savedConfig.sourceCollection]);
-            }
-
-            // Restore query for preview
-            if (savedConfig.sql || savedConfig.previewSql) {
-              setLatestWithSQL({
-                sql: savedConfig.sql || savedConfig.previewSql,
-                previewSql: savedConfig.previewSql || savedConfig.sql,
-                explanation: savedConfig.sqlExplanation || '',
-                queryDescription: savedConfig.queryDescription || ''
-              });
-            }
-
-            // Restore table schema
-            if (savedConfig.sourceTableSchema) {
-              setTableSchema(savedConfig.sourceTableSchema);
-            }
-          } else if (savedConfig.sourceConnectionType === 'api' || savedConfig.apiFetchCode) {
-            // Restore REST API fetch function so the user can refine or re-run
-            // it. Rebuild selConn so it points at the original API connection,
-            // not the local-nedb placeholder used for downstream routing.
-            const apiConn = {
-              id: savedConfig.sourceApiConnectionId,
-              name: savedConfig.sourceApiConnectionName,
-              connectionType: 'database',
-              dbType: 'rest-api',
-              dbConfig: savedConfig.apiConnectionPublicConfig || {},
-              dbCategory: 'API',
-            };
-            setSelConn(apiConn);
-
-            setApiFetchPrompt(savedConfig.apiFetchPrompt || null);
-            setApiFetchCode(savedConfig.apiFetchCode || null);
-            setApiFetchExplanation(savedConfig.apiFetchExplanation || '');
-            if (savedConfig.sourceLocalPath || savedConfig.sourceCollection) {
-              setApiFetchResult({
-                rowCount: null,
-                localPath: savedConfig.sourceLocalPath,
-                collection: savedConfig.sourceCollection,
-              });
-            }
-            // The fetch has already been run and saved — do not re-prompt for
-            // a run until the user refines the request (which flips the
-            // dirty flag).
-            setApiFetchDirty(false);
-          } else if (savedConfig.connectionType === 'file') {
-            // Restore for file-based connections (SQLite, NeDB, LanceDB)
-            // Add file path information if it's a file connection
-            if (savedConfig.sourceLocalPath) {
-              conn.fileInfo = {
-                filePath: savedConfig.sourceLocalPath
-              };
-            }
-
-            // Restore selected tables
-            if (savedConfig.sourceTableName) {
-              setAiSelectedTables([savedConfig.sourceTableName]);
-            } else if (savedConfig.sourceIndexName) {
-              // For LanceDB file connections
-              setAiSelectedTables([savedConfig.sourceIndexName]);
-            } else if (savedConfig.sourceCollection) {
-              // For NeDB file connections
-              setAiSelectedTables([savedConfig.sourceCollection]);
-            }
-
-            // Restore table schema
-            if (savedConfig.sourceTableSchema) {
-              setTableSchema(savedConfig.sourceTableSchema);
-            }
-          }
-        }
-      } else {
-        // New node - show initial message
-        if (initialChat.length === 0) {
-          setDisableInput(true);
-          addBotMessage("Hi! Let's configure your data source.\nWhich connection would you like to use?", true, 'connection', 'connectionId');
-        }
-      }
-
-      loadConnections();
-    }
-  }, []);
-
-  // Auto-scroll to bottom when chat messages change
-  useEffect(() => {
-    if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [chat]);
-
-  // Update node config when SQL changes to trigger data preview refresh
-  useEffect(() => {
-    if (latestWithSQL && latestWithSQL.previewSql && onPreviewConfigUpdate && selConn) {
-      const previewConfig = {
-        connectionId: selConn.id,
-        connectionName: selConn.name,
-        connectionType: selConn.connectionType,
-        dbType: selConn.dbType,
-        dbConfig: selConn.dbConfig,
-        sourceType: selConn.dbType,
-        sql: latestWithSQL.sql,
-        previewSql: latestWithSQL.previewSql,
-        sqlExplanation: latestWithSQL.explanation,
-        queryDescription: latestWithSQL.queryDescription
-      };
-      onPreviewConfigUpdate(node.id, previewConfig);
-    }
-  }, [latestWithSQL?.previewSql]);
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Core Functions
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const addBotMessage = (text, responseRequired = false, responseType = 'text', ref = '', placeholder = '', metadata = null) => {
-    setChat(prev => [...prev, {
-      id: `bot-${Date.now()}-${Math.random()}`,
-      sender: 'bot',
-      text,
-      timestamp: new Date(),
-      responseRequired,
-      responseType,
-      ref,
-      placeholder: placeholder || 'Type your response…',
-      metadata,
-    }]);
-  };
-
-  const addUserMessage = (text, ref, value, data = null) => {
-    const userMsg = {
-      id: `user-${Date.now()}-${Math.random()}`,
-      sender: 'user',
-      text,
-      timestamp: new Date(),
-      ref,
-      value: value || text,
-      data,
-    };
-    setChat(prev => [...prev, userMsg]);
-    return userMsg;
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Handle User Responses
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const handleUserResponse = async (text, ref, value, data) => {
-    const userMsg = addUserMessage(text, ref, value, data);
-    // console.log('value, data: ', value, data)
-    if (ref === 'connectionId') {
-      await handleConnectionSelection(userMsg);
-    } else if (ref === 'tableSelection') {
-      await handleTableSelection(userMsg);
-    } else if (ref === 'sheetSelection') {
-      await handleSheetSelection(userMsg);
-    } else if (ref === 'apiFetchRequest' || ref === 'apiFetchRefine') {
-      await handleApiFetchRequest(userMsg);
-    }
-    // Removed: processingEnvironment and databaseQuery handlers
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // REST API fetch flow
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const sanitizeCollectionName = (raw) => {
-    const base = String(raw || node?.id || 'api_response')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .slice(0, 64);
-    return base || 'api_response';
-  };
-
-  const handleApiFetchRequest = async (userMsg) => {
-    if (!selConn) return;
-
-    setAiLoading(true);
+  const loadConnections = useCallback(async () => {
     try {
-      const conversationHistory = chat
-        .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
-        .join('\n');
+      const conns = await connectionsDb.getAll();
 
-      const prompt = await buildChatPrompt('restApi.restApiAnalysisRequest', [{
-        userRequest: userMsg.text,
-        connectionAuthType: selConn.dbConfig?.authType || 'none',
-        connectionBaseUrl: selConn.dbConfig?.baseUrl || '',
-        connectionApiKeyName: selConn.dbConfig?.apiKeyName || '',
-        connectionBasicUser: selConn.dbConfig?.basicUser || '',
-        conversationHistory,
-      }]);
-
-      const response = await getWorkflowAssistance(
-        'rest-api',
-        prompt,
-        { connectionId: selConn.id, userRequest: userMsg.text },
-        chat.map(m => ({ sender: m.sender, text: m.text }))
-      );
-
-      let parsed;
-      try {
-        parsed = JSON.parse(response);
-      } catch (err) {
-        console.error('[RestApi] failed to parse AI JSON:', err, response);
-        addBotMessage('I had trouble understanding that. Could you rephrase the request?', true, 'text', 'apiFetchRefine', 'Try again…');
-        return;
-      }
-
-      switch (parsed.action) {
-        case 'answer_directly': {
-          addBotMessage(parsed.directAnswer || '', false);
-          addBotMessage(
-            'Would you like to refine further, or describe a different call?',
-            true,
-            'text',
-            'apiFetchRefine',
-            'Describe the data you want to fetch…'
-          );
-          break;
-        }
-
-        case 'ask_questions': {
-          addBotMessage(
-            parsed.followUpQuestion || 'Could you share a bit more detail?',
-            true,
-            'text',
-            'apiFetchRefine',
-            'Provide additional details…'
-          );
-          break;
-        }
-
-        case 'create_plan':
-        default: {
-          if (!parsed.code || typeof parsed.code !== 'string') {
-            addBotMessage('The AI did not return a valid fetch function. Please refine your request.', true, 'text', 'apiFetchRefine', 'Try again…');
-            return;
-          }
-          setApiFetchPrompt(userMsg.text);
-          setApiFetchCode(parsed.code);
-          setApiFetchExplanation(parsed.explanation || '');
-          setApiFetchResult(null);
-          setApiFetchDirty(true);
-
-          addBotMessage(
-            `✓ Fetch function ready.\n\n${parsed.explanation || 'Fetch function generated.'}`,
-            false,
-            'text',
-            '',
-            '',
-            {
-              javascriptFunction: parsed.code,
-            }
-          );
-          addBotMessage(
-            'Refine the request, or click Run & Save to execute the function and cache the data into a local NeDB collection.',
-            true,
-            'text',
-            'apiFetchRefine',
-            'Ask for changes or press Run & Save…'
-          );
-          setSaveState(true);
-          break;
-        }
-      }
-    } catch (err) {
-      console.error('[handleApiFetchRequest]', err);
-      addBotMessage(`Error generating fetch plan: ${err.message}`, false);
-    } finally {
-      setAiLoading(false);
-    }
-  };
-
-  /**
-   * Fire the live fetch in the main process, materialise rows into NeDB, then
-   * emit the complete node config via onSave.
-   */
-  const runAndSaveApiFetch = async () => {
-    if (!selConn || !apiFetchCode) {
-      addBotMessage('No fetch function to run yet.', false);
-      return;
-    }
-    if (!window.electronAPI?.dbConnect?.executeRestApiFetch) {
-      addBotMessage('REST API execution is not available in this build.', false);
-      return;
-    }
-
-    setApiRunning(true);
-    setSaveState(false);
-    try {
-      const collection = sanitizeCollectionName(node?.data?.label || node?.id);
-      const result = await window.electronAPI.dbConnect.executeRestApiFetch({
-        apiConnectionId: selConn.id,
-        apiConnectionConfig: selConn.dbConfig || {},
-        apiFetchCode,
-        nedbCollection: collection,
-        operationMode: 'new_table',
-      });
-
-      if (!result?.success) {
-        addBotMessage(`✗ Fetch failed: ${result?.error || 'Unknown error'}`, false);
-        setSaveState(true);
-        return;
-      }
-
-      const freshResult = {
-        rowCount: result.rowCount || 0,
-        localPath: result.localPath,
-        collection: result.collection || collection,
-      };
-      setApiFetchResult(freshResult);
-      setApiFetchDirty(false);
-
-      addBotMessage(
-        `✓ Fetched ${result.rowCount || 0} row${result.rowCount === 1 ? '' : 's'} into "${result.collection || collection}".`,
-        false
-      );
-
-      // Persist config via the normal save path. Pass freshResult directly
-      // since setApiFetchResult above hasn't flushed yet.
-      const config = buildConfig(freshResult);
-      onSave(config, chat);
-    } catch (err) {
-      console.error('[runAndSaveApiFetch]', err);
-      addBotMessage(`✗ Fetch error: ${err.message}`, false);
-      setSaveState(true);
-    } finally {
-      setApiRunning(false);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Connection Selection
-  // ─────────────────────────────────────────────────────────────────────────
-
-  // Load plugin manager on mount
-  useEffect(() => {
-    const loadPluginManager = async () => {
+      // Plugin metadata carries dbCategory / storageType, which decides the
+      // dataset step for each connection.
+      const pluginsMap = new Map();
       if (window.electronAPI?.dbConnect?.listPlugins) {
         try {
-          const result = await window.electronAPI.dbConnect.listPlugins();
-          if (result.success) {
-            // Create a simple plugin manager object
-            const manager = {
-              getConnector: (dbType) => {
-                const connector = result.connectors?.find(c => c.id === dbType);
-                return connector || null;
-              }
-            };
-            setPluginManager(manager);
+          const pluginsResult = await window.electronAPI.dbConnect.listPlugins();
+          if (pluginsResult.success && pluginsResult.connectors) {
+            pluginsResult.connectors.forEach((plugin) => pluginsMap.set(plugin.id, plugin));
+            setPluginManager({
+              getConnector: (dbType) => pluginsResult.connectors.find((c) => c.id === dbType) || null,
+            });
           }
         } catch (error) {
-          console.error('Failed to load plugin manager:', error);
+          console.error('Failed to load plugins:', error);
         }
       }
-    };
 
-    loadPluginManager();
+      const enriched = conns.map((conn) => {
+        const plugin = pluginsMap.get(conn.dbType);
+        return { ...conn, dbCategory: plugin?.dbCategory || null, storageType: plugin?.storageType || null };
+      });
+      setConnections(enriched);
+      return enriched;
+    } catch (err) {
+      console.error('Failed to load connections', err);
+      return [];
+    }
   }, []);
 
-  // Load installed plugins for connection forms
   useEffect(() => {
     const loadInstalledPlugins = async () => {
       try {
         if (window.electronAPI?.plugins?.listInstalled) {
           const result = await window.electronAPI.plugins.listInstalled();
-          if (result.success) {
-            setInstalledPlugins(result.connectors || []);
-          }
+          if (result.success) setInstalledPlugins(result.connectors || []);
         }
       } catch (error) {
         console.error('Failed to load installed plugins:', error);
       }
     };
-
     loadInstalledPlugins();
   }, []);
 
-  // Handle file selection from cloud storage browser
+  /**
+   * Re-attach the saved connection. A source that was imported (a cloud file)
+   * carries its local path in the config, so graft that back on rather than
+   * making the user re-import.
+   */
+  const restoreConnection = (list, cfg) => {
+    if (!cfg) return null;
+    if (cfg.sourceApiConnectionId) {
+      return list.find((c) => c.id === cfg.sourceApiConnectionId) || null;
+    }
+    const direct = list.find((c) => c.id === cfg.sourceConnectionId);
+    if (!direct) return null;
+    // Google Sheets keeps its own connection; the import is restored separately.
+    if (direct.dbType === 'google-sheets') return direct;
+    if (cfg.sourceConnectionType === 'file' && cfg.sourceLocalPath && !direct.fileInfo?.filePath) {
+      return {
+        ...direct,
+        connectionType: 'file',
+        fileInfo: { ...(direct.fileInfo || {}), filePath: cfg.sourceLocalPath },
+      };
+    }
+    return direct;
+  };
+
+  useEffect(() => {
+    if (initialized.current) return;
+    initialized.current = true;
+    (async () => {
+      setLoading(true);
+      const list = await loadConnections();
+
+      const restored = restoreConnection(list, initialConfig);
+      if (restored) {
+        setSelConn(restored);
+        const savedTable = initialConfig.sourceTableName
+          || initialConfig.sourceCollection
+          || initialConfig.sourceIndexName
+          || '';
+        setSelectedSchema(initialConfig.sourceSchema || '');
+
+        if (restored.dbType === 'google-sheets') {
+          // The spreadsheet + sheet were already imported into SQLite; restore
+          // the import rather than re-running it.
+          setSelectedTableName(initialConfig.sourceSpreadsheetId || '');
+          setSelectedSheet(initialConfig.sourceSheetName || '');
+          if (initialConfig.sourceLocalPath && initialConfig.sourceTableName) {
+            setSheetImport({
+              tableName: initialConfig.sourceTableName,
+              localPath: initialConfig.sourceLocalPath,
+              sheetName: initialConfig.sourceSheetName || '',
+            });
+          }
+        } else {
+          setSelectedTableName(savedTable);
+        }
+
+        if (initialConfig.sourceSql) {
+          setLatestWithSQL({
+            sql: initialConfig.sourceSql,
+            previewSql: initialConfig.sourcePreviewSql || initialConfig.sourceSql,
+            explanation: initialConfig.sourceSqlExplanation || '',
+            queryDescription: initialConfig.sourceQueryDescription || '',
+          });
+        }
+        const kind = connKindOf(restored);
+        if (kind !== 'api' && kind !== 'cloud' && kind !== 'ready') {
+          await loadTables(restored);
+        }
+      }
+      setLoading(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Table loading ────────────────────────────────────────────────────────
+
+  const loadTables = async (conn) => {
+    // LanceDB file connections already carry their table list from import.
+    if (conn.dbType === 'lancedb' && conn.connectionType === 'file') {
+      const tableList = conn.fileInfo?.tables || [];
+      setDbTableObjects(tableList.map((t) => ({ name: t, schema: null, type: 'table' })));
+      return;
+    }
+
+    setTablesLoading(true);
+    try {
+      const result = await onLoadDatabaseTables(conn);
+      if (!result?.success) {
+        console.log('Failed to load tables: ', result);
+        setDbTableObjects([]);
+        return;
+      }
+
+      let tableList = result.tables || [];
+
+      // A file connection only owns the tables that came from its own upload.
+      if (conn.connectionType === 'file' && conn.fileInfo?.tables?.length > 0) {
+        const owned = conn.fileInfo.tables;
+        tableList = tableList.filter((t) => owned.includes(t.name || String(t)));
+      }
+
+      setDbTableObjects(tableList.map((t) => ({
+        name: t.name || String(t),
+        schema: t.schema || null,
+        displayName: t.displayName || null,
+        type: t.type || null,
+      })));
+    } catch (err) {
+      console.error('Failed to load tables:', err);
+      setDbTableObjects([]);
+    } finally {
+      setTablesLoading(false);
+    }
+  };
+
+  // ── Connection selection ─────────────────────────────────────────────────
+
+  const selectConnection = async (conn) => {
+    setDirty(true);
+    setAttempted(false);
+    setSelConn(conn);
+    setDbTableObjects([]);
+    setSelectedSchema('');
+    setSelectedTableName('');
+    setSelectedSheet('');
+    setSheets([]);
+    setSheetImport(null);
+    setTableSchema(null);
+    setLatestWithSQL(null);
+    setImportedFile(null);
+
+    const kind = connKindOf(conn);
+
+    if (kind === 'cloud') {
+      setCloudStorageConnection(conn);
+      setCloudStorageBrowserOpen(true);
+      return;
+    }
+    if (kind === 'api' || kind === 'ready') return;
+
+    await loadTables(conn);
+  };
+
+  const filteredConnections = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return connections;
+    return connections.filter((c) =>
+      (c.name || '').toLowerCase().includes(q) || (c.dbType || '').toLowerCase().includes(q));
+  }, [connections, search]);
+
+  const groupedConnections = useMemo(() => {
+    const buckets = new Map();
+    filteredConnections.forEach((c) => {
+      const g = groupOf(c);
+      if (!buckets.has(g)) buckets.set(g, []);
+      buckets.get(g).push(c);
+    });
+    buckets.forEach((list) => list.sort((a, b) => byName(a.name, b.name)));
+    return GROUP_ORDER.filter((g) => buckets.has(g)).map((g) => [g, buckets.get(g)]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredConnections]);
+
+  // Categories collapse so a long connection list stays navigable. Seed with
+  // the group holding the current selection, else the first group.
+  const [openGroups, setOpenGroups] = useState({});
+  const groupsSeeded = useRef(false);
+  useEffect(() => {
+    // Wait for init to finish, so a restored connection is already known and
+    // we open ITS group rather than defaulting to the first one.
+    if (groupsSeeded.current || loading || groupedConnections.length === 0) return;
+    groupsSeeded.current = true;
+    const current = selConn ? groupOf(selConn) : null;
+    setOpenGroups({ [current || groupedConnections[0][0]]: true });
+  }, [groupedConnections, selConn, loading]);
+
+  const toggleGroup = (group) => setOpenGroups((prev) => ({ ...prev, [group]: !prev[group] }));
+
+  // While searching, show every matching group expanded — collapsing hides hits.
+  const searching = search.trim().length > 0;
+
+  // ── Dataset selection ────────────────────────────────────────────────────
+
+  const schemaOptions = useMemo(() => {
+    const set = new Set(dbTableObjects.map((t) => t.schema).filter(Boolean));
+    return Array.from(set).sort(byName);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dbTableObjects]);
+
+  const tableOptions = useMemo(() => {
+    const scoped = schemaOptions.length > 0 && selectedSchema
+      ? dbTableObjects.filter((t) => t.schema === selectedSchema)
+      : dbTableObjects;
+    return scoped
+      .map((t) => ({ label: t.displayName || t.name, value: t.name }))
+      .sort((a, b) => byName(a.label, b.label));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dbTableObjects, schemaOptions, selectedSchema]);
+
+  const sheetOptions = useMemo(() => (
+    [...sheets]
+      .sort((a, b) => byName(a.name, b.name))
+      .map((s) => ({
+        label: `${s.name} — ${s.rowCount} rows × ${s.columnCount} columns`,
+        value: s.name,
+      }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ), [sheets]);
+
+  const selectedTable = useMemo(
+    () => dbTableObjects.find((t) => t.name === selectedTableName) || null,
+    [dbTableObjects, selectedTableName],
+  );
+
+  // Only one schema / one table (a CSV or single-sheet Excel import, say) means
+  // there is no choice to make — take it and show it as a read-only value
+  // rather than a dropdown with a single option.
+  const onlySchema = schemaOptions.length === 1 ? schemaOptions[0] : null;
+  const onlyTable = tableOptions.length === 1 ? tableOptions[0] : null;
+
+  useEffect(() => {
+    if (onlySchema && !selectedSchema) setSelectedSchema(onlySchema);
+  }, [onlySchema, selectedSchema]);
+
+  const loadTableSchemaFromDB = async (table, connection = null, sheetName = null) => {
+    const conn = connection || selConn;
+    try {
+      // Prefer a schema captured at import time.
+      if (conn.fileInfo?.schemas) {
+        let savedSchema = null;
+        if (Array.isArray(conn.fileInfo.schemas)) {
+          savedSchema = conn.fileInfo.schemas.find((s) => s.tableName === table.name);
+        } else if (conn.fileInfo.schemas.tableName === table.name) {
+          savedSchema = conn.fileInfo.schemas;
+        }
+        if (savedSchema) {
+          setTableSchema(savedSchema);
+          return savedSchema;
+        }
+      }
+
+      // A workbook became one Parquet file per sheet, so the selected table
+      // decides which file to read — fileInfo.filePath is only the first.
+      const localPath = conn.connectionType === 'file'
+        ? (conn.fileInfo?.tablePaths?.[table.name] || conn.fileInfo?.filePath)
+        : null;
+      const schema = await loadTableSchema({
+        connection: conn,
+        tableName: table.name,
+        tableSchema: table.schema,
+        localPath,
+        sheetName,
+      });
+      if (schema) setTableSchema(schema);
+      return schema || null;
+    } catch (error) {
+      console.error('Failed to load table schema:', error);
+      return null;
+    }
+  };
+
+  const loadVectorTableSchema = async (table) => {
+    try {
+      const result = await window.electronAPI.skills.queryVectorPreview({
+        vectorDbType: selConn.dbType,
+        tableName: table.name,
+        namespace: table.schema || '',
+        dbConfig: selConn.dbConfig || {},
+        connectionId: selConn.id,
+        targetLocalPath: selConn.localPath || selConn.fileInfo?.filePath,
+      });
+
+      if (result.success && result.data?.length > 0) {
+        const sampleRecord = result.data[0];
+        const schema = {
+          tableName: table.name,
+          columns: Object.keys(sampleRecord).map((key) => ({
+            name: key,
+            type: inferColumnType(sampleRecord[key]),
+            nullable: true,
+          })),
+          sampleData: result.data.slice(0, 5),
+          recordCount: result.totalRows || result.recordCount,
+        };
+        setTableSchema(schema);
+        return schema;
+      }
+      console.warn('No data returned from vector database preview');
+      return null;
+    } catch (error) {
+      console.error('Failed to load vector table schema:', error);
+      return null;
+    }
+  };
+
+  /** Picking a table loads its schema and the preview query for DataPreview. */
+  const selectTable = async (tableName) => {
+    setDirty(true);
+    setSelectedTableName(tableName);
+    setSelectedSheet('');
+    setSheets([]);
+    setSheetImport(null);
+    setTableSchema(null);
+    setLatestWithSQL(null);
+
+    const table = dbTableObjects.find((t) => t.name === tableName);
+    if (!table) return;
+
+    if (connKind === 'sheets') {
+      await loadSheetsFor(table);
+      return;
+    }
+
+    if (connKind === 'vector') {
+      setTablesLoading(true);
+      const schema = await loadVectorTableSchema(table);
+      setTablesLoading(false);
+      pushPreview({ tableName, table, tableSchema: schema, latestWithSQL: null, sheetImport: null });
+      return;
+    }
+
+    setTablesLoading(true);
+    try {
+      let previewQuery;
+      if (selConn.dbType === 'mongodb' || selConn.dbType === 'nedb') {
+        previewQuery = JSON.stringify({ collection: table.name, filter: {}, limit: 100 });
+      } else {
+        const quoted = await window.electronAPI.dbConnect.quoteIdentifier(
+          selConn.dbType, table.name, table.schema, selConn.dbConfig, selConn.id,
+        );
+        const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
+          selConn.dbType, quoted.quotedIdentifier, 100,
+        );
+        previewQuery = previewResult.success
+          ? previewResult.previewQuery
+          : `SELECT * FROM ${quoted.quotedIdentifier} LIMIT 100`;
+      }
+
+      const schema = await loadTableSchemaFromDB(table);
+
+      const sql = {
+        sql: previewQuery,
+        previewSql: previewQuery,
+        explanation: `Selecting all columns from ${table.schema ? `${table.schema}.${table.name}` : table.name}`,
+        queryDescription: `Preview data from ${table.name}`,
+      };
+      setLatestWithSQL(sql);
+
+      // One push, with the query AND the schema already in hand.
+      pushPreview({ tableName, table, tableSchema: schema, latestWithSQL: sql, sheetImport: null });
+    } catch (err) {
+      console.error('Failed to prepare table preview:', err);
+    } finally {
+      setTablesLoading(false);
+    }
+  };
+
+  // Take the only table on offer without asking. Guarded by a ref rather than
+  // by selectTable's identity, which changes every render.
+  const autoPickedRef = useRef(null);
+  useEffect(() => {
+    if (!onlyTable || selectedTableName) return;
+    if (schemaOptions.length > 0 && !selectedSchema) return;
+    if (autoPickedRef.current === onlyTable.value) return;
+    autoPickedRef.current = onlyTable.value;
+    selectTable(onlyTable.value);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onlyTable, selectedTableName, selectedSchema, schemaOptions.length]);
+
+  // ── Google Sheets ────────────────────────────────────────────────────────
+
+  const loadSheetsFor = async (spreadsheet) => {
+    setSheetsLoading(true);
+    try {
+      const columnsResult = await window.electronAPI.dbConnect.getColumns(
+        selConn.dbType, selConn.dbConfig, spreadsheet.schema, spreadsheet.name, selConn.id,
+      );
+      setSheets(columnsResult.success && columnsResult.sheets ? columnsResult.sheets : []);
+    } catch (error) {
+      console.error('Failed to load sheets:', error);
+      antdMessage.error('Failed to load sheets from this spreadsheet.');
+      setSheets([]);
+    } finally {
+      setSheetsLoading(false);
+    }
+  };
+
+  /**
+   * Selecting a sheet imports it into SQLite and re-points the connection at
+   * the imported file, exactly as the chat flow did.
+   */
+  const selectSheet = async (sheetName) => {
+    setDirty(true);
+    setSelectedSheet(sheetName);
+    setSheetImport(null);
+    if (!sheetName || !selectedTable) return;
+
+    setSheetsLoading(true);
+    try {
+      const importResult = await window.electronAPI.dbConnect.importGoogleSheetToSqlite(
+        selConn.dbConfig, selConn.id, selectedTable.name, sheetName,
+      );
+
+      if (!importResult.success) {
+        antdMessage.error(`Failed to import sheet: ${importResult.message}`);
+        return;
+      }
+
+      const schema = await loadTableSchema({
+        connection: { dbType: 'sqlite', dbConfig: {} },
+        tableName: importResult.tableName,
+        tableSchema: null,
+        localPath: importResult.localPath,
+        limit: 5,
+      });
+      if (schema) setTableSchema({ ...schema, sheetName });
+
+      const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
+        'sqlite', `"${importResult.tableName}"`, 100,
+      );
+      const previewQuery = previewResult.success
+        ? previewResult.previewQuery
+        : `SELECT * FROM "${importResult.tableName}" LIMIT 100`;
+
+      const nextImport = {
+        tableName: importResult.tableName,
+        localPath: importResult.localPath,
+        sheetName,
+      };
+      const sql = {
+        sql: previewQuery,
+        previewSql: previewQuery,
+        explanation: `Selecting all columns from ${importResult.tableName}`,
+        queryDescription: `Preview data from ${sheetName}`,
+      };
+      setSheetImport(nextImport);
+      setLatestWithSQL(sql);
+      pushPreview({
+        sheetImport: nextImport,
+        tableName: nextImport.tableName,
+        tableSchema: schema ? { ...schema, sheetName } : null,
+        latestWithSQL: sql,
+        spreadsheetId: selectedTable.name,
+      });
+      antdMessage.success(`Imported ${importResult.rowCount} rows from "${sheetName}".`);
+    } catch (error) {
+      console.error('Failed to import Google Sheet:', error);
+      antdMessage.error('Failed to import Google Sheet. Please try again.');
+    } finally {
+      setSheetsLoading(false);
+    }
+  };
+
+  // ── Cloud storage import ─────────────────────────────────────────────────
+
   const handleCloudFileSelect = async (fileInfo) => {
     setCloudStorageBrowserOpen(false);
 
-    // Create a local file connection from the imported cloud file
     const localConnection = {
       id: `cloud-import-${Date.now()}`,
       name: `[${cloudStorageConnection.name}] ${fileInfo.fileName}`,
@@ -585,597 +808,86 @@ const DataSourceNodeChat = ({
         fileName: fileInfo.fileName,
         filePath: fileInfo.localPath,
         tables: fileInfo.tables,
-        schemas: fileInfo.schemas // Store schema(s) from import
+        schemas: fileInfo.schemas,
       },
-      cloudSource: fileInfo.cloudSource
+      cloudSource: fileInfo.cloudSource,
     };
 
-    // Save this as a new connection
     try {
-      // Add user message with connection data BEFORE saving
-      // This ensures buildConfig() picks up the imported file connection, not the cloud storage one
-      addUserMessage(
-        `${localConnection.name}`,
-        'connectionId',
-        localConnection.id,
-        localConnection
-      );
-
       await connectionsDb.save(localConnection);
+      await loadConnections();
 
-      // Update selected connection
       setSelConn(localConnection);
-      setconnectionComplete(true);
-      setDisableInput(true);
-      setLoading(true);
+      setImportedFile({
+        name: fileInfo.fileName,
+        path: fileInfo.cloudSource?.objectPath || fileInfo.fileName,
+      });
+      setDirty(true);
 
-      // Load tables from the imported file (silent mode - we handle messages below) for preview section
-      await loadDatabaseTables(localConnection, true);
+      await loadTables(localConnection);
 
-      // Set up the first table for preview (similar to handleTableSelection)
-      if (fileInfo.tables && fileInfo.tables.length > 0) {
-        const tableName = fileInfo.tables[0];
-        setAiSelectedTables([tableName]);
+      const tableName = fileInfo.tables?.[0];
+      if (tableName) {
+        setSelectedTableName(tableName);
 
-        // Use saved schema if available, otherwise load from DB
+        let schema = null;
         if (fileInfo.schemas) {
-          // Use the first schema (for single table files) or find matching schema
-          const schema = Array.isArray(fileInfo.schemas)
-            ? fileInfo.schemas.find(s => s.tableName === tableName) || fileInfo.schemas[0]
+          schema = Array.isArray(fileInfo.schemas)
+            ? fileInfo.schemas.find((s) => s.tableName === tableName) || fileInfo.schemas[0]
             : fileInfo.schemas;
-
-          if (schema) {
-            setTableSchema(schema);
-            console.log('Using saved schema:', schema);
-          }
+          if (schema) setTableSchema(schema);
         } else if (fileInfo.dbType !== 'lancedb') {
-          // Fallback: Load table schema from DB (skip for LanceDB)
-          await loadTableSchemaFromDB({ name: tableName, schema: null }, localConnection);
+          schema = await loadTableSchemaFromDB({ name: tableName, schema: null }, localConnection);
         }
 
-        // Generate preview query based on database type
-        const isNoSQL = fileInfo.dbType === 'nedb';
-        const isLanceDB = fileInfo.dbType === 'lancedb';
-        let previewQuery;
-
-        if (isLanceDB) {
-          // LanceDB - no SQL preview query needed for vector databases
-          previewQuery = null;
-        } else if (isNoSQL) {
-          // NeDB/MongoDB - use JSON query format
-          previewQuery = JSON.stringify({
-            collection: tableName,
-            filter: {},
-            limit: 100
-          });
+        let sql = null;
+        if (fileInfo.dbType === 'lancedb') {
+          // Vector sources have no SQL preview query.
+        } else if (fileInfo.dbType === 'nedb') {
+          const previewQuery = JSON.stringify({ collection: tableName, filter: {}, limit: 100 });
+          sql = {
+            sql: previewQuery,
+            previewSql: previewQuery,
+            explanation: `Selecting all documents from ${tableName}`,
+            queryDescription: `Preview data from ${tableName}`,
+          };
         } else {
-          // SQLite - use database-specific preview query syntax
           const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
-            fileInfo.dbType || 'sqlite',
-            `"${tableName}"`,
-            100
+            fileInfo.dbType || 'sqlite', `"${tableName}"`, 100,
           );
-          previewQuery = previewResult.success ? previewResult.previewQuery : `SELECT * FROM "${tableName}" LIMIT 100`;
-        }
-
-        // Store the query for preview (skip for LanceDB)
-        if (!isLanceDB) {
-          setLatestWithSQL({
+          const previewQuery = previewResult.success
+            ? previewResult.previewQuery
+            : `SELECT * FROM "${tableName}" LIMIT 100`;
+          sql = {
             sql: previewQuery,
             previewSql: previewQuery,
             explanation: `Selecting all columns from ${tableName}`,
-            queryDescription: `Preview data from ${tableName}`
-          });
+            queryDescription: `Preview data from ${tableName}`,
+          };
+        }
+        if (sql) setLatestWithSQL(sql);
+
+        // selConn hasn't flushed yet, so build against the imported connection.
+        if (onPreviewConfigUpdate) {
+          onPreviewConfigUpdate(node.id, buildConfigFor(localConnection, {
+            tableName,
+            table: { name: tableName, schema: null },
+            tableSchema: schema,
+            latestWithSQL: sql,
+            sheetImport: null,
+          }));
         }
       }
-
-      addBotMessage(
-        `File imported successfully! Tables loaded from "${fileInfo.fileName}". Configuration complete! Click Save below.`,
-        false
-      );
-
-      // Enable save button
-      setSaveState(true);
     } catch (error) {
       console.error('Failed to save cloud import connection:', error);
-      addBotMessage('Failed to import file. Please try again.', false);
+      antdMessage.error('Failed to import the file. Please try again.');
     }
   };
 
-  const handleConnectionSelection = async (userMsg) => {
-    const conn = userMsg.data;
-    setSelConn(conn);
+  // ── New connection modals ────────────────────────────────────────────────
 
-    // REST API connection: auth lives on the connection, but the actual
-    // endpoint + request shape is authored here via natural language. The
-    // resulting fetch plan will be executed in the main process and
-    // materialised to a local NeDB collection.
-    if (conn.dbType === 'rest-api') {
-      setconnectionComplete(true);
-      setDisableInput(false);
-      const baseUrl = conn.dbConfig?.baseUrl;
-      const urlLine = baseUrl ? `\n\nBase URL: ${baseUrl}` : '';
-      addBotMessage(
-        `Connected to "${conn.name}".${urlLine}\n\nDescribe the request you want to make — which endpoint to call and the HTTP method (e.g., "GET /users?status=active" or "POST /orders with a JSON body").`,
-        true,
-        'text',
-        'apiFetchRequest',
-        'e.g. GET /users?status=active'
-      );
-      return;
-    }
-
-    // Check if this is a cloud storage connection
-    const isCloudStorage = conn.dbCategory === 'CloudStorage';
-
-    if (isCloudStorage) {
-      // Open cloud storage browser
-      setCloudStorageConnection(conn);
-      setCloudStorageBrowserOpen(true);
-      addBotMessage(`Opening cloud storage browser for "${conn.name}"...`, false);
-      return;
-    }
-
-    // Handle LanceDB file connections separately - tables are already in fileInfo
-    if (conn.dbType === 'lancedb' && conn.connectionType === 'file') {
-      setDisableInput(true);
-      setconnectionComplete(true);
-
-      // Get tables from fileInfo (already loaded during import)
-      const tableList = conn.fileInfo?.tables || [];
-
-      if (tableList.length > 0) {
-        // Store table names
-        setDbTables(tableList);
-        setDbTableObjects(tableList.map(t => ({ name: t, schema: null, type: 'table' })));
-
-        addBotMessage(
-          `Connected! Found ${tableList.length} table${tableList.length !== 1 ? 's' : ''} in "${conn.name}".\n\nYou can view the schema in the Data Preview panel below.`,
-          false
-        );
-        addBotMessage(
-          'Which table would you like to use?',
-          true,
-          'choice',
-          'tableSelection',
-          '',
-          {
-            choices: tableList.map(tableName => ({
-              label: tableName,
-              value: tableName,
-              description: '',
-              _data: { name: tableName, schema: null, type: 'table' },
-              displayType: 'dropdown'
-            }))
-          }
-        );
-      } else {
-        addBotMessage('No tables found in this LanceDB. Make sure the directory contains valid .lance table folders.', false);
-      }
-    }
-    // Handle database connections and local database files (SQLite, NeDB)
-    else if (conn.connectionType === 'database' || conn.dbType === 'sqlite' || conn.dbType === 'nedb') {
-      // Load database tables directly (no processing environment question)
-      setDisableInput(true); // Keep input disabled for database connections
-      setconnectionComplete(true);
-      setLoading(true); // Set loading immediately to hide choices
-      await loadDatabaseTables(conn);
-    } else {
-      // Non-database connections end here (CSV/Excel imported to internal db, JSON imported to NeDB)
-      // Keep input disabled since configuration is complete
-      setconnectionComplete(true);
-      addBotMessage(`"${conn.name}" selected. Configuration complete! Click Save below.`, false);
-      setSaveState(true)
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Table Selection
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const handleTableSelection = async (userMsg) => {
-    const selectedTable = userMsg.data; // Table object with name and schema
-    setAiSelectedTables([selectedTable.name]); // Store selected table name
-
-    // Check if this is Google Sheets - need to select sheet/tab
-    if (selConn?.dbType === 'google-sheets') {
-      setLoading(true);
-      try {
-        // Get sheets list from the spreadsheet
-        const columnsResult = await window.electronAPI.dbConnect.getColumns(
-          selConn.dbType,
-          selConn.dbConfig,
-          selectedTable.schema,
-          selectedTable.name, // This is the spreadsheet ID
-          selConn.id
-        );
-
-        if (columnsResult.success && columnsResult.sheets && columnsResult.sheets.length > 0) {
-          setLoading(false);
-
-          addBotMessage(
-            `Selected "${selectedTable.displayName || selectedTable.name}". This spreadsheet has ${columnsResult.sheets.length} sheet${columnsResult.sheets.length !== 1 ? 's' : ''}.`,
-            false
-          );
-
-          addBotMessage(
-            'Which sheet would you like to use?',
-            true,
-            'choice',
-            'sheetSelection',
-            '',
-            {
-              choices: columnsResult.sheets.map(sheet => ({
-                label: sheet.name,
-                value: sheet.name,
-                description: `${sheet.rowCount} rows × ${sheet.columnCount} columns`,
-                _data: {
-                  ...selectedTable,
-                  sheetName: sheet.name,
-                  sheetIndex: sheet.index
-                },
-                displayType: 'dropdown'
-              }))
-            }
-          );
-          return;
-        }
-      } catch (error) {
-        console.error('Failed to load sheets:', error);
-        addBotMessage('Failed to load sheets from this spreadsheet.', false);
-        setLoading(false);
-        return;
-      }
-    }
-
-    // Handle vector databases (LanceDB and Pinecone)
-    const isVectorDB = selConn?.dbCategory === 'Vector' || selConn?.dbType === 'lancedb' || selConn?.dbType === 'pinecone';
-
-    if (isVectorDB) {
-      // For vector databases, load schema from the database
-      setLoading(true);
-      await loadVectorTableSchema(selectedTable);
-      setLoading(false);
-
-      addBotMessage(
-        `Table "${selectedTable.name}" selected. Configuration complete! Click Save below.`,
-        false
-      );
-      setSaveState(true); // Enable save button
-      return;
-    }
-
-    // Generate a basic query for preview based on database type
-    const isMongoDB = selConn?.dbType === 'mongodb';
-    let previewQuery;
-
-    if (isMongoDB) {
-      // MongoDB JSON query
-      previewQuery = JSON.stringify({
-        collection: selectedTable.name,
-        filter: {},
-        limit: 100
-      });
-    } else {
-      // SQL query - use database-specific identifier quoting
-      const quotedResult = await window.electronAPI.dbConnect.quoteIdentifier(
-        selConn.dbType,
-        selectedTable.name,
-        selectedTable.schema,
-        selConn.dbConfig,
-        selConn.id
-      );
-      const fullTableName = quotedResult.quotedIdentifier;
-
-      // Use database-specific preview query syntax
-      const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
-        selConn.dbType,
-        fullTableName,
-        100
-      );
-      previewQuery = previewResult.previewQuery;
-    }
-
-    // Load table schema with columns and sample data
-    await loadTableSchemaFromDB(selectedTable);
-
-    // Store the query for preview
-    setLatestWithSQL({
-      sql: previewQuery,
-      previewSql: previewQuery,
-      explanation: `Selecting all columns from ${selectedTable.schema ? `${selectedTable.schema}.${selectedTable.name}` : selectedTable.name}`,
-      queryDescription: `Preview data from ${selectedTable.name}`
-    });
-
-    addBotMessage(
-      `Table "${selectedTable.schema ? `${selectedTable.schema}.${selectedTable.name}` : selectedTable.name}" selected. Configuration complete! Click Save below.`,
-      false
-    );
-
-    setSaveState(true); // Enable save button
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Sheet Selection (for Google Sheets)
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const handleSheetSelection = async (userMsg) => {
-    const sheetData = userMsg.data; // Contains spreadsheet info + selected sheet
-    const { name: spreadsheetId, displayName, sheetName } = sheetData;
-
-    setLoading(true);
-
-    try {
-      addBotMessage(`Importing sheet "${sheetName}" from "${displayName}"...`, false);
-
-      // Import the Google Sheet to SQLite
-      const importResult = await window.electronAPI.dbConnect.importGoogleSheetToSqlite(
-        selConn.dbConfig,
-        selConn.id,
-        spreadsheetId,
-        sheetName
-      );
-
-      if (!importResult.success) {
-        addBotMessage(`Failed to import sheet: ${importResult.message}`, false);
-        setLoading(false);
-        return;
-      }
-
-      console.log('Import result:', importResult);
-
-      // Update the connection to point to the imported SQLite file
-      const actualFileName = 'app-data.db'; // This is hardcoded in the plugin
-
-      const localConnection = {
-        ...selConn,
-        connectionType: 'file',
-        fileType: 'sqlite',
-        dbType: 'sqlite',
-        dbConfig: {},
-        fileInfo: {
-          filePath: importResult.localPath,
-          fileName: actualFileName, // Use actual file name from the path
-          dbType: 'sqlite',
-          tables: [importResult.tableName],
-          source: 'google-sheets',
-          originalSpreadsheetId: spreadsheetId,
-          originalSpreadsheetName: displayName,
-          originalSheetName: sheetName
-        },
-        // Keep the original Google Sheets connection info for reference
-        _googleSheetsSource: {
-          spreadsheetId,
-          spreadsheetName: displayName,
-          sheetName
-        }
-      };
-
-      setSelConn(localConnection);
-
-      // Update selected tables to use the imported SQLite table name
-      setAiSelectedTables([importResult.tableName]);
-
-      // Load schema from the imported SQLite table
-      const schema = await loadTableSchema({
-        connection: { dbType: 'sqlite', dbConfig: {} },
-        tableName: importResult.tableName,
-        tableSchema: null,
-        localPath: importResult.localPath,
-        limit: 5
-      });
-
-      if (schema) {
-        setTableSchema(schema);
-      }
-
-      // Generate preview query for the SQLite table
-      const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
-        'sqlite',
-        `"${importResult.tableName}"`,
-        100
-      );
-      const previewQuery = previewResult.success ? previewResult.previewQuery : `SELECT * FROM "${importResult.tableName}" LIMIT 100`;
-
-      // Store the query for preview
-      setLatestWithSQL({
-        sql: previewQuery,
-        previewSql: previewQuery,
-        explanation: `Selecting all columns from ${importResult.tableName}`,
-        queryDescription: `Preview data from ${sheetName}`
-      });
-
-      addBotMessage(
-        `Sheet "${sheetName}" from "${displayName}" imported successfully! ${importResult.rowCount} rows imported. Configuration complete! Click Save below.`,
-        false
-      );
-
-      setSaveState(true); // Enable save button
-      setLoading(false);
-    } catch (error) {
-      console.error('Failed to import Google Sheet:', error);
-      addBotMessage('Failed to import Google Sheet. Please try again.', false);
-      setLoading(false);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Load Table Schema (columns and sample data)
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const loadTableSchemaFromDB = async (selectedTable, connection = null, sheetName = null) => {
-    try {
-      // Use provided connection or fall back to selConn
-      const conn = connection || selConn;
-
-      // First check if schema is already saved in fileInfo
-      if (conn.fileInfo?.schemas) {
-        let savedSchema = null;
-
-        // Handle both single schema object and schemas array
-        if (Array.isArray(conn.fileInfo.schemas)) {
-          // Multiple schemas (e.g., Excel with multiple sheets)
-          savedSchema = conn.fileInfo.schemas.find(s => s.tableName === selectedTable.name);
-        } else if (conn.fileInfo.schemas.tableName) {
-          // Single schema object
-          if (conn.fileInfo.schemas.tableName === selectedTable.name) {
-            savedSchema = conn.fileInfo.schemas;
-          }
-        }
-
-        if (savedSchema) {
-          setTableSchema(savedSchema);
-          console.log('Using saved schema from fileInfo:', savedSchema);
-          return;
-        }
-      }
-
-      // Fallback: Load table schema from DB if not found in fileInfo
-      // For file-based connections, pass the local file path
-      const localPath = conn.connectionType === 'file' ? conn.fileInfo?.filePath : null;
-
-      const schema = await loadTableSchema({
-        connection: conn,
-        tableName: selectedTable.name,
-        tableSchema: selectedTable.schema,
-        localPath: localPath,
-        sheetName: sheetName // Pass sheet name for Google Sheets
-      });
-
-      if (schema) {
-        setTableSchema(schema);
-        console.log('Loaded table schema from DB:', schema);
-      }
-    } catch (error) {
-      console.error('Failed to load table schema:', error);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Load Vector Database Schema (LanceDB and Pinecone)
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const loadVectorTableSchema = async (selectedTable) => {
-    try {
-      const dbType = selConn.dbType;
-      const tableName = selectedTable.name;
-
-      // Use vector DB skill to query for preview
-      const result = await window.electronAPI.skills.queryVectorPreview({
-        vectorDbType: dbType,
-        tableName: tableName,
-        namespace: selectedTable.schema || '',
-        dbConfig: selConn.dbConfig || {},
-        connectionId: selConn.id,
-        targetLocalPath: selConn.localPath || selConn.fileInfo?.filePath
-      });
-
-      if (result.success && result.data && result.data.length > 0) {
-        // Infer schema from first record
-        const sampleRecord = result.data[0];
-        const columns = Object.keys(sampleRecord).map(key => ({
-          name: key,
-          type: inferColumnType(sampleRecord[key]),
-          nullable: true
-        }));
-
-        const schema = {
-          tableName: tableName,
-          columns: columns,
-          sampleData: result.data.slice(0, 5), // First 5 records
-          recordCount: result.totalRows || result.recordCount
-        };
-
-        setTableSchema(schema);
-        console.log('Loaded vector database schema:', schema);
-      } else {
-        console.warn('No data returned from vector database preview');
-      }
-    } catch (error) {
-      console.error('Failed to load vector table schema:', error);
-    }
-  };
-
-  // Helper function to infer column type from value
-  const inferColumnType = (value) => {
-    if (value === null || value === undefined) return 'string';
-    if (typeof value === 'number') return 'number';
-    if (typeof value === 'boolean') return 'boolean';
-    if (Array.isArray(value)) return 'array';
-    if (typeof value === 'string' && value.includes('[') && value.includes('dims]')) {
-      return 'vector'; // Vector field (compacted representation)
-    }
-    return 'string';
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Database Operations
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const loadConnections = async () => {
-    setLoading(true);
-    try {
-      const token = localStorage.getItem('auth-token');
-      let conns = [];
-      // if (!token) {
-        conns = await connectionsDb.getAll();
-      // } else {
-      //   const res = await axios.post('/workflow/connections', { transformer: false }, {
-      //     headers: { 'auth-token': token },
-      //   });
-      //   if (res.data.success) conns = res.data.data;
-      // }
-
-      // Load plugins to get dbCategory for each connection
-      let pluginsMap = new Map();
-      if (window.electronAPI?.dbConnect?.listPlugins) {
-        try {
-          const pluginsResult = await window.electronAPI.dbConnect.listPlugins();
-          if (pluginsResult.success && pluginsResult.connectors) {
-            pluginsResult.connectors.forEach(plugin => {
-              pluginsMap.set(plugin.id, plugin);
-            });
-          }
-        } catch (error) {
-          console.error('Failed to load plugins:', error);
-        }
-      }
-
-      // Enrich connections with plugin metadata
-      const enrichedConnections = conns.map(conn => {
-        const plugin = pluginsMap.get(conn.dbType);
-        return {
-          ...conn,
-          dbCategory: plugin?.dbCategory || null,
-          storageType: plugin?.storageType || null
-        };
-      });
-
-      setConnections(enrichedConnections);
-    } catch (err) {
-      console.error('Failed to load connections', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleConnectionTypeSelectorClose = () => {
-    setIsConnectionTypeSelectorOpen(false);
-    // Refresh connections list in case new ones were added
-    loadConnections();
-  };
-
-  // Handle connection type selection
-  const handleConnectionTypeSelect = (type) => {
-    setIsConnectionTypeSelectorOpen(false);
-    setActiveDbType(type);
-  };
-
-  // Test connection handler
   const handleTestConnection = async (dbType, config) => {
     let result;
-
-    // Prefer direct Electron IPC (no backend required)
     if (window.electronAPI?.dbConnect) {
       result = await window.electronAPI.dbConnect.test(dbType, config);
     } else {
@@ -1196,135 +908,82 @@ const DataSourceNodeChat = ({
       }
     }
 
-    if (result.success) {
-      antdMessage.success(result.message || 'Connection successful!');
-    } else {
-      antdMessage.error(result.message || 'Connection failed.');
-    }
-
+    if (result.success) antdMessage.success(result.message || 'Connection successful!');
+    else antdMessage.error(result.message || 'Connection failed.');
     return result;
   };
 
-  // Save connection handler
   const handleSaveDbConnection = async (connectionData) => {
-    const token = localStorage.getItem('auth-token');
-    const isFileConnection = connectionData.connectionType === 'file';
-
-    if (!token || isFileConnection) {
-      try {
-        // For database connections, separate sensitive credentials from connection data
-        if (connectionData.connectionType === 'database' && connectionData.dbConfig && window.electronAPI?.dbCredentials) {
-          const { dbConfig, ...connectionDataWithoutConfig } = connectionData;
-
-          let sensitiveFields = {};
-          let nonSensitiveConfig = {};
-
-          // Get the plugin's config schema to determine which fields are sensitive
-          const plugin = installedPlugins.find(p => p.id === connectionData.dbType);
-          if (plugin && plugin.configSchema && plugin.configSchema.fields) {
-            // Dynamically separate sensitive and non-sensitive fields based on plugin schema
-            plugin.configSchema.fields.forEach(field => {
-              const fieldValue = dbConfig[field.name];
-              if (fieldValue !== undefined) {
-                if (field.sensitive) {
-                  sensitiveFields[field.name] = fieldValue;
-                } else {
-                  nonSensitiveConfig[field.name] = fieldValue;
-                }
-              }
-            });
-          } else {
-            // Fallback: treat password, username, host, uri as sensitive
-            sensitiveFields = {
-              password: dbConfig.password,
-              username: dbConfig.username,
-              host: dbConfig.host,
-              uri: dbConfig.uri,
-            };
-
-            nonSensitiveConfig = {
-              port: dbConfig.port,
-              database: dbConfig.database,
-              ssl: dbConfig.ssl,
-              instanceName: dbConfig.instanceName,
-              engine: dbConfig.engine,
-              schema: dbConfig.schema,
-            };
-          }
-
-          // Prepare connection data with only non-sensitive config
-          const safeConnectionData = {
-            ...connectionDataWithoutConfig,
-            dbConfig: nonSensitiveConfig
-          };
-
-          const saved = await connectionsDb.save(safeConnectionData);
-          // Save credentials separately (encrypted) using the new connection ID
-          await window.electronAPI.dbCredentials.save(saved.id, sensitiveFields);
-
-          antdMessage.success('Connection saved securely.');
-          setActiveDbType(null);
-          loadConnections();
-        } else {
-          // Non-database connections (file, API) - save as-is
-          await connectionsDb.save(connectionData);
-          antdMessage.success('Connection saved.');
-          setActiveDbType(null);
-          loadConnections();
-        }
-      } catch (error) {
-        console.error('Error saving connection:', error);
-        antdMessage.error('Failed to save connection.');
-      }
-      return;
-    }
-
     try {
-      const payload = { ...connectionData, status: 'untested' };
-      const response = await axios.post('/workflow/connection-save', payload, {
-        headers: { 'auth-token': token },
-      });
-      if (response.data.success) {
-        loadConnections();
-        setActiveDbType(null);
-        antdMessage.success('Connection saved.');
+      // Database credentials are encrypted separately from the connection row.
+      if (connectionData.connectionType === 'database' && connectionData.dbConfig && window.electronAPI?.dbCredentials) {
+        const { dbConfig, ...connectionDataWithoutConfig } = connectionData;
+
+        let sensitiveFields = {};
+        let nonSensitiveConfig = {};
+
+        const plugin = installedPlugins.find((p) => p.id === connectionData.dbType);
+        if (plugin?.configSchema?.fields) {
+          plugin.configSchema.fields.forEach((field) => {
+            const fieldValue = dbConfig[field.name];
+            if (fieldValue !== undefined) {
+              if (field.sensitive) sensitiveFields[field.name] = fieldValue;
+              else nonSensitiveConfig[field.name] = fieldValue;
+            }
+          });
+        } else {
+          sensitiveFields = {
+            password: dbConfig.password,
+            username: dbConfig.username,
+            host: dbConfig.host,
+            uri: dbConfig.uri,
+          };
+          nonSensitiveConfig = {
+            port: dbConfig.port,
+            database: dbConfig.database,
+            ssl: dbConfig.ssl,
+            instanceName: dbConfig.instanceName,
+            engine: dbConfig.engine,
+            schema: dbConfig.schema,
+          };
+        }
+
+        const saved = await connectionsDb.save({ ...connectionDataWithoutConfig, dbConfig: nonSensitiveConfig });
+        await window.electronAPI.dbCredentials.save(saved.id, sensitiveFields);
+        antdMessage.success('Connection saved securely.');
       } else {
-        antdMessage.error(response.data.error || 'Failed to save connection.');
+        await connectionsDb.save(connectionData);
+        antdMessage.success('Connection saved.');
       }
-    } catch (err) {
+      setActiveDbType(null);
+      await loadConnections();
+    } catch (error) {
+      console.error('Error saving connection:', error);
       antdMessage.error('Failed to save connection.');
     }
   };
 
-  // Get modal title for connection type
   const getModalTitle = (dbType) => {
     const titleMap = {
       sqlite: 'Connect SQLite Database',
       nedb: 'Connect NeDB Database',
+      lancedb: 'Connect LanceDB Database',
       json: 'Upload JSON File',
       spreadsheet: 'Add Spreadsheet',
       parquet: 'Upload Parquet File',
       avro: 'Upload Avro File',
     };
-
-    if (titleMap[dbType]) {
-      return titleMap[dbType];
-    }
-
-    const plugin = installedPlugins.find(p => p.id === dbType);
-    if (plugin) {
-      return `Connect to ${plugin.metadata?.displayName || plugin.name}`;
-    }
-
+    if (titleMap[dbType]) return titleMap[dbType];
+    const plugin = installedPlugins.find((p) => p.id === dbType);
+    if (plugin) return `Connect to ${plugin.metadata?.displayName || plugin.name}`;
     return 'Connect to Database';
   };
 
-  // Get active form component based on connection type
-  const getActiveFormComponent = () => {
+  const ActiveForm = useMemo(() => {
     if (!activeDbType) return null;
-
-    // Local file connections (sqlite, nedb, json, spreadsheet, parquet, avro)
-    if (['sqlite', 'nedb', 'json', 'spreadsheet', 'parquet', 'avro'].includes(activeDbType)) {
+    // Same set the connector picker offers under "Local Files" — leaving
+    // lancedb out here meant choosing it opened no form at all.
+    if (['sqlite', 'nedb', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'].includes(activeDbType)) {
       return () => (
         <LocalFileConnectionForm
           fileType={activeDbType}
@@ -1334,9 +993,7 @@ const DataSourceNodeChat = ({
         />
       );
     }
-
-    // Database connectors use dynamic form based on plugin
-    const plugin = installedPlugins.find(p => p.id === activeDbType);
+    const plugin = installedPlugins.find((p) => p.id === activeDbType);
     if (plugin) {
       return () => (
         <DynamicConnectionForm
@@ -1348,948 +1005,650 @@ const DataSourceNodeChat = ({
         />
       );
     }
-
     return null;
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeDbType, installedPlugins]);
 
-  const ActiveForm = getActiveFormComponent();
+  // ── Validation ───────────────────────────────────────────────────────────
 
-  const loadDatabaseTables = async (conn, silent = false) => {
-    setLoading(true);
-    try {
-      const result = await onLoadDatabaseTables(conn);
-      
-      if (result.success) {
-        let tableList = result.tables || [];
-
-        // Filter tables for file-based connections to only show tables from this specific upload
-        if (conn.connectionType === 'file' && conn.fileInfo?.tables && conn.fileInfo.tables.length > 0) {
-          // Only show tables that belong to this connection
-          const connectionTables = conn.fileInfo.tables;
-          tableList = tableList.filter(t => {
-            const tableName = t.name || String(t);
-            return connectionTables.includes(tableName);
-          });
-        }
-
-        // Store full table objects with schema information
-        const tableObjects = tableList.map(t => ({
-          name: t.name || String(t),
-          schema: t.schema || null,
-          displayName: t.displayName || null,
-          type: t.type || null
-        }));
-        setDbTableObjects(tableObjects);
-
-        // Extract just the table names for AI processing
-        const tableNames = tableObjects.map(t => t.name);
-        setDbTables(tableNames);
-
-        // Only add messages if not in silent mode (when restoring state)
-        if (!silent) {
-          if (tableNames.length > 0) {
-            addBotMessage(
-              `Connected! Found ${tableNames.length} table${tableNames.length !== 1 ? 's' : ''} in "${conn.name}".\n\nYou can view the schema in the Data Preview panel below.`,
-              false
-            );
-            addBotMessage(
-              'Which table would you like to use?',
-              true,
-              'choice',
-              'tableSelection',
-              '',
-              {
-                choices: tableObjects.map(table => {
-                  // Use displayName if available (for services like Google Sheets)
-                  const displayText = table.displayName || table.name;
-                  return {
-                    label: table.schema ? `${table.schema}.${displayText}` : displayText,
-                    value: table.name,
-                    description: table.schema || '',
-                    _data: table,
-                    displayType: 'dropdown'
-                  };
-                })
-              }
-            );
-          } else {
-            addBotMessage('No tables found. Make sure the connection is configured correctly.', false);
-          }
-        }
-      } else {
-        console.log('Failed to load tables: ', result)
-        if (!silent) {
-          addBotMessage('Failed to load tables. Please check the connection settings.', false);
-        }
+  const missing = useMemo(() => {
+    const out = {};
+    if (!selConn) { out.connection = true; return out; }
+    if (connKind === 'sql' || connKind === 'nosql' || connKind === 'vector') {
+      if (schemaOptions.length > 0 && !selectedSchema && connKind === 'sql') out.schema = true;
+      if (!selectedTableName) out.table = true;
+    } else if (connKind === 'sheets') {
+      // A restored import is already complete, even if the spreadsheet list
+      // hasn't been re-fetched yet.
+      if (!sheetImport) {
+        if (!selectedTableName) out.table = true;
+        else if (!selectedSheet) out.sheet = true;
       }
-    } catch (err) {
-      console.error('Failed to load tables:', err);
-      if (!silent) {
-        addBotMessage('Failed to load tables. Please check the connection settings.', false);
-      }
-    } finally {
-      setLoading(false);
+    } else if (connKind === 'cloud') {
+      out.cloudFile = true; // A cloud connection is replaced by its import.
     }
+    return out;
+  }, [selConn, connKind, schemaOptions, selectedSchema, selectedTableName, selectedSheet, sheetImport]);
+
+  const missingCount = Object.keys(missing).length;
+  const invalid = (key) => attempted && !!missing[key];
+
+  const gateMessage = missing.cloudFile
+    ? 'Pick a file to enable Save'
+    : attempted && missingCount > 0
+      ? `${missingCount} field${missingCount === 1 ? '' : 's'} still needed`
+      : null;
+
+  // ── Build config ─────────────────────────────────────────────────────────
+
+  // Every source* key this node can emit, reset to null. onPreviewConfigUpdate
+  // MERGES into the node's existing config, so a key we simply omit keeps its
+  // previous value — which is how a Postgres "SELECT * FROM …" survived a
+  // switch to MongoDB and came back as "Unexpected token 'S'". Always emit the
+  // whole set so switching connections genuinely clears the old one.
+  const BLANK_SOURCE = {
+    sourceDbType: null,
+    sourceDbCategory: null,
+    sourceDbConfig: null,
+    sourceLocalPath: null,
+    // The file DuckDB reads, and how to read it. For a local source these are
+    // the whole story — there is no imported copy behind them.
+    sourceFilePath: null,
+    sourceFormat: null,
+    sourceDataset: null,
+    sourceTableName: null,
+    sourceCollection: null,
+    sourceIndexName: null,
+    sourceNamespace: null,
+    sourceSchema: null,
+    sourceTable: null,
+    sourceSelectedTables: [],
+    sourceTableSchema: null,
+    sourceSql: null,
+    sourcePreviewSql: null,
+    sourceSqlExplanation: '',
+    sourceQueryDescription: '',
+    sourceSpreadsheetId: null,
+    sourceSheetName: null,
+    sourceApiConnectionId: null,
+    sourceApiConnectionName: null,
+    apiFetchPrompt: null,
+    apiFetchExplanation: '',
+    apiFetchCode: '',
+    cloudSource: null,
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // AI Database Query Handler (handles all database user inputs)
-  // ─────────────────────────────────────────────────────────────────────────
+  /**
+   * `override` lets a caller build the config from a selection that state
+   * hasn't flushed yet (selectTable pushes the preview before its setState
+   * calls land); `connection` does the same for selConn itself.
+   */
+  const buildConfigFor = (connection, override = {}) => {
+    const selConnLocal = connection;
+    if (!selConnLocal) return {};
 
-  // const handleDatabaseQuery = async (userMsg, databaseType) => {
-  //   setAiLoading(true);
-  //   setLoading(true);
-  //   const schemas = {};
-  //   const targetSchema = selConn?.dbConfig?.schema;
-  //   const fullTableName = `${targetSchema}.${node.id.replace('-', '_').toLowerCase()}`;
+    const sel = {
+      tableName: sheetImport ? sheetImport.tableName : selectedTableName,
+      table: selectedTable,
+      schema: selectedSchema,
+      tableSchema,
+      latestWithSQL,
+      sheetImport,
+      spreadsheetId: selectedTableName,
+      ...override,
+    };
 
-  //   // Build chat history for AI context (excluding the current message)
-  //   const chatHistory = chat.slice(0, -1).map(msg => ({
-  //     sender: msg.sender,
-  //     text: msg.text
-  //   }));
-  //   console.log('dbTables: ', dbTables)
-  //   try {
-  //     // Step 1: If first query, analyze which tables are needed
-  //     if (aiSelectedTables.length === 0) {
-  //       const tableListText = dbTables.join(', ');
-  //       // Get schema from connection config
+    // A Google Sheet is imported into SQLite; downstream nodes read that file,
+    // not the Sheets API. Keep the connection's id/name so the source is still
+    // recognisable, and swap in the local file everywhere else.
+    const conn = sel.sheetImport
+      ? {
+        ...selConnLocal,
+        connectionType: 'file',
+        fileType: 'sqlite',
+        dbType: 'sqlite',
+        dbConfig: {},
+        fileInfo: {
+          filePath: sel.sheetImport.localPath,
+          fileName: 'app-data.db',
+          dbType: 'sqlite',
+          tables: [sel.sheetImport.tableName],
+          source: 'google-sheets',
+          originalSpreadsheetId: sel.spreadsheetId,
+          originalSheetName: sel.sheetImport.sheetName,
+        },
+      }
+      : selConnLocal;
 
-  //       // Use appropriate terminology based on database type
-  //       const entityName = databaseType === 'mongodb' ? 'collections' : 'tables';
-  //       const queryType = databaseType === 'mongodb' ? 'query' : 'SQL';
+    // For a Sheets source the picked "table" is the spreadsheet — the dataset
+    // downstream is the SQLite table it was imported into.
+    const tableName = sel.tableName;
+    const tableSchemaVal = sel.tableSchema;
+    const sqlVal = sel.latestWithSQL;
 
-  //       const analysisPrompt = `
-  //       You are helping query a ${databaseType === 'mongodb' ? 'MongoDB database' : 'database'}.
+    const config = {
+      ...BLANK_SOURCE,
+      nodeType: 'datasource',
+      sourceConnectionId: conn.id,
+      sourceConnectionName: conn.name,
+      sourceConnectionType: conn.connectionType || 'file',
+      sourceType: conn.fileType || conn.apiType || conn.dbType,
+    };
 
-  //       User request:
-  //       "${userMsg.text}"
+    if (sel.sheetImport) {
+      config.sourceSpreadsheetId = sel.spreadsheetId;
+      config.sourceSheetName = sel.sheetImport.sheetName;
+    }
 
-  //       Available ${entityName}:
-  //       ${tableListText}
+    // REST API sources materialise into local NeDB and behave like any other
+    // NoSQL local source downstream. The fetch function itself is authored in
+    // the chat (build_dataSource) — preserve it if it is already there.
+    if (conn.dbType === 'rest-api') {
+      // Only carry the previous fetch forward when this is the SAME API
+      // connection being re-saved. Otherwise a node that used to point at a
+      // local NeDB file (or a different API) kept that file's sourceLocalPath,
+      // and the preview then tried to read a collection this node never wrote —
+      // surfacing as "97% of the data file is corrupt".
+      const sameApi = !!initialConfig?.sourceApiConnectionId
+        && initialConfig.sourceApiConnectionId === conn.id;
 
-  //       Your task:
-  //       Decide whether to answer the question directly (if it is not ${queryType}-related) or request the relevant ${entityName} so you can retrieve their schema for a follow-up ${queryType} generation step.
+      // The node label is not unique (every dragged source is "Data Source"),
+      // so fold in the node id to keep two API nodes off the same NeDB file.
+      const collection = (sameApi && initialConfig?.sourceCollection)
+        || sanitizeCollectionName(
+          `${node?.data?.label || 'api'}_${String(node?.id || '').slice(-6)}`,
+          node?.id,
+        );
 
-  //       You must return one of these two JSON formats:
-
-  //       1. If no ${queryType} is required:
-  //       {"response": "Direct response to the question"}
-
-  //       2. If schema details are required before writing ${queryType}:
-  //       {"tables": ["Exact ${entityName.slice(0, -1)} names from the provided list that are relevant to the user's request"]}
-  //       `;
-  //       //         Target schema: ${targetSchema}
-  //       // Target table name for results: ${fullTableName}
-  //       //         2. Direct answer with SQL (for simple queries that do not require schema inspection):
-  //       // {"explanation": "Brief explanation of what the query does",
-  //       // "ddl": "CREATE TABLE ${fullTableName} statement to store the results, using ${databaseType} syntax",
-  //       // "sql": "INSERT INTO ${fullTableName} statement to populate the table, using ${databaseType} syntax"}
-
-  //       const response = await getWorkflowAssistance('tableSelection', analysisPrompt, { dbTables }, chatHistory);
-  //       console.log('response: ', response)
-  //       // Store the analysis context for later SQL generation
-  //       setTableAnalysisContext({
-  //         prompt: analysisPrompt,
-  //         response: response
-  //       });
-
-  //       let selectedTables = {};
-  //       try {
-  //           selectedTables = JSON.parse(response);
-  //       } catch (e) {
-  //         selectedTables = dbTables;
-  //       }
-
-  //       if(selectedTables.sql){
-  //         setSaveState(true)
-  //         // Generate preview SQL/query locally based on database type
-  //         let previewSql;
-  //         if (databaseType === 'mongodb') {
-  //           // For MongoDB, use the same query as the main query
-  //           previewSql = selectedTables.sql;
-  //         } else {
-  //           // For SQL databases, generate SELECT statement
-  //           previewSql = `SELECT * FROM ${fullTableName} LIMIT 100`;
-  //         }
-
-  //         // Direct SQL response - save it to latestWithSQL
-  //         setLatestWithSQL({
-  //           ddl: selectedTables.ddl || '',
-  //           sql: selectedTables.sql,
-  //           previewSql: previewSql,
-  //           explanation: selectedTables.explanation || '',
-  //           queryDescription: userMsg.text
-  //         });
-
-  //         // Store SQL in user message
-  //         setChat(prev => prev.map(msg => {
-  //           if (msg.id === userMsg.id) {
-  //             return {
-  //               ...msg,
-  //               ddl: selectedTables.ddl || '',
-  //               sql: selectedTables.sql,
-  //               previewSql: previewSql,
-  //               explanation: selectedTables.explanation
-  //             };
-  //           }
-  //           return msg;
-  //         }));
-
-  //         // Add bot message with SQL in metadata
-  //         const botMessage = selectedTables.explanation || 'Here\'s the SQL query:';
-  //         addBotMessage(botMessage, false, 'text', '', '', {
-  //           ddl: selectedTables.ddl || '',
-  //           sql: selectedTables.sql,
-  //           previewSql: previewSql
-  //         });
-  //         addBotMessage(
-  //           'You can ask follow-up questions to refine this query, or click Save when ready.',
-  //           true,
-  //           'text',
-  //           'databaseQuery',
-  //           'Ask a follow-up question or request changes…'
-  //         );
-  //         return;
-  //       }
-
-  //       if(selectedTables.response){
-  //         addBotMessage(selectedTables.response, false);
-  //         addBotMessage(
-  //           'You can ask follow-up questions, or click Save when ready.',
-  //           true,
-  //           'text',
-  //           'databaseQuery',
-  //           'Ask a follow-up question…'
-  //         );
-  //         return;
-  //       }
-
-  //       if(selectedTables.explanation){
-  //         addBotMessage(selectedTables.explanation, false);
-  //         addBotMessage(
-  //           'You can ask follow-up questions, or click Save when ready.',
-  //           true,
-  //           'text',
-  //           'databaseQuery',
-  //           'Ask a follow-up question…'
-  //         );
-  //         return;
-  //       }
-
-  //       // selectedTables.tables contains the array of table names
-  //       const tableArray = selectedTables.tables || selectedTables;
-  //       selectedTables = Array.isArray(tableArray) ? tableArray.filter(t => dbTables.includes(t)) : dbTables;
-
-  //       const entitySingular = databaseType === 'mongodb' ? 'collection' : 'table';
-
-  //       if (selectedTables.length === 0){
-  //         addBotMessage(
-  //           `No ${entityName} found based on your request.`,
-  //           true
-  //         );
-  //         return;
-  //       }
-
-  //       setAiSelectedTables(selectedTables);
-
-  //       addBotMessage(
-  //         `I'll use ${selectedTables.length === 1 ? `this ${entitySingular}` : `these ${entityName}`}: **${selectedTables.join(', ')}**`,
-  //         false
-  //       );
-
-  //       // Step 2: Load sample data (100 distinct records) and column metadata for selected tables
-  //       let totalRows = 0;
-  //       const columnMetadata = {}; // Store column info with data types
-
-  //       for (const tableName of selectedTables) {
-  //         if (window.electronAPI?.dbConnect && selConn) {
-  //           // Find the table object to get its schema
-  //           const tableObj = dbTableObjects.find(t => t.name === tableName);
-  //           const tableSchema = tableObj?.schema || null;
-
-  //           // Fetch column metadata (including data types)
-  //           const columnsResult = await window.electronAPI.dbConnect.getColumns(
-  //             selConn.dbType,
-  //             selConn.dbConfig,
-  //             tableSchema,
-  //             tableName,
-  //             selConn.id
-  //           );
-
-  //           if (columnsResult.success && columnsResult.columns) {
-  //             columnMetadata[tableName] = columnsResult.columns;
-  //           }
-
-  //           // Build query to get 100 distinct records
-  //           let query;
-  //           if (selConn.dbType === 'mongodb') {
-  //             // For MongoDB, use JSON query format
-  //             query = JSON.stringify({
-  //               collection: tableName,
-  //               filter: {},
-  //               limit: 100
-  //             });
-  //           } else {
-  //             // For SQL databases, use SELECT statement
-  //             const fullTableName = tableSchema ? `${tableSchema}.${tableName}` : tableName;
-  //             query = `SELECT DISTINCT * FROM ${fullTableName} LIMIT 100`;
-  //           }
-
-  //           const result = await window.electronAPI.dbConnect.runQuery(
-  //             selConn.dbType,
-  //             selConn.dbConfig,
-  //             query,
-  //             selConn.id
-  //           );
-
-  //           if (result.success && result.rows) {
-  //             // Trim long text fields in the sample data
-  //             const trimmedRows = result.rows.map(row => {
-  //               const trimmedRow = {};
-  //               Object.keys(row).forEach(key => {
-  //                 const value = row[key];
-  //                 if (typeof value === 'string' && value.length > 100) {
-  //                   trimmedRow[key] = value.substring(0, 100) + '...';
-  //                 } else {
-  //                   trimmedRow[key] = value;
-  //                 }
-  //               });
-  //               return trimmedRow;
-  //             });
-
-  //             schemas[tableName] = { rows: trimmedRows, columns: columnMetadata[tableName] || [] };
-  //             totalRows += trimmedRows.length;
-  //           }
-  //         }
-  //       }
-
-  //       setSelectedTableSchemas(schemas);
-
-  //       // addBotMessage(
-  //       //   `Analyzing ${selectedTables.length} table${selectedTables.length !== 1 ? 's' : ''} (${totalRows} sample records)...`,
-  //       //   false
-  //       // );
-  //     }
-
-  //     // Step 3: Generate/refine SQL with sample data context
-  //     const context = {
-  //       dbType: selConn?.dbType,
-  //       connectionName: selConn?.name,
-  //       selectedTables: aiSelectedTables,
-  //       tableSchemas: {}
-  //     };
-  //     // Include sample data and column metadata for each table (first 5 rows as examples)
-  //     Object.entries(schemas).forEach(([tableName, data]) => {
-  //       if (data && data.rows && data.rows.length > 0) {
-  //         // Take first 5 rows as examples
-  //         const sampleRows = data.rows.slice(0, 5);
-
-  //         // Build columns array with name and type
-  //         const columnsWithTypes = data.columns && data.columns.length > 0
-  //           ? data.columns.map(col => ({
-  //               name: col.name,
-  //               type: col.type,
-  //               nullable: col.nullable
-  //             }))
-  //           : Object.keys(data.rows[0]).map(colName => ({ name: colName, type: 'unknown' }));
-
-  //         context.tableSchemas[tableName] = {
-  //           columns: columnsWithTypes,
-  //           sampleData: sampleRows
-  //         };
-  //       }
-  //     });
-  //     // console.log('schemas: ', schemas)
-  //     // console.log('context.tableSchemas: ', context.tableSchemas)
-
-
-  //     // Add table analysis context to chat history if available
-  //     if (tableAnalysisContext) {
-  //       chatHistory.unshift(
-  //         { sender: 'user', text: tableAnalysisContext.prompt },
-  //         { sender: 'bot', text: tableAnalysisContext.response }
-  //       );
-  //     }
-
-
-
-  //     // Build prompt dynamically based on database type and processing environment
-  //     let getSQL;
-
-  //     if (databaseType === 'mongodb') {
-  //       if (processingEnvironment === 'local') {
-  //         // MongoDB local processing - generate JavaScript function
-  //         getSQL = ChatPrompts.datasource.mongodb_local(userMsg, context)
-  //       } else {
-  //         // MongoDB database processing
-  //         getSQL = ChatPrompts.datasource.mongodb_cloud(userMsg, context)
-  //       }
-  //     } else {
-  //       // SQL databases
-  //       if (processingEnvironment === 'local') {
-  //         // SQL local processing - use SQLite DDL and SELECT with OFFSET
-  //         getSQL = ChatPrompts.datasource.sql_local(userMsg, databaseType, context, node)
-  //       } else {
-  //         // SQL database processing
-  //         getSQL = ChatPrompts.datasource.sql_cloud(userMsg, databaseType, targetSchema, fullTableName, context)
-  //       }
-  //     }
-
-  //     const response = await getWorkflowAssistance('getSQL', getSQL, context, chatHistory);
-  //     console.log('getSQL: ', response)
-  //     // Try to parse JSON response first
-  //     let parsedResponse;
-  //     try {
-  //       parsedResponse = JSON.parse(response);
-  //     } catch (e) {
-  //       // Fallback to old extraction method if JSON parsing fails
-  //       const sql = extractSQL(response);
-  //       const explanation = response.replace(/```(?:sql)?\s*[\s\S]*?```/g, '').trim();
-  //       parsedResponse = {
-  //         ddl: '',
-  //         sql: sql,
-  //         explanation: explanation
-  //       };
-  //     }
-
-  //     const ddl = parsedResponse.ddl || '';
-  //     const sql = parsedResponse.sql;
-
-  //     // Generate preview SQL/query locally based on database type
-  //     let previewSql;
-  //     if (databaseType === 'mongodb') {
-  //       // For MongoDB, use the same query as the main query (it already has limit)
-  //       previewSql = sql;
-  //     } else {
-  //       // For SQL databases, generate SELECT statement
-  //       previewSql = `SELECT * FROM ${fullTableName} LIMIT 100`;
-  //     }
-
-  //     const explanation = parsedResponse.explanation || '';
-
-  //     if (sql) {
-  //       setSaveState(true)
-  //       // Update latestWithSQL state
-  //       setLatestWithSQL({
-  //         ddl,
-  //         sql,
-  //         previewSql,
-  //         explanation,
-  //         queryDescription: userMsg.text
-  //       });
-
-  //       // Store SQL in this user message
-  //       setChat(prev => prev.map(msg => {
-  //         if (msg.id === userMsg.id) {
-  //           return { ...msg, ddl, sql, previewSql, explanation };
-  //         }
-  //         return msg;
-  //       }));
-
-  //       // Add bot message with SQL in metadata
-  //       addBotMessage(explanation, false, 'text', '', '', {
-  //         ddl: ddl,
-  //         sql: sql,
-  //         previewSql: previewSql
-  //       });
-  //     } else {
-  //       addBotMessage(explanation, false);
-  //     }
-  //     addBotMessage(
-  //       'You can ask follow-up questions to refine this query, or click Save when ready.',
-  //       true,
-  //       'text',
-  //       'databaseQuery',
-  //       'Ask a follow-up question or request changes…'
-  //     );
-
-  //   } catch (error) {
-  //     console.error('Database query error:', error);
-  //     addBotMessage('Failed to process query. Please try again.', false);
-  //   } finally {
-  //     setAiLoading(false);
-  //     setLoading(false);
-  //   }
-  // };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Build Configuration
-  // ─────────────────────────────────────────────────────────────────────────
-  // console.log('chat: ', chat, aiSelectedTables)
-  const buildConfig = (apiFetchOverride = null) => {
-    const config = {};
-
-    // Use selConn (which may have been updated after Google Sheets import)
-    // instead of chat history to handle cases where connection was converted to SQLite
-    const conn = selConn;
-    console.log('buildConfig: ', conn)
-    if (conn) {
-      config.nodeType = 'datasource'
-      config.sourceConnectionId = conn.id;
-      config.sourceConnectionName = conn.name;
-      config.sourceConnectionType = conn.connectionType || 'file';
-      config.sourceType = conn.fileType || conn.apiType || conn.dbType;
-
-      // REST API sources materialise into local NeDB and behave like any
-      // other NoSQL local source for downstream nodes.
-      if (conn.dbType === 'rest-api') {
-        // Prefer the override (fresh result from runAndSaveApiFetch) over
-        // state, which may not have flushed yet when called synchronously
-        // after setApiFetchResult(...).
-        const fetchResult = apiFetchOverride || apiFetchResult;
-
-        config.sourceConnectionType = 'api';
-        config.sourceDbType = 'nedb';
-        config.sourceDbCategory = 'API';
-
-        // Point downstream at the same connection identifier used for other
-        // local NeDB imports so DataPreview / Joins can route correctly.
-        config.sourceApiConnectionId = conn.id;
-        config.sourceApiConnectionName = conn.name;
-        config.sourceConnectionId = 'local-nedb';
-
-        const collection = fetchResult?.collection || sanitizeCollectionName(node?.data?.label || node?.id);
-        config.sourceCollection = collection;
-        config.sourceDataset = collection;
-        // The NeDB file is always written by the main process; persist its
-        // path so downstream nodes can read the materialised collection
-        // without needing to re-run the fetch.
-        config.sourceLocalPath = fetchResult?.localPath || null;
-
-        // Fetch function — persisted so every workflow run can re-execute it.
-        config.apiFetchPrompt = apiFetchPrompt || null;
-        config.apiFetchExplanation = apiFetchExplanation || '';
-        config.apiFetchCode = apiFetchCode || '';
-
-        // Snapshot the public connection config so the chat can restore
-        // enough context on reopen to let the user refine the request without
-        // needing a live lookup of the connection.
-        config.apiConnectionPublicConfig = {
+      Object.assign(config, {
+        sourceConnectionType: 'api',
+        // Fetched rows are materialised as a local Parquet file, so downstream
+        // nodes treat an API source like any other local file.
+        sourceDbType: 'duckdb',
+        sourceDbCategory: 'API',
+        sourceApiConnectionId: conn.id,
+        sourceApiConnectionName: conn.name,
+        sourceConnectionId: 'local-duckdb',
+        sourceCollection: collection,
+        sourceDataset: collection,
+        sourceLocalPath: sameApi ? (initialConfig.sourceLocalPath || null) : null,
+        apiFetchPrompt: sameApi ? (initialConfig.apiFetchPrompt || null) : null,
+        apiFetchExplanation: sameApi ? (initialConfig.apiFetchExplanation || '') : '',
+        apiFetchCode: sameApi ? (initialConfig.apiFetchCode || '') : '',
+        apiConnectionPublicConfig: {
           baseUrl: conn.dbConfig?.baseUrl || '',
           authType: conn.dbConfig?.authType || 'none',
           apiKeyName: conn.dbConfig?.apiKeyName || '',
           basicUser: conn.dbConfig?.basicUser || '',
-        };
-
-        return config;
+          // Key names only. Values live encrypted on the connection and are
+          // resolved in the main process at fetch time.
+          apiParamKeys: conn.dbConfig?.apiParamKeys || [],
+        },
+      });
+      if (sameApi && initialConfig?.sourceTableSchema) {
+        config.sourceTableSchema = initialConfig.sourceTableSchema;
       }
-
-      // For file-based connections (SQLite, NeDB, spreadsheets, JSON)
-      if (conn.connectionType === 'file') {
-        config.sourceDataset = conn.name;
-
-        // Add local file path information (SOURCE)
-        if (conn.fileInfo?.filePath) {
-          config.sourceLocalPath = conn.fileInfo.filePath;
-        }
-
-        // Add cloud source information if this file came from cloud storage
-        if (conn.cloudSource) {
-          config.cloudSource = conn.cloudSource;
-        }
-
-        // For SQLite, NeDB, and LanceDB, set appropriate dbType
-        if (conn.dbType === 'sqlite' || conn.dbType === 'nedb' || conn.dbType === 'lancedb') {
-          config.sourceDbType = conn.dbType;
-          config.sourceDbCategory = conn.dbCategory || (conn.dbType === 'lancedb' ? 'Vector' : null);
-
-          // For SQLite, set source table name
-          if (conn.dbType === 'sqlite' && aiSelectedTables.length > 0) {
-            config.sourceTableName = aiSelectedTables[0];
-          }
-
-          // For NeDB, set source collection name
-          if (conn.dbType === 'nedb' && aiSelectedTables.length > 0) {
-            config.sourceCollection = aiSelectedTables[0];
-          }
-
-          // For LanceDB, set source index name (table name)
-          if (conn.dbType === 'lancedb' && aiSelectedTables.length > 0) {
-            config.sourceIndexName = aiSelectedTables[0];
-            config.sourceTableName = aiSelectedTables[0];
-            config.sourceNamespace = ''; // LanceDB doesn't use namespaces
-          }
-
-          // Store table schema if available
-          if (tableSchema) {
-            config.sourceTableSchema = tableSchema;
-          }
-        }
-
-        // Store preview query for SQLite
-        if (conn.dbType === 'sqlite' && latestWithSQL) {
-          config.sourceSql = latestWithSQL.sql;
-          config.sourcePreviewSql = latestWithSQL.previewSql;
-          config.sourceSqlExplanation = latestWithSQL.explanation || '';
-        }
-      } else if (conn.connectionType !== 'database') {
-        // For other non-database connections (API, etc.)
-        config.sourceDataset = conn.name;
-      }
-      // console.log('buildConfig: ', conn)
-      if (conn.connectionType === 'database') {
-        config.sourceDbType = conn.dbType;
-        config.sourceDbCategory = conn.dbCategory;
-        config.sourceDbConfig = conn.dbConfig;
-        config.sourceSelectedTables = aiSelectedTables;
-
-        // Store the selected table(s) for use in the workflow
-        if (aiSelectedTables.length > 0) {
-          config.sourceTable = aiSelectedTables[0]; // Primary selected table (deprecated, use sourceTableName)
-        }
-
-        // Get the selected table's schema from the table selection message
-        const tableSelectionMsg = chat.slice().reverse().find(m => m.ref === 'tableSelection' && m.sender === 'user');
-        const selectedTableData = tableSelectionMsg?.data;
-
-        // Set source table/collection name
-        const isNoSQL = conn.dbType === 'mongodb' || conn.dbType === 'nedb';
-        const isVector = conn.dbCategory === 'Vector' || conn.dbType === 'pinecone' || conn.dbType === 'lancedb';
-
-        if (isVector) {
-          // For Vector databases, set sourceIndexName and sourceNamespace
-          if (aiSelectedTables.length > 0) {
-            const selectedTable = aiSelectedTables[0];
-
-            if (conn.dbType === 'pinecone') {
-              // Pinecone: parse index/namespace if format is "index/namespace"
-              if (selectedTable.includes('/')) {
-                const parts = selectedTable.split('/');
-                config.sourceIndexName = parts[0];
-                config.sourceNamespace = parts.slice(1).join('/');
-              } else {
-                config.sourceIndexName = selectedTable;
-                config.sourceNamespace = selectedTableData?.namespace || '';
-              }
-              // Also set sourceTableName for compatibility with other parts of the system
-              config.sourceTableName = config.sourceIndexName;
-              config.sourceSchema = config.sourceNamespace;
-            } else if (conn.dbType === 'lancedb') {
-              // LanceDB: table name only (no namespace concept)
-              config.sourceIndexName = selectedTable;
-              config.sourceTableName = selectedTable;
-              config.sourceNamespace = '';
-            }
-          }
-        } else if (isNoSQL) {
-          // For NoSQL, set sourceCollection
-          config.sourceCollection = aiSelectedTables.length > 0 ? aiSelectedTables[0] : null;
-        } else {
-          // For SQL, set sourceTableName and sourceSchema
-          config.sourceTableName = aiSelectedTables.length > 0 ? aiSelectedTables[0] : null;
-          // Use the schema from the selected table, not the connection's default schema
-          config.sourceSchema = selectedTableData?.schema || conn.dbConfig?.schema;
-        }
-        // console.log('latestWithSQL: ', latestWithSQL)
-        // Store the preview query
-        if (latestWithSQL) {
-          config.sourceSql = latestWithSQL.sql;
-          config.sourcePreviewSql = latestWithSQL.previewSql;
-          config.sourceSqlExplanation = latestWithSQL.explanation || '';
-          config.sourceQueryDescription = latestWithSQL.queryDescription || '';
-        }
-
-        // Store the table schema (columns and sample data)
-        if (tableSchema) {
-          config.sourceTableSchema = tableSchema;
-        }
-
+      return config;
     }
+
+    if (conn.connectionType === 'file') {
+      config.sourceDataset = conn.name;
+      if (conn.fileInfo?.filePath) config.sourceLocalPath = conn.fileInfo.filePath;
+      if (conn.cloudSource) config.cloudSource = conn.cloudSource;
+
+      if (['duckdb', 'sqlite', 'nedb', 'lancedb'].includes(conn.dbType)) {
+        config.sourceDbType = conn.dbType;
+        config.sourceDbCategory = conn.dbCategory || (conn.dbType === 'lancedb' ? 'Vector' : null);
+
+        // A DuckDB source is a file: the path is the address, and the table
+        // name is only the label the user sees. A multi-sheet workbook became
+        // one Parquet file per sheet, so the chosen sheet picks the path.
+        if (conn.dbType === 'duckdb') {
+          const selected = tableName || conn.fileInfo?.tables?.[0] || null;
+          const filePath = (selected && conn.fileInfo?.tablePaths?.[selected]) || conn.fileInfo?.filePath || null;
+          config.sourceFilePath = filePath;
+          config.sourceLocalPath = filePath;
+          config.sourceFormat = conn.fileInfo?.format || null;
+          if (selected) config.sourceTableName = selected;
+        }
+        if (conn.dbType === 'sqlite' && tableName) config.sourceTableName = tableName;
+        if (conn.dbType === 'nedb' && tableName) config.sourceCollection = tableName;
+        if (conn.dbType === 'lancedb' && tableName) {
+          config.sourceIndexName = tableName;
+          config.sourceTableName = tableName;
+          config.sourceNamespace = '';
+        }
+        if (tableSchemaVal) config.sourceTableSchema = tableSchemaVal;
+      }
+
+      if ((conn.dbType === 'sqlite' || conn.dbType === 'duckdb') && sqlVal) {
+        config.sourceSql = sqlVal.sql;
+        config.sourcePreviewSql = sqlVal.previewSql;
+        config.sourceSqlExplanation = sqlVal.explanation || '';
+      }
+    } else if (conn.connectionType !== 'database') {
+      config.sourceDataset = conn.name;
+    }
+
+    if (conn.connectionType === 'database') {
+      config.sourceDbType = conn.dbType;
+      config.sourceDbCategory = conn.dbCategory;
+      config.sourceDbConfig = conn.dbConfig;
+      config.sourceSelectedTables = tableName ? [tableName] : [];
+      if (tableName) config.sourceTable = tableName;
+
+      const isNoSQL = conn.dbType === 'mongodb' || conn.dbType === 'nedb';
+      const isVector = conn.dbCategory === 'Vector' || conn.dbType === 'pinecone' || conn.dbType === 'lancedb';
+
+      if (isVector && tableName) {
+        if (conn.dbType === 'pinecone') {
+          if (tableName.includes('/')) {
+            const parts = tableName.split('/');
+            config.sourceIndexName = parts[0];
+            config.sourceNamespace = parts.slice(1).join('/');
+          } else {
+            config.sourceIndexName = tableName;
+            config.sourceNamespace = sel.table?.schema || '';
+          }
+          config.sourceTableName = config.sourceIndexName;
+          config.sourceSchema = config.sourceNamespace;
+        } else {
+          config.sourceIndexName = tableName;
+          config.sourceTableName = tableName;
+          config.sourceNamespace = '';
+        }
+      } else if (isNoSQL) {
+        config.sourceCollection = tableName || null;
+      } else {
+        config.sourceTableName = tableName || null;
+        config.sourceSchema = sel.table?.schema || sel.schema || conn.dbConfig?.schema || null;
+      }
+
+      if (sqlVal) {
+        config.sourceSql = sqlVal.sql;
+        config.sourcePreviewSql = sqlVal.previewSql;
+        config.sourceSqlExplanation = sqlVal.explanation || '';
+        config.sourceQueryDescription = sqlVal.queryDescription || '';
+      }
+      if (tableSchemaVal) config.sourceTableSchema = tableSchemaVal;
     }
 
     return config;
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // UI Helpers
-  // ─────────────────────────────────────────────────────────────────────────
+  const buildConfig = (override = {}) => buildConfigFor(selConn, override);
 
-  const getCurrentQuestion = () => {
-    for (let i = 0; i < chat.length; i++) {
-      const msg = chat[i];
-      if (msg.sender === 'bot' && msg.responseRequired) {
-        const nextMsg = chat[i + 1];
-        if (!nextMsg || nextMsg.sender !== 'user') {
-          return msg;
-        }
-      }
-    }
-    return null;
+  /**
+   * Push the current selection to the Data Preview. Called once per COMPLETED
+   * selection, never mid-flight: an earlier version fired on every state change,
+   * so picking a table pushed one config with a table but no query and another
+   * with both. The premature one raced the previous connection's still-open
+   * query ("connection is in closed state") and left the preview refetching
+   * twice per click.
+   */
+  const pushPreview = (override = {}) => {
+    if (!onPreviewConfigUpdate || !selConn) return;
+    onPreviewConfigUpdate(node.id, buildConfig(override));
   };
 
-  const currentQ = getCurrentQuestion();
+  const handleSave = () => {
+    setAttempted(true);
+    if (missingCount > 0) return;
+    if (hasSaved && !dirty) return;
 
-  const getChoices = () => {
-    if (!currentQ) return [];
+    onSave(buildConfig(), []);
+    setDirty(false);
+    setHasSaved(true);
+    setAttempted(false);
 
-    // Only show connection choices if connection not yet selected
-    if (!connectionComplete && currentQ.responseType === 'connection') {
-      const categorize = (conn) => {
-        if (conn.dbCategory === 'CloudStorage') return 'Cloud Storage';
-        if (conn.dbCategory === 'API') return 'APIs';
-        if (conn.connectionType === 'database') return 'Databases';
-        if (conn.connectionType === 'file') return 'Local Files';
-        return 'Other';
-      };
-
-      const groupColor = {
-        'Cloud Storage': '#0891b2',
-        'APIs': '#2563eb',
-        'Databases': '#7c3aed',
-        'Local Files': '#d97706',
-        'Other': '#5a6678',
-      };
-
-      const connectionChoices = connections.map(conn => {
-        const group = categorize(conn);
-        return {
-          label: conn.name,
-          value: conn.id,
-          description: conn.description,
-          fullWidth: true,
-          _data: conn,
-          icon: getConnectionIcon(conn),
-          group,
-          groupColor: groupColor[group],
-        };
-      });
-
-      // Keep the "New Connection" button at the top, outside of groups
-      return [
-        {
-          label: 'New Connection',
-          value: '__new_connection__',
-          description: 'Create a new data source connection',
-          fullWidth: true,
-          variant: 'outlined',
-          icon: <PlusOutlined style={{ fontSize: 16 }} />,
-          _isNewConnection: true
-        },
-        ...connectionChoices
-      ];
-    }
-
-    // Show table selection choices
-    if (currentQ.responseType === 'choice' && currentQ.ref === 'tableSelection') {
-      return currentQ.metadata?.choices || [];
-    }
-
-    // Show sheet selection choices (for Google Sheets)
-    if (currentQ.responseType === 'choice' && currentQ.ref === 'sheetSelection') {
-      return currentQ.metadata?.choices || [];
-    }
-
-    return [];
+    // A REST API source has no form fields left to fill — the request is
+    // described in the chat, which opens with this node in focus.
+    if (connKind === 'api') onRequestChatHandoff?.(node.id);
   };
 
-  const getPlaceholder = () => {
-    if (!currentQ) return '';
-    return currentQ.placeholder || 'Type your response…';
-  };
+  // ── Render ───────────────────────────────────────────────────────────────
 
-  const handleSendMessage = () => {
-    const text = inputValue.trim();
-    if (!text || !currentQ) return;
-    setInputValue('');
-    handleUserResponse(text, currentQ.ref, text, selectedChoice?._data);
-  };
+  const datasetBusy = tablesLoading || sheetsLoading;
 
-  const handleChoiceSelect = (choice) => {
-    if (!currentQ) return;
-    // console.log('choice: ', choice)
-    setSelectedChoice(choice)
-    handleUserResponse(choice.label, currentQ.ref, choice.value, choice._data);
-  };
-
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
-    }
-  };
-
-  const handleSave = async () => {
-    setSaveState(false);
-
-    // Save configuration
-    const config = buildConfig();
-    onSave(config, chat);
-  };
-
-
-  const displayChoices = () => {
-    // Don't show choices while loading
-    if (loading || aiLoading || executing || apiRunning) return [];
-
-    // REST API: offer Run & Save only while there is a freshly generated
-    // fetch function that has not yet been executed. Reopening a saved node
-    // should not re-prompt the user to run unless they refine the request.
-    if (selConn?.dbType === 'rest-api' && apiFetchCode && apiFetchDirty) {
-      return [{
-        label: 'Run & Save Configuration',
-        value: 'run_save_api',
-        variant: 'contained',
-        fullWidth: true,
-      }];
-    }
-
-    // Show Save when configuration is complete
-    if (saveState) {
-      return [{ label: 'Save Configuration', value: 'save', variant: 'contained', fullWidth: true }];
-    }
-
-    return getChoices();
-  };
-
-  const handleChoiceClick = (choice) => {
-    if (choice.value === 'save') {
-      handleSave();
-    } else if (choice.value === 'run_save_api') {
-      runAndSaveApiFetch();
-    } else if (choice._isNewConnection) {
-      // Open ConnectionTypeSelector modal
-      setIsConnectionTypeSelectorOpen(true);
-    } else {
-      handleChoiceSelect(choice);
-    }
-  };
-
-  const displayMessages = chat.map(m => ({
-    id: m.id,
-    text: m.text,
-    metadata: m.metadata,
-    sender: m.sender,
-    timestamp: m.timestamp || new Date(),
-  }));
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Code popup wiring — mapping from chat-message metadata field to node config
-  // ─────────────────────────────────────────────────────────────────────────
-  const handleCodeSave = useCallback((field, value, message) => {
-    const updatedChat = chat.map(m =>
-      m.id === message?.id
-        ? { ...m, metadata: { ...m.metadata, [field]: value } }
-        : m
-    );
-    setChat(updatedChat);
-
-    if (field === 'sql') {
-      setLatestWithSQL(prev => ({
-        ...(prev || {}),
-        sql: value,
-        previewSql: value,
-      }));
-    }
-
-    if (!onConfigUpdate || !node?.id) return;
-
-    let update;
-    switch (field) {
-      case 'sql':
-        update = { sourceSql: value, sourcePreviewSql: value };
-        break;
-      case 'ddl':
-        update = { sourceDdl: value };
-        break;
-      case 'transformFunction':
-        update = { transformFunction: value };
-        break;
-      case 'pythonCode':
-        update = { pythonCode: value };
-        break;
-      case 'javascriptFunction':
-        update = { javascriptFunction: value };
-        break;
-      default:
-        update = { [field]: value };
-    }
-    onConfigUpdate(node.id, { ...update, chat: updatedChat });
-  }, [onConfigUpdate, node?.id, chat]);
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
+  // Which file a local source actually reads, and the format it was added as.
+  // The table names below are generated from the file, so without this the
+  // form never names the file itself.
+  const fileSummary = useMemo(() => {
+    const fileType = fileTypeOf(selConn);
+    if (!fileType) return null;
+    const label = `${FILE_TYPE_LABEL[fileType] || fileType} file`;
+    const name = fileNameOf(selConn);
+    return <Picked>{name ? <><code>{name}</code> — {label}</> : label}</Picked>;
+  }, [selConn]);
 
   return (
-    <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <ChatArea
-          hideHeader
-          isFullscreen={false}
-          currentChatTitle=""
-          multiStepData={null}
-          handleFullscreen={() => {}}
-          handleToggleChat={() => {}}
-          chatContainerRef={chatContainerRef}
-          messages={displayMessages}
-          isLoading={loading || aiLoading}
-          progressInfo={{ progress: 0, stage: (loading || aiLoading) ? 'Processing...' : '' }}
-          messagesEndRef={messagesEndRef}
-          inputRef={inputRef}
-          inputValue={inputValue}
-          setInputValue={setInputValue}
-          handleKeyPress={handleKeyPress}
-          handleSendMessage={handleSendMessage}
-          formatTimestamp={formatTimestamp}
-          onSaveToMain={null}
-          choices={displayChoices()}
-          onChoiceSelect={handleChoiceClick}
-          inputPlaceholder={getPlaceholder()}
-          disableInput={disableInput}
-          showRunButton={false}
-          onRun={null}
-          runButtonLoading={false}
-          onCodeSave={handleCodeSave}
-        />
+    <FormScope>
+      <FormBody>
+        <Card label="Connection">
+          {loading ? (
+            <EmptyState>Loading connections…</EmptyState>
+          ) : (
+            <>
+              <SearchBox value={search} onChange={setSearch} />
+              {filteredConnections.length === 0 ? (
+                <EmptyState>
+                  {connections.length === 0
+                    ? 'No saved connections yet.'
+                    : 'No connection matches that search.'}
+                </EmptyState>
+              ) : (
+                <ConnList grouped>
+                  {groupedConnections.map(([group, conns]) => {
+                    const open = searching || !!openGroups[group];
+                    return (
+                      <React.Fragment key={group}>
+                        <ConnGroupToggle
+                          label={group}
+                          color={GROUP_COLOR[group]}
+                          count={conns.length}
+                          open={open}
+                          onToggle={() => toggleGroup(group)}
+                        />
+                        {open && conns.map((conn) => (
+                          <ConnRow
+                            key={conn.id}
+                            icon={getConnectionIcon(conn)}
+                            name={conn.name}
+                            meta={connMeta(conn)}
+                            selected={conn.id === selConn?.id}
+                            onClick={() => selectConnection(conn)}
+                          />
+                        ))}
+                      </React.Fragment>
+                    );
+                  })}
+                </ConnList>
+              )}
+              <NewConnButton onClick={() => setIsConnectionTypeSelectorOpen(true)} />
+            </>
+          )}
+        </Card>
 
-        {/* Cloud Storage Browser Modal */}
-        {cloudStorageBrowserOpen && cloudStorageConnection && (
-          cloudStorageConnection.dbType === 'google-drive' && cloudStorageConnection.dbConfig?.accessToken ? (
-            // Google Drive with OAuth login - use Picker
-            <GoogleDrivePicker
-              connection={cloudStorageConnection}
-              onFileSelect={handleCloudFileSelect}
-              onClose={() => setCloudStorageBrowserOpen(false)}
-            />
-          ) : pluginManager ? (
-            // Other cloud storage or Google Drive without OAuth - use browser
-            <CloudStorageBrowser
-              open={cloudStorageBrowserOpen}
-              onClose={() => setCloudStorageBrowserOpen(false)}
-              connection={cloudStorageConnection}
-              onFileSelect={handleCloudFileSelect}
-              pluginManager={pluginManager}
-            />
-          ) : null
+        {/* SQL → schema + table */}
+        {connKind === 'sql' && (
+          <Card label="Dataset">
+            {fileSummary}
+            {datasetBusy && dbTableObjects.length === 0 ? (
+              <EmptyState>Loading tables…</EmptyState>
+            ) : dbTableObjects.length === 0 ? (
+              <EmptyState>No tables found. Check the connection settings.</EmptyState>
+            ) : (
+              <Fields>
+                {schemaOptions.length > 0 && (
+                  <Field label="Schema" required invalid={invalid('schema')}>
+                    {onlySchema ? (
+                      <StaticValue>{onlySchema}</StaticValue>
+                    ) : (
+                      <SearchSelect
+                        value={selectedSchema}
+                        placeholder="Select a schema…"
+                        searchPlaceholder="Filter schemas…"
+                        options={schemaOptions.map((s) => ({ label: s, value: s }))}
+                        onChange={(v) => { setDirty(true); setSelectedSchema(v); setSelectedTableName(''); }}
+                      />
+                    )}
+                  </Field>
+                )}
+                <Field
+                  label="Table"
+                  required
+                  invalid={invalid('table')}
+                  hint={onlyTable
+                    ? 'The only table in this source.'
+                    : schemaOptions.length > 0 ? 'Loaded from the connection once a schema is chosen.' : null}
+                >
+                  {onlyTable ? (
+                    <StaticValue>{onlyTable.label}</StaticValue>
+                  ) : (
+                    <SearchSelect
+                      value={selectedTableName}
+                      placeholder="Select a table…"
+                      searchPlaceholder="Filter tables…"
+                      options={tableOptions}
+                      disabled={schemaOptions.length > 0 && !selectedSchema}
+                      onChange={selectTable}
+                    />
+                  )}
+                </Field>
+              </Fields>
+            )}
+          </Card>
         )}
 
-        {/* Connection Type Selector Modal */}
-        <ConnectionTypeSelector
-          open={isConnectionTypeSelectorOpen}
-          onClose={handleConnectionTypeSelectorClose}
-          onSelectType={handleConnectionTypeSelect}
-        />
-
-        {/* Connection Form Modal */}
-        {ActiveForm && (
-          <Modal
-            title={getModalTitle(activeDbType)}
-            open={Boolean(activeDbType)}
-            onCancel={() => {
-              // Cancel any active OAuth server
-              if (window.electronAPI?.oauth?.cancelServer) {
-                window.electronAPI.oauth.cancelServer(3000);
-              }
-              setActiveDbType(null);
-            }}
-            footer={null}
-            width={640}
-            destroyOnClose
-          >
-            <ActiveForm />
-          </Modal>
+        {/* NoSQL → collection */}
+        {connKind === 'nosql' && (
+          <Card label="Dataset">
+            {fileSummary}
+            {datasetBusy && dbTableObjects.length === 0 ? (
+              <EmptyState>Loading collections…</EmptyState>
+            ) : dbTableObjects.length === 0 ? (
+              <EmptyState>No collections found. Check the connection settings.</EmptyState>
+            ) : (
+              <Fields>
+                <Field
+                  label="Collection"
+                  required
+                  invalid={invalid('table')}
+                  hint={onlyTable ? 'The only collection in this source.' : null}
+                >
+                  {onlyTable ? (
+                    <StaticValue>{onlyTable.label}</StaticValue>
+                  ) : (
+                    <SearchSelect
+                      value={selectedTableName}
+                      placeholder="Select a collection…"
+                      searchPlaceholder="Filter collections…"
+                      options={tableOptions}
+                      onChange={selectTable}
+                    />
+                  )}
+                </Field>
+              </Fields>
+            )}
+          </Card>
         )}
-    </div>
+
+        {/* Vector → index */}
+        {connKind === 'vector' && (
+          <Card label="Dataset">
+            {fileSummary}
+            {datasetBusy && dbTableObjects.length === 0 ? (
+              <EmptyState>Loading indexes…</EmptyState>
+            ) : dbTableObjects.length === 0 ? (
+              <EmptyState>No indexes found. Check the connection settings.</EmptyState>
+            ) : (
+              <Fields>
+                <Field
+                  label="Index"
+                  required
+                  invalid={invalid('table')}
+                  hint={onlyTable ? 'The only index in this source.' : null}
+                >
+                  {onlyTable ? (
+                    <StaticValue>{onlyTable.label}</StaticValue>
+                  ) : (
+                    <SearchSelect
+                      value={selectedTableName}
+                      placeholder="Select an index…"
+                      searchPlaceholder="Filter indexes…"
+                      options={tableOptions}
+                      onChange={selectTable}
+                    />
+                  )}
+                </Field>
+              </Fields>
+            )}
+          </Card>
+        )}
+
+        {/* Google Sheets → spreadsheet + sheet */}
+        {connKind === 'sheets' && (
+          <Card label="Dataset">
+            {datasetBusy && dbTableObjects.length === 0 ? (
+              <EmptyState>Loading spreadsheets…</EmptyState>
+            ) : (
+              <Fields>
+                <Field label="Spreadsheet" required invalid={invalid('table')}>
+                  <SearchSelect
+                    value={selectedTableName}
+                    placeholder="Select a spreadsheet…"
+                    searchPlaceholder="Filter spreadsheets…"
+                    options={tableOptions}
+                    onChange={selectTable}
+                  />
+                </Field>
+                {(selectedTableName || sheetImport) && (
+                  <Field
+                    label="Sheet"
+                    required
+                    invalid={invalid('sheet')}
+                    hint="The chosen sheet is imported to a local table."
+                  >
+                    <SearchSelect
+                      value={selectedSheet}
+                      placeholder={sheetsLoading ? 'Loading sheets…' : 'Select a sheet…'}
+                      searchPlaceholder="Filter sheets…"
+                      options={sheetOptions.length > 0
+                        ? sheetOptions
+                        // On reopen the tab list hasn't been re-fetched; keep
+                        // the saved sheet selectable so it still renders.
+                        : selectedSheet ? [{ label: selectedSheet, value: selectedSheet }] : []}
+                      disabled={sheetsLoading || (sheetOptions.length === 0 && !selectedSheet)}
+                      onChange={selectSheet}
+                    />
+                  </Field>
+                )}
+                {sheetImport && (
+                  <Picked>Imported into <code>{sheetImport.tableName}</code></Picked>
+                )}
+              </Fields>
+            )}
+          </Card>
+        )}
+
+        {/* API → save, then the chat opens with this node in focus */}
+        {connKind === 'api' && (
+          <Card label="API request">
+            <Handoff color={FORM_ACCENT.transform} icon={<IconChat />} title="Continues in chat after you save">
+              <HandoffBody>
+                {selConn?.dbConfig?.baseUrl ? (
+                  <>Base URL: <code>{selConn.dbConfig.baseUrl}</code><br /></>
+                ) : null}
+                Auth is stored on the connection. <strong>Press Save and the chat opens with this
+                node in focus</strong>, where you describe the request — endpoint, method, filtering.
+                You can come back and modify the request at any time.
+              </HandoffBody>
+              {initialConfig?.apiFetchCode ? (
+                <Picked>
+                  Fetch function ready{initialConfig.sourceCollection
+                    ? <> — cached into <code>{initialConfig.sourceCollection}</code></>
+                    : null}
+                </Picked>
+              ) : null}
+            </Handoff>
+          </Card>
+        )}
+
+        {/* Cloud storage → picker; save stays disabled until a file is chosen */}
+        {connKind === 'cloud' && (
+          <Card label="Cloud file">
+            <Handoff
+              color={FORM_ACCENT.source}
+              icon={<IconFolder color={FORM_ACCENT.source} size={14} />}
+              title="Pick a file to import"
+            >
+              <HandoffBody>
+                Browse the connected storage and choose a CSV, Excel, JSON or Parquet file. It is
+                imported to a local table, and the table + schema are filled in for you. Save stays
+                disabled until a file is picked.
+              </HandoffBody>
+              <CloudButton onClick={() => { setCloudStorageConnection(selConn); setCloudStorageBrowserOpen(true); }}>
+                Open storage browser
+              </CloudButton>
+            </Handoff>
+          </Card>
+        )}
+
+        {/* An imported cloud file, or a file source with nothing left to pick */}
+        {importedFile && connKind !== 'cloud' && (
+          <Card label="Cloud file">
+            <Picked>Imported <code>{importedFile.path}</code></Picked>
+            <CloudButton onClick={() => {
+              setCloudStorageConnection(cloudStorageConnection);
+              setCloudStorageBrowserOpen(true);
+            }}>
+              Change file
+            </CloudButton>
+          </Card>
+        )}
+
+        {connKind === 'ready' && !importedFile && (
+          <Card label="Dataset">
+            {fileSummary}
+            <Note>
+              <strong>{selConn?.name}</strong> is already imported — there is nothing else to pick.
+            </Note>
+          </Card>
+        )}
+      </FormBody>
+
+      <FormFooter
+        error={gateMessage}
+        onCancel={onCancel}
+        onSave={handleSave}
+        saveDisabled={!!missing.cloudFile || (hasSaved && !dirty)}
+        saveDisabledReason={missing.cloudFile
+          ? 'Open the storage browser and pick a file to import first.'
+          : 'Nothing has changed since the last save.'}
+      />
+
+      {/* Cloud Storage Browser */}
+      {cloudStorageBrowserOpen && cloudStorageConnection && (
+        cloudStorageConnection.dbType === 'google-drive' && cloudStorageConnection.dbConfig?.accessToken ? (
+          <GoogleDrivePicker
+            connection={cloudStorageConnection}
+            onFileSelect={handleCloudFileSelect}
+            onClose={() => setCloudStorageBrowserOpen(false)}
+          />
+        ) : pluginManager ? (
+          <CloudStorageBrowser
+            open={cloudStorageBrowserOpen}
+            onClose={() => setCloudStorageBrowserOpen(false)}
+            connection={cloudStorageConnection}
+            onFileSelect={handleCloudFileSelect}
+            pluginManager={pluginManager}
+          />
+        ) : null
+      )}
+
+      {/* New connection */}
+      <ConnectionTypeSelector
+        open={isConnectionTypeSelectorOpen}
+        onClose={() => { setIsConnectionTypeSelectorOpen(false); loadConnections(); }}
+        onSelectType={(type) => { setIsConnectionTypeSelectorOpen(false); setActiveDbType(type); }}
+      />
+
+      {ActiveForm && (
+        <Modal
+          title={getModalTitle(activeDbType)}
+          open={Boolean(activeDbType)}
+          onCancel={() => {
+            if (window.electronAPI?.oauth?.cancelServer) window.electronAPI.oauth.cancelServer(3000);
+            setActiveDbType(null);
+          }}
+          footer={null}
+          width={640}
+          destroyOnClose
+        >
+          <ActiveForm />
+        </Modal>
+      )}
+    </FormScope>
   );
 };
 

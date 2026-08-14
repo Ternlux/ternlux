@@ -3,6 +3,7 @@ import axios from 'axios';
 import { connectionsDb } from '../../../utils/localDb';
 import { getWorkflowAssistance } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
+import { qualifyLocalTableName } from '../../../utils/workflowNaming';
 import { buildChatPrompt } from '../../../utils/chatPrompts';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 import {
@@ -111,7 +112,8 @@ const JoinNodeChat = ({
   onPreviewConfigUpdate,
   executeJoin,
   executingInd,
-  executing = false
+  executing = false,
+  workflowScopeId = null
 }) => {
   const messagesEndRef = useRef(null);
   const chatContainerRef = useRef(null);
@@ -156,6 +158,19 @@ const JoinNodeChat = ({
     userRequest: null              // Original user request
   });
 
+  // Local joins all write into the one shared app-data.db, so a user/AI-chosen
+  // table name is prefixed with this workflow's token to stop two workflows
+  // dropping and recreating each other's table. Node-id defaults are already
+  // unique. Applied before the AI writes the DDL, which the executor runs
+  // verbatim.
+  const resolveJoinTableName = (settings) => {
+    const base = settings?.targetTableName || node.id.replace('-', '_').toLowerCase();
+    return qualifyLocalTableName(base, {
+      workflowId: workflowScopeId,
+      isLocal: !!settings?.destinationSelection?.startsWith('local-'),
+    });
+  };
+
   const [pendingChoices, setPendingChoices] = useState([]);
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -170,7 +185,7 @@ const JoinNodeChat = ({
       try {
         // Determine operationType based on target connection dbType
         const dbType = targetConnection?.dbType;
-        const operationType = ['mongodb', 'nedb'].includes(dbType) ? 'nosql' : 'sql';
+        const operationType = dbType === 'mongodb' ? 'nosql' : 'sql';
 
         // Load join skills with context
         const result = await window.electronAPI.skills.getDescriptions('join', {
@@ -331,6 +346,22 @@ const JoinNodeChat = ({
     return userMsg;
   };
 
+  // Surface an invalid (non-JSON / truncated) AI response cleanly: a short
+  // "Invalid response" message plus an expandable "raw response" node so the
+  // user can inspect exactly what the model returned. Stops the spinner.
+  const showInvalidResponse = (rawResponse) => {
+    const raw = typeof rawResponse === 'string'
+      ? rawResponse
+      : (() => { try { return JSON.stringify(rawResponse, null, 2); } catch (_) { return String(rawResponse); } })();
+    addBotMessage(
+      'Invalid response — the AI did not return a valid result. Expand "raw response" below to see what it returned, then try again or rephrase.',
+      false, 'text', '', '',
+      { invalidJson: raw || '(empty response)' }
+    );
+    setAiLoading(false);
+    setLoading(false);
+  };
+
   // ─────────────────────────────────────────────────────────────────────────
   // Detect Source Nodes
   // ─────────────────────────────────────────────────────────────────────────
@@ -447,23 +478,14 @@ const JoinNodeChat = ({
     });
 
     // Add local storage options (always available)
+    // One local destination: the join result is written as a Parquet file this
+    // node owns, and read back by DuckDB. Tabular and document data alike.
     destinations.push({
-      id: 'local-sqlite',
-      label: 'Local SQLite',
-      value: 'local-sqlite',
-      description: 'Store locally in SQLite file',
-      connection: { dbType: 'sqlite', connectionType: 'file' },
-      icon: <SqlliteIcon style={{ width: 20, height: 20 }} />,
-      group: 'Local Files',
-      groupColor: DESTINATION_GROUP_COLOR['Local Files'],
-    });
-
-    destinations.push({
-      id: 'local-nedb',
-      label: 'Local NeDB',
-      value: 'local-nedb',
-      description: 'Store locally in NeDB file',
-      connection: { dbType: 'nedb', connectionType: 'file' },
+      id: 'local-duckdb',
+      label: 'Local file',
+      value: 'local-duckdb',
+      description: 'Store the result as a local file (Parquet)',
+      connection: { dbType: 'duckdb', connectionType: 'file' },
       icon: <DatabaseOutlined style={{ fontSize: 18 }} />,
       group: 'Local Files',
       groupColor: DESTINATION_GROUP_COLOR['Local Files'],
@@ -491,7 +513,7 @@ const JoinNodeChat = ({
 
     try {
       const sourceConfig = source?.data?.config || {};
-      const isNoSQL = connection.dbType === 'mongodb' || connection.dbType === 'nedb';
+      const isNoSQL = connection.dbType === 'mongodb';
 
       let tableName = null;
       let tableSchema = null;
@@ -504,9 +526,6 @@ const JoinNodeChat = ({
                     sourceConfig.table;
         localPath = sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath;
 
-        if (connection.dbType === 'nedb') {
-          queryConnection = { ...connection, dbType: 'mongodb' };
-        }
       } else {
         tableSchema = sourceConfig.targetSchema || sourceConfig.sourceSchema || connection.dbConfig?.schema;
         tableName = sourceConfig.targetTableName ||
@@ -599,7 +618,7 @@ const JoinNodeChat = ({
       await analyzeJoinRequest(userMsg.text, sourcesInfo, chatHistory);
     } catch (error) {
       console.error('Join analysis error:', error);
-      addBotMessage(`Failed to analyze your request. Error: ${error}`, false);
+      addBotMessage(error?.message || `Failed to analyze your request. Error: ${error}`, false);
       setAiLoading(false);
       setLoading(false);
     }
@@ -639,7 +658,7 @@ const JoinNodeChat = ({
 
       // Determine operationType
       const dbType = targetConnection?.dbType;
-      const operationType = ['mongodb', 'nedb'].includes(dbType) ? 'nosql' : 'sql';
+      const operationType = dbType === 'mongodb' ? 'nosql' : 'sql';
 
       // Build source schemas for context
       const sourcesInfo = sourceTableSchemas.map(schema => ({
@@ -857,14 +876,12 @@ const JoinNodeChat = ({
     try {
       analysis = JSON.parse(response);
     } catch (e) {
-      console.error('Failed to parse join analysis:', e);
-      // Fallback: ask for more details
-      analysis = {
-        action: 'ask_questions',
-        followUpQuestion: 'I need more details about your join. Please specify which columns from each table should be matched, what type of join (INNER, LEFT, etc.), and which columns you want in the final result.',
-        inferredSettings: {},
-        reasoning: 'Failed to parse analysis, asking for clarification'
-      };
+      // Invalid JSON (often truncated or wrapped in prose). Don't fall through
+      // to a generic "I need more details" re-prompt — surface a clear "Invalid
+      // response" with the raw text expandable, and abort.
+      console.error('Failed to parse join analysis JSON:', e, response);
+      showInvalidResponse(response);
+      return;
     }
 
     console.log('Join analysis:', analysis);
@@ -984,12 +1001,16 @@ const JoinNodeChat = ({
 
     // Check if destination is NoSQL
     const isNoSQL = destination.connection?.dbType === 'mongodb' ||
-                    destination.connection?.dbType === 'nedb' ||
-                    value?.startsWith('local-nedb') ||
                     value?.startsWith('local-mongodb');
 
-    // For NoSQL destinations, automatically set to new_table and skip the question
-    if (isNoSQL) {
+    // A local destination is this node's own output file, rewritten in full on
+    // every run — there is no existing table to merge into, so don't offer a
+    // choice that cannot be honoured.
+    const isLocalFileDestination = destination.connection?.dbType === 'duckdb' ||
+                    value === 'local-duckdb';
+
+    // For these destinations, automatically set to new_table and skip the question
+    if (isNoSQL || isLocalFileDestination) {
       const updatedSettingsWithMode = {
         ...updatedSettings,
         operationMode: 'new_table'
@@ -1186,13 +1207,16 @@ const JoinNodeChat = ({
     const targetDbType = targetConnection?.dbType ||
                         (settings.destinationSelection?.startsWith('local-')
                           ? settings.destinationSelection.replace('local-', '')
-                          : 'sqlite');
+                          : 'duckdb');
 
-    const isNoSQL = targetDbType === 'mongodb' || targetDbType === 'nedb';
+    const isNoSQL = targetDbType === 'mongodb';
     const isVectorDestination =
       targetConnection?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetDbType);
+    // A local destination writes a file via DuckDB — no temp tables to stage
+    // sources into, so its sources need far less from the model.
+    const isLocalDestination = targetDbType === 'duckdb';
 
-    const targetTableName = settings.targetTableName || node.id.replace('-', '_').toLowerCase();
+    const targetTableName = resolveJoinTableName(settings);
 
     const destinationConnectionId = targetConnection?.id || settings.destinationSelection;
 
@@ -1200,9 +1224,10 @@ const JoinNodeChat = ({
     const sourcesInfo = sourceTableSchemas.map((schema, idx) => {
       const sourceConnectionId = sourceConnections[idx]?.id;
       const sourceDbType = sourceConnections[idx]?.dbType;
-      const isSourceNoSQL = sourceDbType === 'mongodb' || sourceDbType === 'nedb';
+      const isSourceNoSQL = sourceDbType === 'mongodb';
       const isSourceVector =
         sourceConnections[idx]?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(sourceDbType);
+      const isSourceLocalFile = sourceDbType === 'duckdb';
       const isInDestinationDb = sourceConnectionId === destinationConnectionId;
 
       // Determine what fields are needed for this source
@@ -1221,6 +1246,21 @@ const JoinNodeChat = ({
           requiredFields = ['nosqlOperation']; // Query to fetch from NoSQL source
         } else {
           requiredFields = ['sql']; // Query to fetch from SQL source
+        }
+      } else if (isLocalDestination) {
+        // Local destination: DuckDB reads each source and writes one file.
+        // A local file source needs nothing but a name to be referred to by —
+        // it is read where it sits, so no DDL and no staging query. Remote
+        // sources still need their rows fetched, but DuckDB infers the types,
+        // so they need no DDL either.
+        if (isSourceLocalFile) {
+          requiredFields = ['tempTableName'];
+        } else if (isSourceVector) {
+          requiredFields = ['tempTableName', 'vectorFetchOperation', 'selectedColumns'];
+        } else if (isSourceNoSQL) {
+          requiredFields = ['tempTableName', 'nosqlOperation', 'selectedColumns'];
+        } else {
+          requiredFields = ['tempTableName', 'sql', 'selectedColumns'];
         }
       } else {
         if (isSourceVector) {
@@ -1257,7 +1297,7 @@ const JoinNodeChat = ({
 
     // True when any source — or the destination — is a local nedb / sqlite /
     // lancedb file. Gates the dbPath note in the join-generation prompt.
-    const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['nedb', 'sqlite', 'lancedb']);
+    const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['duckdb', 'lancedb']);
     const hasLocalSource = sourcesInfo.some((s) => s.localPath);
     const destinationIsLocal = LOCAL_DB_TYPES_FOR_PROMPT.has(targetDbType);
 
@@ -1303,12 +1343,12 @@ const JoinNodeChat = ({
       try {
         parsedResponse = JSON.parse(response);
       } catch (e) {
-        console.error('Failed to parse join response:', e);
-        parsedResponse = {
-          explanation: response,
-          sql: '',
-          ddl: ''
-        };
+        // Invalid/truncated JSON — never mark anything runnable (TLX-012).
+        // Show a clear "Invalid response" with the raw text expandable.
+        console.error('Failed to parse join response JSON:', e, response);
+        setSaveState(false);
+        showInvalidResponse(response);
+        return;
       }
 
       console.log('Join configuration:', parsedResponse);
@@ -1360,6 +1400,33 @@ const JoinNodeChat = ({
         joinConfig.transformFunction = parsedResponse.javascriptFunction;
       }
 
+      // Completeness gate — never present an incomplete/invalid config as
+      // runnable (TLX-012). A SQL join needs a non-empty joinSql; a NoSQL/
+      // vector join needs its JavaScript function. If the model's output was
+      // truncated or missing the runnable piece, refuse to enable Run.
+      const needsJsFunction = isNoSQL || isVectorDestination;
+      const hasRunnable = needsJsFunction
+        ? !!(parsedResponse.javascriptFunction && String(parsedResponse.javascriptFunction).trim())
+        : !!(parsedResponse.joinSql && String(parsedResponse.joinSql).trim());
+
+      if (!hasRunnable) {
+        // Valid JSON, but it's missing the runnable join query/function.
+        setSaveState(false);
+        setLatestJoinConfig(null);
+        addBotMessage(
+          `✗ I couldn't produce a complete join configuration — it did not include a runnable join query.\n\nNothing has been marked ready to run. Please try again, or simplify the request (fewer columns, avoid CTEs/temp tables).`,
+          false
+        );
+        addBotMessage(
+          'Describe the join again or refine your request…',
+          true,
+          'text',
+          'chatContinue',
+          'Ask a follow-up question or request changes…'
+        );
+        return;
+      }
+
       setLatestJoinConfig(joinConfig);
       setSaveState(true);
 
@@ -1396,7 +1463,8 @@ const JoinNodeChat = ({
 
     } catch (error) {
       console.error('Join generation error:', error);
-      addBotMessage('Failed to generate join configuration. Please try again.', false);
+      // Prefer the plain-language provider error when we have one.
+      addBotMessage(error?.message || 'Failed to generate join configuration. Please try again.', false);
     } finally {
       setAiLoading(false);
       setLoading(false);
@@ -1442,7 +1510,7 @@ const JoinNodeChat = ({
   const buildConfig = async () => {
     if (!sourceConnections || sourceConnections.length === 0) return {};
 
-    const isNoSQL = targetConnection?.dbType === 'mongodb' || targetConnection?.dbType === 'nedb';
+    const isNoSQL = targetConnection?.dbType === 'mongodb';
     const isLocalStorage = joinSettings.destinationSelection?.startsWith('local-');
 
     // Base configuration
@@ -1482,12 +1550,14 @@ const JoinNodeChat = ({
     }
 
     // Target configuration
-    const targetTableName = joinSettings.targetTableName || node.id.replace('-', '_').toLowerCase();
+    const targetTableName = resolveJoinTableName(joinSettings);
 
     if (isLocalStorage) {
-      const localDbType = isNoSQL ? 'nedb' : 'sqlite';
+      // A local join result is a Parquet file this node owns, read by DuckDB.
+      // Vector destinations keep their own token and are handled above.
+      const localDbType = joinSettings.destinationSelection === 'local-lancedb' ? 'lancedb' : 'duckdb';
       config.targetConnectionId = `local-${localDbType}`;
-      config.targetConnectionName = localDbType === 'nedb' ? 'Local NeDB' : 'Local SQLite';
+      config.targetConnectionName = localDbType === 'lancedb' ? 'Local LanceDB' : 'Local file';
       config.targetConnectionType = 'file';
       config.targetDbType = localDbType;
       config.targetDbConfig = {};
@@ -1557,8 +1627,8 @@ const JoinNodeChat = ({
     setExecutionError(null);
     let localPathFromResult = null;
 
-    const isNoSQL = targetConnection?.dbType === 'mongodb' || targetConnection?.dbType === 'nedb';
-    const targetTableName = joinSettings.targetTableName || node.id.replace('-', '_').toLowerCase();
+    const isNoSQL = targetConnection?.dbType === 'mongodb';
+    const targetTableName = resolveJoinTableName(joinSettings);
 
     // Execute join using the new executeJoin function
     executingInd(true);
@@ -1705,7 +1775,17 @@ const JoinNodeChat = ({
 
     if (choice.value === 'fix_error') {
       const errorText = executionError?.error || 'an unknown error';
-      const message = `Fix this error: ${errorText}`;
+      // Feed the FAILING code + error back to the model so it can patch the
+      // specific problem, instead of restarting and re-asking for columns the
+      // user already gave. The failed SQL/function is injected into the chat
+      // history via this user message.
+      const failedCfg = executionError?.joinConfig || latestJoinConfig || {};
+      const failedSql = failedCfg.joinSql || failedCfg.targetSql || '';
+      const failedFn = failedCfg.transformFunction || failedCfg.javascriptFunction || '';
+      let message = `The join failed at execution with this error:\n${errorText}\n\n`;
+      if (failedSql) message += `The join query that failed was:\n\`\`\`sql\n${failedSql}\n\`\`\`\n\n`;
+      if (failedFn) message += `The join function that failed was:\n\`\`\`javascript\n${failedFn}\n\`\`\`\n\n`;
+      message += `Diagnose the cause and return a corrected join configuration. Reuse the configuration I already provided — do not ask me to re-specify columns or join type; fix only what caused the error.`;
       setExecutionError(null);
       handleUserResponse(message, 'chatContinue', message, null);
       return;

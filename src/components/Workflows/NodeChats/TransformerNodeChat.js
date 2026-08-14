@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { getWorkflowAssistance } from '../../../utils/workflowAI';
 import ChatArea from '../../Chat/ChatArea';
+import { qualifyLocalTableName } from '../../../utils/workflowNaming';
 import { buildChatPrompt } from '../../../utils/chatPrompts';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +27,8 @@ const TransformerNodeChat = ({
   executeTransformation,
   getSourceLocalPath,
   executingInd,
-  executing = false
+  executing = false,
+  workflowScopeId = null
 }) => {
   const messagesEndRef = useRef(null);
   const chatContainerRef = useRef(null);
@@ -241,6 +243,22 @@ const TransformerNodeChat = ({
     };
     setChat(prev => [...prev, userMsg]);
     return userMsg;
+  };
+
+  // Surface an invalid (non-JSON / truncated) AI response cleanly: a short
+  // "Invalid response" message plus an expandable "raw response" node so the
+  // user can inspect exactly what the model returned. Stops the spinner.
+  const showInvalidResponse = (rawResponse) => {
+    const raw = typeof rawResponse === 'string'
+      ? rawResponse
+      : (() => { try { return JSON.stringify(rawResponse, null, 2); } catch (_) { return String(rawResponse); } })();
+    addBotMessage(
+      'Invalid response — the AI did not return a valid result. Expand "raw response" below to see what it returned, then try again or rephrase.',
+      false, 'text', '', '',
+      { invalidJson: raw || '(empty response)' }
+    );
+    setAiLoading(false);
+    setLoading(false);
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -488,7 +506,7 @@ const TransformerNodeChat = ({
       await analyzeTransformationRequest(userMsg.text, chatHistory);
     } catch (error) {
       console.error('Analysis error:', error);
-      addBotMessage(`Failed to analyze your request. Error: ${error}`, false);
+      addBotMessage(error?.message || `Failed to analyze your request. Error: ${error}`, false);
       setAiLoading(false);
       setLoading(false);
     }
@@ -761,23 +779,17 @@ Source: ${sourceTableSchema.sourceNodeLabel}
 
     // console.log('Analysis response:', response);
 
-    let analysis;
+    let analysis = null;
     try {
       analysis = JSON.parse(response);
     } catch (e) {
-      console.error('Failed to parse analysis:', e);
-      // Fallback: ask all questions
-      analysis = {
-        action: 'ask_questions',
-        inferredSettings: {
-          operationMode: null,
-          storageLocation: null,
-          tableName: null
-        },
-        questionsNeeded: ['operationMode', 'storageLocation'],
-        dynamicChoices: {},
-        reasoning: 'Failed to parse analysis, asking all questions'
-      };
+      // The model returned invalid JSON (often truncated or wrapped in prose).
+      // Do NOT fall through to the question flow — that previously leaked the
+      // raw "operationMode" field name into the UI. Surface a clear "Invalid
+      // response" with the raw text expandable, and abort.
+      console.error('Failed to parse analysis JSON:', e, response);
+      showInvalidResponse(response);
+      return;
     }
 
     console.log('Parsed analysis:', analysis);
@@ -979,8 +991,12 @@ Source: ${sourceTableSchema.sourceNodeLabel}
       // Update the current question index in state
       setCurrentQuestionIndex(currentIndex);
 
-      // Get the question text from questionsNeeded object
-      const questionText = questionsObj[questionType] || getDefaultQuestionText(questionType);
+      // Get the question text from questionsNeeded object. Never show the raw
+      // internal field name (e.g. "operationMode") to the user — fall back to a
+      // human-friendly label when the AI omitted the text or echoed the key
+      // back (TLX-009).
+      const rawText = typeof questionsObj?.[questionType] === 'string' ? questionsObj[questionType].trim() : '';
+      const questionText = (rawText && rawText !== questionType) ? rawText : getDefaultQuestionText(questionType);
 
       // Get the choices for this question
       const choices = getDefaultChoices(questionType);
@@ -1117,12 +1133,25 @@ Source: ${sourceTableSchema.sourceNodeLabel}
   // Apply Transformation Result (Consolidation Helper)
   // ─────────────────────────────────────────────────────────────────────────
 
+  // The one place the target table name is decided. Local SQLite output shares
+  // a single app-data.db across every workflow, so a user/AI-chosen name is
+  // prefixed with this workflow's token; node-id defaults are already unique.
+  // in_place reuses the SOURCE table and must never be renamed.
+  const resolveTargetTableName = (settings, { inPlace = false, sourceName = null } = {}) => {
+    if (inPlace) return sourceName;
+    const base = settings?.tableName || node.id.replace('-', '_').toLowerCase();
+    return qualifyLocalTableName(base, {
+      workflowId: workflowScopeId,
+      isLocal: settings?.storageLocation === 'local',
+    });
+  };
+
   const applyTransformationResult = async (transformationData, settings, userRequest, isRefinement = false) => {
     const explanation = transformationData.explanation || '';
     const isNoSQL = sourceConnection?.dbType === 'mongodb' || sourceConnection?.dbType === 'nedb';
     const dbType = sourceConnection?.dbType;
     const targetSchema = sourceConnection?.dbConfig?.schema;
-    const targetTableName = settings.tableName || node.id.replace('-', '_').toLowerCase();
+    const targetTableName = resolveTargetTableName(settings);
 
     // Get properly quoted table name for SQL databases
     let fullTableName = `${targetSchema}.${targetTableName}`;
@@ -1143,7 +1172,9 @@ Source: ${sourceTableSchema.sourceNodeLabel}
       const nosqlOperation = transformationData.nosqlOperation;
       const transformFunction = transformationData.transformFunction;
 
-      if (nosqlOperation) {
+      // Require the actual operation before enabling Run — a response missing
+      // nosqlOperation (e.g. truncated) would otherwise process nothing.
+      if (nosqlOperation && String(nosqlOperation).trim()) {
         setSaveState(true);
 
         // Determine target database type based on storage location
@@ -1196,7 +1227,8 @@ Source: ${sourceTableSchema.sourceNodeLabel}
 
         return true;
       } else {
-        addBotMessage(explanation || 'Unable to generate transformation.', false);
+        setSaveState(false);
+        addBotMessage(explanation || 'Unable to generate transformation. Nothing has been marked ready to run — please try again.', false);
         return false;
       }
     } else {
@@ -1206,7 +1238,13 @@ Source: ${sourceTableSchema.sourceNodeLabel}
       const insertSql = transformationData.insertSql || null;
       const previewSql = transformationData.previewSql;
 
-      if (sql || ddl) {
+      // Require the statement that actually POPULATES the table — DDL alone
+      // (CREATE TABLE with no INSERT/SELECT) would produce an empty table and
+      // still report success (the TLX-008 zero-row failure).
+      const hasRunnableSql =
+        (sql && String(sql).trim()) || (insertSql && String(insertSql).trim());
+
+      if (hasRunnableSql) {
         setSaveState(true);
 
         // Determine target database type based on storage location
@@ -1248,7 +1286,15 @@ Source: ${sourceTableSchema.sourceNodeLabel}
 
         return true;
       } else {
-        addBotMessage(explanation || 'Unable to generate transformation.', false);
+        setSaveState(false);
+        const detail = ddl
+          ? ' It only returned the table definition, not the statement that fills it.'
+          : '';
+        addBotMessage(
+          (explanation || 'Unable to generate a complete transformation.') +
+          `${detail} Nothing has been marked ready to run — please try again or refine the request.`,
+          false
+        );
         return false;
       }
     }
@@ -1442,7 +1488,7 @@ Source: ${sourceTableSchema.sourceNodeLabel}
 
     const targetSchema = sourceNode?.data?.config?.targetSchema || sourceNode?.data?.config?.sourceSchema;
     // Use custom table name from settings if provided, otherwise use default from node ID
-    const targetTableName = settings.tableName || node.id.replace('-', '_').toLowerCase();
+    const targetTableName = resolveTargetTableName(settings);
     const isNoSQL = sourceConnection?.dbType === 'mongodb' || sourceConnection?.dbType === 'nedb';
     const dbType = sourceConnection?.dbType;
     
@@ -1500,15 +1546,23 @@ Transformation Settings:
 
       let transformationPrompt;
 
-      if (isNoSQL) {
-        // For local NoSQL (NeDB), use the chatPrompts IPC. For remote NoSQL, fetch from plugin.
-        if (dbType === 'nedb') {
-          if (settings.operationMode === 'in_place') {
-            transformationPrompt = await buildChatPrompt('transfomer.nedbTransformationInPlace', [settings, sourceTableInfo, settingsContext, sourceTableSchema]);
-          } else {
-            transformationPrompt = await buildChatPrompt('transfomer.nedbTransformationNewTable', [settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName]);
-          }
-        } else {
+      // A local target is DuckDB, whatever the shape of the data — one prompt
+      // pair covers it. Everything else is a remote engine and gets its prompt
+      // from that connector's own plugin.
+      if (dbType === 'duckdb') {
+        // In-place on a FILE addresses the per-node staging table the executor
+        // materialises it into; the prompt derives that name from the node id,
+        // so the statements the model writes match the table that exists. A
+        // source that is already a DuckDB table is addressed by its own name.
+        const inPlaceTarget = String(getSourceLocalPath(node) || '').toLowerCase().endsWith('.duckdb')
+          ? (sourceTableSchema?.tableName || null)
+          : { nodeId: node.id, fallback: sourceTableSchema?.tableName };
+
+        transformationPrompt = settings.operationMode === 'in_place'
+          ? await buildChatPrompt('transfomer.duckdbTransformationInPlace', [settings, sourceTableInfo, settingsContext, sourceTableSchema, inPlaceTarget])
+          : await buildChatPrompt('transfomer.duckdbTransformationNewTable', [settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName]);
+      } else if (isNoSQL) {
+        {
           // Generate prompt from plugin (e.g., MongoDB)
           const sourceSchema = sourceConnection?.dbConfig?.database;
           const sourceFullTableName = sourceTableSchema.tableName;
@@ -1534,16 +1588,9 @@ Transformation Settings:
           }
         }
       } else {
-        // For SQL databases
-        if (dbType === 'sqlite') {
-          // Use SQLite prompts only for local SQLite files
-          if (settings.operationMode === 'in_place') {
-            transformationPrompt = await buildChatPrompt('transfomer.sqliteTransformationInPlace', [settings, sourceTableInfo, settingsContext, sourceTableSchema]);
-          } else {
-            transformationPrompt = await buildChatPrompt('transfomer.sqliteTransformationNewTable', [settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName]);
-          }
-        } else {
-          // Generate prompt from plugin for all other cases (database storage or remote DB to local)
+        // Remote SQL engines: the prompt comes from that connector's plugin so
+        // it speaks the right dialect.
+        {
           // sourceFullTableName is already defined and quoted above (before sourceTableInfo)
 
           const promptResult = await window.electronAPI.dbConnect.generateTransformPrompt(
@@ -1583,12 +1630,12 @@ Transformation Settings:
       try {
         parsedResponse = JSON.parse(response);
       } catch (e) {
-        console.log('ERROR: ', e);
-        parsedResponse = {
-          explanation: response,
-          ddl: '',
-          sql: ''
-        };
+        // Invalid/truncated JSON — never mark anything runnable (TLX-008/012).
+        // Show a clear "Invalid response" with the raw text expandable.
+        console.error('Failed to parse transformation JSON:', e, response);
+        setSaveState(false);
+        showInvalidResponse(response);
+        return;
       }
       console.log('parsedResponse:', parsedResponse);
 
@@ -1607,7 +1654,9 @@ Transformation Settings:
 
     } catch (error) {
       console.error('Transformation generation error:', error);
-      addBotMessage('Failed to generate transformation. Please try again.', false);
+      // Prefer the plain-language provider error (rate limit, bad key, model
+      // unavailable, …) when we have one; otherwise a generic fallback.
+      addBotMessage(error?.message || 'Failed to generate transformation. Please try again.', false);
     } finally {
       setAiLoading(false);
       setLoading(false);
@@ -1672,14 +1721,12 @@ Transformation Settings:
       config.targetDbType = config.sourceDbType;
       config.targetDbConfig = config.sourceDbConfig;
     } else if (isLocalStorage) {
-      // New table with local storage: use local SQLite or NeDB
-      const localDbType = isNoSQL ? 'nedb' : 'sqlite';
-      const localDbName = localDbType === 'nedb' ? 'Local NeDB' : 'Local SQLite';
-
-      config.targetConnectionId = `local-${localDbType}`;
-      config.targetConnectionName = localDbName;
+      // New dataset stored locally: one Parquet file this node owns, read by
+      // DuckDB. Tabular and document data alike — there is no second store.
+      config.targetConnectionId = 'local-duckdb';
+      config.targetConnectionName = 'Local file';
       config.targetConnectionType = 'file';
-      config.targetDbType = localDbType;
+      config.targetDbType = 'duckdb';
       config.targetDbConfig = {};
     } else {
       // New table with database storage: same as source
@@ -1729,15 +1776,19 @@ Transformation Settings:
       
 
       // Target table name
-      if (isInPlace) {
-        config.targetTableName = sourceConfig.targetTableName || sourceConfig.sourceTableName || sourceTableSchema.tableName;
-      } else {
-        config.targetTableName = transformationSettings.tableName || node.id.replace('-', '_').toLowerCase();
-      }
+      config.targetTableName = resolveTargetTableName(transformationSettings, {
+        inPlace: isInPlace,
+        sourceName: sourceConfig.targetTableName || sourceConfig.sourceTableName || sourceTableSchema.tableName,
+      });
 
-      // Local path for SQLite
+      // Where the output lives: the executor reports it, since in-place
+      // updates the source in place while a new table lands in this workflow's
+      // DuckDB database.
       if (isLocalStorage) {
-        config.targetLocalPath = latestWithSQL.localPath || sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath;
+        config.targetLocalPath = latestWithSQL.localPath
+          || (isInPlace ? sourceConfig.sourceLocalPath : null)
+          || sourceConfig.targetLocalPath
+          || null;
       } else if (isInPlace && sourceConfig.targetLocalPath) {
         config.targetLocalPath = sourceConfig.targetLocalPath;
       }
@@ -1746,7 +1797,15 @@ Transformation Settings:
       if (isLocalStorage || config.targetLocalPath) {
         // Local SQLite storage
         const previewResult = await window.electronAPI.dbConnect.getPreviewQuery('sqlite', config.targetTableName, 100);
-        config.targetPreviewSql = latestWithSQL.previewSql || previewResult.previewQuery;
+        // An in-place file update runs its statements against a per-run staging
+        // table that is dropped when the run ends, so the model's previewSql
+        // would name something that no longer exists. Preview the updated file
+        // by the name it answers to instead.
+        const inPlaceOnFile = isInPlace
+          && !String(config.targetLocalPath || '').toLowerCase().endsWith('.duckdb');
+        config.targetPreviewSql = inPlaceOnFile
+          ? previewResult.previewQuery
+          : (latestWithSQL.previewSql || previewResult.previewQuery);
       } else {
         const quotedResult = await window.electronAPI.dbConnect.quoteIdentifier(
           sourceConnection.dbType,
@@ -1872,13 +1931,19 @@ Transformation Settings:
 
     } else if (latestWithSQL?.sql) {
       // SQL transformation - use executeTransformation
-      const targetTableName = transformationSettings.tableName || node.id.replace('-', '_').toLowerCase();
+      const targetTableName = resolveTargetTableName(transformationSettings);
 
-      // Get source local path for local SQLite storage
+      // Get source local path for a local target or an in-place rewrite
       let sourceLocalPath = null;
       if (transformationSettings.storageLocation === 'local' || transformationSettings.operationMode === 'in_place') {
         sourceLocalPath = getSourceLocalPath(node);
       }
+
+      // In-place updates the source where it lies. A new table leaves this
+      // null so the executor derives this workflow's database from the scope.
+      const targetLocalPath = transformationSettings.operationMode === 'in_place'
+        ? sourceLocalPath
+        : null;
 
       const result = await executeTransformation({
         connectionConfig: {
@@ -1892,6 +1957,8 @@ Transformation Settings:
         previewSql: latestWithSQL.previewSql,
         targetTableName: targetTableName,
         sourceLocalPath: sourceLocalPath,
+        targetLocalPath,
+        sourceFormat: sourceConnection?.fileInfo?.format || null,
         storageLocation: transformationSettings.storageLocation,
         operationMode: transformationSettings.operationMode,
         setExecutingFn: executingInd,
@@ -1957,9 +2024,10 @@ Transformation Settings:
         });
       } else {
         // SQL transformation
-        const targetTableName = isInPlace
-          ? (sourceNode?.data?.config?.targetTableName || sourceNode?.data?.config?.sourceTableName || sourceTableSchema.tableName)
-          : (transformationSettings.tableName || node.id.replace('-', '_').toLowerCase());
+        const targetTableName = resolveTargetTableName(transformationSettings, {
+          inPlace: isInPlace,
+          sourceName: sourceNode?.data?.config?.targetTableName || sourceNode?.data?.config?.sourceTableName || sourceTableSchema.tableName,
+        });
 
         // Determine schema and local path based on storage location
         let schemaLocalPath = null;
@@ -2069,7 +2137,16 @@ Transformation Settings:
 
     if (choice.value === 'fix_error') {
       const errorText = executionError?.error || 'an unknown error';
-      const message = `Fix this error: ${errorText}`;
+      // Feed the FAILING code + error back to the model so it patches the
+      // specific problem instead of restarting from scratch. The failed
+      // SQL/function is injected into the chat history via this user message.
+      const t = executionError?.transformation || latestWithSQL || {};
+      const failedSql = t.sql || '';
+      const failedFn = t.transformFunction || '';
+      let message = `The transformation failed at execution with this error:\n${errorText}\n\n`;
+      if (failedSql) message += `The SQL that failed was:\n\`\`\`sql\n${failedSql}\n\`\`\`\n\n`;
+      if (failedFn) message += `The function that failed was:\n\`\`\`javascript\n${failedFn}\n\`\`\`\n\n`;
+      message += `Diagnose the cause and return a corrected transformation. Reuse the request I already gave — do not ask me to re-describe it; fix only what caused the error.`;
       setExecutionError(null);
       handleUserResponse(message, 'chatContinue', message, null);
       return;
