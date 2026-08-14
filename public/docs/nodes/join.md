@@ -21,10 +21,17 @@ one hundred percent certain from your explicit statements.
 
 ## Picking the destination
 
-The chat groups every available connection by category — Databases,
+A Join can't be configured at all until it knows where its result
+goes — the destination decides the SQL dialect, whether sources have
+to be staged, and where the output lands. So selecting a Join with no
+destination puts the picker in front of the conversation first. You
+can also just name the destination in the chat.
+
+The picker groups every available connection by category — Databases,
 Vector, Cloud Storage, APIs, Local Files — and de-duplicates them so
-you never see the same connection twice. Local SQL and local document
-workspaces are always offered alongside your saved connections.
+you never see the same connection twice. One local option is always
+offered alongside your saved connections: **Local file**, which writes
+the joined rows to a table in the workflow's own DuckDB database.
 
 The mode options shown depend on the destination type:
 
@@ -32,7 +39,7 @@ The mode options shown depend on the destination type:
   existing table" are available. For "merge into existing", the chat
   loads the list of existing tables in that destination so you can
   pick one (or type a custom name when nothing matches).
-- **Document destination (MongoDB / NeDB)** — only "new table" is
+- **Document destination (MongoDB)** — only "new table" is
   available. Document stores don't support upsert semantics for
   arbitrary documents, so Ternlux always creates a fresh collection.
 - **Vector destination** — always "new table" (the upsert into the
@@ -56,9 +63,14 @@ are dropped.
 Temp table names are generated to be unique per node and per source
 position so two joins running concurrently never collide.
 
-If the destination is the local SQL workspace, the same pattern runs
-locally — sources are loaded into temporary local tables and the
-join runs there.
+### Local file destination
+
+The workflow's own DuckDB database is the venue. It reads each source
+directly — Parquet, CSV or JSON files in place, upstream node tables in
+the same database, rows pulled across from remote connections — runs
+the generated join SQL over them, and writes the result as this node's
+table. No temporary tables are created, and nothing is staged in a
+database shared with other workflows.
 
 ### Document destination
 

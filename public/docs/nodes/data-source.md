@@ -17,7 +17,7 @@ the node behaves:
   tables are read directly from the file. For Pinecone, you can
   enumerate indexes / namespaces from the picker.
 - **Local file connection** — the node references a file you've
-  already imported (CSV, Excel, Parquet, Avro, JSON, SQLite, NeDB,
+  added as local files (CSV, Excel, Parquet, Avro, JSON, SQLite, NeDB,
   LanceDB). At execution time the file is re-imported into the local
   workspace so downstream nodes see fresh data.
 - **Cloud storage connection** — the node references a specific object
@@ -100,7 +100,7 @@ first, so re-running a workflow gives a deterministic result.
 
 ## NoSQL and SQL routing
 
-When the source is a document store (MongoDB, NeDB), the chat uses
+When the source is a remote document store (MongoDB), the chat uses
 collection / filter terminology and routes through the document path.
 When it's a SQL database, table / query terminology is used. The
 underlying difference is hidden from you — the same node config flow
