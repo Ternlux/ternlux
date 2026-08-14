@@ -16,56 +16,43 @@ hit and how to paginate.
 
 ## Connection form
 
-| Field | Required | Sensitive | Visibility | Default |
-| --- | --- | --- | --- | --- |
-| Base URL | No | No | Always | — |
-| Authentication | Yes | No | Always | None |
-| Bearer Token | No | Yes | When Auth is Bearer | — |
-| API Key Header Name | No | No | When Auth is API Key | `X-API-Key` |
-| API Key Value | No | Yes | When Auth is API Key | — |
-| Basic Auth Username | No | No | When Auth is Basic | — |
-| Basic Auth Password | No | Yes | When Auth is Basic | — |
+| Field | Required | Sensitive | Notes |
+| --- | --- | --- | --- |
+| Base URL | No | No | — |
+| Parameters & Credentials | No | Values only | Up to 50 key/value entries |
 
-The form shows only the fields relevant to the auth type you picked.
+### Parameters & Credentials
 
-## Setting up credentials
+One row per thing the API needs: an auth header, an API key, a tenant
+id, a fixed query parameter.
 
-The exact steps depend on the API you're integrating with. Below is
-the general pattern for each auth scheme. Always read the API's own
-documentation for the canonical instructions.
+- Up to 50 entries per connection.
+- Keys must be unique within a connection (case-insensitively).
+- A row with an empty key is discarded when you save.
+- Values are encrypted with the OS keychain. Editing the connection
+  brings the keys back with blank values — leave one blank to keep
+  what's stored, or delete the row to remove it.
 
-### Bearer token
+The key names are public; the values are not. The AI that writes your
+fetch function sees only the names and refers to each value by a
+placeholder, so a key named `access_key` becomes `{{ACCESS_KEY}}` in the
+generated request and is filled in at run time inside the background
+engine.
 
-1. Sign in to the third-party service.
-2. Find the section called "API Tokens", "Personal Access Tokens",
-   "Developer Settings", or similar.
-3. Generate a new token. Scope it as narrowly as possible (read-only
-   if you don't need to write).
-4. Copy the token — most services show it only once.
-5. In Ternlux, pick **Bearer Token** as the auth type and paste the
-   token.
+Where each entry goes is decided by the generated fetch function, from
+the key name and what you asked for — a request header, a query-string
+parameter, or a body field. An API that wants `?access_key=...` works
+the same way as one that wants an `Authorization` header; name the key
+the way the API names it.
 
-### API key (header)
+### Setting up credentials
 
-1. Sign in to the third-party service and create an API key.
-2. Confirm what header name the API expects (often `X-API-Key`,
-   `Authorization`, or the service's custom name like
-   `X-RapidAPI-Key`).
-3. In Ternlux, pick **API Key (header)**, set the header name, and
-   paste the key value.
+The exact steps depend on the API. In general: sign in to the service,
+create an API key or token (scope it read-only where you can), check
+its documentation for the exact header or parameter name it expects,
+then add that name and the value as one row here.
 
-### HTTP basic
-
-1. The third party gives you a username and password (or a username
-   plus an "API password").
-2. In Ternlux, pick **Basic Auth** and enter both fields. Ternlux
-   handles the base64 encoding required by the protocol — you don't
-   need to encode anything yourself.
-
-### No auth
-
-For public APIs that don't require authentication, pick **None** and
-leave the credential fields empty.
+For public APIs that need no authentication, leave the list empty.
 
 ### Base URL
 
@@ -86,9 +73,9 @@ JavaScript function that:
   requires.
 - Returns rows as an array of plain objects.
 
-The function uses placeholder tokens (`{{BASE_URL}}`,
-`{{AUTH_HEADER_NAME}}`, etc.) — never literal credentials — when
-referencing the connection. The placeholders are filled in with real
+The function uses placeholder tokens (`{{BASE_URL}}`, plus one per
+saved parameter, such as `{{ACCESS_KEY}}`) — never literal credentials
+— when referencing the connection. The placeholders are filled in with real
 values only inside the background engine, just before the function
 runs. The interactive layer therefore never holds a decrypted key,
 and saved workflows contain no secrets even if shared.
