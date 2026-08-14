@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Form, Input, InputNumber, Switch, Button, Space, message, Alert, Select } from 'antd';
 import { LinkOutlined, CheckCircleOutlined } from '@ant-design/icons';
+import KeyValueFields, { MAX_PAIRS, normalisePairs } from './KeyValueFields';
 
 /**
  * Dynamic Connection Form
@@ -19,9 +20,29 @@ const DynamicConnectionForm = ({
   const [authorizing, setAuthorizing] = useState(false);
   const [isAuthorized, setIsAuthorized] = useState(false);
 
+  // keyValue fields declared by the plugin schema. Their values are sensitive
+  // and live in the OS keychain, so only the key names round-trip through the
+  // saved connection (`field.publicKeysField`).
+  const keyValueFields = useMemo(
+    () => (plugin.configSchema?.fields || []).filter(f => f.type === 'keyValue'),
+    [plugin]
+  );
+
   useEffect(() => {
     if (editingConnection?.dbConfig) {
-      form.setFieldsValue(editingConnection.dbConfig);
+      const dbConfig = { ...editingConnection.dbConfig };
+
+      // Rebuild the editor rows from the stored key names. Values stay blank —
+      // the renderer never pulls decrypted secrets back out of the keychain,
+      // and a blank value on save means "keep the stored one".
+      keyValueFields.forEach(f => {
+        const savedKeys = f.publicKeysField ? editingConnection.dbConfig[f.publicKeysField] : null;
+        dbConfig[f.name] = Array.isArray(savedKeys)
+          ? savedKeys.map(k => ({ key: String(k), value: '' }))
+          : [];
+      });
+
+      form.setFieldsValue(dbConfig);
 
       // Check if OAuth tokens exist
       if (plugin.authType === 'oauth2' && editingConnection.dbConfig.accessToken) {
@@ -35,9 +56,10 @@ const DynamicConnectionForm = ({
           defaults[field.name] = field.default;
         }
       });
+      keyValueFields.forEach(f => { defaults[f.name] = defaults[f.name] || []; });
       form.setFieldsValue(defaults);
     }
-  }, [editingConnection, plugin, form]);
+  }, [editingConnection, plugin, form, keyValueFields]);
 
   // Cleanup OAuth server on unmount
   useEffect(() => {
@@ -52,7 +74,7 @@ const DynamicConnectionForm = ({
 
   const handleTest = async () => {
     try {
-      const values = await form.validateFields();
+      const values = applyKeyValueFields(await form.validateFields());
       setTesting(true);
       await onTest(plugin.id, values);
     } catch (error) {
@@ -62,9 +84,26 @@ const DynamicConnectionForm = ({
     }
   };
 
+  /**
+   * Collapse every keyValue field into its saved shape:
+   *   - blank keys dropped (a value with no key has nowhere to go)
+   *   - capped at maxPairs
+   *   - key names mirrored into `publicKeysField` so the rest of the app can
+   *     name the pairs without ever touching the encrypted values
+   * Mutates and returns `values`.
+   */
+  const applyKeyValueFields = (values) => {
+    keyValueFields.forEach(f => {
+      const pairs = normalisePairs(values[f.name]).slice(0, f.maxPairs || MAX_PAIRS);
+      values[f.name] = pairs;
+      if (f.publicKeysField) values[f.publicKeysField] = pairs.map(p => p.key);
+    });
+    return values;
+  };
+
   const handleSave = async () => {
     try {
-      const values = await form.validateFields();
+      const values = applyKeyValueFields(await form.validateFields());
       setSaving(true);
 
       const connectionData = {
@@ -216,6 +255,11 @@ const DynamicConnectionForm = ({
     ];
 
     switch (field.type) {
+      // Declared in the schema so the save path can classify it (sensitive vs
+      // not), but written programmatically — never rendered.
+      case 'internal':
+        return null;
+
       case 'hidden':
         // Render hidden fields so form tracks them, but hide from UI
         return (
@@ -271,6 +315,15 @@ const DynamicConnectionForm = ({
               autoComplete="new-password"
             />
           </Form.Item>
+        );
+
+      case 'keyValue':
+        return (
+          <KeyValueFields
+            key={field.name}
+            field={field}
+            editing={Boolean(editingConnection)}
+          />
         );
 
       case 'select':

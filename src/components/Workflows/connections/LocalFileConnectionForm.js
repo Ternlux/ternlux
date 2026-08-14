@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { Form, Input, Button, Space, message, Upload, Card, Typography, Progress } from 'antd';
 import {
   InboxOutlined,
@@ -14,6 +14,25 @@ const { Dragger } = Upload;
 const { TextArea } = Input;
 const { Text, Title } = Typography;
 
+// Imports stream in batches, so the main process reports how far it has got.
+// Where the source is a plain byte stream (CSV, JSON) we know the file size and
+// can show a true percentage; a workbook or columnar file only reports rows, so
+// the bar approaches the end of the import band without ever claiming to
+// arrive. The bands: 0-25 selecting/reading, 25-90 writing, 90-100 finalising.
+const IMPORT_BAND_START = 25;
+const IMPORT_BAND_SIZE = 65;
+const ROWS_HALFWAY = 250000; // rows at which a total-less import reads ~half done
+
+const importPercent = ({ phase, bytesRead, totalBytes, rows = 0 }) => {
+  if (phase === 'reading') return IMPORT_BAND_START;
+  const ratio = (totalBytes > 0 && bytesRead >= 0)
+    ? Math.min(1, bytesRead / totalBytes)
+    : 1 - Math.exp(-rows / ROWS_HALFWAY);
+  return Math.round(IMPORT_BAND_START + IMPORT_BAND_SIZE * ratio);
+};
+
+const formatCount = (n) => (typeof n === 'number' ? n.toLocaleString() : '0');
+
 // SVG Icon wrapper with consistent sizing
 const DbIcon = ({ Icon, bg }) => (
   <div style={{
@@ -26,7 +45,7 @@ const DbIcon = ({ Icon, bg }) => (
 );
 
 const LocalFileConnectionForm = ({
-  fileType, // 'sqlite', 'nedb', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'
+  fileType, // 'duckdb', 'sqlite', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'
   onSave,
   onCancel,
   editingConnection,
@@ -39,6 +58,8 @@ const LocalFileConnectionForm = ({
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragActive, setDragActive] = useState(false);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
+  // Live counters from the streaming import in the main process.
+  const [importStatus, setImportStatus] = useState(null);
 
   // Initialize form with editing data
   React.useEffect(() => {
@@ -66,7 +87,7 @@ const LocalFileConnectionForm = ({
     // Define file extensions based on type
     const filters = {
       sqlite: [{ name: 'SQLite Database', extensions: ['db', 'sqlite', 'sqlite3'] }],
-      nedb: [{ name: 'NeDB Database', extensions: ['db', 'nedb'] }],
+      duckdb: [{ name: 'DuckDB Database', extensions: ['duckdb'] }],
       lancedb: [{ name: 'LanceDB Directory', extensions: ['lance'] }],
       json: [{ name: 'JSON Files', extensions: ['json'] }],
       spreadsheet: [
@@ -121,7 +142,7 @@ const LocalFileConnectionForm = ({
   const isValidFileType = (filename) => {
     const validExtensions = {
       sqlite: ['.db', '.sqlite', '.sqlite3'],
-      nedb: ['.db', '.nedb'],
+      duckdb: ['.duckdb'],
       lancedb: ['.lance'],
       json: ['.json'],
       spreadsheet: ['.csv', '.xlsx', '.xls'],
@@ -208,10 +229,19 @@ const LocalFileConnectionForm = ({
 
   // Auto-process a file handed in from outside the form (e.g. dropped onto the
   // workflow canvas) so the user lands on a pre-filled form instead of an empty one.
+  //
+  // Guarded by identity rather than a plain dependency array: StrictMode mounts
+  // effects twice in development, and handleBeforeUpload is not idempotent — it
+  // re-extracts the path, starts a second progress interval and toasts again,
+  // which is why the success message appeared twice per drop. A new drop is a
+  // new File object, so comparing the object itself is enough to tell a repeat
+  // effect run from a genuinely different file.
+  const autoImportedFileRef = useRef(null);
   React.useEffect(() => {
-    if (initialFile && !editingConnection) {
-      handleBeforeUpload(initialFile);
-    }
+    if (!initialFile || editingConnection) return;
+    if (autoImportedFileRef.current === initialFile) return;
+    autoImportedFileRef.current = initialFile;
+    handleBeforeUpload(initialFile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialFile]);
 
@@ -245,62 +275,69 @@ const LocalFileConnectionForm = ({
       let targetFilePath = filePath;
       let connectionType = 'file';
       let importedTables = null;
-      let schemas = null; // Store schema(s) from import
+      let schemas = null; // Schema(s) reported by DuckDB
+      let tablePaths = null; // table name -> the file DuckDB reads for it
+      let fileFormat = null; // what DuckDB reads it as: csv | json | parquet
 
       setUploading(true);
       setUploadProgress(10);
 
-      // For spreadsheet, parquet, avro, and JSON, we need to import to internal database first
+      // Data files are no longer imported into a local database. They are
+      // registered by path and queried in place by DuckDB — so adding a file
+      // is instant regardless of its size. Excel and Avro are the exception:
+      // DuckDB can't read them, so they are converted to Parquet once here.
       if (['spreadsheet', 'parquet', 'avro', 'json'].includes(fileType)) {
-        setUploadProgress(30);
+        setUploadProgress(IMPORT_BAND_START);
 
-        if (fileType === 'spreadsheet' || fileType === 'parquet' || fileType === 'avro') {
-          // Import CSV/Excel/Parquet/Avro to internal SQLite
-          const importResult = await window.electronAPI.importToSqlite({
-            filePath: filePath,
-            tableName: values.name.replace(/[^a-zA-Z0-9_]/g, '_'),
-            fileType: fileType // Pass file type to help backend determine how to parse
-          });
+        // Conversions stream in the main process and report progress back, so
+        // the bar tracks real rows rather than a timer.
+        const importId = `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const unsubscribe = window.electronAPI?.onImportProgress
+          ? window.electronAPI.onImportProgress((evt) => {
+            if (evt.importId !== importId) return;
+            setImportStatus(evt);
+            setUploadProgress(importPercent(evt));
+          })
+          : () => {};
 
-          setUploadProgress(70);
+        let result;
+        try {
+          result = await window.electronAPI.registerLocalFile({ filePath, importId });
+        } finally {
+          unsubscribe();
+        }
 
-          if (!importResult.success) {
-            message.error('Failed to import file: ' + importResult.message);
-            setUploading(false);
-            setUploadProgress(0);
-            return;
-          }
+        if (!result?.success) {
+          message.error('Failed to add file: ' + (result?.message || 'unknown error'));
+          setUploading(false);
+          setUploadProgress(0);
+          setImportStatus(null);
+          return;
+        }
 
-          targetDbType = 'sqlite';
-          targetFilePath = importResult.dbPath;
-          importedTables = importResult.tables; // Store the imported table names
-          schemas = importResult.schemas || importResult.schema; // Store schema(s)
-          message.success(`Imported ${importResult.rowCount} rows to SQLite`);
-        } else if (fileType === 'json') {
-          // Import JSON to internal NeDB
-          const importResult = await window.electronAPI.importToNeDB({
-            filePath: filePath,
-            collectionName: values.name.replace(/[^a-zA-Z0-9_]/g, '_')
-          });
+        targetDbType = 'duckdb';
+        fileFormat = result.format;
+        targetFilePath = result.tables[0].path;
+        importedTables = result.tables.map((t) => t.name);
+        tablePaths = Object.fromEntries(result.tables.map((t) => [t.name, t.path]));
+        schemas = result.tables.map((t) => t.schema).filter(Boolean);
 
-          setUploadProgress(70);
-
-          if (!importResult.success) {
-            message.error('Failed to import file: ' + importResult.message);
-            setUploading(false);
-            setUploadProgress(0);
-            return;
-          }
-
-          targetDbType = 'nedb';
-          targetFilePath = importResult.dbPath;
-          message.success(`Imported ${importResult.docCount} documents to NeDB`);
+        if (result.converted) {
+          const rows = result.tables.reduce((sum, t) => sum + (t.rowCount || 0), 0);
+          message.success(`Converted ${formatCount(rows)} rows to Parquet (${result.tables.length} table(s))`);
+        } else {
+          message.success(`Added ${result.tables[0].name} — queried in place, no import needed`);
         }
 
         setUploadProgress(90);
       } else {
-        // SQLite, NeDB, and LanceDB - direct file reference
-        targetDbType = fileType;
+        // Databases and LanceDB — referenced where they are, nothing imported.
+        //
+        // A DuckDB or SQLite file is opened BY DuckDB: it attaches the file and
+        // its tables stay real tables, so they can be read, written and joined
+        // against every other local connection in one query. That is why both
+        // become a `duckdb` connection rather than one per format.
+        targetDbType = (fileType === 'sqlite' || fileType === 'duckdb') ? 'duckdb' : fileType;
         setUploadProgress(50);
 
         // For LanceDB, list the tables in the database directory
@@ -335,12 +372,16 @@ const LocalFileConnectionForm = ({
         fileType: fileType,
         fileInfo: {
           originalName: fileName,
+          // The file DuckDB reads: the user's own file for csv/json/parquet, or
+          // the converted Parquet for Excel/Avro.
           filePath: targetFilePath,
-          sourceFilePath: originalFilePath, // Keep original file path before any imports
+          sourceFilePath: originalFilePath, // Always the file the user picked
+          format: fileFormat, // csv | json | parquet — how DuckDB reads it
           fileSize: null,
           uploadedAt: new Date().toISOString(),
-          tables: importedTables, // Store which tables belong to this connection
-          schemas: schemas, // Store schema(s) from import
+          tables: importedTables, // Table (sheet) names belonging to this connection
+          tablePaths, // table name -> path, for multi-sheet workbooks
+          schemas: schemas, // Schema(s) reported by DuckDB
         },
         status: 'ready',
         createdAt: editingConnection?.createdAt || new Date().toISOString(),
@@ -351,6 +392,7 @@ const LocalFileConnectionForm = ({
       setTimeout(() => {
         setUploading(false);
         setUploadProgress(0);
+        setImportStatus(null);
         onSave(connectionData);
       }, 500);
     } catch (error) {
@@ -358,13 +400,14 @@ const LocalFileConnectionForm = ({
       message.error('Failed to save connection');
       setUploading(false);
       setUploadProgress(0);
+      setImportStatus(null);
     }
   };
 
   const getTitle = () => {
     const titles = {
       sqlite: 'SQLite Database',
-      nedb: 'NeDB Database',
+      duckdb: 'DuckDB Database',
       lancedb: 'LanceDB Vector Database',
       json: 'JSON File',
       spreadsheet: 'CSV/Excel File',
@@ -377,7 +420,7 @@ const LocalFileConnectionForm = ({
   const getIcon = () => {
     const icons = {
       sqlite: <DatabaseOutlined style={{ fontSize: 48, color: '#0f80cc' }} />,
-      nedb: <DatabaseOutlined style={{ fontSize: 48, color: '#52c41a' }} />,
+      duckdb: <DatabaseOutlined style={{ fontSize: 48, color: '#fff100' }} />,
       lancedb: <DatabaseOutlined style={{ fontSize: 48, color: '#722ed1' }} />,
       json: <FileTextOutlined style={{ fontSize: 48, color: '#fa8c16' }} />,
       spreadsheet: <FileTextOutlined style={{ fontSize: 48, color: '#1890ff' }} />,
@@ -390,9 +433,9 @@ const LocalFileConnectionForm = ({
   const getDescription = () => {
     const descriptions = {
       sqlite: 'Connect to an existing SQLite database file on your computer',
-      nedb: 'Connect to an existing NeDB database file on your computer',
+      duckdb: 'Connect to an existing DuckDB database file on your computer',
       lancedb: 'Connect to a local LanceDB vector database directory',
-      json: 'Upload a JSON file to import into a local NeDB database',
+      json: 'Add a JSON file — queried where it is, no import step',
       spreadsheet: 'Upload a CSV or Excel file to import into a local SQLite database',
       parquet: 'Upload a Parquet file to import into a local SQLite database',
       avro: 'Upload an Avro file to import into a local SQLite database'
@@ -403,7 +446,7 @@ const LocalFileConnectionForm = ({
   const getDragText = () => {
     const texts = {
       sqlite: 'Click or drag SQLite database file to this area',
-      nedb: 'Click or drag NeDB database file to this area',
+      duckdb: 'Click or drag DuckDB database file to this area',
       lancedb: 'Click to select LanceDB directory (contains .lance table folders)',
       json: 'Click or drag JSON file to this area to import',
       spreadsheet: 'Click or drag CSV or Excel file to this area to import',
@@ -416,7 +459,7 @@ const LocalFileConnectionForm = ({
   const getAcceptedFiles = () => {
     const accepts = {
       sqlite: '.db,.sqlite,.sqlite3',
-      nedb: '.db,.nedb',
+      duckdb: '.duckdb',
       lancedb: '.lance',
       json: '.json',
       spreadsheet: '.csv,.xlsx,.xls',
@@ -429,7 +472,7 @@ const LocalFileConnectionForm = ({
   const getHelpText = () => {
     const helps = {
       sqlite: 'SQLite database files (.db, .sqlite, .sqlite3)',
-      nedb: 'NeDB database files (.db, .nedb)',
+      duckdb: 'DuckDB database files (.duckdb)',
       lancedb: 'LanceDB vector database directory - Contains table folders with vector embeddings and metadata',
       json: 'JSON files (.json) - Arrays or single objects',
       spreadsheet: 'Excel (.xlsx, .xls) and CSV (.csv) files - Multi-sheet Excel files will create multiple tables',
@@ -571,11 +614,20 @@ const LocalFileConnectionForm = ({
               }}
             />
             <Text type="secondary" style={{ display: 'block', textAlign: 'center', marginTop: 8 }}>
-              {uploadProgress < 30 ? 'Reading file...' :
-               uploadProgress < 70 ? 'Importing data...' :
-               uploadProgress < 100 ? 'Finalizing...' :
-               'Complete!'}
+              {importStatus
+                ? (importStatus.phase === 'reading'
+                  ? 'Reading workbook...'
+                  : `Imported ${formatCount(importStatus.rows)} ${fileType === 'json' ? 'documents' : 'rows'}${importStatus.sheet ? ` from "${importStatus.sheet}"` : ''}...`)
+                : uploadProgress < IMPORT_BAND_START ? 'Reading file...' :
+                  uploadProgress < 90 ? 'Importing data...' :
+                  uploadProgress < 100 ? 'Finalizing...' :
+                  'Complete!'}
             </Text>
+            {importStatus && (
+              <Text type="secondary" style={{ display: 'block', textAlign: 'center', marginTop: 4, fontSize: 12 }}>
+                Streaming in batches — large files import without loading fully into memory.
+              </Text>
+            )}
           </div>
         )}
 
