@@ -3,6 +3,7 @@ import { Modal, Typography, Tag, Select, Space, Spin, message, Button } from 'an
 import { DataGrid } from '@mui/x-data-grid';
 import { FileExcelOutlined, DatabaseOutlined, DownloadOutlined } from '@ant-design/icons';
 import axios from 'axios';
+import { fullscreenModalProps } from './_designShared';
 
 const { Title, Text } = Typography;
 
@@ -166,9 +167,7 @@ const DataPreviewModal = ({ open, data, onClose }) => {
       open={open}
       onCancel={onClose}
       footer={null}
-      width="90%"
-      style={{ top: 50 }}
-      bodyStyle={{ height: 'calc(100vh - 140px)', padding: '20px' }}
+      {...fullscreenModalProps({ bodyPadding: 20 })}
     >
       <div style={{ marginBottom: '16px' }}>
         {/* Source Selector for POS Connections */}

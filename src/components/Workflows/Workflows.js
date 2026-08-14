@@ -3,11 +3,17 @@ import WorkflowsTab from './WorkflowsTab';
 import ConnectionsTab from './ConnectionsTab';
 import ExecutionTab from './ExecutionTab';
 import Settings from '../Settings/Settings';
-import ChatAssistant from '../Chat/ChatAssistant';
 import { C, SANS } from './_designShared';
 import './Workflows.css';
 
-const Workflows = () => {
+// The ChatAssistant lives in App.js (it can pin itself as a sibling column of
+// this whole view), so the state it shares with the tabs is owned up there and
+// handed back down: `onChatContextChange` reports upwards, and `builtWorkflow`
+// is the assistant's Accept-plan result coming in.
+const Workflows = ({
+  onChatContextChange = () => {},
+  builtWorkflow = null, // { id, bump } | null
+}) => {
   const [activeTab, setActiveTab] = useState('workflows');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState('account');
@@ -22,31 +28,37 @@ const Workflows = () => {
     window.addEventListener('ternlux:open-settings', handler);
     return () => window.removeEventListener('ternlux:open-settings', handler);
   }, []);
-  // What the user is currently focused on — passed down so each tab can
-  // notify the chat assistant when the user clicks a workflow / connection /
-  // execution. Shape: { kind, id, name, summary }.
-  const [chatContext, setChatContext] = useState(null);
+  // What the user is currently focused on — each tab reports the workflow /
+  // connection / execution the user clicked, and it goes up to the assistant.
+  // Shape: { kind, id, name, summary }.
+  const reportContext = useCallback((ctx) => onChatContextChange(ctx || null), [onChatContextChange]);
 
-  // Cross-cutting signal: ChatAssistant calls onWorkflowBuilt after a
-  // successful Accept-plan build. We bounce to the Workflows tab and
-  // hand the workflow id to WorkflowsTab so it can refresh + open it.
-  // The bump counter forces the effect to fire even when the same
-  // workflow id is "built" twice in a row.
+  // The assistant's Accept-plan build arrives as `builtWorkflow`: bounce to the
+  // Workflows tab and hand the id to WorkflowsTab so it can refresh + open it.
+  // The bump counter forces the effect to fire even when the same workflow id
+  // is "built" twice in a row.
   const [pendingOpenWorkflow, setPendingOpenWorkflow] = useState(null); // { id, bump }
-  // True while a node-config chat panel inside WorkflowEditor is open.
-  // Hides the global ChatAssistant so the two don't fight for the corner.
-  const [nodeChatOpen, setNodeChatOpen] = useState(false);
-
-  const reportContext = useCallback((ctx) => setChatContext(ctx || null), []);
-  const handleNodeChatOpenChange = useCallback((isOpen) => setNodeChatOpen(!!isOpen), []);
-
-  const handleWorkflowBuilt = useCallback(({ workflowId } = {}) => {
-    if (!workflowId) return;
+  useEffect(() => {
+    if (!builtWorkflow?.id) return;
     setActiveTab('workflows');
-    setPendingOpenWorkflow((prev) => ({ id: workflowId, bump: (prev?.bump || 0) + 1 }));
-  }, []);
+    setPendingOpenWorkflow({ id: builtWorkflow.id, bump: builtWorkflow.bump });
+  }, [builtWorkflow]);
+
+  // Switching tabs unmounts the previous tab (and any editor/panel it had
+  // open), so whatever it had put in focus is gone — clear it too.
+  useEffect(() => { onChatContextChange(null); }, [activeTab, onChatContextChange]);
 
   const clearPendingOpen = useCallback(() => setPendingOpenWorkflow(null), []);
+
+  // A data file dropped on the Workflows tab belongs to Connections — that tab
+  // owns the import popups. Bounce there and hand the batch over; the bump
+  // counter makes dropping the same file twice re-trigger the flow.
+  const [pendingDroppedFiles, setPendingDroppedFiles] = useState(null); // { files, bump }
+  const handleFilesDropped = useCallback((files) => {
+    setPendingDroppedFiles((prev) => ({ files, bump: (prev?.bump || 0) + 1 }));
+    setActiveTab('connections');
+  }, []);
+  const clearPendingFiles = useCallback(() => setPendingDroppedFiles(null), []);
 
   const TABS = [
     { id: 'workflows',   label: 'Workflows',   render: () => (
@@ -54,10 +66,16 @@ const Workflows = () => {
         onContextChange={reportContext}
         pendingOpenWorkflow={pendingOpenWorkflow}
         onPendingOpenHandled={clearPendingOpen}
-        onNodeChatOpenChange={handleNodeChatOpenChange}
+        onFilesDropped={handleFilesDropped}
       />
     ) },
-    { id: 'connections', label: 'Connections', render: () => <ConnectionsTab onContextChange={reportContext} /> },
+    { id: 'connections', label: 'Connections', render: () => (
+      <ConnectionsTab
+        onContextChange={reportContext}
+        pendingFiles={pendingDroppedFiles}
+        onPendingFilesHandled={clearPendingFiles}
+      />
+    ) },
     { id: 'execution',   label: 'Executions',  render: () => <ExecutionTab   onContextChange={reportContext} /> },
   ];
   const active = TABS.find(t => t.id === activeTab) || TABS[0];
@@ -135,8 +153,6 @@ const Workflows = () => {
       {isSettingsOpen && (
         <Settings initialTab={settingsTab} onClose={() => setIsSettingsOpen(false)} />
       )}
-
-      <ChatAssistant activeContext={chatContext} onWorkflowBuilt={handleWorkflowBuilt} hidden={nodeChatOpen} />
     </div>
   );
 };

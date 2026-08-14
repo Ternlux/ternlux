@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { debounce } from 'lodash';
 import ReactFlow, {
   ReactFlowProvider,
@@ -12,7 +12,7 @@ import ReactFlow, {
   Panel,
 } from 'reactflow';
 import { Button, Space, Input, message, Typography, Modal, Spin, Dropdown, Menu } from 'antd';
-import { SaveOutlined, UndoOutlined, CloudUploadOutlined, SettingOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, ExportOutlined, MoreOutlined } from '@ant-design/icons';
+import { SaveOutlined, UndoOutlined, SettingOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, ExportOutlined, MoreOutlined, CloseOutlined } from '@ant-design/icons';
 import 'reactflow/dist/style.css';
 
 import StartNode from './nodes/StartNode';
@@ -23,10 +23,14 @@ import OutputNode from './nodes/OutputNode';
 import NodeTypePanel from './NodeTypePanel';
 import NodeChatPanel from './NodeChatPanel';
 import LocalFileConnectionForm from './connections/LocalFileConnectionForm';
+import {
+  detectFileType, collectDroppableFiles, fileDragHandlers, FileDropOverlay,
+  LOCAL_FILE_MODAL_TITLES,
+} from './connections/localFileDrop';
 import DataPreview from './DataPreview';
 import WorkflowStepsEditor from './WorkflowStepsEditor';
 import { generateStepsFromNodes } from '../../utils/workflowUtils';
-import { connectionsDb } from '../../utils/localDb';
+import { connectionsDb, executionsDb } from '../../utils/localDb';
 import axios from 'axios';
 
 const { Title } = Typography;
@@ -53,35 +57,14 @@ const toCloneable = (value, label = 'workflow') => {
 const initialNodes = [];
 const initialEdges = [];
 
-// File validation constants
-const ALLOWED_EXTENSIONS = ['.xlsx', '.xls', '.csv'];
-const ALLOWED_MIME_TYPES = [
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.ms-excel',
-  'text/csv',
-  'application/csv'
-];
+// Which extensions are droppable, and which import form each one opens, is
+// owned by connections/localFileDrop so the canvas accepts exactly the files
+// the Connections tab does — and hands each to the form that can actually read
+// it. Nodes created from consecutive dropped files are fanned out from the drop
+// point by this much so they don't land on top of each other.
+const DROP_STACK_OFFSET = 48;
 
-// Helper function to validate dropped files
-const isValidFile = (file) => {
-  const fileExtension = file.name.toLowerCase().slice(file.name.lastIndexOf('.'));
-  
-  if (!ALLOWED_EXTENSIONS.includes(fileExtension)) {
-    return false;
-  }
-  
-  if (!ALLOWED_MIME_TYPES.includes(file.type)) {
-    return false;
-  }
-  
-  if (file.size > 50 * 1024 * 1024 * 1024) { // 50GB limit
-    return false;
-  }
-  
-  return true;
-};
-
-const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest, onSidebarOpenChange }) => {
+const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest }) => {
   const reactFlowWrapper = useRef(null);
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
@@ -91,17 +74,53 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   const [workflowName, setWorkflowName] = useState('');
   const [workflowDescription, setWorkflowDescription] = useState('');
   const [saving, setSaving] = useState(false);
-  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  // Dropped-file import, mirroring the Connections tab: one popup per file,
+  // opened for whichever form matches that file's type, with the rest of the
+  // drop queued behind it. `activeFileType` doubles as the modal's open flag.
+  const [activeFileType, setActiveFileType] = useState(null);
   const [droppedFile, setDroppedFile] = useState(null);
+  const [fileQueue, setFileQueue] = useState([]); // remaining dropped files waiting for their popup
   const [isDragOver, setIsDragOver] = useState(false);
+  // Where on the canvas the files were dropped, and how many of that batch have
+  // already produced a node — together they place each new node near the cursor
+  // instead of stacking every one at a fixed spot.
+  const dropOriginRef = useRef(null);
+  const dropIndexRef = useRef(0);
+  // Set true when the user cancels (X / Cancel) so an in-flight import that
+  // finishes afterwards doesn't persist the connection or open the next file.
+  const importCancelledRef = useRef(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [initialWorkflowState, setInitialWorkflowState] = useState(null);
   const [isStepsEditorOpen, setIsStepsEditorOpen] = useState(false);
   const [executionSteps, setExecutionSteps] = useState([]);
   const [triggerSidebarSave, setTriggerSidebarSave] = useState(false);
   const [currentWorkflowId, setCurrentWorkflowId] = useState(workflow?.id || null);
+  // Nodes write files (local NeDB collections) as soon as they execute, which
+  // can be well before the workflow is first saved. currentWorkflowId stays
+  // null until then — it doubles as the "already persisted?" flag for the save
+  // path — so this ref carries an id from the moment the editor opens and is
+  // what file scoping keys on. workflowsDb.save honours a supplied id, so the
+  // provisional value becomes the real one on first save rather than being
+  // replaced (which would orphan anything already written under it).
+  const workflowScopeIdRef = useRef(workflow?.id || `wf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const newScopeId = () => `wf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // The current graph, readable from window-event handlers that are registered
+  // once and would otherwise close over a stale render's nodes/edges.
+  const nodesRef = useRef([]);
+  const edgesRef = useRef([]);
   const [editorLoading, setEditorLoading] = useState(!!workflow?.id);
   const [saveAfterStepsEditor, setSaveAfterStepsEditor] = useState(false);
+  // Temp-state save: auto-save persists work-in-progress but marks the record
+  // as "temp" (tempStateSave: true). The user must click Save and verify the
+  // Execution Steps to commit a real save (which clears the flag). Execute and
+  // Close are gated on this so unverified changes aren't run or lost silently.
+  const [tempStateSave, setTempStateSave] = useState(false);
+  // Controlled 3-button "unsaved changes" prompt shown on Execute/Close when
+  // there are uncommitted changes. intent = 'close' | 'execute'.
+  const [unsavedPrompt, setUnsavedPrompt] = useState({ open: false, intent: null });
+  // After an explicit save completes (via the steps editor), perform this
+  // deferred action: 'close' | 'execute' | null.
+  const [pendingAction, setPendingAction] = useState(null);
 
   // Latest signals the on-disk code watcher reads to decide whether a
   // 'workflow:codeChanged' event should reload the canvas. `suppressUntil`
@@ -120,6 +139,36 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
   // Execution state
   const [isExecuting, setIsExecuting] = useState(false);
+  // A still-running execution for this workflow (detected on open or while a
+  // run is in progress), so the editor reflects an in-flight run even after
+  // being reopened.
+  const [runningExecution, setRunningExecution] = useState(null);
+
+  // Poll for an in-progress execution of the current workflow. This keeps the
+  // "running" indicator accurate when the editor is reopened mid-run and clears
+  // it (refreshing the preview) once the run finishes.
+  useEffect(() => {
+    if (!currentWorkflowId) { setRunningExecution(null); return; }
+    let cancelled = false;
+
+    const check = async () => {
+      try {
+        const running = await executionsDb.getRunningByWorkflow(currentWorkflowId);
+        if (cancelled) return;
+        setRunningExecution(prev => {
+          // A run we were tracking just finished — refresh the data preview.
+          if (prev && !running) setDataPreviewRefreshTrigger(t => t + 1);
+          return running;
+        });
+      } catch (err) {
+        console.error('Error checking for running execution:', err);
+      }
+    };
+
+    check();
+    const interval = setInterval(check, 3000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [currentWorkflowId]);
 
   // Close context menu when clicking anywhere in the document
   useEffect(() => {
@@ -136,25 +185,20 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     };
   }, [contextMenu]);
 
-  // Clear dbTables when selected node changes or is not a database
+  // Clear dbTables when the selected node isn't a configured data source.
+  // Both database AND file (local SQLite/NeDB) sources populate the Schema
+  // tab, so we must not wipe file sources here — doing so left the Schema tab
+  // empty for configured local sources even though Preview worked (TLX-005).
   useEffect(() => {
-    if (!selectedNode ||
-        selectedNode.type !== 'dataSource' ||
-        selectedNode.data?.config?.connectionType !== 'database') {
+    const connType = selectedNode?.data?.config?.connectionType;
+    const isConfiguredSource =
+      selectedNode?.type === 'dataSource' &&
+      (connType === 'database' || connType === 'file');
+    if (!isConfiguredSource) {
       setDbTables([]);
       setActiveConnection(null);
     }
   }, [selectedNode?.id, selectedNode?.type, selectedNode?.data?.config?.connectionType]);
-
-  // Bubble the node-chat panel's open state up so the top-level
-  // ChatAssistant can hide itself while a node chat is active (they share
-  // the same screen corner).
-  useEffect(() => {
-    if (typeof onSidebarOpenChange === 'function') onSidebarOpenChange(isSidebarOpen);
-    return () => {
-      if (typeof onSidebarOpenChange === 'function') onSidebarOpenChange(false);
-    };
-  }, [isSidebarOpen, onSidebarOpenChange]);
 
   // Fetch a saved workflow from the local database and hydrate the editor.
   // Reused for the initial load and for live reloads when the workflow's
@@ -175,6 +219,8 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       setWorkflowName(fullWorkflow.name || '');
       setWorkflowDescription(fullWorkflow.description || '');
       setCurrentWorkflowId(fullWorkflow.id || null);
+      if (fullWorkflow.id) workflowScopeIdRef.current = fullWorkflow.id;
+      setTempStateSave(!!fullWorkflow.tempStateSave);
 
       const workflowNodes = Array.isArray(fullWorkflow.nodes) ? fullWorkflow.nodes : [];
       const workflowEdges = Array.isArray(fullWorkflow.edges) ? fullWorkflow.edges : [];
@@ -220,6 +266,8 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       setEdges(workflowEdges);
       setExecutionSteps(workflow.executionSteps || []);
       setCurrentWorkflowId(null);
+      workflowScopeIdRef.current = newScopeId();
+      setTempStateSave(false);
       setInitialWorkflowState({
         name: workflow.name || '',
         description: workflow.description || '',
@@ -249,6 +297,8 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       setWorkflowDescription('');
       setExecutionSteps([]);
       setCurrentWorkflowId(null);
+      workflowScopeIdRef.current = newScopeId();
+      setTempStateSave(false);
 
       setInitialWorkflowState({
         name: '',
@@ -259,6 +309,26 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       setEditorLoading(false);
     }
   }, [workflow, setNodes, setEdges, loadWorkflowFromDb]);
+
+  // Latest code-change handler, kept in a ref so the watcher-registration
+  // effect below can depend ONLY on currentWorkflowId. If the effect also
+  // depended on loadWorkflowFromDb (or an inline closure over it), every render
+  // that changed that identity would tear the watcher down and re-create it —
+  // producing the rapid "Watching / Stopped watching" churn — and each teardown
+  // fires racy async unwatch/watch IPC. Routing through a ref means the watcher
+  // is registered exactly once per workflow id while still calling the latest
+  // logic (fresh loadWorkflowFromDb / guard state) on every event.
+  const codeChangedHandlerRef = useRef(() => {});
+  codeChangedHandlerRef.current = (workflowId, wfId) => {
+    if (workflowId !== wfId) return;
+    const guard = reloadGuardRef.current;
+    if (guard.saving || Date.now() < guard.suppressUntil) return;
+    if (guard.hasUnsavedChanges) {
+      message.warning('Workflow code changed on disk, but you have unsaved canvas edits — not reloaded.');
+      return;
+    }
+    loadWorkflowFromDb(wfId, { isReload: true });
+  };
 
   // Watch the open workflow's externalized-code folder on disk. When a code
   // file is edited externally (e.g. in an IDE or by an AI tool), reload the
@@ -272,21 +342,14 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
     api.watchCode(wfId);
     const unsubscribe = api.onCodeChanged(({ workflowId }) => {
-      if (workflowId !== wfId) return;
-      const guard = reloadGuardRef.current;
-      if (guard.saving || Date.now() < guard.suppressUntil) return;
-      if (guard.hasUnsavedChanges) {
-        message.warning('Workflow code changed on disk, but you have unsaved canvas edits — not reloaded.');
-        return;
-      }
-      loadWorkflowFromDb(wfId, { isReload: true });
+      codeChangedHandlerRef.current(workflowId, wfId);
     });
 
     return () => {
       unsubscribe();
       api.unwatchCode(wfId);
     };
-  }, [currentWorkflowId, loadWorkflowFromDb]);
+  }, [currentWorkflowId]);
 
   // Mirror save state into the code-watcher guard so externally-detected file
   // changes can tell our own auto-save writes apart from real edits.
@@ -343,20 +406,15 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   }, [workflowName, workflowDescription, nodes, edges, initialWorkflowState]);
 
   const handleCancel = useCallback(() => {
-    if (hasUnsavedChanges) {
-      Modal.confirm({
-        title: 'Unsaved Changes',
-        content: 'You have unsaved changes. Are you sure you want to close without saving?',
-        okText: 'Yes, close',
-        cancelText: 'Stay',
-        onOk: () => {
-          onCancel();
-        }
-      });
+    // Uncommitted work exists if there are unsaved edits OR the last save was a
+    // background temp save the user hasn't committed. Prompt with Save / Don't
+    // save / Cancel so the temp state is covered by an explicit save on close.
+    if (hasUnsavedChanges || tempStateSave) {
+      setUnsavedPrompt({ open: true, intent: 'close' });
     } else {
       onCancel();
     }
-  }, [hasUnsavedChanges, onCancel]);
+  }, [hasUnsavedChanges, tempStateSave, onCancel]);
 
   // Register close request handler with parent
   useEffect(() => {
@@ -365,16 +423,63 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     }
   }, [onCloseRequest, handleCancel]);
 
+  // A node can only be a parent (the source of a connection) once it has been
+  // configured AND run — otherwise it has no output for the child node to
+  // consume, and the failure only surfaces later as an opaque downstream error.
+  // Checking it here lets us show the user a clear, actionable message instead.
+  const isNodeConfiguredAndRun = (node) => {
+    const cfg = node?.data?.config || {};
+    switch (node?.type) {
+      case 'start':
+        // Root node — nothing to configure/run before it can feed data sources.
+        return true;
+      case 'dataSource': {
+        const connectionId = cfg.sourceConnectionId || cfg.connectionId;
+        const isApiSource = cfg.sourceDbCategory === 'API' || cfg.sourceConnectionType === 'api';
+        if (isApiSource) {
+          // A REST API source only has data once its fetch function has run.
+          return !!(cfg.sourceLocalPath && cfg.apiFetchCode);
+        }
+        // A regular source is "run" once a connection and a table/collection/
+        // query/materialised file are in place.
+        const hasOutput = !!(cfg.sourceTableName || cfg.sourceCollection ||
+          cfg.sourcePreviewSql || cfg.sourceLocalPath || cfg.sourceIndexName);
+        return !!connectionId && hasOutput;
+      }
+      case 'transformer':
+      case 'join':
+        // A transform/join has run once its output is materialised. The output
+        // location is set the same way regardless of mode — SQL, NoSQL, or a
+        // Python/JavaScript/vector-db skill — so check the mode-agnostic target
+        // markers rather than SQL-only fields (targetPreviewSql is absent for
+        // several of those modes).
+        return !!(cfg.targetConnectionId && (
+          cfg.targetTableName || cfg.targetCollection ||
+          cfg.targetLocalPath || cfg.targetPreviewSql
+        ));
+      default:
+        // Branch and any future types: don't block.
+        return true;
+    }
+  };
+
   const onConnect = useCallback((params) => {
     // Get the source and target nodes
     const sourceNode = nodes.find(node => node.id === params.source);
     const targetNode = nodes.find(node => node.id === params.target);
-    
+
     if (!sourceNode || !targetNode) {
       message.error('Invalid connection attempt');
       return;
     }
-    
+
+    // A node with no output yet cannot feed another node. Without this guard the
+    // edge forms silently and only errors later, deep in execution.
+    if (!isNodeConfiguredAndRun(sourceNode)) {
+      message.error('Please configure and run this node before connecting it to another node.');
+      return;
+    }
+
     // Enforce connection rules
     if (sourceNode.type === 'start') {
       // Start nodes can only connect to data source nodes
@@ -428,45 +533,56 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     setEdges((eds) => addEdge(params, eds));
   }, [setEdges, nodes, edges]);
 
-  const onDragOver = useCallback((event) => {
-    event.preventDefault();
-    
-    // Check if files are being dragged
-    const hasFiles = event.dataTransfer.types.includes('Files');
-    if (hasFiles) {
-      event.dataTransfer.dropEffect = 'copy';
-      setIsDragOver(true);
-    } else {
-      event.dataTransfer.dropEffect = 'move';
-    }
-  }, []);
+  // While an import popup is open it owns the drop — see fileDragHandlers.
+  const dropDisabled = Boolean(activeFileType);
+  const { onDragOver, onDragLeave } = useMemo(
+    () => fileDragHandlers(setIsDragOver, dropDisabled), [dropDisabled]);
 
-  const onDragLeave = useCallback((event) => {
-    event.preventDefault();
-    // Only set dragOver to false if we're leaving the main container
-    if (!event.currentTarget.contains(event.relatedTarget)) {
-      setIsDragOver(false);
+  // Open the import popup for the next queued file, storing the rest so it can
+  // be resumed after this one is saved. When the queue is empty everything is
+  // closed. The file is only read once its popup mounts (see the
+  // LocalFileConnectionForm initialFile effect), so nothing imports early.
+  const processNextFile = useCallback((remaining) => {
+    if (!remaining || remaining.length === 0) {
+      setActiveFileType(null);
+      setDroppedFile(null);
+      setFileQueue([]);
+      return;
     }
+    importCancelledRef.current = false; // fresh popup — this file's import is allowed
+    const [next, ...rest] = remaining;
+    setFileQueue(rest);
+    setDroppedFile(next);
+    setActiveFileType(detectFileType(next.name));
   }, []);
 
   const onDrop = useCallback(
     (event) => {
+      if (dropDisabled) return;
       event.preventDefault();
       setIsDragOver(false);
 
-      // Check if files were dropped
-      const files = Array.from(event.dataTransfer.files);
-      if (files.length > 0) {
-        const file = files[0];
-        
-        if (!isValidFile(file)) {
-          message.error('Only Excel (.xlsx, .xls) and CSV (.csv) files are allowed, up to 50GB');
-          return;
-        }
-        
-        // Store the dropped file and open upload modal
-        setDroppedFile(file);
-        setIsUploadModalOpen(true);
+      // Files dropped on the canvas become data sources, one popup at a time,
+      // exactly as they do on the Connections tab.
+      if (event.dataTransfer.files?.length > 0) {
+        // The editor is itself inside the Workflows tab's modal, whose own drop
+        // target would otherwise see this too and bounce to Connections.
+        event.stopPropagation();
+
+        const validFiles = collectDroppableFiles(event);
+        if (validFiles.length === 0) return;
+
+        // Remember where they landed so the nodes appear under the cursor.
+        const bounds = reactFlowWrapper.current?.getBoundingClientRect();
+        dropOriginRef.current = bounds && reactFlowInstance
+          ? reactFlowInstance.project({
+            x: event.clientX - bounds.left,
+            y: event.clientY - bounds.top,
+          })
+          : null;
+        dropIndexRef.current = 0;
+
+        processNextFile(validFiles);
         return;
       }
 
@@ -529,7 +645,7 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         setNodes((nds) => nds.concat(newNode));
       }
     },
-    [reactFlowInstance, setNodes, setEdges, nodes]
+    [reactFlowInstance, setNodes, setEdges, nodes, edges, processNextFile, dropDisabled]
   );
 
   const getNodeLabel = (type) => {
@@ -571,18 +687,32 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   };
 
   const onNodeClick = useCallback((event, node) => {
+    // Everything the clicked node is carrying — the raw node (position, data)
+    // and its full config, chat transcript and schemas included, plus how it
+    // is wired. Logged as live objects so the console can expand them.
+    console.log('[WorkflowEditor] node clicked:', node );
+
     // Close context menu if open
     setContextMenu(null);
     setContextMenuNode(null);
 
-    // Check if node has required inputs for sidebar to open
+    // Check if node has required inputs (transformer needs 1 upstream, join 2).
     const canOpenSidebar = canNodeOpenSidebar(node, nodes, edges);
+    if (!canOpenSidebar) {
+      message.warning(getNodeRequirementMessage(node));
+      return;
+    }
 
-    if (canOpenSidebar) {
+    // Transformer/Join are configured through the chat assistant (which targets
+    // the focused node), NOT the per-node sidebar. Selecting them shows the
+    // DataPreview (Details tab) and focuses the chat via the node-focus effect.
+    if (node.type === 'transformer' || node.type === 'join') {
+      setSelectedNode(node);
+      setIsSidebarOpen(false);
+    } else {
+      // Data Source / Start / Output — option-picking config in the sidebar.
       setSelectedNode(node);
       setIsSidebarOpen(true);
-    } else {
-      message.warning(getNodeRequirementMessage(node));
     }
   }, [nodes, edges]);
 
@@ -603,11 +733,15 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       setContextMenu(null);
       const canOpenSidebar = canNodeOpenSidebar(contextMenuNode, nodes, edges);
 
-      if (canOpenSidebar) {
+      if (!canOpenSidebar) {
+        message.warning(getNodeRequirementMessage(contextMenuNode));
+      } else if (contextMenuNode.type === 'transformer' || contextMenuNode.type === 'join') {
+        // Chat-configured — select (shows Details + focuses chat), no sidebar.
+        setSelectedNode(contextMenuNode);
+        setIsSidebarOpen(false);
+      } else {
         setSelectedNode(contextMenuNode);
         setIsSidebarOpen(true);
-      } else {
-        message.warning(getNodeRequirementMessage(contextMenuNode));
       }
       setContextMenuNode(null);
     }
@@ -641,6 +775,10 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   const handlePaneClick = useCallback(() => {
     setContextMenu(null);
     setContextMenuNode(null);
+    // Clicking empty canvas takes the node out of focus — same as the Data
+    // Preview close button (closes the preview and clears the chat's focus).
+    setSelectedNode(null);
+    setIsSidebarOpen(false);
   }, []);
   // console.log('nodes: ', selectedNode)
   // Handle node configuration updates
@@ -668,6 +806,122 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     setTriggerSidebarSave(true);
   }, [setNodes]);
 
+  // ── Chat-assistant node targeting ────────────────────────────────────────
+  // Build the payload the ChatAssistant sends to chat:step as `targetNode`, so
+  // the main prompt can route to the transformer/join (or REST-API dataSource)
+  // builder for THIS node. Only chat-configured node types are targetable.
+  const buildTargetNodePayload = useCallback((node) => {
+    if (!node) return null;
+    const type = node.type;
+    const cfg = node.data?.config || {};
+    const isApiDS = type === 'dataSource' &&
+      (cfg.sourceConnectionType === 'api' || cfg.sourceDbType === 'rest-api' || cfg.dbType === 'rest-api');
+    if (type !== 'transformer' && type !== 'join' && !isApiDS) return null;
+    try {
+      const upstreamNodes = edges
+        .filter((e) => e.target === node.id)
+        .map((e) => nodes.find((n) => n.id === e.source))
+        .filter(Boolean);
+      return {
+        // The scope id, not currentWorkflowId: a chat build can write files
+        // before the workflow has ever been saved.
+        workflowId: workflowScopeIdRef.current || currentWorkflowId || null,
+        nodeId: node.id,
+        type,
+        label: node.data?.label || type,
+        config: toCloneable(node.data?.config || {}, 'targetNode.config'),
+        upstreamNodes: toCloneable(upstreamNodes, 'targetNode.upstream'),
+        connectionId: isApiDS ? (cfg.sourceApiConnectionId || cfg.sourceConnectionId || null) : null,
+        isApi: !!isApiDS,
+      };
+    } catch (e) {
+      console.warn('[WorkflowEditor] could not build targetNode payload:', e);
+      return null;
+    }
+  }, [nodes, edges, currentWorkflowId]);
+
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  useEffect(() => { edgesRef.current = edges; }, [edges]);
+
+  // Broadcast the focused node to the ChatAssistant. It re-fires when the
+  // node's config changes (e.g. right after a build) so the chat always has
+  // the current SQL/JS for refinement. Clears focus when nothing is selected.
+  useEffect(() => {
+    const payload = selectedNode ? buildTargetNodePayload(selectedNode) : null;
+    window.dispatchEvent(new CustomEvent('ternlux:node-focus', { detail: payload }));
+    // Fire only when the selection or its config changes (not on every canvas
+    // drag/highlight). buildTargetNodePayload is intentionally excluded — it
+    // reads the current nodes/edges at call time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNode?.id, selectedNode?.data?.config]);
+
+  // Closing the workflow takes the canvas — and therefore the focused node —
+  // away with it. The assistant outlives this editor, so drop the focus on the
+  // way out or it keeps offering to edit a node that is no longer on screen.
+  useEffect(() => () => {
+    window.dispatchEvent(new CustomEvent('ternlux:node-focus', { detail: null }));
+  }, []);
+
+  // Apply a config the ChatAssistant built for a node (via build_transformer /
+  // build_join / build_dataSource). Writes it onto the node + the selectedNode
+  // snapshot, flags unsaved, and refreshes the preview.
+  useEffect(() => {
+    const handler = (e) => {
+      const nb = e.detail;
+      if (!nb || !nb.nodeId || !nb.config) return;
+      setNodes((prev) => prev.map((n) => n.id === nb.nodeId
+        ? { ...n, data: { ...n.data, config: { ...(n.data?.config || {}), ...nb.config } } }
+        : n));
+      setSelectedNode((prev) => (prev && prev.id === nb.nodeId
+        ? { ...prev, data: { ...prev.data, config: { ...(prev.data?.config || {}), ...nb.config } } }
+        : prev));
+      setHasUnsavedChanges(true);
+      // `partial` = a follow-up chat commit (question/answer only), not a build.
+      if (!nb.partial) {
+        message.success(`Updated ${nb.nodeType || 'node'} configuration from chat.`);
+        if (handleDataPreviewRefresh) handleDataPreviewRefresh();
+      }
+    };
+    window.addEventListener('ternlux:apply-node-config', handler);
+    return () => window.removeEventListener('ternlux:apply-node-config', handler);
+  }, [setNodes]);
+
+  // Run one node on the chat assistant's behalf. The assistant holds the
+  // approval UI but not the graph, so it asks here and we answer through the
+  // `resolve` callback the event carries (same renderer — a function in the
+  // detail is fine). Nodes are read out of setNodes rather than the closure so
+  // a config applied moments ago is already in what we send.
+  useEffect(() => {
+    const handler = (e) => {
+      const { nodeId, resolve } = e.detail || {};
+      const done = typeof resolve === 'function' ? resolve : () => {};
+      if (!nodeId) { done({ success: false, message: 'No node was named.' }); return; }
+      (async () => {
+        try {
+          if (!window.electronAPI?.workflow?.executeNode) {
+            done({ success: false, message: 'Node execution is not available.' });
+            return;
+          }
+          const result = await window.electronAPI.workflow.executeNode({
+            workflowId: workflowScopeIdRef.current || currentWorkflowId || null,
+            nodeId,
+            // Same sanitization the full-run path needs: live nodes carry Arrow
+            // vectors and circular refs that cannot cross IPC.
+            nodes: toCloneable(nodesRef.current, 'nodes'),
+            edges: toCloneable(edgesRef.current, 'edges'),
+          });
+          if (result?.success && handleDataPreviewRefresh) handleDataPreviewRefresh();
+          done(result || { success: false, message: 'No result returned.' });
+        } catch (err) {
+          done({ success: false, message: err.message || String(err) });
+        }
+      })();
+    };
+    window.addEventListener('ternlux:execute-node', handler);
+    return () => window.removeEventListener('ternlux:execute-node', handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentWorkflowId]);
+
   // Update only the selectedNode for preview purposes (doesn't save to workflow)
   const onPreviewConfigUpdate = useCallback((nodeId, config) => {
     // console.log('onPreviewConfigUpdate: ', selectedNode, nodeId, config)
@@ -690,6 +944,16 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     setDataPreviewRefreshTrigger(prev => prev + 1);
   }, []);
 
+  // A REST API data source has no form fields beyond the connection — once it
+  // is saved the request itself is described in the chat. Close the form (the
+  // node panel and the assistant share the same corner, so the assistant is
+  // hidden while it is open) and open the assistant, which picks this node up
+  // through the ternlux:node-focus broadcast below.
+  const handleRequestChatHandoff = useCallback((nodeId) => {
+    setIsSidebarOpen(false);
+    window.dispatchEvent(new CustomEvent('ternlux:open-chat', { detail: { nodeId } }));
+  }, []);
+
   // Load database tables (called from DataSourceNodeChat)
   const loadDatabaseTables = useCallback(async (connection) => {
     try {
@@ -703,6 +967,22 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         if (!filePath) {
           console.error('File path not found in connection');
           return { success: false, tables: [] };
+        }
+
+        if (connection.dbType === 'duckdb') {
+          // A local file records its tables when it is added — one per sheet
+          // for a workbook, otherwise just the file itself. Nothing to query.
+          const tableList = (connection.fileInfo?.tables || [])
+            .map((t) => ({ name: typeof t === 'string' ? t : t?.name }))
+            .filter((t) => t.name);
+
+          if (tableList.length === 0) {
+            console.error('No tables recorded for local file connection', connection.name);
+            return { success: false, tables: [] };
+          }
+
+          setDbTables(tableList.map((t) => ({ name: t.name, schema: null })));
+          return { success: true, tables: tableList };
         }
 
         if (connection.dbType === 'sqlite') {
@@ -934,6 +1214,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       }
 
       const workflowData = {
+        // Pin the id the editor has been scoping files under, so the first
+        // save adopts it instead of minting a different one.
+        id: currentWorkflowId || workflowScopeIdRef.current,
         name: workflowName,
         description: workflowDescription,
         nodes: toCloneable(nodes, 'nodes'),
@@ -974,46 +1257,50 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     }
   };
 
-  // Auto-save with debouncing to avoid excessive API calls
-  const autoSave = useCallback(async () => {
+  // Auto-save with debouncing to avoid excessive API calls.
+  // `explicit` = true → a committed save (Save button, after verifying steps):
+  //   clears the temp-state flag. `explicit` = false → a background temp save
+  //   (marks the record tempStateSave: true). Returns true on success so
+  //   callers can perform a deferred action (close/execute) only if it saved.
+  const autoSave = useCallback(async ({ explicit = false, executionStepsOverride = null, outputValidation = null } = {}) => {
     if (saving) {
       // Don't auto-save if already saving
-      return;
+      return false;
     }
 
     if (!workflowName.trim()) {
       // Don't auto-save if workflow doesn't have a name
       message.warning('Cannot save: Please enter a workflow name');
-      return;
+      return false;
     }
 
     // Custom validation for auto-save with error messages
     if (nodes.length === 0) {
       message.warning('Cannot save: Workflow must have at least one node');
-      return;
+      return false;
     }
 
     // Check if there's a start node
     const hasStart = nodes.some(node => node.type === 'start');
     if (!hasStart) {
       message.warning('Cannot save: Workflow must have a Start node');
-      return;
+      return false;
     }
 
     // Check if there's at least one data source node
     const hasDataSource = nodes.some(node => node.type === 'dataSource');
     if (!hasDataSource) {
       message.warning('Cannot save: Workflow must have at least one Data Source node');
-      return;
+      return false;
     }
-    
+
     // Check if start node is connected to at least one data source
     const startNode = nodes.find(node => node.type === 'start');
     if (startNode) {
       const startConnections = edges.filter(edge => edge.source === startNode.id);
       if (startConnections.length === 0) {
         message.warning('Cannot save: Start node must be connected to at least one Data Source');
-        return;
+        return false;
       }
     }
 
@@ -1039,12 +1326,15 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         }
       }
 
-      let finalExecutionSteps = executionSteps;
+      let finalExecutionSteps = executionStepsOverride || executionSteps;
       if (!finalExecutionSteps.length && nodes.length > 0) {
         finalExecutionSteps = generateStepsFromNodes(nodes, edges);
       }
-      
+
       const workflowData = {
+        // Pin the id the editor has been scoping files under, so the first
+        // save adopts it instead of minting a different one.
+        id: currentWorkflowId || workflowScopeIdRef.current,
         name: workflowName,
         description: workflowDescription,
         nodes: toCloneable(nodes, 'nodes'),
@@ -1053,19 +1343,34 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         type: 'Custom',
         final_dataset: toCloneable(finalDatasetS3Key, 'final_dataset'),
         executionSteps: finalExecutionSteps || [],
+        // A background auto-save is a temporary, unverified snapshot; an
+        // explicit Save (after the user verifies Execution Steps) commits it.
+        tempStateSave: !explicit,
+        // Output-validation toggle/function from the steps editor. Only included
+        // when set so the DB $set merge leaves any existing field alone otherwise.
+        ...(outputValidation ? { outputValidation } : {}),
       };
 
+      // Arm the reload guard BEFORE the save writes any code files. onAutoSave
+      // rewrites this workflow's externalized code on disk, which the watcher
+      // sees; arming here (not just after) guarantees the guard is already in
+      // place when chokidar emits, so a slow save can't lose the race and bounce
+      // the canvas.
+      reloadGuardRef.current.suppressUntil = Date.now() + 3000;
       const savedId = await onAutoSave(workflowData, currentWorkflowId);
       if (savedId && !currentWorkflowId) {
         setCurrentWorkflowId(savedId);
       }
 
+      if (executionStepsOverride) setExecutionSteps(finalExecutionSteps);
       setInitialWorkflowState({ name: workflowName, description: workflowDescription, nodes, edges });
       setHasUnsavedChanges(false);
-      // Auto-save just rewrote this workflow's externalized code files, which
-      // the on-disk watcher will see. Suppress the resulting reload so we don't
-      // bounce the canvas right after saving.
+      setTempStateSave(!explicit);
+      if (explicit) message.success('Workflow saved');
+      // Re-extend the guard past the save's own writes (chokidar's
+      // awaitWriteFinish delays emission ~500ms after the last write settles).
       reloadGuardRef.current.suppressUntil = Date.now() + 3000;
+      return true;
     } catch (error) {
       console.error('Auto-save failed:', error, );
       if (error.message === 'Duplicate workflow name') {
@@ -1073,12 +1378,17 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       } else if (error.response?.status === 404) {
         message.error('Cannot save: Workflow not found. It may have been deleted.');
         setCurrentWorkflowId(null);
-      } else if (error.message !== 'Network Error' && error.response) {
+      } else if (error.response) {
         message.error(`Cannot save: ${error.response?.data?.error || error.message || 'Unknown error'}`);
-      } else {
+      } else if (error.message === 'Network Error') {
         message.error('Cannot save: Network error. Please check your connection.');
+      } else {
+        // Local failure (e.g. serialization / IPC error) — surface the real
+        // message instead of blaming the network for a local operation.
+        message.error(`Cannot save: ${error.message || 'Unknown error'}`);
       }
       setHasUnsavedChanges(false);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -1092,10 +1402,22 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     autoSaveRef.current = autoSave;
   }, [autoSave]);
 
-  // Create a stable debounced function that always calls the latest autoSave
+  // Create a stable debounced function that always calls the latest autoSave.
+  //
+  // AUTO-SAVE DISABLED: background auto-save is commented out so that nothing is
+  // persisted until the user explicitly clicks Save. Previously a background
+  // auto-save wrote changes to the workflow record, which meant "Don't save" in
+  // the unsaved-changes prompt could not truly discard — the state had already
+  // been persisted. With auto-save off, "Don't save" really discards, and the
+  // only path that writes to the DB is the explicit Save (which calls
+  // autoSave({ explicit: true }) directly after the user verifies the steps).
+  //
+  // The debounce wrapper is kept (as a no-op) so the effects below can still
+  // call debouncedAutoSave() / .cancel() without breaking. To re-enable
+  // auto-save, restore the `autoSaveRef.current();` call below.
   const debouncedAutoSave = useRef(
     debounce(() => {
-      autoSaveRef.current();
+      // autoSaveRef.current();  // ← re-enable to turn background auto-save back on
     }, 2000)
   ).current;
 
@@ -1150,7 +1472,34 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   }, [triggerSidebarSave, workflowName]);
 
 
+  // Cancelling drops the whole batch: this file isn't saved and the queued ones
+  // never open. Matches the Connections tab, where ✕ / Cancel exits the
+  // multi-file flow rather than advancing through it.
+  const handleUploadCancel = () => {
+    importCancelledRef.current = true; // stop any in-flight import from advancing
+    setActiveFileType(null);
+    setDroppedFile(null);
+    setFileQueue([]);
+    dropOriginRef.current = null;
+    dropIndexRef.current = 0;
+  };
+
+  // Place a node for a freshly imported file near where the batch was dropped,
+  // fanning consecutive files out diagonally so they stay individually clickable.
+  const droppedNodePosition = () => {
+    const origin = dropOriginRef.current || { x: 100, y: 100 };
+    const step = dropIndexRef.current * DROP_STACK_OFFSET;
+    dropIndexRef.current += 1;
+    return { x: origin.x + step, y: origin.y + step };
+  };
+
   const handleSaveDroppedConnection = async (connectionData) => {
+    // The user hit ✕/Cancel while this file's import was still running — abort
+    // the whole flow: don't save this connection and don't open the next file.
+    // handleUploadCancel already cleared the state; the flag is reset by
+    // processNextFile when the next drop opens a popup.
+    if (importCancelledRef.current) return;
+
     // Persist the local file connection (same path ConnectionsTab uses for file
     // connections) so we get a connection with an id to reference from the node.
     let saved;
@@ -1159,64 +1508,40 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     } catch (error) {
       console.error('Error saving dropped data source:', error);
       message.error('Failed to create data source.');
-      return;
+      return; // leave the popup open so the user can retry or cancel
     }
 
-    // Close the upload modal
-    setIsUploadModalOpen(false);
-    setDroppedFile(null);
+    message.success(`Data source "${saved.name}" created.`);
 
-    // Show success message
-    message.success('Data source created successfully! You can now add it to your workflow.');
-
-    // Optionally create a data source node automatically
-    if (reactFlowInstance) {
-      const newNode = {
-        id: `dataSource-${Date.now()}`,
-        type: 'dataSource',
-        position: { x: 100, y: 100 },
-        data: {
-          label: 'Data Source',
-          config: {
-            connectionId: saved.id,
-            connectionName: saved.name
-          }
+    // Add a data source node for it, wired to the start node the same way a
+    // node dragged from the palette is.
+    const newNode = {
+      id: `dataSource-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: 'dataSource',
+      position: droppedNodePosition(),
+      data: {
+        label: 'Data Source',
+        config: {
+          connectionId: saved.id,
+          connectionName: saved.name,
         },
-      };
-      // Auto-connect to start node (same logic as drag-and-drop)
-      const startNode = nodes.find(node => node.type === 'start' && node.id === 'start-node');
-      console.log('DEBUG - Auto-connection after upload:', { startNode, newNodeId: newNode.id });
-      
-      if (startNode) {
-        // Check if start node is already connected to this specific data source
-        const existingConnection = edges.find(edge => edge.source === startNode.id && edge.target === newNode.id);
-        
-        if (existingConnection) {
-          message.warning('This data source is already connected to the start node.');
-          return; // Don't add the node if already connected
-        }
-        
-        const newEdge = {
-          id: `edge-${startNode.id}-${newNode.id}`,
-          source: startNode.id,
-          target: newNode.id,
-          type: 'default'
-        };
-        console.log('DEBUG - Creating auto-connection edge after upload:', newEdge);
-        
-        // Add both node and edge together
-        setNodes((nds) => nds.concat(newNode));
-        setEdges((eds) => [...eds, newEdge]);
-      } else {
-        console.log('DEBUG - No start node found for auto-connection after upload');
-        setNodes((nds) => nds.concat(newNode));
-      }
+      },
+    };
+    const startNode = nodesRef.current.find(node => node.type === 'start' && node.id === 'start-node');
+    if (startNode) {
+      setNodes((nds) => nds.concat(newNode));
+      setEdges((eds) => [...eds, {
+        id: `edge-${startNode.id}-${newNode.id}`,
+        source: startNode.id,
+        target: newNode.id,
+        type: 'default',
+      }]);
+    } else {
+      setNodes((nds) => nds.concat(newNode));
     }
-  };
 
-  const handleUploadCancel = () => {
-    setIsUploadModalOpen(false);
-    setDroppedFile(null);
+    // Advance to the next dropped file (if any); otherwise this closes the popup.
+    processNextFile(fileQueue);
   };
 
 
@@ -1226,10 +1551,19 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   };
 
   const handleSaveWorkflow = () => {
-    if (!validateWorkflow()) {
+    // The Save button is always clickable (never silently disabled). Give clear
+    // feedback instead of a dead "not-allowed" cursor.
+    if (saving) {
+      message.warning('A save is already in progress. Please wait…');
       return;
     }
-    // Open steps editor first, then save after steps are saved
+    if (!validateWorkflow()) {
+      // validateWorkflow shows a specific message (e.g. "Please enter a
+      // workflow name") — nothing more to do.
+      return;
+    }
+    // Open steps editor first, then commit an explicit save after the user
+    // verifies the Execution Steps.
     setSaveAfterStepsEditor(true);
     setIsStepsEditorOpen(true);
   };
@@ -1263,31 +1597,104 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   const handleStepsEditorClose = () => {
     setIsStepsEditorOpen(false);
     setSaveAfterStepsEditor(false);
+    // Cancelling the steps editor abandons any deferred close/execute action.
+    setPendingAction(null);
   };
 
-  const handleStepsEditorSave = async (savedExecutionSteps) => {
+  // Lightweight goal-drift check after an explicit save. Only fires when the
+  // saved validation function is the SAME one that came in (user didn't
+  // regenerate). One cheap AI call (skipped in the backend when structure is
+  // unchanged); on drift, offers to regenerate against the just-saved workflow.
+  const maybeOfferRevalidation = async (outputValidation, savedExecutionSteps) => {
+    try {
+      const priorFn = workflow?.outputValidation?.validationFunction || null;
+      const savedFn = outputValidation?.validationFunction || null;
+      if (!outputValidation?.enabled || !savedFn || savedFn !== priorFn) return;
+
+      const wfId = currentWorkflowId || workflowScopeIdRef.current;
+      const savedWorkflow = toCloneable({
+        id: wfId,
+        nodes,
+        edges,
+        executionSteps: savedExecutionSteps,
+        outputValidation,
+      }, 'driftCheck');
+      const drift = await window.electronAPI.workflow.checkValidationDrift({ workflow: savedWorkflow });
+      if (!drift?.drifted) return;
+
+      Modal.confirm({
+        title: 'Validation may be out of date',
+        content: drift.reason || 'This workflow changed since its output-validation function was written. Regenerate it to match the current pipeline?',
+        okText: 'Regenerate',
+        cancelText: 'Keep current',
+        onOk: async () => {
+          const res = await window.electronAPI.workflow.generateValidation({ workflowId: wfId });
+          if (res?.success) message.success('Validation regenerated');
+          else message.error(res?.message || 'Failed to regenerate validation');
+        },
+      });
+    } catch (_) {
+      // Drift check is best-effort — never block the save on it.
+    }
+  };
+
+  const handleStepsEditorSave = async (savedExecutionSteps, opts = {}) => {
     // Update the workflow state to include execution steps
     setExecutionSteps(savedExecutionSteps);
-    setHasUnsavedChanges(true);
+    const outputValidation = opts.outputValidation || null;
 
     console.log('Execution steps saved to workflow state:', savedExecutionSteps);
 
-    // If Save button was clicked, trigger autoSave instead of calling handleSave directly
     if (saveAfterStepsEditor) {
       setSaveAfterStepsEditor(false);
-      // Trigger immediate autoSave using the sidebar save mechanism
-      setTriggerSidebarSave(true);
-
-      // Show message that steps are updated (autoSave will handle the actual save)
-      message.success('Execution steps updated. Auto-saving workflow...');
+      setIsStepsEditorOpen(false);
+      // Commit an EXPLICIT save now that the user has verified the steps. This
+      // clears the temp-state flag. Pass the just-saved steps directly to avoid
+      // reading stale state.
+      const ok = await autoSave({ explicit: true, executionStepsOverride: savedExecutionSteps, outputValidation });
+      const action = pendingAction;
+      setPendingAction(null);
+      if (!ok) return; // save failed/validation — stay in the editor
+      // Goal-drift check: if we just saved a PRE-EXISTING validation function the
+      // user did not regenerate, verify it still fits the (possibly edited)
+      // workflow and offer to regenerate. Non-blocking; the deferred action still
+      // proceeds below.
+      maybeOfferRevalidation(outputValidation, savedExecutionSteps);
+      // Perform any action the user deferred behind the save (close/execute).
+      if (action === 'close') {
+        onCancel();
+      } else if (action === 'execute') {
+        doExecuteWorkflow();
+      }
+    } else {
+      // Steps edited without an immediate save request — mark as unsaved so the
+      // change is picked up by the next save/close.
+      setHasUnsavedChanges(true);
     }
   };
 
   /**
-   * Execute the entire workflow
-   * Iterates through nodes in order and executes each one
+   * Execute button entry point. Gate on uncommitted changes first: if there are
+   * unsaved edits or an uncommitted temp save, prompt the user to save (verify
+   * Execution Steps) before running, so a run never executes unverified state.
    */
   const handleExecuteWorkflow = async () => {
+    if (!nodes || nodes.length === 0) {
+      message.warning('No nodes to execute');
+      return;
+    }
+    if (hasUnsavedChanges || tempStateSave) {
+      setUnsavedPrompt({ open: true, intent: 'execute' });
+      return;
+    }
+    doExecuteWorkflow();
+  };
+
+  /**
+   * Execute the entire workflow (no save-gate — call only after the gate).
+   * Iterates through nodes in order and executes each one.
+   */
+  const doExecuteWorkflow = async () => {
     if (!nodes || nodes.length === 0) {
       message.warning('No nodes to execute');
       return;
@@ -1324,13 +1731,16 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         });
       }
 
-      // Start execution
+      // Start execution. Strip non-structured-cloneable values (Arrow Vectors,
+      // functions, circular refs) first — the same sanitization the save path
+      // uses. Without this, executing a saved multi-node workflow fails at the
+      // IPC boundary with "An object could not be cloned".
       const result = await window.electronAPI.workflow.executeWorkflow({
         workflowId: currentWorkflowId,
         workflowName: workflowName || 'Untitled Workflow',
-        nodes,
-        edges,
-        executionSteps: finalExecutionSteps
+        nodes: toCloneable(nodes, 'nodes'),
+        edges: toCloneable(edges, 'edges'),
+        executionSteps: toCloneable(finalExecutionSteps, 'executionSteps')
       });
 
       if (result.success) {
@@ -1375,6 +1785,40 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     }
   };
 
+  // ── Unsaved-changes prompt (Save / Don't save / Cancel) ──────────────────
+  // Shown from Execute and Close when there are uncommitted changes.
+  const handlePromptSave = () => {
+    const intent = unsavedPrompt.intent;
+    setUnsavedPrompt({ open: false, intent: null });
+    if (saving) {
+      message.warning('A save is already in progress. Please wait…');
+      return;
+    }
+    if (!validateWorkflow()) {
+      // e.g. missing name — user must fix, then retry close/execute.
+      return;
+    }
+    // Route through the steps editor: the user verifies Execution Steps, then
+    // an explicit save commits and the deferred action (close/execute) runs.
+    setPendingAction(intent);
+    setSaveAfterStepsEditor(true);
+    setIsStepsEditorOpen(true);
+  };
+
+  const handlePromptDontSave = () => {
+    const intent = unsavedPrompt.intent;
+    setUnsavedPrompt({ open: false, intent: null });
+    if (intent === 'close') {
+      onCancel();
+    } else if (intent === 'execute') {
+      doExecuteWorkflow();
+    }
+  };
+
+  const handlePromptCancel = () => {
+    setUnsavedPrompt({ open: false, intent: null });
+  };
+
   if (editorLoading) {
     return (
       <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -1385,28 +1829,36 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', fontFamily: "'Inter',-apple-system,sans-serif" }}>
-      {/* Header */}
+      {/* Header. The modal's own close button is turned off (closable={false}
+          in WorkflowsTab) so the ✕ can live here, aligned with the other
+          actions and inside the same padding as the name and description. */}
       <div style={{
-        padding: '10px 16px 10px 0px',
+        padding: '12px 20px',
         borderBottom: '1px solid #e2e6eb',
         background: '#fff',
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'center',
-        gap: 12,
+        gap: 16,
         flexShrink: 0,
       }}>
         <div style={{ flex: 1, minWidth: 0 }}>
+          {/* Borderless inputs are pulled left by their own padding so the text
+              lines up with the header's edge, and get it back on hover/focus
+              so they still read as editable fields. */}
           <Input
             placeholder="Enter workflow name"
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
+            className="workflow-title-input"
             style={{
-              fontSize: 18,
+              fontSize: 17,
               fontWeight: 600,
               color: '#111827',
-              padding: '2px 0px',
-              letterSpacing: '-0.01em',
+              padding: '2px 6px',
+              marginLeft: -6,
+              letterSpacing: '-0.02em',
+              borderRadius: 4,
             }}
             bordered={false}
           />
@@ -1414,24 +1866,41 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
             placeholder="Enter workflow description"
             value={workflowDescription}
             onChange={(e) => setWorkflowDescription(e.target.value)}
-            rows={1}
+            autoSize={{ minRows: 1, maxRows: 2 }}
+            className="workflow-title-input"
             style={{
-              fontSize: 11,
-              padding: 0,
-              marginTop: 6,
+              fontSize: 12,
+              lineHeight: 1.45,
+              padding: '2px 6px',
+              marginLeft: -6,
+              marginTop: 2,
               color: '#5a6678',
               resize: 'none',
+              borderRadius: 4,
             }}
             bordered={false}
           />
         </div>
         <Space size={6}>
+          {runningExecution && (
+            <span
+              title={`Execution ${runningExecution.executionId} is running`}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                padding: '3px 10px', borderRadius: 4,
+                background: 'rgba(37,99,235,0.16)', border: '1px solid rgba(37,99,235,0.4)',
+                color: '#1d4ed8', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap',
+              }}
+            >
+              <Spin size="small" /> Running…
+            </span>
+          )}
           <Button
             type="primary"
             icon={<PlayCircleOutlined />}
             onClick={handleExecuteWorkflow}
-            disabled={!nodes || nodes.length === 0 || isExecuting}
-            loading={isExecuting}
+            disabled={!nodes || nodes.length === 0 || isExecuting || !!runningExecution}
+            loading={isExecuting || !!runningExecution}
             title="Execute workflow"
             size="small"
             style={{
@@ -1448,13 +1917,12 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
             type="primary"
             icon={<SaveOutlined />}
             onClick={handleSaveWorkflow}
-            disabled={!workflowName.trim() || saving}
             loading={saving}
             title="Save workflow"
             size="small"
             className="workflow-save-button"
           >
-            Save
+            {saving ? 'Saving…' : 'Save'}
           </Button>
           <Dropdown
             overlay={
@@ -1491,6 +1959,17 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
               Auto-saving…
             </span>
           )}
+          {/* Separated from the actions so it never reads as one of them —
+              it still routes through handleCancel, so unsaved work prompts. */}
+          <span style={{ width: 1, height: 20, background: '#e2e6eb', margin: '0 4px' }} />
+          <Button
+            size="small"
+            icon={<CloseOutlined />}
+            onClick={handleCancel}
+            title="Close workflow"
+            aria-label="Close workflow"
+            style={{ borderRadius: 4, borderColor: '#e2e6eb', color: '#5a6678' }}
+          />
         </Space>
       </div>
 
@@ -1615,11 +2094,13 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
           nodes={nodes}
           edges={edges}
           currentWorkflowId={currentWorkflowId}
+          workflowScopeId={workflowScopeIdRef.current}
           onClose={onCloseSidebar}
           onConfigUpdate={onNodeConfigUpdate}
           onPreviewConfigUpdate={onPreviewConfigUpdate}
           onLoadDatabaseTables={loadDatabaseTables}
           onDataPreviewRefresh={handleDataPreviewRefresh}
+          onRequestChatHandoff={handleRequestChatHandoff}
         />
 
         {/* Data Preview Component */}
@@ -1632,75 +2113,35 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
           dbTables={dbTables}
           activeConnection={activeConnection}
           refreshTrigger={dataPreviewRefreshTrigger}
+          onClose={() => { setSelectedNode(null); setIsSidebarOpen(false); }}
         />
 
         {/* File Drop Overlay */}
-        {isDragOver && (
-          <div style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            backgroundColor: 'rgba(37, 99, 235, 0.08)',
-            border: '2px dashed #2563eb',
-            zIndex: 1000,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            pointerEvents: 'none',
-            fontFamily: "'Inter',-apple-system,sans-serif",
-          }}>
-            <div style={{
-              textAlign: 'center',
-              backgroundColor: '#fff',
-              padding: 28,
-              border: '1px solid #e2e6eb',
-              borderRadius: 8,
-              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.12)'
-            }}>
-              <CloudUploadOutlined style={{
-                fontSize: 48,
-                color: '#2563eb',
-                marginBottom: 12
-              }} />
-              <div style={{
-                fontSize: 14,
-                fontWeight: 600,
-                color: '#111827',
-                marginBottom: 6,
-                letterSpacing: '-0.01em',
-              }}>
-                Drop your Excel or CSV file here
-              </div>
-              <div style={{
-                fontSize: 11,
-                color: '#5a6678',
-                fontFamily: "'JetBrains Mono', monospace",
-              }}>
-                A new data source connection will be created
-              </div>
-            </div>
-          </div>
-        )}
+        {isDragOver && <FileDropOverlay title="Drop a file to add a data source" />}
       </div>
 
-      {/* Data Source Upload Modal */}
-      <Modal
-        title="Create Data Source from File"
-        open={isUploadModalOpen}
-        onCancel={handleUploadCancel}
-        footer={null}
-        width={640}
-        destroyOnClose
-      >
-        <LocalFileConnectionForm
-          fileType="spreadsheet"
-          initialFile={droppedFile}
-          onSave={handleSaveDroppedConnection}
+      {/* Dropped-file import — same form, titles and one-popup-per-file flow as
+          the Connections tab, opened for the type the dropped file actually is. */}
+      {activeFileType && (
+        <Modal
+          // Remount the form per dropped file so its name/state resets cleanly
+          // between consecutive uploads of the same file type.
+          key={droppedFile ? `${droppedFile.name}-${droppedFile.lastModified}` : activeFileType}
+          title={LOCAL_FILE_MODAL_TITLES[activeFileType] || 'Create Data Source from File'}
+          open
           onCancel={handleUploadCancel}
-        />
-      </Modal>
+          footer={null}
+          width={640}
+          destroyOnClose
+        >
+          <LocalFileConnectionForm
+            fileType={activeFileType}
+            initialFile={droppedFile}
+            onSave={handleSaveDroppedConnection}
+            onCancel={handleUploadCancel}
+          />
+        </Modal>
+      )}
 
       {/* Workflow Steps Editor */}
       <WorkflowStepsEditor
@@ -1711,6 +2152,30 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         nodes={nodes}
         edges={edges}
       />
+
+      {/* Unsaved-changes prompt (Save / Don't save / Cancel). Save opens the
+          Edit Execution Steps editor, then commits an explicit save. */}
+      <Modal
+        open={unsavedPrompt.open}
+        title="Unsaved changes"
+        onCancel={handlePromptCancel}
+        maskClosable={false}
+        footer={[
+          <Button key="cancel" onClick={handlePromptCancel}>
+            Cancel
+          </Button>,
+          <Button key="dontsave" danger onClick={handlePromptDontSave}>
+            Don't save
+          </Button>,
+          <Button key="save" type="primary" icon={<SaveOutlined />} onClick={handlePromptSave}>
+            Save
+          </Button>,
+        ]}
+      >
+        {unsavedPrompt.intent === 'execute'
+          ? 'You have unsaved changes. Save and verify the Execution Steps before running, or run without saving?'
+          : 'You have unsaved changes. Save before closing, or discard them?'}
+      </Modal>
     </div>
   );
 };

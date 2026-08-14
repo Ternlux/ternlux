@@ -8,7 +8,9 @@ import {
   ExpandOutlined,
   CompressOutlined,
   DownloadOutlined,
-  RightOutlined
+  RightOutlined,
+  ProfileOutlined,
+  CloseOutlined
 } from '@ant-design/icons';
 import axios from 'axios';
 import Editor from '@monaco-editor/react';
@@ -25,7 +27,8 @@ const DataPreview = ({
   onNodeUpdate,
   dbTables = [],
   activeConnection = null,
-  refreshTrigger = 0
+  refreshTrigger = 0,
+  onClose = null
 }) => {
   // Component state
   const [isExpanded, setIsExpanded] = useState(false);
@@ -40,6 +43,9 @@ const DataPreview = ({
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [loadingTransformed, setLoadingTransformed] = useState(false);
   const [connectedDataSources, setConnectedDataSources] = useState([]);
+  // A REST API source is picked in the form but described in the chat; until
+  // its fetch has run there is nothing to preview.
+  const [awaitingApiConfig, setAwaitingApiConfig] = useState(false);
 
   // Schema Explorer state (for database connections)
   const [dbSchema, setDbSchema] = useState({});
@@ -48,6 +54,23 @@ const DataPreview = ({
   // Refs for resizing
   const containerRef = useRef(null);
   const isDragging = useRef(false);
+  // Two separate effects watch the node config and both call fetchPreviewData,
+  // so one selection change used to fire two identical queries — enough to race
+  // a connection that was being torn down ("connection is in closed state").
+  // This holds the descriptor of the last fetch issued; a repeat is ignored.
+  const inFlightFetchKey = useRef(null);
+  // Monotonic id for preview fetches, so a slow one that resolves after the
+  // user has already picked a different table is discarded instead of
+  // overwriting the newer selection.
+  const previewRequestSeq = useRef(0);
+
+  // A REST API source is not a browsable store: it has no schema to explore and
+  // nothing to "transform" — its Details tab carries the endpoint instead.
+  const isApiDataSource = selectedNode?.type === 'dataSource' && (
+    selectedNode?.data?.config?.sourceDbCategory === 'API' ||
+    selectedNode?.data?.config?.sourceConnectionType === 'api' ||
+    selectedNode?.data?.config?.sourceDbType === 'rest-api'
+  );
 
   // Authentication error handler
   const handleAuthError = (error) => {
@@ -114,7 +137,7 @@ const DataPreview = ({
         };
       }
 
-      if (dbType === 'sqlite' || dbType === 'nedb') {
+      if (dbType === 'sqlite' || dbType === 'nedb' || dbType === 'duckdb') {
         // Use sourceLocalPath for data source nodes, fallback to connection fileInfo
         const localPath = config.sourceLocalPath || connection.fileInfo?.filePath;
 
@@ -124,11 +147,12 @@ const DataPreview = ({
         }
 
         // Determine storage type from connection dbType
-        const storageType = dbType === 'sqlite' ? 'sqlite' : 'nedb';
-        // Use sourcePreviewSql for SQLite if available
-        const sqlPreview = storageType === 'sqlite' ? config.targetPreviewSql || config.sourcePreviewSql : null;
-        // Get table name for SQLite queries
-        const tableName = storageType === 'sqlite' ? (config.targetTableName || config.sourceTableName || config.table) : null;
+        const storageType = dbType === 'sqlite' ? 'sqlite' : dbType === 'duckdb' ? 'duckdb' : 'nedb';
+        // SQL stores take a preview statement; NeDB has none.
+        const isSqlStore = storageType === 'sqlite' || storageType === 'duckdb';
+        const sqlPreview = isSqlStore ? config.targetPreviewSql || config.sourcePreviewSql : null;
+        // Get table name for SQL queries
+        const tableName = isSqlStore ? (config.targetTableName || config.sourceTableName || config.table) : null;
         // console.log('sqlPreview: ', sqlPreview)
         const result = await window.electronAPI.db.readLocalCollection(localPath, 1000, storageType, sqlPreview, tableName);
         // console.log('result: ', result)
@@ -150,25 +174,30 @@ const DataPreview = ({
             storageType: 'NeDB'
           };
         } else {
-          // SQLite data - format as table
+          // Tabular data (SQLite / DuckDB) - format as table. DuckDB reports
+          // its columns, so an empty result still shows the right headers.
+          const label = storageType === 'duckdb' ? 'DuckDB' : 'SQLite';
+          const declaredHeaders = (result.columns || []).map((c) => (typeof c === 'string' ? c : c.name));
+
           if (rows.length === 0) {
             return {
-              headers: result.columns || [],
+              headers: declaredHeaders,
               data: [],
               metadata: { rowCount: 0 },
               isJson: false,
-              storageType: 'SQLite',
+              storageType: label,
               tables: result.tables || [],
               currentTable: result.currentTable || null
             };
           }
 
-          const headers = Object.keys(rows[0]);
+          const headers = declaredHeaders.length > 0 ? declaredHeaders : Object.keys(rows[0]);
           const formattedRows = rows.map(row =>
             headers.map(header => {
               const value = row[header];
               if (value === null || value === undefined || value === 'null') return '';
-              return String(value);
+              // DuckDB returns real objects/arrays for STRUCT and LIST columns.
+              return typeof value === 'object' ? JSON.stringify(value) : String(value);
             })
           );
 
@@ -177,7 +206,7 @@ const DataPreview = ({
             data: formattedRows,
             metadata: { rowCount: formattedRows.length },
             isJson: false,
-            storageType: 'SQLite',
+            storageType: label,
             tables: result.tables || [],
             currentTable: result.currentTable || null
           };
@@ -264,6 +293,19 @@ const DataPreview = ({
         );
 
         if (!result.success) {
+          // A transformer/join target table only exists after the node runs.
+          // Before that, the preview query fails with "no such table" — show a
+          // neutral pre-execution state instead of leaking the raw SQL error.
+          const isMissingTable = /no such table|doesn'?t exist|does not exist|not found/i.test(String(result.message || ''));
+          const isTargetPreview = query === config.targetPreviewSql;
+          if (isMissingTable && isTargetPreview) {
+            return {
+              headers: [],
+              data: [],
+              metadata: { rowCount: 0, pendingExecution: true },
+              pendingExecution: true
+            };
+          }
           message.error('Database query failed: ' + result.message);
           return null;
         }
@@ -331,6 +373,42 @@ const DataPreview = ({
     setConnectedDataSources(connectedNodes);
   }, [selectedNode?.id, edges]);
 
+  // Moving to another node (or closing the panel) clears the per-node preview
+  // guards, so its data is always fetched fresh rather than being mistaken for
+  // a duplicate. The visible table is dropped too: whatever loads next belongs
+  // to the new node, and leaving the old rows up meant selecting an unconfigured
+  // node — which fetches nothing — kept showing the previous node's data. Both
+  // the direct data and the per-source caches (read by the join/transformer
+  // render paths) are wiped so no stale rows survive the switch.
+  useEffect(() => {
+    inFlightFetchKey.current = null;
+    previewRequestSeq.current += 1; // orphan any in-flight fetch for the old node
+    setPreviewData(null);
+    setPreviewDataBySource({});
+    setTransformedData(null);
+    setTransformedDataBySource({});
+    setLoadingPreview(false);
+    setLoadingTransformed(false);
+    setDbSchema({});
+    setActivePreviewTab('0');
+    setActiveTransformedTab('0');
+  }, [selectedNode?.id]);
+
+  // An API source with no materialised collection has nothing to show, and
+  // fetchPreviewData may never even run for it (an unsaved node has no
+  // sourceConnectionId to fetch by), so the waiting state is derived here
+  // rather than only inside the fetch. Re-evaluates when the chat's fetch
+  // lands and sourceLocalPath appears.
+  useEffect(() => {
+    const cfg = selectedNode?.data?.config;
+    setAwaitingApiConfig(!!isApiDataSource && (!cfg?.sourceLocalPath || !cfg?.apiFetchCode));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    isApiDataSource,
+    selectedNode?.data?.config?.sourceLocalPath,
+    selectedNode?.data?.config?.apiFetchCode,
+  ]);
+
   useEffect(() => {
     if (dbTables.length > 0){
       setActiveTab('schema');
@@ -341,9 +419,22 @@ const DataPreview = ({
     const timeoutId = setTimeout(() => {
       if (selectedNode) {
         console.log('activeTab: ', activeTab)
-        
-        // Ensure we default to preview tab when node is selected
-        if (dbTables.length > 0){
+
+        // Default tab when a node is selected. Transformer/Join lead with the
+        // Details tab (their logic lives in config, not a live preview);
+        // data sources keep their schema/preview default.
+        const apiSource = selectedNode.type === 'dataSource' && (
+          selectedNode.data?.config?.sourceDbCategory === 'API' ||
+          selectedNode.data?.config?.sourceConnectionType === 'api' ||
+          selectedNode.data?.config?.sourceDbType === 'rest-api'
+        );
+        if (selectedNode.type === 'transformer' || selectedNode.type === 'join') {
+          setActiveTab('details');
+        } else if (apiSource) {
+          // No Schema tab for an API source, and nothing to preview until its
+          // fetch has run — the endpoint details are the useful view.
+          setActiveTab('details');
+        } else if (dbTables.length > 0){
           setActiveTab('schema');
         }else{
           setActiveTab('preview');
@@ -481,6 +572,9 @@ const DataPreview = ({
   useEffect(() => {
     if (refreshTrigger > 0) {
       console.log('refreshTrigger: ', refreshTrigger)
+      // The config descriptor is unchanged but the DATA moved, so drop the
+      // de-dupe guard and let the query run again.
+      inFlightFetchKey.current = null;
       refreshNodeData(true); // Force refetch
     }
   }, [refreshTrigger, refreshNodeData]);
@@ -505,6 +599,40 @@ const DataPreview = ({
       return;
     }
 
+    // A REST API source has no data until its fetch function has been written
+    // (in the chat) and run. Reading the NeDB collection before that hits an
+    // empty / not-yet-materialised file and reports it as corrupt, so wait.
+    // Both conditions matter: no fetch function means nothing was ever written,
+    // and a stale sourceLocalPath can point at another node's file.
+    const isApiSource = config.sourceDbCategory === 'API' || config.sourceConnectionType === 'api';
+    if (isApiSource && (!config.sourceLocalPath || !config.apiFetchCode)) {
+      setPreviewData(null);
+      setLoadingPreview(false);
+      setAwaitingApiConfig(true);
+      return;
+    }
+    setAwaitingApiConfig(false);
+
+    // Collapse the duplicate fetches the two config-watching effects above
+    // would otherwise fire for a single selection change.
+    const fetchKey = JSON.stringify([
+      connectionId,
+      config.sourceDbType || config.targetDbType,
+      config.sourceTableName || config.targetTableName,
+      config.sourceCollection || config.targetCollection,
+      config.sourceIndexName,
+      config.sourcePreviewSql || config.targetPreviewSql,
+      config.sourceLocalPath || config.targetLocalPath,
+    ]);
+    if (inFlightFetchKey.current === fetchKey) return;
+    inFlightFetchKey.current = fetchKey;
+
+    // Sequence number for this request. A slow query for the table the user has
+    // since navigated away from must not paint over the one they picked next,
+    // so a result is only applied if it is still the newest request.
+    const requestId = ++previewRequestSeq.current;
+    const isStale = () => requestId !== previewRequestSeq.current;
+
     setLoadingPreview(true);
 
     // Check if user is logged in - if not, use local data fetching
@@ -512,7 +640,7 @@ const DataPreview = ({
       try {
         let connection;
 
-        // Check if this is a local storage placeholder ID (local-sqlite or local-nedb)
+        // Check if this is a local storage placeholder ID (local-duckdb)
         const isLocalPlaceholder = connectionId?.startsWith('local-');
 
         if (isLocalPlaceholder) {
@@ -536,6 +664,7 @@ const DataPreview = ({
           connection = await connectionsDb.getById(connectionId);
 
           if (!connection) {
+            if (isStale()) return;
             message.error('Connection not found');
             setLoadingPreview(false);
             return;
@@ -545,19 +674,22 @@ const DataPreview = ({
         // Fetch local data
         const localData = await fetchLocalData(config, connection);
 
+        // The user moved on while this was in flight — cache the result under
+        // its own key but leave the visible table alone.
+        const connectionSourceIdentifier = config?.targetTableName || config?.sourceTableName || config?.targetCollection || config.sourceCollection;
         if (localData) {
-          const connectionSourceIdentifier = config?.targetTableName || config?.sourceTableName || config?.targetCollection || config.sourceCollection;
           setPreviewDataBySource(prev => ({
             ...prev,
             [connectionId + connectionSourceIdentifier]: localData
           }));
-          setPreviewData(localData);
+          if (!isStale()) setPreviewData(localData);
         }
 
-        setLoadingPreview(false);
+        if (!isStale()) setLoadingPreview(false);
         return;
       } catch (error) {
         console.error('Error fetching local data:', error);
+        if (isStale()) return;
         message.error('Failed to load local data');
         setLoadingPreview(false);
         return;
@@ -698,11 +830,35 @@ const DataPreview = ({
       );
     }
 
+    // A REST API source is configured in two steps: pick the connection in the
+    // form, then describe the request in the chat. Between those there is
+    // genuinely nothing to read yet.
+    if (awaitingApiConfig) {
+      return (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="Describe the request in the chat to configure this API source. Its data appears here once the fetch has run."
+        />
+      );
+    }
+
     if (!data || !data.data) {
       return (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description="No data available"
+        />
+      );
+    }
+
+    // Transformer/join output that hasn't been materialized yet — the target
+    // table only exists after the node runs. Show a neutral pre-execution
+    // state instead of a raw "no such table" SQL error (TLX-007).
+    if (data.pendingExecution) {
+      return (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="Preview available after this node runs. Execute the workflow to generate its output."
         />
       );
     }
@@ -937,7 +1093,7 @@ const DataPreview = ({
       // if (!isLoggedIn()) {
         let connection;
 
-        // Check if this is a local storage placeholder ID (local-sqlite or local-nedb)
+        // Check if this is a local storage placeholder ID (local-duckdb)
         const isLocalPlaceholder = nodeConfig.targetConnectionId?.startsWith('local-');
 
         if (isLocalPlaceholder) {
@@ -1064,6 +1220,11 @@ const DataPreview = ({
           !selectedNode?.data?.config?.sql) {
         setActiveTab('schema');
       }
+    } else {
+      // No tables — the node is unconfigured or the panel was closed (the parent
+      // wipes dbTables in both cases). Drop the previous node's schema so the
+      // Schema tab doesn't keep showing stale columns.
+      setDbSchema({});
     }
   }, [dbTables, selectedNode]);
 
@@ -1100,7 +1261,28 @@ const DataPreview = ({
           return;
         }
 
-        if (connection.dbType === 'sqlite') {
+        if (connection.dbType === 'duckdb') {
+          // DuckDB reports column types with the rows, so one read is enough.
+          const result = await window.electronAPI.db.readLocalCollection(
+            localPath,
+            1,
+            'duckdb',
+            null,
+            tableName
+          );
+
+          const columns = (result.columns || []).map(({ name, type }) => ({
+            name,
+            type: type || 'unknown',
+            nullable: true,
+            isPrimary: false
+          }));
+
+          setDbSchema(prev => ({
+            ...prev,
+            [tableName]: { ...prev[tableName], columns, loading: false }
+          }));
+        } else if (connection.dbType === 'sqlite') {
           // For SQLite, use PRAGMA table_info to get column information
           const pragmaQuery = `PRAGMA table_info("${tableName}")`;
           const result = await window.electronAPI.db.readLocalCollection(
@@ -1206,6 +1388,314 @@ const DataPreview = ({
         [tableName]: { ...prev[tableName], columns: [], loading: false }
       }));
     }
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Details tab — all node configuration in one place. Reads the same
+  // node.data.config that each NodeChat's buildConfig() persists. Purely a
+  // read-only view; other tabs (Preview/Schema/Transformed) are unchanged.
+  // ─────────────────────────────────────────────────────────────────────────
+  const renderNodeDetails = () => {
+    if (!selectedNode) {
+      return (
+        <div style={{ textAlign: 'center', padding: '50px' }}>
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Select a node to view its details" />
+        </div>
+      );
+    }
+    const type = selectedNode.type;
+    const config = selectedNode.data?.config || {};
+    const label = selectedNode.data?.label || type;
+
+    const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+    const TYPE_LABEL = { start: 'Start', dataSource: 'Data Source', transformer: 'Transformer', join: 'Join', output: 'Output', branch: 'Branch' };
+
+    // Is a chat-built node (transformer/join) actually configured?
+    const isConfigured = (() => {
+      if (type === 'transformer') {
+        return (config.usesSkill && config.skillId) || nonEmpty(config.targetSql) ||
+          nonEmpty(config.targetInsertSql) || nonEmpty(config.nosqlOperation) ||
+          nonEmpty(config.transformFunction);
+      }
+      if (type === 'join') {
+        return nonEmpty(config.joinSql) || nonEmpty(config.targetSql) ||
+          nonEmpty(config.transformFunction) || nonEmpty(config.aggregationPipeline);
+      }
+      return Object.keys(config).length > 0;
+    })();
+
+    // Build the [label, value] rows per node type, grouped into Source /
+    // Target / General buckets. Source and Target render inside collapsible
+    // panels (collapsed by default); General rows render flat.
+    const sourceRows = [];
+    const targetRows = [];
+    const pushTo = (bucket, k, v) => { if (nonEmpty(v)) bucket.push([k, String(v)]); };
+
+    if (type === 'transformer') {
+      pushTo(sourceRows, 'Source', config.sourceConnectionName);
+      pushTo(sourceRows, 'Source type', [config.sourceConnectionType, config.sourceDbType].filter(nonEmpty).join(' · '));
+      pushTo(sourceRows, 'Source table', config.sourceTableName || config.sourceCollection);
+      pushTo(targetRows, 'Target', config.targetConnectionName);
+      pushTo(targetRows, 'Target type', [config.targetConnectionType, config.targetDbType].filter(nonEmpty).join(' · '));
+      pushTo(targetRows, 'Target table', config.targetTableName || config.targetCollection);
+      pushTo(targetRows, 'Operation mode', config.transformationSettings?.operationMode);
+      pushTo(targetRows, 'Storage', config.transformationSettings?.storageLocation);
+      if (config.usesSkill) pushTo(targetRows, 'Skill', config.skillId);
+    } else if (type === 'join') {
+      const srcNames = Array.isArray(config.sources)
+        ? config.sources.map((s) => s.sourceConnectionName || s.sourceNodeLabel || s.sourceTableName).filter(nonEmpty).join(', ')
+        : '';
+      pushTo(sourceRows, 'Sources', srcNames);
+      const cols = Array.isArray(config.joinColumns)
+        ? config.joinColumns.map((c) => (typeof c === 'string' ? c : (c.left && c.right ? `${c.left} = ${c.right}` : JSON.stringify(c)))).join(', ')
+        : '';
+      pushTo(sourceRows, 'Join columns', cols);
+      pushTo(targetRows, 'Target', config.targetConnectionName);
+      pushTo(targetRows, 'Target table', config.targetTableName || config.targetCollection);
+      pushTo(targetRows, 'Operation mode', config.joinSettings?.operationMode);
+      pushTo(targetRows, 'Storage', config.joinSettings?.storageLocation);
+    } else if (type === 'dataSource' && isApiDataSource) {
+      // A REST API source has no table or schema to describe — what matters is
+      // which endpoint it calls and how it authenticates. Credentials live
+      // encrypted on the connection and are never surfaced here, only their
+      // presence.
+      const api = config.apiConnectionPublicConfig || {};
+      const authType = api.authType && api.authType !== 'none' ? api.authType : null;
+      const paramKeys = Array.isArray(api.apiParamKeys) ? api.apiParamKeys : [];
+      pushTo(sourceRows, 'Connection', config.sourceApiConnectionName || config.sourceConnectionName);
+      pushTo(sourceRows, 'Type', 'REST API');
+      pushTo(sourceRows, 'Base URL', api.baseUrl);
+      // Key names only — values stay encrypted on the connection.
+      if (paramKeys.length > 0) {
+        pushTo(sourceRows, 'Parameters', `${paramKeys.join(', ')} · values stored encrypted on the connection`);
+      } else {
+        pushTo(sourceRows, 'Auth', authType ? `${authType} · credentials stored on the connection` : 'None');
+      }
+      if (nonEmpty(api.apiKeyName)) pushTo(sourceRows, 'API key header', api.apiKeyName);
+      if (nonEmpty(api.basicUser)) pushTo(sourceRows, 'Basic auth user', api.basicUser);
+      pushTo(sourceRows, 'Request', config.apiFetchPrompt);
+      pushTo(sourceRows, 'Cached into', config.sourceCollection);
+      pushTo(sourceRows, 'Local path', config.sourceLocalPath);
+      if (!nonEmpty(config.apiFetchCode)) {
+        pushTo(sourceRows, 'Status', 'Not configured yet — describe the request in the chat');
+      }
+    } else if (type === 'dataSource') {
+      pushTo(sourceRows, 'Connection', config.sourceConnectionName || config.connectionName);
+      pushTo(sourceRows, 'Type', [config.sourceConnectionType || config.connectionType, config.sourceDbType || config.dbType].filter(nonEmpty).join(' · '));
+      pushTo(sourceRows, 'Table', config.sourceTableName || config.sourceCollection || config.sourceIndexName);
+      pushTo(sourceRows, 'Local path', config.sourceLocalPath);
+    } else if (type === 'output') {
+      pushTo(targetRows, 'Destination', config.targetConnectionName || config.outputType || config.destinationType);
+      pushTo(targetRows, 'Format', config.outputFormat || config.format);
+      pushTo(targetRows, 'Target table', config.targetTableName);
+      pushTo(targetRows, 'Local path', config.targetLocalPath);
+    } else if (type === 'start') {
+      pushTo(targetRows, 'Trigger', config.triggerType || 'manual');
+    }
+
+    const totalRows = sourceRows.length + targetRows.length;
+
+    // Chat transcript that built this node (persisted as config.chat). Shown
+    // in a collapsible dropdown in place of the raw "request to build" input.
+    const chatMessages = Array.isArray(config.chat)
+      ? config.chat.filter((m) => nonEmpty(m?.text))
+      : [];
+
+    // The AI's explanation of what this node does. Chat-built SQL/NoSQL nodes
+    // store it as targetSqlExplanation; NoSQL joins and skill executors
+    // (python / javascript / vector-db) don't set that field and instead
+    // carry a descriptive request string — fall back through those so the
+    // explanation section is never empty when a description exists.
+    const explanation = config.targetSqlExplanation || config.sqlExplanation ||
+      config.explanation || config.transformationRequest || config.joinRequest ||
+      config.joinDescription || '';
+
+    // Code blocks (SQL / DDL / functions) present on this node.
+    const codeBlocks = [];
+    const addCode = (title, code, lang) => { if (nonEmpty(code)) codeBlocks.push({ title, code: String(code), lang }); };
+    addCode('Generated SQL', config.targetSql || config.joinSql, 'sql');
+    addCode('DDL (CREATE TABLE)', config.targetDdl, 'sql');
+    addCode('Insert SQL', config.targetInsertSql, 'sql');
+    addCode('Source SQL', config.sourceSql || config.sourcePreviewSql, 'sql');
+    addCode('JavaScript function', config.transformFunction || config.apiFetchCode, 'javascript');
+    if (config.nosqlOperation) addCode('NoSQL operation', typeof config.nosqlOperation === 'string' ? config.nosqlOperation : JSON.stringify(config.nosqlOperation, null, 2), 'json');
+    if (config.aggregationPipeline) addCode('Aggregation pipeline', typeof config.aggregationPipeline === 'string' ? config.aggregationPipeline : JSON.stringify(config.aggregationPipeline, null, 2), 'json');
+
+    const rowStyle = { display: 'grid', gridTemplateColumns: '128px 1fr', gap: '2px 12px', padding: '6px 0', borderBottom: '1px solid #f0f2f5' };
+    const preStyle = {
+      margin: 0, padding: '10px 12px', borderRadius: 6, overflow: 'auto',
+      background: '#f7f9fc', border: '1px solid #e2e6eb',
+      fontFamily: "'JetBrains Mono', Menlo, Consolas, monospace", fontSize: 11.5, lineHeight: 1.55,
+      color: '#111827', whiteSpace: 'pre',
+    };
+    const groupHeaderStyle = { fontSize: 11, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#5a6678' };
+    const descBoxStyle = { fontSize: 12, color: '#5a6678', background: '#f7f9fc', border: '1px solid #e2e6eb', borderLeft: '2px solid #2563eb', borderRadius: 6, padding: '9px 11px' };
+
+    // Render a group of [label, value] rows.
+    const renderRows = (rowList) => (
+      <div>
+        {rowList.map(([k, v], i) => (
+          <div key={i} style={rowStyle}>
+            <Text type="secondary" style={{ fontSize: 12 }}>{k}</Text>
+            <Text style={{ fontSize: 12, wordBreak: 'break-word' }}>{v}</Text>
+          </div>
+        ))}
+      </div>
+    );
+
+    // JSON blocks render in a Monaco editor for clean, formatted output;
+    // SQL / JS stay as a lightweight <pre>.
+    const defineCodeTheme = (monaco) => {
+      monaco.editor.defineTheme('ternlux-code', {
+        base: 'vs', inherit: true, rules: [],
+        colors: {
+          'editor.background': '#f7f9fc',
+          'editorLineNumber.foreground': '#c2c9d4',
+          'editorLineNumber.activeForeground': '#5a6678',
+          'editorIndentGuide.background': '#e6eaf0',
+          'editorGutter.background': '#f7f9fc',
+        },
+      });
+    };
+    const renderCode = (b) => {
+      if (b.lang === 'json') {
+        const editorHeight = Math.min(340, Math.max(96, b.code.split('\n').length * 18 + 20));
+        return (
+          <div style={{ border: '1px solid #e2e6eb', borderRadius: 6, overflow: 'hidden' }}>
+            <Editor
+              height={editorHeight}
+              language="json"
+              value={b.code}
+              beforeMount={defineCodeTheme}
+              theme="ternlux-code"
+              options={{
+                readOnly: true,
+                minimap: { enabled: false },
+                fontSize: 12,
+                fontFamily: "'JetBrains Mono', Menlo, Consolas, monospace",
+                lineNumbers: 'off',
+                folding: false,
+                scrollBeyondLastLine: false,
+                automaticLayout: true,
+                wordWrap: 'on',
+                tabSize: 2,
+                renderLineHighlight: 'none',
+                overviewRulerLanes: 0,
+                scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+                padding: { top: 8, bottom: 8 },
+              }}
+            />
+          </div>
+        );
+      }
+      return <pre style={preStyle}>{b.code}</pre>;
+    };
+
+    // Unconfigured chat node → neutral empty state.
+    if ((type === 'transformer' || type === 'join') && !isConfigured) {
+      return (
+        <div style={{ padding: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+            <Text strong style={{ fontSize: 14 }}>{label}</Text>
+            <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.03em', textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20, background: '#fdf1e3', color: '#b45309' }}>Not configured</span>
+          </div>
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={`This ${TYPE_LABEL[type] || type} node isn't set up yet. Its logic is built through chat — open the chat to describe what it should do.`}
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div style={{ padding: '16px', height: height - 100, overflow: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <Text strong style={{ fontSize: 14 }}>{label}</Text>
+          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.03em', textTransform: 'uppercase', color: '#5a6678' }}>
+            {TYPE_LABEL[type] || type}
+          </span>
+          {(type === 'transformer' || type === 'join') && (
+            <span style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, letterSpacing: '0.03em', textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20, background: isConfigured ? '#e7f6ec' : '#fdf1e3', color: isConfigured ? '#16a34a' : '#b45309' }}>
+              {isConfigured ? 'Configured' : 'Not configured'}
+            </span>
+          )}
+        </div>
+
+        {/* Explanation — what this node does, at the very top. */}
+        {nonEmpty(explanation) && (
+          <div style={{ ...descBoxStyle, marginBottom: 14 }}>
+            {explanation}
+          </div>
+        )}
+
+        {/* Build logic — the generated SQL / DDL / functions that define what
+            this node does, first panel open. */}
+        {codeBlocks.length > 0 && (
+          <Collapse ghost className="details-collapse" style={{ marginBottom: 14, borderBottom: '1px solid #f0f2f5' }}>
+            {codeBlocks.map((b, i) => (
+              <Panel
+                key={String(i)}
+                header={<span style={groupHeaderStyle}>{b.title}</span>}
+              >
+                {renderCode(b)}
+              </Panel>
+            ))}
+          </Collapse>
+        )}
+
+        {totalRows > 0 ? (
+          <Collapse ghost className="details-collapse">
+            {sourceRows.length > 0 && (
+              <Panel key="source" header={<span style={groupHeaderStyle}>Source details</span>}>
+                {renderRows(sourceRows)}
+              </Panel>
+            )}
+            {targetRows.length > 0 && (
+              <Panel key="target" header={<span style={groupHeaderStyle}>Target details</span>}>
+                {renderRows(targetRows)}
+              </Panel>
+            )}
+          </Collapse>
+        ) : (
+          <Text type="secondary" style={{ fontSize: 12 }}>No configuration recorded for this node yet.</Text>
+        )}
+
+        {/* Chat history dropdown — the conversation that built this node,
+            in place of the raw build request. Collapsed by default. */}
+        {chatMessages.length > 0 && (
+          <Collapse ghost className="details-collapse" style={{ marginTop: 10 }}>
+            <Panel
+              key="chat"
+              header={<span style={groupHeaderStyle}>Chat history ({chatMessages.length})</span>}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflow: 'auto' }}>
+                {chatMessages.map((m, i) => {
+                  const isUser = m.sender === 'user';
+                  return (
+                    <div
+                      key={m.id || i}
+                      style={{
+                        alignSelf: isUser ? 'flex-end' : 'flex-start',
+                        maxWidth: '88%',
+                        background: isUser ? '#eef4ff' : '#f7f9fc',
+                        border: '1px solid #e2e6eb',
+                        borderRadius: 8,
+                        padding: '6px 10px',
+                      }}
+                    >
+                      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#9ca3af', marginBottom: 2 }}>
+                        {isUser ? 'You' : 'Assistant'}
+                      </div>
+                      <div style={{ fontSize: 12, color: '#111827', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Panel>
+          </Collapse>
+        )}
+      </div>
+    );
   };
 
   // Render Schema Explorer for database connections
@@ -1447,7 +1937,13 @@ const DataPreview = ({
         position: 'fixed',
         bottom: 0,
         left: 0,
-        right: isNodeSidebarOpen ? '420px' : 0,
+        // The workflow editor lives in an antd modal, which portals to <body>
+        // and so escapes the containment that keeps the app's own overlays
+        // clear of a pinned assistant. This bar is laid out against the
+        // viewport, so it has to step aside for the rail itself — otherwise
+        // its right edge runs on underneath the assistant. ChatAssistant
+        // publishes --chat-rail-w, which is 0px whenever the rail is not up.
+        right: `calc(${isNodeSidebarOpen ? '420px' : '0px'} + var(--chat-rail-w, 0px))`,
         height: `${height}px`,
         backgroundColor: '#fff',
         borderTop: '1px solid #e2e6eb',
@@ -1518,24 +2014,23 @@ const DataPreview = ({
                 })()}
               </span>
             </div>
-            <Button
-              size="small"
-              icon={<DownloadOutlined />}
-              onClick={handleExport}
-              disabled={
-                (activeTab === 'preview' && (loadingPreview || !previewData)) ||
-                (activeTab === 'transformed' && (loadingTransformed || !transformedData))
-              }
-              style={{
-                borderRadius: 4,
-                fontSize: 11,
-                color: '#5a6678',
-                borderColor: '#e2e6eb',
-                background: '#fff',
-              }}
-            >
-              {isCurrentDataJson() ? 'Export JSON' : 'Export CSV'}
-            </Button>
+            {onClose && (
+              <Tooltip title="Close — take this node out of focus">
+                <Button
+                  size="small"
+                  icon={<CloseOutlined />}
+                  onClick={onClose}
+                  aria-label="Close preview"
+                  style={{
+                    borderRadius: 4,
+                    fontSize: 11,
+                    color: '#5a6678',
+                    borderColor: '#e2e6eb',
+                    background: '#fff',
+                  }}
+                />
+              </Tooltip>
+            )}
           </div>
         )}
 
@@ -1545,12 +2040,48 @@ const DataPreview = ({
           size="small"
           style={{ height: '100%', paddingLeft: 12, flex: 1 }}
           tabBarStyle={{ margin: 0, borderBottom: '1px solid #e2e6eb' }}
+          tabBarExtraContent={activeTab === 'details' ? undefined : {
+            right: (
+              <Button
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={handleExport}
+                disabled={
+                  (activeTab === 'preview' && (loadingPreview || !previewData)) ||
+                  (activeTab === 'transformed' && (loadingTransformed || !transformedData))
+                }
+                style={{
+                  borderRadius: 4,
+                  fontSize: 11,
+                  color: '#5a6678',
+                  borderColor: '#e2e6eb',
+                  background: '#fff',
+                  marginRight: 8,
+                }}
+              >
+                {isCurrentDataJson() ? 'Export JSON' : 'Export CSV'}
+              </Button>
+            )
+          }}
         >
-          {previewData &&
+          {/* Details tab — all node configuration (primary tab) */}
           <TabPane
             tab={
               <span>
-                <EyeOutlined />
+                <ProfileOutlined style={{ marginRight: 6 }} />
+                Details
+              </span>
+            }
+            key="details"
+            style={{ height: '100%' }}
+          >
+            {renderNodeDetails()}
+          </TabPane>
+          {(previewData || awaitingApiConfig) &&
+          <TabPane
+            tab={
+              <span>
+                <EyeOutlined style={{ marginRight: 6 }} />
                 Preview
               </span>
             }
@@ -1560,12 +2091,14 @@ const DataPreview = ({
             {renderDataSourceTabs()}
           </TabPane>
           }
-          {/* Schema tab - only for database data sources */}
-          {selectedNode?.type === 'dataSource' && (
+          {/* Schema tab - only for database data sources. A REST API source has
+              no browsable schema (it has no tables until its fetch runs), so it
+              gets the Details tab only. */}
+          {selectedNode?.type === 'dataSource' && !isApiDataSource && (
             <TabPane
               tab={
                 <span>
-                  <DatabaseOutlined />
+                  <DatabaseOutlined style={{ marginRight: 6 }} />
                   Schema
                   {dbTables.length > 0 && (
                     <span style={{ marginLeft: 4, color: '#999', fontSize: 11 }}>
@@ -1581,10 +2114,10 @@ const DataPreview = ({
             </TabPane>
           )}
 
-          {selectedNode.data.label !== 'Data Source' && <TabPane
+          {selectedNode.data.label !== 'Data Source' && !isApiDataSource && <TabPane
             tab={
               <span>
-                <SwapOutlined />
+                <SwapOutlined style={{ marginRight: 6 }} />
                 Transformed
                 {transformedData && <span style={{ marginLeft: 4, color: '#52c41a' }}>✓</span>}
               </span>

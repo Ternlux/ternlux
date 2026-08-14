@@ -10,8 +10,14 @@ import {
 // Import node-specific chat components
 import StartNodeChat from './NodeChats/StartNodeChat';
 import DataSourceNodeChat from './NodeChats/DataSourceNodeChat';
-import TransformerNodeChat from './NodeChats/TransformerNodeChat';
-import JoinNodeChat from './NodeChats/JoinNodeChat';
+// Transformer and Join are configured through the chat assistant, not this
+// panel — WorkflowEditor's node click and context-menu Edit both close the
+// sidebar for those two types (WorkflowEditor.js:703 and :733), so these
+// components can never mount. Their files are still in NodeChats/; re-enable
+// by restoring these imports, the two cases in renderNodeChat, and the
+// setIsSidebarOpen(true) branches in WorkflowEditor.
+// import TransformerNodeChat from './NodeChats/TransformerNodeChat';
+// import JoinNodeChat from './NodeChats/JoinNodeChat';
 import OutputNodeChat from './NodeChats/OutputNodeChat';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,10 +59,14 @@ const SANS = "'Inter',-apple-system,sans-serif";
 // Routes to specific node type components
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose, onConfigUpdate, onPreviewConfigUpdate, onLoadDatabaseTables, onDataPreviewRefresh }) => {
-  console.log('NodeChatPanel: ', nodes, edges)
+// Start / Data Source / Output are configured through a form rather than a
+// chat transcript: they read node.data.config directly, report their dirty
+// state up so the header can show the "unsaved" marker, and close themselves
+// via onCancel. Transformer / Join stay chat-driven.
+const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowScopeId, onClose, onConfigUpdate, onPreviewConfigUpdate, onLoadDatabaseTables, onDataPreviewRefresh, onRequestChatHandoff }) => {
   const [resetKey, setResetKey] = useState(0);
   const [executing, setExecuting] = useState(false);
+  const [formDirty, setFormDirty] = useState(false);
 
   // Reset the resetKey when node changes or panel closes
   useEffect(() => {
@@ -65,11 +75,17 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
     // }
   }, [isOpen, node?.id]);
 
+  // A different node (or a "start over") clears the unsaved marker.
+  useEffect(() => { setFormDirty(false); }, [node?.id, resetKey]);
+
   if (!isOpen || !node) return null;
   // console.log('node?.id: ', node?.id)
 
-  // Use empty chat when reset, otherwise use saved chat
-  const initialChat = resetKey > 0 ? [] : (node.data?.config?.chat || []);
+  // Only the chat-driven components consumed this, and they no longer mount.
+  // const initialChat = resetKey > 0 ? [] : (node.data?.config?.chat || []);
+  // Same idea for the form nodes: "start over" drops the saved config so the
+  // form comes up empty instead of pre-filled.
+  const initialConfig = resetKey > 0 ? null : (node.data?.config || null);
   // console.log('resetKey: ', resetKey)
   // ─────────────────────────────────────────────────────────────────────────
   // Shared Helper: Get source local path for NeDB
@@ -115,6 +131,9 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
     storageLocation = null,
     operationMode = null,
     targetLocalPath = null,
+    // How DuckDB should read the source file (csv | json | parquet), when the
+    // extension alone isn't the whole story.
+    sourceFormat = null,
 
     // Optional callbacks
     onSuccess = null,
@@ -145,7 +164,9 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
           transformFunction,
           storageLocation,
           operationMode,
-          targetLocalPath
+          targetLocalPath,
+          // Scopes the local NeDB file to this workflow + node.
+          { workflowId: workflowScopeId || currentWorkflowId, nodeId: node.id }
         );
 
         if (result.success && onDataPreviewRefresh) {
@@ -197,7 +218,12 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
         targetSchema,
         targetTableName,
         sourceLocalPath,
-        insertSql
+        insertSql,
+        targetLocalPath,
+        // Same scope the NoSQL branch passes: a local target writes one file
+        // per node, and configuring the node here must land on the same path
+        // the workflow runner would use.
+        { workflowId: workflowScopeId || currentWorkflowId, nodeId: node.id, sourceFormat }
       );
       console.log('result: ', result)
       if (result.success && onDataPreviewRefresh) {
@@ -294,11 +320,20 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
         }
         break;
 
-      case 'output':
-        summaryText = `Configuration saved!\n\n**Type:** ${config.outputSettings.format}`;
+      case 'output': {
+        const out = config.outputSettings || {};
+        summaryText = 'Configuration saved!\n';
+        if (out.outputType === 'local') {
+          summaryText += `\n**Type:** Local file (${out.format})`;
+          if (out.savePath) summaryText += `\n**Save to:** ${out.savePath}`;
+        } else if (out.outputType === 'connection') {
+          summaryText += '\n**Type:** Connection';
+          if (out.tableName) summaryText += `\n**Target:** ${out.tableName}`;
+        }
         if (config.analysisPrompt) summaryText += `\n**Prompt:** ${config.analysisPrompt}`;
         if (config.emailAddress) summaryText += `\n**Email:** ${config.emailAddress}`;
         break;
+      }
 
       case 'branch': {
         const routeTrue = config.outputRoutes?.true || 'valid';
@@ -352,6 +387,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
     // Also update the selectedNode so DataPreview can show the new data
     onPreviewConfigUpdate(node.id, { ...config, chat: finalChat });
 
+    setFormDirty(false);
     antMessage.success('Configuration saved! Check the Data Preview below.');
   };
 
@@ -420,7 +456,7 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
             sourceTableSchema: config.sourceTableSchema,
             operationType: config.operationType,             // python-executor
             transformFunction: config.transformFunction,     // javascript-executor / vector-db-executor
-            outputType: config.targetDbType,                 // javascript-executor: nedb | lancedb
+            outputType: config.targetDbType,                 // javascript-executor: duckdb | lancedb
             targetLocalPath: config.targetLocalPath,
             storageLocation: config.transformationSettings?.storageLocation || config.storageLocation,
             operationMode: config.transformationSettings?.operationMode || config.operationMode,
@@ -520,7 +556,8 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
       const result = await window.electronAPI.dbConnect.executeJoin(
         destinationConnection,
         joinConfig,
-        operationMode
+        operationMode,
+        { workflowId: workflowScopeId || currentWorkflowId, nodeId: node.id }
       );
 
       if (result.success && onDataPreviewRefresh) {
@@ -654,50 +691,56 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
           <DataSourceNodeChat
             key={`${node.id}-${resetKey}`}
             node={node}
-            initialChat={initialChat}
+            initialConfig={initialConfig}
             onSave={handleSave}
+            onCancel={onClose}
+            onDirtyChange={setFormDirty}
+            onRequestChatHandoff={onRequestChatHandoff}
             onLoadDatabaseTables={onLoadDatabaseTables}
-            onConfigUpdate={onConfigUpdate}
             onPreviewConfigUpdate={onPreviewConfigUpdate}
-            executing={executing}
           />
         );
 
-      case 'transformer':
-        return (
-          <TransformerNodeChat
-            key={`${node.id}-${resetKey}`}
-            node={node}
-            nodes={nodes}
-            edges={edges}
-            initialChat={initialChat}
-            onSave={handleSave}
-            onConfigUpdate={onConfigUpdate}
-            onPreviewConfigUpdate={onPreviewConfigUpdate}
-            executeTransformation={executeTransformation}
-            getSourceLocalPath={getSourceLocalPath}
-            executingInd={executingInd}
-            executing={executing}
-          />
-        );
+      // Unreachable — the sidebar never opens for these two (see the note on
+      // the imports at the top of this file). The chat assistant configures
+      // them through build_transformer / build_join instead.
+      // case 'transformer':
+      //   return (
+      //     <TransformerNodeChat
+      //       key={`${node.id}-${resetKey}`}
+      //       node={node}
+      //       workflowScopeId={workflowScopeId || currentWorkflowId}
+      //       nodes={nodes}
+      //       edges={edges}
+      //       initialChat={initialChat}
+      //       onSave={handleSave}
+      //       onConfigUpdate={onConfigUpdate}
+      //       onPreviewConfigUpdate={onPreviewConfigUpdate}
+      //       executeTransformation={executeTransformation}
+      //       getSourceLocalPath={getSourceLocalPath}
+      //       executingInd={executingInd}
+      //       executing={executing}
+      //     />
+      //   );
 
-      case 'join':
-        return (
-          <JoinNodeChat
-            key={`${node.id}-${resetKey}`}
-            node={node}
-            nodes={nodes}
-            edges={edges}
-            initialChat={initialChat}
-            onSave={handleSave}
-            onLoadDatabaseTables={onLoadDatabaseTables}
-            onConfigUpdate={onConfigUpdate}
-            onPreviewConfigUpdate={onPreviewConfigUpdate}
-            executeJoin={executeJoin}
-            executingInd={executingInd}
-            executing={executing}
-          />
-        );
+      // case 'join':
+      //   return (
+      //     <JoinNodeChat
+      //       key={`${node.id}-${resetKey}`}
+      //       node={node}
+      //       workflowScopeId={workflowScopeId || currentWorkflowId}
+      //       nodes={nodes}
+      //       edges={edges}
+      //       initialChat={initialChat}
+      //       onSave={handleSave}
+      //       onLoadDatabaseTables={onLoadDatabaseTables}
+      //       onConfigUpdate={onConfigUpdate}
+      //       onPreviewConfigUpdate={onPreviewConfigUpdate}
+      //       executeJoin={executeJoin}
+      //       executingInd={executingInd}
+      //       executing={executing}
+      //     />
+      //   );
 
       case 'output':
         return (
@@ -706,9 +749,10 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
             node={node}
             nodes={nodes}
             edges={edges}
-            initialChat={initialChat}
+            initialConfig={initialConfig}
             onSave={handleSave}
-            onConfigUpdate={onConfigUpdate}
+            onCancel={onClose}
+            onDirtyChange={setFormDirty}
             executeOutput={executeOutput}
             executingInd={executingInd}
             executing={executing}
@@ -721,9 +765,10 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
             key={`${node.id}-${resetKey}`}
             currentWorkflowId={currentWorkflowId}
             node={node}
-            initialChat={initialChat}
+            initialConfig={initialConfig}
             onSave={handleSave}
-            onConfigUpdate={onConfigUpdate}
+            onCancel={onClose}
+            onDirtyChange={setFormDirty}
           />
         );
 
@@ -747,7 +792,12 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
   return (
     <div
       style={{
-        position: 'fixed', right: 0, top: 0, bottom: 0, width: 420, zIndex: 1030,
+        // The editor is an antd Modal portaled to <body>, so this resolves
+        // against the viewport rather than the app column — without the offset
+        // it would render underneath the pinned assistant rail. The var is
+        // published by ChatAssistant and defaults to 0px (App.css).
+        position: 'fixed', right: 'var(--chat-rail-w, 0px)', top: 0, bottom: 0,
+        width: 420, zIndex: 1030,
         background: '#fff', borderLeft: '1px solid #e2e6eb',
         boxShadow: '-6px 0 24px rgba(0,0,0,0.08)',
         display: 'flex', flexDirection: 'column',
@@ -784,6 +834,14 @@ const NodeChatPanel = ({ isOpen, node, nodes, edges, currentWorkflowId, onClose,
             {node.data?.label || `Configure ${node.type}`}
           </div>
         </div>
+        {formDirty && (
+          <span style={{
+            fontFamily: MONO, fontSize: 10, fontWeight: 600,
+            color: '#b45309', whiteSpace: 'nowrap', flexShrink: 0,
+          }}>
+            ● unsaved
+          </span>
+        )}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {/* Show run button for dataSource, transformer, and join nodes with SQL/DDL */}
           {(

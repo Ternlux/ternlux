@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Modal, message, Spin } from 'antd';
-import { C, MONO, SANS, I } from './_designShared';
+import { C, MONO, SANS, I, fullscreenModalProps } from './_designShared';
 import { isLoggedIn } from '../../utils/authService';
 
 const LOGO_PREFIX = 'http://www.ternlux.com/wp-content/uploads/2026/04/';
@@ -10,13 +10,13 @@ const LOGO_PREFIX = 'http://www.ternlux.com/wp-content/uploads/2026/04/';
 // list; everything else falls back to monogram letters.
 const CONNECTION_TYPES = [
   // Local files
-  { key: 'spreadsheet', title: 'CSV / Excel',     description: 'Import CSV or Excel files into local SQLite database', category: 'file', img: LOGO_PREFIX + 'CSV.png',  fileBased: true, tone: '#1890ff' },
-  { key: 'json',        title: 'JSON',            description: 'Import JSON files into local NeDB database',           category: 'file', img: LOGO_PREFIX + 'JSON.png', fileBased: true, tone: '#fa8c16' },
-  { key: 'sqlite',      title: 'SQLite',          description: 'Connect to an existing SQLite database file',          category: 'file', letters: 'SQ', tone: '#0f80cc', fileBased: true },
-  { key: 'nedb',        title: 'NeDB',            description: 'Connect to an existing NeDB database file',            category: 'file', letters: 'ND', tone: '#52c41a', fileBased: true },
+  { key: 'spreadsheet', title: 'CSV / Excel',     description: 'Query CSV or Excel files in place, no import step',     category: 'file', img: LOGO_PREFIX + 'CSV.png',  fileBased: true, tone: '#1890ff' },
+  { key: 'json',        title: 'JSON',            description: 'Query JSON files in place, no import step',             category: 'file', img: LOGO_PREFIX + 'JSON.png', fileBased: true, tone: '#fa8c16' },
+  { key: 'duckdb',      title: 'DuckDB',          description: 'Connect to an existing DuckDB database file',           category: 'file', letters: 'DD', tone: '#fff100', fileBased: true },
+  { key: 'sqlite',      title: 'SQLite',          description: 'Connect to an existing SQLite database file',           category: 'file', letters: 'SQ', tone: '#0f80cc', fileBased: true },
   { key: 'lancedb',     title: 'LanceDB',         description: 'Connect to local LanceDB vector database',             category: 'file', img: LOGO_PREFIX + 'LanceDB.png', tone: '#7c3aed', fileBased: true },
-  { key: 'parquet',     title: 'Parquet',         description: 'Import Parquet files into local SQLite database',      category: 'file', letters: 'PQ', tone: '#9254de', fileBased: true },
-  { key: 'avro',        title: 'Avro',            description: 'Import Avro files into local SQLite database',         category: 'file', letters: 'AV', tone: '#eb2f96', fileBased: true },
+  { key: 'parquet',     title: 'Parquet',         description: 'Query Parquet files in place, no import step',          category: 'file', letters: 'PQ', tone: '#9254de', fileBased: true },
+  { key: 'avro',        title: 'Avro',            description: 'Import Avro files, converted to Parquet once',          category: 'file', letters: 'AV', tone: '#eb2f96', fileBased: true },
 
   // Databases
   { key: 'postgres',  title: 'PostgreSQL',      description: 'Connect to a PostgreSQL database',                category: 'database', img: LOGO_PREFIX + 'PostgreSQL.png',           tone: '#336791' },
@@ -37,21 +37,21 @@ const CONNECTION_TYPES = [
 
   // APIs
   { key: 'google-sheets', title: 'Google Sheets', description: 'Connect to Google Sheets via OAuth2.0',                                  category: 'api', img: LOGO_PREFIX + 'Google_Sheets.png', tone: '#34a853' },
-  { key: 'rest-api',      title: 'REST API',      description: 'Generic HTTP endpoint — URL + auth here, request authored on the node', category: 'api', letters: 'API', tone: '#2563eb' },
+  { key: 'rest-api',      title: 'REST API',      description: 'Generic HTTP endpoint — URL + your own key/value credentials here, request authored on the node', category: 'api', letters: 'API', tone: '#2563eb' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', letters: 'PC', tone: '#0f172a' },
 ];
 
 const SECTIONS = [
-  { key: 'file',     title: 'Local Files',          desc: 'Files imported into a local store on first run', buttonText: 'Select',  tagText: 'Ready' },
+  { key: 'file',     title: 'Local Files',          desc: 'Files and local databases, queried where they are', buttonText: 'Select',  tagText: 'Ready' },
   { key: 'database', title: 'Database Connections', desc: 'Live JDBC / native driver connections',          buttonText: 'Connect', tagText: 'Installed' },
   { key: 'storage',  title: 'Cloud Storage',        desc: 'Object stores and personal drives',              buttonText: 'Connect', tagText: 'Installed' },
   { key: 'api',      title: 'API Connectors',       desc: 'OAuth & token-based service APIs',               buttonText: 'Connect', tagText: 'Installed' },
   { key: 'vector',   title: 'Vector Databases',     desc: 'Embedding stores for AI workflows',              buttonText: 'Connect', tagText: 'Installed' },
 ];
 
-const NO_PLUGIN_REQUIRED = ['spreadsheet', 'json', 'sqlite', 'nedb', 'lancedb', 'parquet', 'avro', 'generic'];
+const NO_PLUGIN_REQUIRED = ['spreadsheet', 'json', 'duckdb', 'sqlite', 'lancedb', 'parquet', 'avro', 'generic'];
 
 // Plugin connectors require a (free) Ternlux account; local file connectors stay open.
 const LoginLockIcon = ({ color = '#d97706', size = 12 }) => (
@@ -602,14 +602,12 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
       open={open}
       onCancel={onClose}
       footer={null}
-      width="calc(100vw - 64px)"
-      style={{ top: 40, paddingBottom: 0, maxWidth: 1600 }}
+      {...fullscreenModalProps({ bodyPadding: 0 })}
       destroyOnClose
       closable={false}
       title={null}
-      styles={{ body: { padding: 0 }, content: { padding: 0, overflow: 'hidden', borderRadius: 10 } }}
     >
-      <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 80px)' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {/* Title */}
         <div style={{
           padding: '22px 28px 18px',

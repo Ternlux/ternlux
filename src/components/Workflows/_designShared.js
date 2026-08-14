@@ -44,7 +44,7 @@ export const I = (name, color = C.muted, size = 14) => icons[name]?.(color, size
 // Status configuration shared by ExecutionTab and any details panel.
 export const STATUS_CFG = {
   completed: { label: 'COMPLETED', color: C.green,  bg: C.gD,  border: C.gB,                        icon: 'check' },
-  running:   { label: 'RUNNING',   color: C.accent, bg: C.aD,  border: 'rgba(37,99,235,0.2)',       icon: 'spin'  },
+  running:   { label: 'RUNNING',   color: '#1d4ed8', bg: 'rgba(37,99,235,0.16)', border: 'rgba(37,99,235,0.4)', icon: 'spin'  },
   failed:    { label: 'FAILED',    color: C.red,    bg: C.rD,  border: 'rgba(220,38,38,0.2)',       icon: 'x'     },
   cancelled: { label: 'CANCELLED', color: C.amber,  bg: C.amD, border: 'rgba(217,119,6,0.2)',       icon: 'clock' },
   pending:   { label: 'PENDING',   color: C.muted,  bg: C.s2,  border: C.border,                    icon: 'clock' },
@@ -186,3 +186,28 @@ export const StatCard = ({ label, value, sub, color }) => (
     {sub && <div style={{ fontSize: 11, color: C.dim, marginTop: 4, fontFamily: MONO }}>{sub}</div>}
   </div>
 );
+
+// ── Workspace-scale popups ─────────────────────────────────────────────────
+// The editor, explorer, uploads and previews are workspaces, not dialogs: they
+// fill the window with a 5% gap all round rather than sizing to their content.
+// Width is a percentage so it tracks the modal wrap — which App.css narrows
+// when the chat assistant is pinned — while height is in vh, since the
+// assistant's rail is full-height and never eats vertical space.
+export const fullscreenModalProps = ({ bodyPadding = 24 } = {}) => ({
+  width: '97%',
+  centered: true,
+  // antd reserves 24px under the modal box, which would push the card off
+  // centre by half that and make the two gaps uneven.
+  style: { paddingBottom: 0, maxWidth: 'none' },
+  styles: {
+    content: {
+      height: '98vh', padding: 0, overflow: 'hidden',
+      display: 'flex', flexDirection: 'column',
+    },
+    header: {
+      padding: '16px 24px', marginBottom: 0,
+      borderBottom: `1px solid ${C.border}`, flexShrink: 0,
+    },
+    body: { flex: 1, minHeight: 0, overflow: 'auto', padding: bodyPadding },
+  },
+});

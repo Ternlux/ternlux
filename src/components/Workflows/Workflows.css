@@ -438,6 +438,23 @@
   border-color: #065f46 !important;
 }
 
+/* Workflow name / description in the editor header. Borderless so the header
+   reads as a title block, but they pick up a field background on hover and
+   focus so it stays obvious they are editable. */
+.workflow-title-input.ant-input {
+  transition: background-color 0.15s, box-shadow 0.15s;
+}
+
+.workflow-title-input.ant-input:hover {
+  background-color: #f7f9fc;
+}
+
+.workflow-title-input.ant-input:focus,
+.workflow-title-input.ant-input-focused {
+  background-color: #fff;
+  box-shadow: 0 0 0 2px #eff4ff;
+}
+
 /* Subtle scrollbars to match redesign */
 .workflow-sidebar ::-webkit-scrollbar,
 .react-flow-wrapper ::-webkit-scrollbar {
