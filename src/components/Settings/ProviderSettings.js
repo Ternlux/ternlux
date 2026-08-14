@@ -4,7 +4,12 @@ import { RobotOutlined, CheckCircleOutlined, SaveOutlined, EditOutlined } from '
 import ProviderKeyForm from '../ApiKeySetup/ProviderKeyForm';
 import OthersProviderForm from '../ApiKeySetup/OthersProviderForm';
 import { hasApiKeyForProvider } from '../../utils/apiKeyStorage';
-import { OPENAI_COMPAT_PROVIDERS } from '../../utils/aiProviders';
+import {
+  OPENAI_COMPAT_PROVIDERS,
+  DEFAULT_MAX_TOKENS,
+  buildTokenOptions,
+  saveMaxTokens,
+} from '../../utils/aiProviders';
 import AI_CONFIG from '../../config/aiProviders.json';
 
 const { Option } = Select;
@@ -44,9 +49,14 @@ const enrichModels = (provider, liveModels) => {
       value: m.value,
       label: match?.label || m.label || m.value,
       description: match?.description || '',
+      // Published by the provider's models endpoint (Anthropic, Google); null
+      // for providers that don't expose limits (OpenAI) and for bundled entries.
+      maxOutputTokens: m.maxOutputTokens || null,
+      maxInputTokens: m.maxInputTokens || null,
     };
   });
 };
+
 
 const ProviderSettings = () => {
   const [form] = Form.useForm();
@@ -63,10 +73,43 @@ const ProviderSettings = () => {
   // Load saved settings on mount
   useEffect(() => {
     loadSettings();
+    initSelectedProvider();
     checkApiKey();
     refreshConfiguredProviders();
     reconcileDefaultProvider();
   }, []);
+
+  // Resolve which provider panel to open on when localStorage has no explicit
+  // selection or default — so Settings reflects the actually-configured provider
+  // instead of always showing Claude (and its false "No API Key" warning). Only
+  // runs when loadSettings couldn't resolve from localStorage; falls back to the
+  // main-process default provider, then the first provider that has a saved key.
+  const initSelectedProvider = async () => {
+    try {
+      let saved = {};
+      try { saved = JSON.parse(localStorage.getItem('ai-provider-settings') || '{}'); } catch (e) { /* corrupt — ignore */ }
+      // An explicit panel selection or chosen default already drove loadSettings.
+      if (saved.provider || saved.defaultProvider) return;
+
+      let candidate = null;
+      try {
+        const res = await window.electronAPI?.ai?.getDefaultProvider?.();
+        candidate = res?.provider || null;
+      } catch (e) { /* main unavailable — fall through */ }
+
+      if (!candidate) {
+        const checks = await Promise.all(PROVIDER_IDS.map((id) => hasApiKeyForProvider(id)));
+        candidate = PROVIDER_IDS.find((_, i) => checks[i]) || null;
+      }
+
+      if (candidate) {
+        setSelectedProvider(candidate);
+        form.setFieldValue('provider', candidate);
+      }
+    } catch (e) {
+      console.warn('[ProviderSettings] could not resolve configured provider:', e);
+    }
+  };
 
   // Check API key for selected provider when it changes
   useEffect(() => {
@@ -85,19 +128,25 @@ const ProviderSettings = () => {
       const savedSettings = localStorage.getItem('ai-provider-settings');
       if (savedSettings) {
         const settings = JSON.parse(savedSettings);
-        setSelectedProvider(settings.provider || 'claude');
+        // Open on the configured provider, not a hardcoded one: prefer the last
+        // panel selection, then the chosen default provider. initSelectedProvider
+        // (mount) resolves the main-process default / first keyed provider when
+        // localStorage has neither, so a Claude fallback only happens when
+        // nothing else is configured.
+        const initialProvider = settings.provider || settings.defaultProvider || 'claude';
+        setSelectedProvider(initialProvider);
         form.setFieldsValue({
           defaultProvider: settings.defaultProvider || settings.provider || undefined,
-          provider: settings.provider || 'claude',
+          provider: initialProvider,
           model: settings.model || 'claude-3-5-sonnet-20241022',
-          maxTokens: settings.maxTokens || 2048
+          maxTokens: settings.maxTokens || DEFAULT_MAX_TOKENS
         });
       } else {
         // Set default values
         form.setFieldsValue({
           provider: 'claude',
           model: 'claude-3-5-sonnet-20241022',
-          maxTokens: 2048
+          maxTokens: DEFAULT_MAX_TOKENS
         });
       }
     } catch (error) {
@@ -224,11 +273,12 @@ const ProviderSettings = () => {
 
   // Persist the default provider to the main process too, so backend-internal
   // AI calls (chat, titles, workflow builds) honor it — not just renderer calls.
-  const persistDefaultProvider = async (provider) => {
-    try {
-      await window.electronAPI?.ai?.setDefaultProvider?.(provider);
-    } catch (e) {
-      console.warn('[ProviderSettings] Could not persist default provider to main:', e);
+  const persistDefaultProvider = async (provider, model) => {
+    // Surface failures instead of swallowing them — a silent failure here is
+    // why the assistant/workflow-builder can ignore the saved provider.
+    const res = await window.electronAPI?.ai?.setDefaultProvider?.(provider, model);
+    if (res && res.success === false) {
+      throw new Error(res.error || 'Failed to persist default provider');
     }
   };
 
@@ -262,7 +312,13 @@ const ProviderSettings = () => {
     if (provider && !form.getFieldValue('defaultProvider')) {
       form.setFieldValue('defaultProvider', provider);
       mergeSettings({ defaultProvider: provider });
-      await persistDefaultProvider(provider);
+      // Compat providers carry their model in the encrypted key entry, so we
+      // don't pass a model here (main resolves it downstream).
+      try {
+        await persistDefaultProvider(provider);
+      } catch (e) {
+        console.error('[ProviderSettings] Could not persist compat default to main:', e);
+      }
     }
     message.success('Provider configured successfully!');
   };
@@ -277,7 +333,15 @@ const ProviderSettings = () => {
         return;
       }
       mergeSettings({ defaultProvider });
-      await persistDefaultProvider(defaultProvider);
+      // Carry the saved model for this provider through to main so backend
+      // AI calls use it (not a hardcoded default). Only pass a model when the
+      // stored config actually belongs to the chosen default provider.
+      let model;
+      try {
+        const saved = JSON.parse(localStorage.getItem('ai-provider-settings') || '{}');
+        if (saved.provider === defaultProvider && saved.model) model = saved.model;
+      } catch (e) { /* ignore corrupt settings */ }
+      await persistDefaultProvider(defaultProvider, model);
       message.success('Default AI provider saved!');
     } catch (error) {
       console.error('Error saving default provider:', error);
@@ -297,8 +361,25 @@ const ProviderSettings = () => {
         provider: values.provider,
         model: values.model,
         temperature: 0.7,
-        maxTokens: values.maxTokens || 2048,
       });
+      // Writes localStorage AND the main-process prefs, clamped to what the
+      // chosen model accepts, so backend calls honor the same number.
+      const cap = models.find((m) => m.value === values.model)?.maxOutputTokens || null;
+      await saveMaxTokens(values.maxTokens || DEFAULT_MAX_TOKENS, cap);
+      // Keep the main-process default in sync so backend AI calls use this
+      // model. If no default provider is set yet, adopt this one so a single
+      // Save "just works"; if this provider IS the default, refresh its model.
+      const currentDefault = form.getFieldValue('defaultProvider');
+      if (!currentDefault || currentDefault === values.provider) {
+        try {
+          form.setFieldValue('defaultProvider', values.provider);
+          mergeSettings({ defaultProvider: values.provider });
+          await persistDefaultProvider(values.provider, values.model);
+        } catch (e) {
+          console.error('[ProviderSettings] Could not sync default to main:', e);
+          message.warning('Settings saved, but the app may not use this provider until you set it as default.');
+        }
+      }
       message.success('Provider settings saved successfully!');
     } catch (error) {
       console.error('Error saving provider settings:', error);
@@ -587,17 +668,33 @@ const ProviderSettings = () => {
               Configure maximum response length for AI outputs.
             </Paragraph>
 
-            <Form.Item
-              label="Max Tokens"
-              name="maxTokens"
-              help="Maximum length of AI responses. Higher values allow longer responses."
-            >
-              <Select getPopupContainer={(trigger) => trigger.parentNode}>
-                <Option value={1024}>1024 - Short responses</Option>
-                <Option value={2048}>2048 - Standard (Recommended)</Option>
-                <Option value={4096}>4096 - Long responses</Option>
-                <Option value={8192}>8192 - Very long responses</Option>
-              </Select>
+            {/* Bounded by the selected model's published output limit, read
+                from the same provider models endpoint that fills the model
+                dropdown. Providers that don't publish limits get the full
+                ladder. */}
+            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.model !== cur.model}>
+              {({ getFieldValue }) => {
+                const selected = models.find((m) => m.value === getFieldValue('model'));
+                const cap = selected?.maxOutputTokens || null;
+                const ctx = selected?.maxInputTokens || null;
+                return (
+                  <Form.Item
+                    label="Max Tokens"
+                    name="maxTokens"
+                    help={
+                      cap
+                        ? `Maximum length of AI responses. ${selected.label} accepts up to ${cap.toLocaleString()} output tokens${ctx ? ` and a ${ctx.toLocaleString()}-token context window` : ''}. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.`
+                        : 'Maximum length of AI responses. This provider does not publish per-model limits, so an unsupported value is rejected at request time. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.'
+                    }
+                  >
+                    <Select getPopupContainer={(trigger) => trigger.parentNode}>
+                      {buildTokenOptions(cap).map((o) => (
+                        <Option key={o.value} value={o.value}>{o.label}</Option>
+                      ))}
+                    </Select>
+                  </Form.Item>
+                );
+              }}
             </Form.Item>
 
             {/* Save Button */}

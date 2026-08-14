@@ -35,6 +35,63 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * Generic local NeDB database access.
    * Collections: 'workflows' | 'connections' | 'executions' | 'chatSessions'
    */
+  /**
+   * Data Explorer. Every database interaction the explorer performs, plus its
+   * persistent query notepad. Backed by public/database/.
+   */
+  explorer: {
+    /** Dialect for this engine: language mode, keywords, functions, labels. */
+    metadata: (dbType) =>
+      ipcRenderer.invoke('explorer:metadata', { dbType }),
+
+    /** Schemas each holding tables / views / collections. */
+    schemaTree: (dbType, config, connectionId = null) =>
+      ipcRenderer.invoke('explorer:schema-tree', { dbType, config, connectionId }),
+
+    /** Columns for one object. Loaded lazily, and used for completions. */
+    columns: (dbType, config, connectionId, schema, table) =>
+      ipcRenderer.invoke('explorer:columns', { dbType, config, connectionId, schema, table }),
+
+    /**
+     * Syntax-check statements. Each is { text, startLine, startColumn } so the
+     * issues come back positioned against the worksheet, not the statement.
+     */
+    validate: (dbType, statements) =>
+      ipcRenderer.invoke('explorer:validate', { dbType, statements }),
+
+    /** Pretty-print a statement in this engine's dialect. */
+    format: (dbType, statement) =>
+      ipcRenderer.invoke('explorer:format', { dbType, statement }),
+
+    /** The default preview statement for a table, in this engine's syntax. */
+    previewQuery: (dbType, schema, table, limit = 100) =>
+      ipcRenderer.invoke('explorer:preview-query', { dbType, schema, table, limit }),
+
+    /** Run one statement. Returns { rows, columns, rowCount, ms, truncated }. */
+    run: (dbType, config, connectionId, statement, limit) =>
+      ipcRenderer.invoke('explorer:run', { dbType, config, connectionId, statement, limit }),
+
+    /** The notepad — worksheets persist per connection across restarts. */
+    worksheets: {
+      list: (connectionId) =>
+        ipcRenderer.invoke('explorer:worksheets:list', { connectionId }),
+      save: (worksheet) =>
+        ipcRenderer.invoke('explorer:worksheets:save', { worksheet }),
+      remove: (id) =>
+        ipcRenderer.invoke('explorer:worksheets:delete', { id }),
+    },
+
+    /** Every statement that was run, successful or not. */
+    history: {
+      list: (connectionId, limit = 100) =>
+        ipcRenderer.invoke('explorer:history:list', { connectionId, limit }),
+      add: (entry) =>
+        ipcRenderer.invoke('explorer:history:add', { entry }),
+      clear: (connectionId) =>
+        ipcRenderer.invoke('explorer:history:clear', { connectionId }),
+    },
+  },
+
   db: {
     /** Insert a document. Returns the inserted doc (with _id). */
     insert: (collection, doc) =>
@@ -99,11 +156,41 @@ contextBridge.exposeInMainWorld('electronAPI', {
   /**
    * Import files into internal databases
    */
+  /**
+   * Record a local file as a data source. Nothing is imported: CSV/JSON/Parquet
+   * are registered by path and queried in place by DuckDB; Excel and Avro are
+   * converted to Parquet once, since DuckDB cannot read those directly.
+   * Returns { success, format, converted, tables: [{ name, path, rowCount, schema }] }.
+   * @param {{ filePath: string, importId?: string }} params
+   */
+  registerLocalFile: (params) =>
+    ipcRenderer.invoke('file:register-local', params),
+
+  // Legacy import paths. Superseded by registerLocalFile — kept so existing
+  // callers keep working, but new file connections no longer use them.
   importToSqlite: (params) =>
     ipcRenderer.invoke('import-to-sqlite', params),
 
   importToNeDB: (params) =>
     ipcRenderer.invoke('import-to-nedb', params),
+
+  /**
+   * Subscribe to progress from a running file import. Imports stream in
+   * batches, so this fires roughly four times a second with what has landed
+   * so far — pass an `importId` to importToSqlite/importToNeDB and match on it.
+   * The callback receives:
+   *   { importId, phase: 'reading'|'writing', rows, table?, sheet?,
+   *     bytesRead?, totalBytes?, file? }
+   * Returns an unsubscribe function — call it on cleanup to avoid leaks.
+   * @param {(evt: object) => void} callback
+   * @returns {() => void}
+   */
+  onImportProgress: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('import:progress', listener);
+    return () => ipcRenderer.removeListener('import:progress', listener);
+  },
 
   listLanceDBTables: (dbPath) =>
     ipcRenderer.invoke('list-lancedb-tables', dbPath),
@@ -147,7 +234,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     //   }),
 
     /** Unified NoSQL transformation (routes to MongoDB or NeDB based on dbType). */
-    transformNoSQL: (dbType, config, connectionId, sourceLocalPath, sourceCollection, targetCollection, operationType, nosqlOperation, transformFunction, storageLocation, operationMode, targetLocalPath = null) =>
+    transformNoSQL: (dbType, config, connectionId, sourceLocalPath, sourceCollection, targetCollection, operationType, nosqlOperation, transformFunction, storageLocation, operationMode, targetLocalPath = null, scope = {}) =>
       ipcRenderer.invoke('dbconn:transform-nosql', {
         dbType,
         config,
@@ -160,11 +247,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
         transformFunction,
         storageLocation,
         operationMode,
-        targetLocalPath
+        targetLocalPath,
+        // Optional { workflowId, nodeId } — scopes the local NeDB output file.
+        workflowId: scope.workflowId || null,
+        nodeId: scope.nodeId || null
       }),
 
-    /** SQL transformation (for PostgreSQL, MySQL, MSSQL, SQLite, CSV/Excel files). */
-    transformSQL: (dbType, config, connectionId, ddl, sql, previewSql, storageLocation, operationMode, targetSchema, targetTableName, sourceLocalPath = null, insertSql = null) =>
+    /** SQL transformation (for PostgreSQL, MySQL, MSSQL, DuckDB local files). */
+    transformSQL: (dbType, config, connectionId, ddl, sql, previewSql, storageLocation, operationMode, targetSchema, targetTableName, sourceLocalPath = null, insertSql = null, targetLocalPath = null, scope = {}) =>
       ipcRenderer.invoke('dbconn:transform-sql', {
         dbType,
         config,
@@ -177,15 +267,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
         targetSchema,
         targetTableName,
         sourceLocalPath,
-        insertSql
+        insertSql,
+        targetLocalPath,
+        // Optional { workflowId, nodeId } — scopes this node's local output
+        // file, so configuring a node interactively writes to the same place
+        // the workflow runner would.
+        workflowId: scope.workflowId || null,
+        nodeId: scope.nodeId || null,
+        sourceFormat: scope.sourceFormat || null
       }),
 
     /** Execute join operation (combines multiple sources into destination). */
-    executeJoin: (destinationConnection, joinConfig, operationMode) =>
+    executeJoin: (destinationConnection, joinConfig, operationMode, scope = {}) =>
       ipcRenderer.invoke('dbconn:execute-join', {
         destinationConnection,
         joinConfig,
-        operationMode
+        operationMode,
+        // Optional { workflowId, nodeId } — scopes the local NeDB output file.
+        workflowId: scope.workflowId || null,
+        nodeId: scope.nodeId || null
       }),
 
     /**
@@ -330,6 +430,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     call: ({ prompt, options = {} } = {}) =>
       ipcRenderer.invoke('ai:call', { prompt, options }),
 
+    /**
+     * Finish an answer that stopped at the model's output limit.
+     * Pass the `resume` payload from a MAX_TOKENS failure; the resolved `text`
+     * is the partial output plus the continuation, already joined.
+     * @returns {Promise<{success: boolean, text?: string, message?: string,
+     *                    code?: string, resume?: object}>}
+     */
+    continue: ({ resume } = {}) =>
+      ipcRenderer.invoke('ai:continue', { resume }),
+
     /** List providers that have a usable API key configured. */
     listProviders: () =>
       ipcRenderer.invoke('ai:listProviders'),
@@ -338,7 +448,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     listModels: (provider) =>
       ipcRenderer.invoke('ai:listModels', { provider }),
 
-    /** Read the persisted default provider (used by backend-internal calls). */
+    /** Read the persisted default provider + model (used by backend-internal calls). */
     getDefaultProvider: () =>
       ipcRenderer.invoke('ai:getDefaultProvider'),
 
@@ -350,9 +460,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     saveCompatProvider: (provider, config) =>
       ipcRenderer.invoke('ai:saveCompatProvider', { provider, config }),
 
-    /** Persist the user's default provider so the main process honors it. */
-    setDefaultProvider: (provider) =>
-      ipcRenderer.invoke('ai:setDefaultProvider', { provider }),
+    /** Persist the user's default provider (and optionally its model) so the
+     *  main process honors it for backend-internal AI calls. */
+    setDefaultProvider: (provider, model) =>
+      ipcRenderer.invoke('ai:setDefaultProvider', { provider, model }),
+
+    /** Persist the user's Max Tokens so backend AI calls honor it too. */
+    setMaxTokens: (maxTokens) =>
+      ipcRenderer.invoke('ai:setMaxTokens', { maxTokens }),
   },
 
   /**
@@ -384,8 +499,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
       provider = null,
       agentMode = 'main',
       workflowSession = null,
+      // Set when the previous turn batched plan_workflow_build with other
+      // tools: main deferred it and handed the args back, and the renderer
+      // restarts the loop with them so the build runs directly instead of
+      // costing another AI turn. Dropping this here silently disabled that
+      // whole branch — every field the renderer sends must be listed.
+      triggerPlanWorkflowBuild = null,
+      targetNode = null,
     } = {}) => ipcRenderer.invoke('chat:step', {
       message, history, scratchpad, activeContext, provider, agentMode, workflowSession,
+      triggerPlanWorkflowBuild, targetNode,
     }),
     /**
      * Ask the AI to produce a 3-5 word topic title for a new conversation.
@@ -394,15 +517,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
      */
     generateTitle: ({ message, provider = null } = {}) =>
       ipcRenderer.invoke('chat:generateTitle', { message, provider }),
+
     /**
-     * Drive one round-trip with a skill subagent. Used while a node
-     * build is paused on a skill that returned ask_questions /
-     * answer_directly. Returns:
-     *   { success, action, question?, directAnswer?, executionParams?, state, explanation? }
-     * where action ∈ { execute, ask_questions, answer_directly, unrelateSkill }.
+     * Execute AI-generated JavaScript the user has just approved.
+     * `runToken` comes from a step's `pendingApproval`. Returns
+     * { success, result } with the same shape run_javascript used to return
+     * directly ({ ran, explanation, transformFunction, recordCount, rows }).
+     * Single-use — a token cannot be run twice.
      */
-    skillStep: ({ skillId, userMessage, currentState = {}, context = {} } = {}) =>
-      ipcRenderer.invoke('chat:skillStep', { skillId, userMessage, currentState, context }),
+    runApprovedJavascript: ({ runToken, provider = null } = {}) =>
+      ipcRenderer.invoke('chat:run-approved-javascript', { runToken, provider }),
+
+    /** Drop generated code the user declined, freeing its captured rows. */
+    discardJavascript: ({ runToken } = {}) =>
+      ipcRenderer.invoke('chat:discard-javascript', { runToken }),
+    // NOTE: `skillStep` (chat:skillStep) was removed. A skill that needs more
+    // input now raises an ordinary clarification through the builder, so its
+    // question travels the same path as any other build question and the answer
+    // returns via executeBuild / build_* — no separate skill channel.
   },
 
   /**
@@ -419,6 +551,41 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * @returns {Promise<{ success, workflowId?, workflowName?, nodeCount?, edgeCount?, warnings?, message? }>}
      */
     executeBuild: ({ plan } = {}) => ipcRenderer.invoke('workflow:executeBuild', { plan }),
+
+    /**
+     * Author (or re-author) a workflow's output-validation function. Persists it
+     * onto the workflow doc and returns the saved outputValidation.
+     * @param {{ workflowId: string }} args
+     * @returns {Promise<{ success, outputValidation?, message? }>}
+     */
+    generateValidation: ({ workflowId } = {}) => ipcRenderer.invoke('workflow:generateValidation', { workflowId }),
+
+    /**
+     * Check whether an edited workflow has drifted from the goal its saved
+     * validation function was written for. `workflow` is the in-progress doc.
+     * @param {{ workflow: object }} args
+     * @returns {Promise<{ drifted: boolean, reason: string }>}
+     */
+    checkValidationDrift: ({ workflow } = {}) => ipcRenderer.invoke('workflow:checkValidationDrift', { workflow }),
+
+    /**
+     * Review a just-applied change (creation, modification, or a single node
+     * rebuilt from chat) against the conversation that produced it, before it
+     * runs. Also reports output-validation drift when the workflow has one.
+     * @param {Object} args
+     * @param {string} args.workflowId
+     * @param {Object} args.change       { kind: 'create'|'update'|'node', summary?, nodeIds? }
+     * @param {Array}  args.chatHistory  [{ role, text }] — the brief the builder
+     *                                   worked from, NOT the chat panel.
+     * @param {Object} [args.pendingNode] { nodeId, nodeType?, label?, config }
+     *                                   applied but not yet saved. Overlaid onto
+     *                                   the saved node, or appended when the node
+     *                                   is new and has never been saved.
+     * @returns {Promise<{ success, valid, reason, issues, remediation,
+     *                     inconclusive?, drift: { drifted, reason } }>}
+     */
+    validateChange: ({ workflowId, change = {}, chatHistory = [], pendingNode = null } = {}) =>
+      ipcRenderer.invoke('workflow:validateChange', { workflowId, change, chatHistory, pendingNode }),
 
     /**
      * Subscribe to live build-progress events emitted by executeBuild while a
@@ -442,6 +609,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * @returns {Promise<{ success, executionId, message, results }>}
      */
     executeWorkflow: (params) => ipcRenderer.invoke('workflow:execute', params),
+
+    /**
+     * Run a SINGLE node the way a full run would, without recording an
+     * execution. Backs the chat assistant's "Run this node" approval — upstream
+     * nodes are not re-run, so the node reads whatever its sources last wrote.
+     * @param {object} params - { workflowId, nodeId, nodes, edges }
+     * @returns {Promise<{ success, message, recordsProcessed?, duration? }>}
+     */
+    executeNode: (params) => ipcRenderer.invoke('workflow:executeNode', params),
 
     /**
      * Start watching the open workflow's externalized-code folder

@@ -6,6 +6,7 @@
   "main": "public/electron.js",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
+    "@duckdb/node-api": "^1.5.5-r.3",
     "@google/generative-ai": "^0.24.1",
     "@huggingface/inference": "^2.6.0",
     "@json2csv/plainjs": "^7.0.6",
@@ -17,10 +18,15 @@
     "axios": "^1.5.1",
     "chokidar": "^5.0.0",
     "electron-updater": "^6.8.9",
+    "mongodb-query-parser": "^4.7.15",
     "node-cron": "^4.2.1",
+    "node-sql-parser": "^5.4.0",
     "openai": "^6.22.0",
+    "papaparse": "^5.5.4",
     "parquetjs": "^0.11.2",
+    "sql-formatter": "^15.8.2",
     "sqlite3": "^5.1.7",
+    "stream-json": "^1.9.1",
     "xlsx": "^0.18.5"
   },
   "scripts": {
@@ -70,6 +76,7 @@
       "!build/NodeExecution/**",
       "!build/chat/**",
       "!build/ChatPrompts/**",
+      "!build/database/**",
       "!build/imports/**",
       "!build/joins/**",
       "!build/lib/**",
@@ -127,7 +134,12 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "perMachine": false
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Ternlux",
+      "menuCategory": false,
+      "runAfterFinish": true
     },
     "linux": {
       "target": [
@@ -186,7 +198,6 @@
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.1",
     "moment": "^2.29.4",
-    "papaparse": "^5.4.1",
     "react": "^18.2.0",
     "react-chartjs-2": "^5.2.0",
     "react-dom": "^18.2.0",

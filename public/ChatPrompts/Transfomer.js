@@ -1,166 +1,93 @@
+// The table an in-place statement addresses. A caller may pass the name
+// directly, or `{ nodeId }` for a file source — that case is staged under a
+// per-node table by public/transfomers/DuckDB.js, and this is the one place
+// the name is worked out so the prompt and the executor cannot disagree.
+const DuckDB = require('../transfomers/DuckDB');
+
+function resolveInPlaceTable(target, sourceTableSchema) {
+  if (target && typeof target === 'object') {
+    return DuckDB.stagingTableFor(target.nodeId, target.fallback || sourceTableSchema?.tableName);
+  }
+  return target || sourceTableSchema?.tableName;
+}
+
 const prompts = {
 
-    transfomer: {
-        // Local database transformation prompts (SQLite, NeDB)
-        // Remote database prompts are generated from plugins via window.electronAPI.dbConnect.generateTransformPrompt
+transfomer: {
+        // Local transformation prompts. Remote database prompts are generated
+        // from plugins via window.electronAPI.dbConnect.generateTransformPrompt
 
-        nedbTransformationNewTable: (settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName) => `You are a NeDB expert helping create a new transformed collection.
+        // Local transformations run on DuckDB. The source is read where it sits
+        // (a file, or an upstream node's table) and the result becomes this
+        // node's own table in the workflow's database. New-table mode is a
+        // SELECT that defines the result; in-place mode is the ALTER / UPDATE /
+        // DELETE the user actually asked for, run against the existing table.
+        duckdbTransformationNewTable: (settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName) => `You are a DuckDB expert transforming a local data file.
 
-        Database Type: NeDB (local file database)
         User's transformation request: "${settings.userRequest}"
 
         ${sourceTableInfo}
 
         ${settingsContext}
 
-        Source Collection: ${sourceTableSchema.tableName}
-        Target Collection: ${targetTableName}
-        Storage Location: Local file
+        Source: ${sourceTableSchema.tableName}  (readable by that name)
+        Target: ${targetTableName}  (a table in this workflow's DuckDB database)
 
         **Instructions**:
 
-        You are creating a NEW collection with transformed data. Choose the appropriate transformation approach:
-
-        1. **Filter Operation**:
-           - Document filtering based on criteria
-           - Returns filter object for NeDB queries
-
-        2. **JavaScript Transformation**:
-           - Use when you need complex custom logic
-           - Complex string manipulations, custom business logic, conditional transformations
-           - Returns a JavaScript function that transforms each document
-           - Function signature: function transformDocument(doc) { return transformedDoc; }
-           - Return null to exclude a document from the output
+        Write ONE SELECT statement that reads from the source and produces the
+        transformed result. The rows it returns become the target table — you do
+        not write CREATE TABLE, and you do not write an INSERT.
 
         **Important Notes**:
-        - You are creating a NEW collection, not modifying the source
-        - All source documents matching your criteria will be transformed and inserted into "${targetTableName}"
+        - Refer to the source by the name above, as if it were a table
+        - Column types come from the file; DuckDB infers them, so you do not declare them
+        - DuckDB speaks PostgreSQL-flavoured SQL, and adds conveniences worth using:
+          SELECT * EXCLUDE (col), SELECT * REPLACE (expr AS col), QUALIFY, GROUP BY ALL
+        - Nested values read as STRUCT/LIST — reach into them with dot notation (addr.city) or [1]
         - For explanations text to bolden key points use **text** and to break lines use \\n
-        - Placeholders like {{current_date}}, {{current_timestamp}} will be replaced at runtime
-        - NeDB uses MongoDB-style query syntax but doesn't support aggregation pipelines
+        - Placeholders like {{current_date}}, {{current_timestamp}} are replaced at runtime
 
         CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
 
         Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of the transformation approach",
-          "operationType": "filter" | "javascript",
-          "nosqlOperation": "Filter object as JSON string",
-          "transformFunction": "JavaScript function code as string (ONLY if operationType is 'javascript', otherwise null). Also still provide nosqlOperation for the query filter"
+          "sql": "SELECT statement producing the transformed rows",
+          "previewSql": "The same SELECT with LIMIT 100, for previewing"
         }
 
         **Examples**:
 
-        Filter operation:
+        Filter and derive a column:
         {
-          "explanation": "Filter records matching criteria",
-          "operationType": "filter",
-          "nosqlOperation": "{ \\"status\\": \\"active\\", \\"total\\": { \\"$gt\\": 100 } }",
-          "transformFunction": null
+          "explanation": "Keep **active** customers and compute their total spending",
+          "sql": "SELECT customer_id, name, email, purchase_count * avg_purchase AS total_spending FROM customers WHERE status = 'active'",
+          "previewSql": "SELECT customer_id, name, email, purchase_count * avg_purchase AS total_spending FROM customers WHERE status = 'active' LIMIT 100"
         }
 
-        JavaScript transformation:
+        Aggregate:
         {
-          "explanation": "Custom validation and formatting that requires complex logic",
-          "operationType": "javascript",
-          "nosqlOperation": "{ \\"status\\": \\"active\\" }",
-          "transformFunction": "function transformDocument(doc) { if (!doc.email || !doc.email.includes('@')) return null; return { ...doc, email: doc.email.toLowerCase().trim(), validated: true }; }"
+          "explanation": "Revenue per city, highest first",
+          "sql": "SELECT city, count(*) AS orders, round(sum(amount), 2) AS revenue FROM orders GROUP BY city ORDER BY revenue DESC",
+          "previewSql": "SELECT city, count(*) AS orders, round(sum(amount), 2) AS revenue FROM orders GROUP BY city ORDER BY revenue DESC LIMIT 100"
         }
 
-        Provide working NeDB operations.`,
-
-        nedbTransformationInPlace: (settings, sourceTableInfo, settingsContext, sourceTableSchema) => `You are a NeDB expert helping modify data in-place.
-
-        Database Type: NeDB (local file database)
-        User's transformation request: "${settings.userRequest}"
-
-        ${sourceTableInfo}
-
-        ${settingsContext}
-
-        Source Collection: ${sourceTableSchema.tableName}
-        Operation Mode: In-Place (modifying source collection directly)
-
-        **Instructions**:
-
-        You are modifying the EXISTING collection. Choose the appropriate operation:
-
-        1. **Delete Operation**:
-           - Remove documents that match specific criteria
-           - Returns deleteMany filter object
-           - Documents matching the filter will be permanently deleted from "${sourceTableSchema.tableName}"
-
-        2. **Update Operation**:
-           - Update fields in documents that match specific criteria
-           - Returns filter object and update operations
-           - Uses NeDB update operators like $set, $unset, $inc, etc.
-           - Best for simple updates (setting values, incrementing, removing fields)
-
-        3. **JavaScript Transformation** (for complex logic):
-           - Use when update operators cannot handle the transformation
-           - Complex string manipulations, conditional logic, calculations across multiple fields
-           - Returns a JavaScript function that transforms each document in-place
-           - Function signature: function transformDocument(doc) { /* modify doc fields */ return doc; }
-           - Documents are processed in batches of 10,000 for efficiency
-           - Return the modified document (do NOT return null to skip - that's not supported for in-place updates)
-           - nosqlOperation should contain the filter to select documents to transform
-
-        **Important Notes**:
-        - You are MODIFYING the source collection "${sourceTableSchema.tableName}" directly
-        - Changes are permanent and irreversible
-        - Delete removes documents completely from the collection
-        - Update modifies existing documents in-place (using NeDB operators)
-        - JavaScript transformation modifies documents in-place with custom logic (processed in 10k batches)
-        - For explanations text to bolden key points use **text** and to break lines use \\n
-        - Placeholders like {{current_date}}, {{current_timestamp}} will be replaced at runtime
-
-        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
-
-        Return your response in exactly this JSON format:
+        Drop a column and rename another:
         {
-          "explanation": "Brief explanation of what will be deleted or updated and why",
-          "operationType": "delete" | "update" | "javascript",
-          "nosqlOperation": "For delete: filter object. For update: { \\"filter\\": {...}, \\"update\\": {...} }. For javascript: filter object as JSON string",
-          "transformFunction": "JavaScript function code as string (ONLY if operationType is 'javascript', otherwise null)"
+          "explanation": "Remove the internal **raw_blob** column and rename **cust_nm**",
+          "sql": "SELECT * EXCLUDE (raw_blob), cust_nm AS customer_name FROM orders",
+          "previewSql": "SELECT * EXCLUDE (raw_blob), cust_nm AS customer_name FROM orders LIMIT 100"
         }
 
-        **Examples**:
+        Provide working DuckDB SQL.`,
 
-        Delete operation:
-        {
-          "explanation": "Delete all cancelled orders from the collection",
-          "operationType": "delete",
-          "nosqlOperation": "{ \\"status\\": \\"cancelled\\" }",
-          "transformFunction": null
-        }
-
-        Update operation:
-        {
-          "explanation": "Mark all old orders as archived",
-          "operationType": "update",
-          "nosqlOperation": "{ \\"filter\\": { \\"createdAt\\": { \\"$lt\\": \\"2024-01-01\\" } }, \\"update\\": { \\"$set\\": { \\"archived\\": true, \\"archivedDate\\": \\"{{current_date}}\\" } } }",
-          "transformFunction": null
-        }
-
-        Update with multiple fields:
-        {
-          "explanation": "Update pricing for premium products",
-          "operationType": "update",
-          "nosqlOperation": "{ \\"filter\\": { \\"category\\": \\"premium\\" }, \\"update\\": { \\"$set\\": { \\"discounted\\": true }, \\"$inc\\": { \\"price\\": -10 } } }",
-          "transformFunction": null
-        }
-
-        JavaScript transformation (complex logic):
-        {
-          "explanation": "Apply complex pricing calculation based on multiple fields that cannot be done with update operators. Documents will be processed in batches of 10,000.",
-          "operationType": "javascript",
-          "nosqlOperation": "{ \\"status\\": \\"active\\" }",
-          "transformFunction": "function transformDocument(doc) { if (doc.quantity > 100 && doc.category === 'premium') { doc.price = doc.price * 0.9; doc.discountApplied = true; } doc.lastModified = new Date().toISOString(); return doc; }"
-        }
-
-        Provide working NeDB operations.`,
-
-        sqliteTransformationNewTable: (settings, sourceTableInfo, settingsContext, sourceTableSchema, targetTableName) => `You are a SQLite expert helping transform data locally.
+        // `target` is what the statements must address. For a source that is
+        // already a table it is that table's name; for a FILE it is the staging
+        // table the executor materialises the file into, derived from the node
+        // id so both sides agree — pass `{ nodeId }` and it is worked out here,
+        // rather than each caller deriving it and risking a mismatch.
+        duckdbTransformationInPlace: (settings, sourceTableInfo, settingsContext, sourceTableSchema, target) => `You are a DuckDB expert modifying a local table in place.
 
         User's transformation request: "${settings.userRequest}"
 
@@ -168,130 +95,71 @@ const prompts = {
 
         ${settingsContext}
 
-        Target Collection/Table: ${targetTableName}
-        Storage Location: Local SQLite file
+        Table: ${resolveInPlaceTable(target, sourceTableSchema)}  (a real table — write statements against it by that name)
+        Operation Mode: In-Place (the table is modified where it stands)
 
         **Instructions**:
 
-        You are creating a NEW local SQLite table with transformed data. Generate a SELECT query that:
-        1. Fetches data from the source
-        2. Transforms it according to the user's request
-        3. The query will be executed in chunks and results saved to local SQLite
+        Write the statement — or statements — that make the change the user
+        asked for. This is an ordinary DuckDB table, so say what you mean:
+
+        - "delete the cancelled orders" -> DELETE FROM orders WHERE status = 'cancelled';
+        - "add a full_name column"      -> ALTER TABLE customers ADD COLUMN full_name VARCHAR;
+                                           UPDATE customers SET full_name = first_name || ' ' || last_name;
+        - "normalise the emails"        -> UPDATE customers SET email = lower(trim(email));
+        - "drop the notes column"       -> ALTER TABLE orders DROP COLUMN notes;
+        - "rename cust_nm"              -> ALTER TABLE orders RENAME COLUMN cust_nm TO customer_name;
+
+        Separate multiple statements with semicolons; they run together as one
+        unit. Adding a column and populating it is the common two-statement
+        case — ALTER first, then UPDATE.
 
         **Important Notes**:
-        - Data will be fetched from the source database/file and saved locally to SQLite
-        - The SELECT query should include all transformations (column calculations, filtering, etc.)
+        - Only what your statements touch changes. Columns and rows you don't
+          mention are left exactly as they are
+        - Refer to the table by the bare name above — do not qualify it with a
+          database or schema
+        - Do NOT write a SELECT: a query changes nothing, and the node would
+          report success having done nothing at all
+        - Do NOT write CREATE TABLE or INSERT — the table already exists
+        - Changes are permanent; the previous contents are not kept
+        - DuckDB speaks PostgreSQL-flavoured SQL
         - For explanations text to bolden key points use **text** and to break lines use \\n
-        - Use standard SQL syntax that works across databases
+        - Placeholders like {{current_date}}, {{current_timestamp}} are replaced at runtime
 
         CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
 
         Return your response in exactly this JSON format:
         {
-          "explanation": "Brief explanation of the transformation approach",
-          "ddl": "CREATE TABLE statement",
-          "sql": "INSERT STATEMENT to populate the DDL based on users request",
-          "previewSql": "SELECT query for the transformed data for target table (LIMIT 100)"
-        }
-
-        **Example**:
-        {
-          "explanation": "Filter active customers and calculate total spending",
-          "ddl": "CREATE TABLE customers(...)",
-          "sql": "INSERT INTO customers (customer_id, name, email, total_spending) SELECT customer_id, name, email, (purchase_count * avg_purchase) AS total_spending FROM customers WHERE status = 'active'"
-          "previewSql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) as total_spending FROM customers WHERE status = 'active' LIMIT 100"
-        }
-
-        Provide working SQL that can fetch and transform the data.`,
-
-        sqliteTransformationInPlace: (settings, sourceTableInfo, settingsContext, sourceTableSchema) => `You are a SQLite expert helping modify local data in-place.
-
-        User's transformation request: "${settings.userRequest}"
-
-        ${sourceTableInfo}
-
-        ${settingsContext}
-
-        Source Table: ${sourceTableSchema.tableName}
-        Operation Mode: In-Place (modifying local SQLite table directly)
-
-        **Instructions**:
-
-        Analyze the request and determine what operations are needed:
-
-        1. **UPDATE/DELETE only**: Use sql field only, ddl is null
-        2. **ALTER TABLE only**: Use ddl field only, sql is null
-        3. **ALTER TABLE + UPDATE/DELETE**: Use both ddl and sql (ddl executes first)
-
-        **Operation Types**:
-        - **UPDATE**: Modify existing records
-        - **DELETE**: Remove records
-        - **ALTER TABLE**: Modify table structure (add/drop/rename columns)
-
-        **Important Notes**:
-        - Changes are permanent and irreversible
-        - For explanations text to bolden key points use **text** and to break lines use \\n
-        - Use SQLite-compatible SQL syntax
-        - For ALTER TABLE in SQLite:
-          - ADD COLUMN is supported
-          - DROP COLUMN requires SQLite 3.35.0+ (use with caution)
-          - RENAME COLUMN is supported
-          - Cannot modify column types directly (requires table recreation)
-        - If both ddl and sql are provided, ddl will execute first, then sql
-
-        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
-
-        Return your response in exactly this JSON format:
-        {
-          "explanation": "Brief explanation of what will be modified and why",
-          "ddl": "ALTER TABLE statement (null if not needed)",
-          "sql": "UPDATE or DELETE statement (null if not needed)",
-          "previewSql": "SELECT query to preview the modified table (LIMIT 100) for previewing transformed data"
+          "explanation": "Brief explanation of what will change and why",
+          "sql": "The statement(s) to run, separated by semicolons",
+          "previewSql": "A SELECT showing the table after the change, with LIMIT 100"
         }
 
         **Examples**:
 
-        Delete operation:
+        Remove rows:
         {
-          "explanation": "Delete all cancelled orders from the local table",
-          "ddl": null,
-          "sql": "DELETE FROM orders WHERE status = 'cancelled'",
+          "explanation": "Delete all **cancelled** orders",
+          "sql": "DELETE FROM orders WHERE status = 'cancelled';",
           "previewSql": "SELECT * FROM orders LIMIT 100"
         }
 
-        Update operation:
+        Add a derived column:
         {
-          "explanation": "Mark all old orders as archived and set archive date",
-          "ddl": null,
-          "sql": "UPDATE orders SET archived = 1, archived_date = datetime('now') WHERE created_at < '2024-01-01'",
-          "previewSql": "SELECT * FROM orders LIMIT 100 for previewing transformed data"
-        }
-
-        Alter table (add column):
-        {
-          "explanation": "Add a new **status_code** column to track order status numerically",
-          "ddl": "ALTER TABLE orders ADD COLUMN status_code INTEGER DEFAULT 0",
-          "sql": null,
-          "previewSql": "SELECT * FROM orders LIMIT 100 for previewing transformed data"
-        }
-
-        Alter table (rename column):
-        {
-          "explanation": "Rename column **customer_name** to **client_name** for consistency",
-          "ddl": "ALTER TABLE orders RENAME COLUMN customer_name TO client_name",
-          "sql": null,
-          "previewSql": "SELECT * FROM orders LIMIT 100 for previewing transformed data"
-        }
-
-        Alter table + update (add column and populate it):
-        {
-          "explanation": "Add **full_name** column and populate it by combining first and last names",
-          "ddl": "ALTER TABLE customers ADD COLUMN full_name TEXT",
-          "sql": "UPDATE customers SET full_name = first_name || ' ' || last_name",
+          "explanation": "Add **full_name**, combining first and last names",
+          "sql": "ALTER TABLE customers ADD COLUMN full_name VARCHAR; UPDATE customers SET full_name = first_name || ' ' || last_name;",
           "previewSql": "SELECT * FROM customers LIMIT 100"
         }
 
-        Provide working SQLite SQL.`,
+        Rewrite a column in place:
+        {
+          "explanation": "Normalise **email** to lowercase",
+          "sql": "UPDATE customers SET email = lower(trim(email));",
+          "previewSql": "SELECT email FROM customers LIMIT 100"
+        }
+
+        Provide working DuckDB SQL.`,
 
         transformationRequest: (userRequest, sourceTablesInfo, dbyType, isSourceLocal = false, availableSkills = []) => `You are an intelligent data transformation assistant. Analyze the user's request and determine the best course of action.
 
@@ -346,8 +214,8 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
            - For each setting that needs clarification, provide a question that would be relevant towards the users input
            - Do not infer anything about the output format or any additional steps outside the scope of the singular transformation step to update/delete/create from the source
            - Do not impose questions if they are already infered from the user input${isSourceLocal ? '' : `
-           - The local environment and storage is the current processing system that this application is running on. For structured data it would be Sqlite and for unstructured data it would be NeDB
-           - If the storage location of the data is local and the source is database, then by default there should be creation of a new table in sqlite`}
+           - "Local" storage means a file on this machine, queried with DuckDB. Tabular and document data are handled the same way — there is no separate store to choose
+           - If the storage location of the data is local and the source is a database, then by default a new local dataset is created`}
 
            **Dynamic Question Logic**: The follow up questions should follow this logic if they are not answered already in users input
             - If an update statement is the direct choice and user hasn't provided input on if they want to update the source table or create a new temporary table for this update

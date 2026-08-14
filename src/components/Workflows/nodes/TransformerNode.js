@@ -1,7 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { SettingOutlined, EditOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, getLatestUserQuestion } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, truncate } from './nodeCardShared';
 
 const COLOR = '#7c3aed';
 const MONO = "'JetBrains Mono', monospace";
@@ -11,42 +11,45 @@ const BORDER = '#e2e6eb';
 const GREEN = '#059669';
 
 const TransformerNode = ({ data, selected }) => {
-  const isConfigured = !!(data.config?.sql || data.config?.transformationRequest);
+  // Matches how the Data Preview decides a transformer is configured: the
+  // chat saves targetSql / nosqlOperation / transformFunction, never a bare
+  // `sql`, so the old check left finished nodes reading "Click to configure".
+  const config = data.config || {};
+  const isConfigured = !!(
+    (config.usesSkill && config.skillId) ||
+    config.targetSql ||
+    config.targetInsertSql ||
+    config.nosqlOperation ||
+    config.transformFunction ||
+    config.sql ||
+    config.transformationRequest
+  );
 
+  // The node's own label names it — what it writes (target table / engine) is
+  // the summary's job. A hand-dropped node starts on the generic type name, so
+  // that one case still defers to whatever the config was named.
   const getDisplayName = () => {
-    if (data.config?.node_name) {
-      return data.config.node_name;
-    }
-
-    const dbType = data.config?.targetDbType;
-    if (dbType) {
-      return dbType.charAt(0).toUpperCase() + dbType.slice(1);
-    }
-
-    return data.label || 'Transformer';
+    const label = String(data.label || '').trim();
+    if (label && label.toLowerCase() !== 'transformer') return label;
+    return config.node_name || label || 'Transformer';
   };
 
   const getSummary = () => {
     if (!isConfigured) return 'Click to configure transformation';
 
-    const config = data.config;
+    // What this node reads and writes, named from its own config — the same
+    // source and target the Data Preview's Details tab lists.
+    const described = describeNode('transformer', config);
+    if (described) return described;
 
-    // Prefer the AI's explanation of what the transformation does. If no
-    // explanation was produced, fall back to the user's most recent question
-    // so the card still reflects intent rather than a generic string.
     const explanation =
+      config.targetSqlExplanation ||
       config.sqlExplanation ||
       config.explanation ||
-      getLatestUserQuestion(config.chat);
-    if (explanation) {
-      return explanation.length > 100 ? explanation.slice(0, 100) + '...' : explanation;
-    }
+      config.transformationRequest;
+    if (explanation) return truncate(explanation);
 
-    if (config.sql) {
-      return 'Transformation configured';
-    }
-
-    return 'Click to configure transformation';
+    return 'Transformation configured';
   };
 
   const latestCodes = extractLatestCodes(data.config?.chat);

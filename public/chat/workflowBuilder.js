@@ -23,6 +23,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// The transformer owns where a local node writes and what an in-place update
+// is staged as. Imported so the paths and names recorded at build time are
+// produced by the same functions the executor uses at run time.
+const DuckDB = require('../transfomers/DuckDB');
+
 const DOCS_ROOT       = path.join(__dirname, '..', 'docs');
 const NODE_DOCS_ROOT  = path.join(DOCS_ROOT, 'nodes');
 const CHAT_DOCS_ROOT  = path.join(DOCS_ROOT, 'chat-prompts');
@@ -30,6 +35,10 @@ const SKILL_DOCS_ROOT = path.join(DOCS_ROOT, 'plugins', 'skills');
 const SAMPLE_ROW_LIMIT = 5;
 const PICK_TABLE_RETRIES = 1;
 const PLAN_RETRIES = 3;
+// How many consecutive questions one skill may ask about a single node before we
+// stop routing to it and build with the standard path instead. Bounds a skill
+// that never converges (see the skill turn in buildTransformerConfig).
+const MAX_SKILL_ROUNDS = 3;
 
 const ChatPrompts = {
   join:       require('../ChatPrompts/Join').join,
@@ -37,23 +46,34 @@ const ChatPrompts = {
   restApi:    require('../ChatPrompts/RestApi'),
 };
 
-// REST API data sources are materialised into local NeDB by running the
-// AI-authored fetch function — the SAME executor the workflow runtime uses
+// REST API data sources are materialised locally by running the AI-authored
+// fetch function — the SAME executor the workflow runtime uses
 // (workflowExecutionHelpers' API source path). Requiring the singleton here
 // reuses the instance electron.js already wired up via apiFetch.initialize().
 const { handleExecuteApiFetch } = require('../NodeExecution/ApiFetch');
 
-// Local NoSQL transform output is persisted by saveToLocalNeDB (public/transfomers/NeDB.js)
-// to a deterministic per-collection file: userData/local-collections/<collection>.db.
-// Compute it here so the builder can record targetLocalPath even when the source is
-// a remote DB (e.g. MongoDB) with no local path to inherit.
-function localNeDBPath(collectionName) {
-  if (!collectionName) return null;
+// A local node's output is a table in its workflow's database. Compute the path
+// here so the builder can record targetLocalPath even when the source is a
+// remote DB (e.g. MongoDB) with no local path to inherit.
+// Mirror of src/utils/workflowNaming.js — main process is CJS and the renderer
+// is ESM, so they cannot share a module.
+
+// Each workflow owns its own database, so a table name only has to be unique
+// within one workflow — no cross-workflow prefixing. Kept as the identity so
+// callers read straightforwardly.
+function qualifyLocalTableName(name) {
+  return name;
+}
+
+// Where a local node's output lives: its workflow's database,
+// workflow-data/<workflowId>.duckdb, with targetTableName naming the table.
+// Delegated so the path recorded at build time and the path the transformer
+// actually writes to can never drift apart.
+function localOutputPath(targetName, scope = {}) {
   try {
-    const { app } = require('electron');
-    return path.join(app.getPath('userData'), 'local-collections', `${collectionName}.db`);
+    return DuckDB.resolveOutputPath(targetName, scope);
   } catch (err) {
-    console.warn('[workflowBuilder] Could not resolve local NeDB path:', err.message);
+    console.warn('[workflowBuilder] Could not resolve local output path:', err.message);
     return null;
   }
 }
@@ -71,19 +91,7 @@ function defaultLanceDBPath() {
   }
 }
 
-// The shared local SQLite workspace, matching appSqliteDbPath in electron.js
-// (userData/app-data.db) — where executeLocalSQLiteJoin writes its result.
-// Recorded as targetLocalPath at build time so previews / downstream nodes can
-// read the joined table before the workflow has been run once.
-function defaultLocalSqlitePath() {
-  try {
-    const { app } = require('electron');
-    return path.join(app.getPath('userData'), 'app-data.db');
-  } catch (err) {
-    console.warn('[workflowBuilder] Could not resolve local SQLite path:', err.message);
-    return null;
-  }
-}
+
 
 // Resolve a concrete absolute path for a local file export when the AI didn't
 // supply one (the interactive output node opens a native save dialog; the
@@ -112,10 +120,10 @@ function defaultOutputSavePath(format, baseName) {
 /**
  * Describe the host machine and Ternlux's on-disk layout so the assistant /
  * planner can reason about and reference real file paths (e.g. where a local
- * export lands, where local collections / LanceDB / the SQLite workspace live,
+ * export lands, where node outputs / LanceDB live,
  * how to write an absolute path that is valid on THIS user's OS). Mirrors the
- * deterministic paths recorded at build time (see localNeDBPath /
- * defaultLanceDBPath / defaultLocalSqlitePath / defaultOutputSavePath above).
+ * deterministic paths recorded at build time (see localOutputPath /
+ * defaultLanceDBPath / defaultOutputSavePath above).
  *
  * Every Electron `app.getPath` lookup is guarded — in a non-Electron context
  * (tests, headless) the fields simply fall back to os.* or are omitted, so this
@@ -157,9 +165,8 @@ function buildSystemContext() {
     lines.push('');
     lines.push(`Ternlux app data : ${userData}`);
     lines.push('  Deterministic locations Ternlux reads/writes inside that folder:');
-    lines.push(`  - Local collections (NeDB)  : ${path.join(userData, 'local-collections')}${path.sep}<collection>.db`);
+    lines.push(`  - Node outputs (DuckDB)     : ${path.join(userData, 'workflow-data')}${path.sep}<workflowId>.duckdb  — one database per workflow; each node's result is a table in it`);
     lines.push(`  - Local LanceDB (vectors)   : ${path.join(userData, 'data', 'lancedb')}  (a directory, not a file)`);
-    lines.push(`  - Shared SQLite workspace   : ${path.join(userData, 'app-data.db')}  (local joins / scratch tables)`);
   }
 
   return lines.join('\n');
@@ -168,41 +175,41 @@ function buildSystemContext() {
 // Extract column names from a CREATE TABLE DDL, best-effort. Splits the
 // parenthesised body on top-level commas (so types like DECIMAL(10,2) survive)
 // and skips table-level constraint clauses (PRIMARY KEY, FOREIGN KEY, …).
-function parseDdlColumns(ddl) {
-  if (!ddl || typeof ddl !== 'string') return [];
-  const open = ddl.indexOf('(');
-  const close = ddl.lastIndexOf(')');
-  if (open === -1 || close === -1 || close <= open) return [];
-  const body = ddl.slice(open + 1, close);
-  const parts = [];
-  let depth = 0;
-  let cur = '';
-  for (const ch of body) {
-    if (ch === '(') depth++;
-    else if (ch === ')') depth--;
-    if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += ch;
-  }
-  if (cur.trim()) parts.push(cur);
+// function parseDdlColumns(ddl) {
+//   if (!ddl || typeof ddl !== 'string') return [];
+//   const open = ddl.indexOf('(');
+//   const close = ddl.lastIndexOf(')');
+//   if (open === -1 || close === -1 || close <= open) return [];
+//   const body = ddl.slice(open + 1, close);
+//   const parts = [];
+//   let depth = 0;
+//   let cur = '';
+//   for (const ch of body) {
+//     if (ch === '(') depth++;
+//     else if (ch === ')') depth--;
+//     if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += ch;
+//   }
+//   if (cur.trim()) parts.push(cur);
 
-  const cols = [];
-  for (const p of parts) {
-    const tokens = p.trim().split(/\s+/);
-    if (!tokens.length) continue;
-    const name = tokens[0].replace(/^["'`[]+|["'`\]]+$/g, '');
-    if (!name) continue;
-    if (/^(PRIMARY|FOREIGN|UNIQUE|CONSTRAINT|CHECK|KEY)$/i.test(name)) continue;
-    cols.push({ name, type: tokens.slice(1).join(' ') || 'unknown' });
-  }
-  return cols;
-}
+//   const cols = [];
+//   for (const p of parts) {
+//     const tokens = p.trim().split(/\s+/);
+//     if (!tokens.length) continue;
+//     const name = tokens[0].replace(/^["'`[]+|["'`\]]+$/g, '');
+//     if (!name) continue;
+//     if (/^(PRIMARY|FOREIGN|UNIQUE|CONSTRAINT|CHECK|KEY)$/i.test(name)) continue;
+//     cols.push({ name, type: tokens.slice(1).join(' ') || 'unknown' });
+//   }
+//   return cols;
+// }
 
 // Best-effort column list for a join's OUTPUT table. The target DDL is the
 // source of truth (it reflects the actual created columns, including any
 // collision aliasing like transactions__id); fall back to the flattened
 // selectedColumns map, else empty.
 function joinOutputColumns(gen, joinSettings) {
-  const fromDdl = parseDdlColumns(gen?.targetDdl);
-  if (fromDdl.length) return fromDdl;
+  // const fromDdl = parseDdlColumns(gen?.targetDdl);
+  // if (fromDdl.length) return fromDdl;
   const sel = joinSettings?.selectedColumns;
   if (sel && typeof sel === 'object') {
     const flat = [];
@@ -232,63 +239,83 @@ class ClarificationNeeded extends Error {
   }
 }
 
-/**
- * Thrown by a node builder when the analyser routes the node through a
- * skill AND the skill returns `ask_questions` / `answer_directly` — i.e.
- * the skill subagent needs to converse with the user before producing
- * execution params. executeBuild lets it bubble; the IPC handler
- * surfaces it as { needsSkillSubagent, skillId, nodeId, question, state,
- * action, context }. The renderer then routes the user's next replies
- * through `chat:skillStep` instead of the regular chat:step until the
- * skill returns `execute` (continue build) or `unrelateSkill` /
- * close-out (fall back to standard SQL/NoSQL flow).
- */
-class SkillSubagentRequired extends Error {
-  constructor({ skillId, nodeId, question, action, state, context, directAnswer }) {
-    super(`Skill subagent ${skillId} requires user input`);
-    this.name = 'SkillSubagentRequired';
-    this.isSkillSubagentRequired = true;
-    this.skillId = skillId;
-    this.nodeId  = nodeId;
-    this.question      = String(question || directAnswer || '').trim();
-    this.directAnswer  = directAnswer || null;
-    this.action  = action; // 'ask_questions' | 'answer_directly'
-    this.state   = state || {};
-    this.context = context || {};
-  }
+// Answers to a builder's follow-up questions come straight from the node's chat
+// transcript — there is no separate clarifications array. When a builder asks a
+// question it's committed as a bot message; the user's reply is the next user
+// message. Given the exact question, find the answer that follows it in `chat`.
+function findClarificationAnswer(chat, question) {
+  const answers = findClarificationAnswers(chat, question);
+  return answers.length ? answers[0] : null;
 }
 
-/**
- * Return the answer the user has already given to this question (if any).
- * Matching is case-insensitive on the question text. Clarifications come
- * from `plan.clarifications`, accumulated across Accept retries.
- */
-/**
- * Render gathered clarifications as a chatHistory array that callAI / callJson
- * can pass through to the provider. Each entry becomes an assistant
- * "Clarifying question: …" message followed by the user's answer. The
- * caller's prompt body should NOT also dump the same Q&A inline — the
- * intent is that the planner / picker / sub-agent reads them out of the
- * conversation rather than out of the prompt.
- */
-function clarificationsAsChatHistory(clarifications) {
-  if (!Array.isArray(clarifications) || clarifications.length === 0) return [];
-  const out = [];
-  for (const c of clarifications) {
-    if (!c || !c.question) continue;
-    out.push({ sender: 'assistant', text: `Clarifying question: ${String(c.question).trim()}` });
-    if (c.answer != null && String(c.answer).trim() !== '') {
-      out.push({ sender: 'user', text: String(c.answer).trim() });
-    }
-  }
-  return out;
-}
-
-function findClarificationAnswer(clarifications, question) {
-  if (!Array.isArray(clarifications) || !question) return null;
+// Every user reply that follows a question, oldest → newest. When a builder
+// REJECTS an answer ("no connection called X") it asks a follow-up, and the
+// user's correction lands after that follow-up — so a builder that re-resolves
+// against only the first reply would reject the same stale answer forever.
+// Those call sites walk this list newest-first instead.
+function findClarificationAnswers(chat, question) {
+  if (!Array.isArray(chat) || !question) return [];
   const q = String(question).trim().toLowerCase();
-  const hit = clarifications.find((c) => String(c?.question || '').trim().toLowerCase() === q);
-  return hit ? String(hit.answer || '').trim() : null;
+  const idx = chat.findIndex((m) => m && m.sender === 'bot' && String(m.text || '').trim().toLowerCase() === q);
+  if (idx < 0) return [];
+  return chat.slice(idx + 1)
+    .filter((x) => x && x.sender === 'user' && String(x.text || '').trim() !== '')
+    .map((x) => String(x.text).trim());
+}
+
+// A node already built by a skill keeps routing to that skill: the analyser is
+// not re-run, so a follow-up can't silently switch the node's whole execution
+// strategy (and we save the call). Cleared when the skill bows out — see the
+// skill turn in buildTransformerConfig / buildJoinConfig.
+//
+// `available` is the skill catalogue for this node type; when it is populated
+// and does not list the id, the skill is gone (uninstalled, or excluded for this
+// node type the way joins exclude vector-db-executor) and routing is dropped.
+function stickySkillId(existingConfig, available) {
+  const id = existingConfig && existingConfig.skillId;
+  if (!id) return null;
+  if (Array.isArray(available) && available.length && !available.some((s) => s && s.id === id)) return null;
+  return id;
+}
+
+// The user-facing question text for an AI response that asked for more info.
+// Mirrors the NodeChat panels (TransformerNodeChat's ask_questions branch):
+// `questionsNeeded` is a { field: questionText } map that gets rendered as a
+// bullet list; otherwise fall back to followUpQuestion / directAnswer.
+function clarificationQuestionFrom(result, fallback = '') {
+  if (!result || typeof result !== 'object') return String(fallback || '').trim();
+  const needed = result.questionsNeeded;
+  if (needed && typeof needed === 'object') {
+    const bullets = Object.entries(needed)
+      .map(([field, val]) => ((typeof val === 'string' && val.trim()) ? val.trim() : (val ? `Please provide: ${field}` : '')))
+      .filter(Boolean)
+      .map((q) => `• ${q}`)
+      .join('\n\n');
+    if (bullets) return `I need some additional information:\n\n${bullets}`;
+  }
+  const direct = result.followUpQuestion || result.question || result.directAnswer || result.message || result.explanation;
+  return String(direct || fallback || '').trim();
+}
+
+// Build the chatHistory a builder hands to the AI from the node's chat. Each
+// message the AI itself imposed as a follow-up (bot message tagged
+// `metadata.clarification`) is prefixed "Clarification by AI:" so the model can
+// tell its own questions apart from the user's requests. This prefix lives ONLY
+// in the AI-facing history — never in the persisted `chat` / config.chat.
+function chatToHistory(chat) {
+  if (!Array.isArray(chat)) return [];
+  return chat
+    .filter((m) => m && m.text)
+    .map((m) => {
+      const meta = (m.sender === 'bot' && m.metadata) ? m.metadata : null;
+      let text = m.text;
+      if (meta && meta.clarification) text = `Clarification by AI: ${String(m.text).trim()}`;
+      // Context the main chat assistant carried over from a turn that never
+      // reached this builder (see noteNodeContext) — labelled so the model reads
+      // it as established background, not as something it said to the user.
+      else if (meta && meta.context) text = `Context from the chat: ${String(m.text).trim()}`;
+      return { sender: m.sender === 'user' ? 'user' : 'assistant', text };
+    });
 }
 
 /**
@@ -496,7 +523,7 @@ function chatPromptDocsAsPromptSection() {
  * Returns an array of skill ids that the planner should be briefed on.
  * Empty array means "no skill docs needed for this request".
  */
-async function pickRelevantSkillDocs({ helpers, userRequest, clarifications = [] }) {
+async function pickRelevantSkillDocs({ helpers, userRequest, chatHistory = [] }) {
   const skillDocs = loadSkillDocs();
   const installedIds = Object.keys(skillDocs);
   if (installedIds.length === 0) return [];
@@ -521,7 +548,7 @@ User request:
 "${String(userRequest || '').trim()}"
 
 Prior clarifying questions and the user's answers (if any) appear in the chat
-history — every assistant message starting with "Clarifying question:" is a
+history — every assistant message starting with "Clarification by AI:" is a
 prior question followed by the user's reply. Take those into account.
 
 Installed skills:
@@ -537,7 +564,6 @@ Rules:
 - Be conservative — every extra skill costs prompt tokens at planning time.`;
 
   try {
-    const chatHistory = clarificationsAsChatHistory(clarifications);
     const out = await callJson(helpers, prompt, { maxTokens: 200, chatHistory });
     const ids = Array.isArray(out?.skillIds) ? out.skillIds : [];
     return ids.filter((id) => installedIds.includes(id));
@@ -576,6 +602,21 @@ function slimSchema(schema) {
   return { ...schema, sampleData: sample };
 }
 
+// A join's `sourcesConfig` is the single heaviest thing in any workflow: one
+// entry per source, each carrying a full table schema (every column, plus
+// sample rows) and its connection's config. On a 22-source union that alone ran
+// to ~400KB. These three are dropped because the entry's own `ddl` and `sql`
+// already state the shape and the columns; everything else on an entry is kept,
+// so a NoSQL or vector source keeps whatever field carries its read operation.
+const JOIN_SOURCE_OMIT = ['sourceTableSchema', 'connection', 'selectedColumns'];
+
+function slimJoinSource(src) {
+  if (!src || typeof src !== 'object') return src;
+  const out = { ...src };
+  for (const k of JOIN_SOURCE_OMIT) delete out[k];
+  return out;
+}
+
 function slimNodeData(data) {
   if (!data || typeof data !== 'object') return data;
   const { chat: _omitChat, ...rest } = data;
@@ -584,6 +625,18 @@ function slimNodeData(data) {
     delete config.chat;
     if (config.sourceTableSchema) config.sourceTableSchema = slimSchema(config.sourceTableSchema);
     if (config.targetTableSchema) config.targetTableSchema = slimSchema(config.targetTableSchema);
+    if (Array.isArray(config.sourcesConfig)) {
+      config.sourcesConfig = config.sourcesConfig.map(slimJoinSource);
+    }
+    // Restates every source's node id, label, schema and connection — all of it
+    // already reachable from the nodes list and from sourcesConfig.
+    delete config.sources;
+    if (config.joinSettings && typeof config.joinSettings === 'object') {
+      // The columns are spelled out in targetDdl and joinSql; listing them a
+      // third time per source is pure repetition.
+      const { selectedColumns: _omitCols, ...joinSettings } = config.joinSettings;
+      config.joinSettings = joinSettings;
+    }
   }
   return { ...rest, ...(config !== undefined ? { config } : {}) };
 }
@@ -636,9 +689,63 @@ async function callJson(helpers, prompt, options = {}) {
   const body = extractFirstJsonObject(String(raw || '').trim()) || String(raw || '').trim();
   try { return JSON.parse(body); }
   catch (err) {
-    console.log('body: ', body)
-    const head = String(raw || '').slice(0, 250);
-    throw new Error(`AI did not return valid JSON: ${err.message}. Head: ${head}`);
+    // The model returned invalid JSON (often truncated or wrapped in prose).
+    // Throw a clean, plain message and carry the FULL raw response on the error
+    // so the renderer can show it in an expandable "raw response" node —
+    // mirroring the interactive transformer/join "Invalid response" treatment.
+    const e = new Error('The AI returned an invalid response (not valid JSON). Please try again or rephrase your request.');
+    e.invalidJson = true;
+    e.rawResponse = String(raw || '');
+    throw e;
+  }
+}
+
+/**
+ * Parse a builder's AI reply into the object the builder expects, or null if it
+ * still isn't whole. Used when a Continue round finishes a truncated call: the
+ * build can only resume once the JSON actually parses.
+ */
+function parseBuilderJson(text) {
+  const body = extractFirstJsonObject(String(text || '').trim()) || String(text || '').trim();
+  try { return JSON.parse(body); } catch (_err) { return null; }
+}
+
+/**
+ * Resumable AI calls — the unit a build can be picked back up from.
+ *
+ * `stage` names one specific call within its builder ('join:gen', …), and
+ * `resumed` is that step's map of stage → already-finished result. Re-entering
+ * a builder replays everything cheap (schema resolution, prompt assembly) but
+ * returns cached results for every AI call that has already been paid for, so
+ * each Continue advances the step by exactly one call and never loses an
+ * earlier one.
+ *
+ * On truncation the error is tagged with the stage and the shape that call
+ * needs back, so ai:continue knows whether the finished text must parse as JSON
+ * before the build can resume.
+ */
+async function callJsonResumable(helpers, prompt, options = {}, { stage, resumed = null } = {}) {
+  if (resumed && resumed[stage] !== undefined) return resumed[stage];
+  try {
+    return await callJson(helpers, prompt, options);
+  } catch (err) {
+    if (err && err.code === 'MAX_TOKENS') { err.resumeStage = stage; err.resumeFormat = 'json'; }
+    throw err;
+  }
+}
+
+/**
+ * Same contract for a call whose reply is NOT JSON — skill turns hand their raw
+ * text to processSkillResponse, and some skills answer in prose, so the text is
+ * cached and replayed verbatim rather than parsed.
+ */
+async function callTextResumable(helpers, prompt, options = {}, { stage, resumed = null } = {}) {
+  if (resumed && resumed[stage] !== undefined) return resumed[stage];
+  try {
+    return await helpers.callAI(prompt, options);
+  } catch (err) {
+    if (err && err.code === 'MAX_TOKENS') { err.resumeStage = stage; err.resumeFormat = 'text'; }
+    throw err;
   }
 }
 
@@ -723,7 +830,7 @@ function nosqlPreviewQuery(collection) {
 }
 
 async function loadSchemaSample(connection, table, schema, helpers, warnings) {
-  const isNoSQL = connection.dbType === 'mongodb' || connection.dbType === 'nedb';
+  const isNoSQL = connection.dbType === 'mongodb';
   let columns = [];
   let sampleData = [];
 
@@ -848,7 +955,7 @@ Return ONLY the JSON object.`;
 // connection.fileInfo; cloud → warn).
 // ---------------------------------------------------------------------------
 
-async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connectionId, chat }) {
+async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connectionId, chat, nodeId, workflowId = null, resumedCalls = null }) {
   // The planner declares step.connectionId at plan-build time and the
   // envelope validator guarantees it resolves to a real saved connection,
   // so the builder no longer has to ask the AI which one to pick.
@@ -881,20 +988,30 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       connectionBaseUrl: conn.dbConfig?.baseUrl || '',
       connectionApiKeyName: conn.dbConfig?.apiKeyName || '',
       connectionBasicUser: conn.dbConfig?.basicUser || '',
+      // Key names only — the values stay encrypted and never reach the model.
+      connectionParamKeys: conn.dbConfig?.apiParamKeys || [],
     });
-    const out = await callJson(helpers, restPrompt);
+    const out = await callJsonResumable(helpers, restPrompt, { chatHistory: chatToHistory(chat) }, { stage: 'dataSource:restAnalysis', resumed: resumedCalls });
     console.log('buildDataSourceConfig+out: ', out)
     if (out.action !== 'create_plan' || !out.code) {
-      warnings.push(`REST API source: AI returned action="${out.action}" — fetch function not produced. Reason: ${out.followUpQuestion || out.directAnswer || 'unknown'}`);
+      // The AI needs more from the user (which endpoint, which auth header, what
+      // the request body should contain, …). Ask rather than assembling a source
+      // node with no fetch function — mirrors the transformer/join builders.
+      const q = clarificationQuestionFrom(out);
+      const answer = q ? findClarificationAnswer(chat, q) : null;
+      if (q && !answer) throw new ClarificationNeeded(q, { nodeId, kind: 'dataSource.api_fetch' });
+      // Already answered (or nothing to ask) and STILL no code — record it and
+      // assemble what we have instead of re-asking the same question forever.
+      warnings.push(`REST API source: AI returned action="${out.action}" — fetch function not produced. Reason: ${q || 'unknown'}`);
     }
     const apiCollection = sanitizeCollectionName(stepPrompt);
     Object.assign(config, {
       sourceConnectionType: 'api',
-      sourceDbType: 'nedb',
+      sourceDbType: 'duckdb',
       sourceDbCategory: 'API',
       sourceApiConnectionId: conn.id || conn._id,
       sourceApiConnectionName: conn.name,
-      sourceConnectionId: 'local-nedb',
+      sourceConnectionId: 'local-duckdb',
       sourceCollection: apiCollection,
       sourceDataset: apiCollection,
       sourceLocalPath: null,
@@ -906,6 +1023,7 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
         authType: conn.dbConfig?.authType || 'none',
         apiKeyName: conn.dbConfig?.apiKeyName || '',
         basicUser: conn.dbConfig?.basicUser || '',
+        apiParamKeys: conn.dbConfig?.apiParamKeys || [],
       },
     });
 
@@ -929,6 +1047,8 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
           apiFetchCode: out.code,
           nedbCollection: apiCollection,
           operationMode: 'new_table',
+          workflowId,
+          nodeId,
         });
         if (fetchResult?.success) {
           config.sourceLocalPath = fetchResult.localPath || null;
@@ -980,7 +1100,7 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
   }
 
   // Branch 4 — Live database (incl. local SQLite/NeDB files). Real getTables call.
-  const isDatabaseLike = conn.connectionType === 'database' || conn.dbType === 'sqlite' || conn.dbType === 'nedb';
+  const isDatabaseLike = conn.connectionType === 'database';
   if (isDatabaseLike) {
     const tables = await helpers.getTables(conn);
     if (!tables.length) {
@@ -989,7 +1109,7 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       return config;
     }
     const picked = await pickTable(stepPrompt, tables, helpers, warnings);
-    const isNoSQL = conn.dbType === 'mongodb' || conn.dbType === 'nedb';
+    const isNoSQL = conn.dbType === 'mongodb';
     const isVector = conn.dbCategory === 'Vector' || conn.dbType === 'pinecone' || conn.dbType === 'lancedb';
     const schema = await loadSchemaSample(conn, picked.name, picked.schema, helpers, warnings);
 
@@ -1027,8 +1147,9 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     return config;
   }
 
-  // Branch 5 — Imported file connections (CSV / Excel / JSON / Parquet / Avro).
-  // The file is already loaded under a known collection/table on import.
+  // Branch 5 — Local file connections (CSV / JSON / Parquet, and Excel / Avro
+  // converted to Parquet when they were added). Nothing was imported: the file
+  // is read in place by DuckDB, so the path IS the source.
   if ((conn.connectionType || '') === 'file') {
     config.sourceDataset = conn.name;
     config.sourceLocalPath = conn.fileInfo?.filePath || null;
@@ -1036,12 +1157,19 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     if (single) {
       const name = typeof single === 'string' ? single : (single.name || conn.name);
       config.sourceSelectedTables = [name];
-      if (conn.dbType === 'sqlite') config.sourceTableName = name;
+      if (conn.dbType === 'duckdb') {
+        // One Parquet file per sheet, so the chosen table picks the file.
+        const filePath = conn.fileInfo?.tablePaths?.[name] || conn.fileInfo?.filePath || null;
+        config.sourceFilePath = filePath;
+        config.sourceLocalPath = filePath;
+        config.sourceFormat = conn.fileInfo?.format || null;
+        config.sourceTableName = name;
+      } else if (conn.dbType === 'sqlite') config.sourceTableName = name;
       else if (conn.dbType === 'nedb') config.sourceCollection = name;
       try { config.sourceTableSchema = await loadSchemaSample(conn, name, null, helpers, warnings); }
-      catch (_) { /* schema is best-effort for imported files */ }
+      catch (_) { /* schema is best-effort for local files */ }
     }
-    pushBotMsg(chat, `Configured imported-file data source "${conn.name}" (${conn.dbType}).`);
+    pushBotMsg(chat, `Configured local-file data source "${conn.name}" (${conn.dbType}).`);
     return config;
   }
 
@@ -1133,10 +1261,12 @@ function renderPluginTransformPrompt({
  * where `action ∈ { execute, ask_questions, answer_directly, unrelateSkill }`.
  *
  * Both the per-node builders (transformer/join) and the renderer-driven
- * `chat:skillStep` IPC call this same helper so the skill contract is
- * uniform regardless of where the turn fires from.
+ * the node route (build_*) and the plan route (executeBuild) call this same
+ * helper, so the skill contract is uniform regardless of where the turn fires
+ * from. There is no separate skill IPC — a skill that needs input raises an
+ * ordinary ClarificationNeeded carrying its state.
  */
-async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, context = {} }) {
+async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, context = {}, stage = 'skill', resumed = null }) {
   if (!helpers?.pluginManager?.buildSkillPrompt) {
     throw new Error('pluginManager.buildSkillPrompt unavailable; cannot run skill subagent.');
   }
@@ -1184,7 +1314,7 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
   }
   let result;
   if (built && built.prompt) {
-    const aiResponse = await helpers.callAI(built.prompt, { });
+    const aiResponse = await callTextResumable(helpers, built.prompt, {}, { stage, resumed });
     result = await helpers.pluginManager.processSkillResponse(
       skillId,
       aiResponse,
@@ -1236,117 +1366,33 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
   };
 }
 
-/**
- * Skill-result builder for transformer steps. Called by executeBuild
- * when the dispatcher finds `plan.skillResults[stepIndex]` for this
- * node — i.e. the skill subagent has already converged on execution
- * params and we just need to stitch them into the node config. Does
- * NOT call the analyser, the main processor, or the skill itself.
- */
-async function applySkillResultTransformer({ stepPrompt, upstreamNode, helpers, nodeId, skillResult, chat }) {
-  if (!upstreamNode) throw new Error('Transformer needs an upstream source node.');
-  if (!skillResult || !skillResult.executionParams) {
-    throw new Error('applySkillResultTransformer requires skillResult.executionParams.');
-  }
-  const base = { nodeType: 'transformer', ...copySourceFromUpstream(upstreamNode) };
-  const dbType  = base.sourceDbType;
-  const isNoSQL = dbType === 'mongodb' || dbType === 'nedb';
-  const ep = skillResult.executionParams;
-  const operationMode    = skillResult.operationMode || ep.operationMode || 'new_table';
-  const storageLocation  = skillResult.storageLocation || ep.storageLocation || (base.sourceConnectionType === 'file' ? 'local' : 'database');
-  const targetTableName  = skillResult.targetTableName || ep.targetTable || ep.targetTableName || `transformer_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`;
-  const transformationSettings = { userRequest: stepPrompt, operationMode, storageLocation, tableName: targetTableName };
-
-  // Vector-skill destination override (mirrors the live skill path in
-  // buildTransformerConfig). Without this, the assembler defaults the
-  // target to the source connection (e.g. Mongo) and the executor reads
-  // the wrong dbType at run time.
-  const isVectorSkill = !!(ep.vectorDbType) || skillResult.skillId === 'vector-db-executor';
-  let targetConn = null;
-  if (isVectorSkill) {
-    const vdb = ep.vectorDbType || 'lancedb';
-    if (vdb === 'lancedb') {
-      targetConn = {
-        id: ep.targetConnectionId || 'local-lancedb',
-        name: ep.targetConnectionName || 'Local LanceDB',
-        type: 'file',
-        dbType: 'lancedb',
-        config: {},
-      };
-    } else {
-      const conn = (helpers.connections || []).find((c) => (c.id || c._id) === ep.targetConnectionId);
-      if (conn) {
-        targetConn = {
-          id: conn.id || conn._id,
-          name: conn.name,
-          type: conn.connectionType || 'database',
-          dbType: conn.dbType,
-          config: conn.dbConfig || {},
-        };
-      }
-    }
-  }
-
-  // Non-vector skills that write to a local NeDB collection (javascript-executor
-  // with outputType "nedb") must target NeDB — not the source's dbType. Mirrors
-  // the live skill path in buildTransformerConfig so a skill that converges via
-  // the subagent round-trip lands the same config (local-nedb target + recorded
-  // targetLocalPath) as one that resolves inline. Without it, targetConn stays
-  // null, the assembler defaults the target to the Mongo source, and the NeDB
-  // output is left with no locatable path → "No data found in source table".
-  const skillOutputType = String(ep.outputType || '').toLowerCase();
-  const isNeDBSkill = !isVectorSkill && skillOutputType === 'nedb';
-  if (isNeDBSkill && !targetConn) {
-    targetConn = {
-      id: ep.targetConnectionId || 'local-nedb',
-      name: ep.targetConnectionName || 'Local NeDB',
-      type: 'file',
-      dbType: 'nedb',
-      config: {},
-    };
-  }
-  const skillIsNoSQL = isNeDBSkill ? true : isNoSQL;
-
-  const skillGen = {
-    explanation: skillResult.explanation || ep.explanation || `Built via ${skillResult.skillId}.`,
-    ddl: ep.ddl || '',
-    sql: ep.sql || '',
-    insertSql: ep.insertSql || null,
-    previewSql: ep.previewSql || null,
-    operationType: ep.operationType || (isVectorSkill ? null : (isNeDBSkill ? 'transform' : (isNoSQL ? 'aggregation' : null))),
-    nosqlOperation: ep.nosqlOperation || null,
-    transformFunction: ep.transformFunction || null,
-  };
-  return assembleTransformerConfig({
-    base, dbType, isNoSQL: skillIsNoSQL, helpers,
-    operationMode, storageLocation, targetTableName, targetConn,
-    transformationSettings, stepPrompt, chat,
-    gen: skillGen,
-    skillInfo: {
-      skillId:          skillResult.skillId,
-      skillExplanation: skillResult.skillExplanation || null,
-      executionParams:  ep,
-      isVectorSkill,
-    },
-  });
-}
-
-async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeId, warnings, clarifications = [], chat, bypassSkills = false }) {
+async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeId, warnings, chat, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null }) {
   if (!upstreamNode) throw new Error('Transformer needs an upstream source node.');
   const base = { nodeType: 'transformer', ...copySourceFromUpstream(upstreamNode) };
+  // The AI-facing history is derived from the chat transcript (answers to
+  // follow-ups are read straight from the chat, not a side array).
+  const chatHistory = chatToHistory(chat);
 
   // Hard prerequisites: the upstream MUST resolve to a real connection.
   // If it doesn't, ask the user rather than emitting a partial config —
   // a half-built transformer can't be saved meaningfully.
   if (!base.sourceConnectionId) {
     const q = `The transformer upstream "${base.sourceNodeLabel || base.sourceNodeId || 'unknown'}" has no resolved connection. Which saved connection should the transformer read from?`;
-    const answer = findClarificationAnswer(clarifications, q);
-    if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'transformer.upstream_connection' });
-    pushBotMsg(chat, q);
-    pushUserMsg(chat, answer);
-    const conn = (helpers.connections || []).find((c) => c.name === answer || (c.id || c._id) === answer);
+    // Walk the replies newest-first: an unmatched name makes us ask again, and
+    // the correction arrives AFTER that second question — resolving only the
+    // first reply would re-reject the same stale name on every retry.
+    const answers = findClarificationAnswers(chat, q);
+    if (!answers.length) throw new ClarificationNeeded(q, { nodeId, kind: 'transformer.upstream_connection' });
+    const matchConn = (name) => {
+      const wanted = String(name || '').trim().toLowerCase();
+      return (helpers.connections || []).find((c) =>
+        String(c.name || '').trim().toLowerCase() === wanted
+        || String(c.id || c._id || '').toLowerCase() === wanted) || null;
+    };
+    let conn = null;
+    for (let i = answers.length - 1; i >= 0 && !conn; i--) conn = matchConn(answers[i]);
     if (!conn) {
-      const q2 = `I couldn't find a saved connection matching "${answer}". Please give me the exact connection name from your list.`;
+      const q2 = `I couldn't find a saved connection matching "${answers[answers.length - 1]}". Please give me the exact connection name from your list.`;
       throw new ClarificationNeeded(q2, { nodeId, kind: 'transformer.upstream_connection' });
     }
     base.sourceConnectionId = conn.id || conn._id;
@@ -1360,10 +1406,8 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // ask the user which table / collection feeds the transformer.
   if (!base.sourceTableSchema || !Array.isArray(base.sourceTableSchema.columns) || base.sourceTableSchema.columns.length === 0) {
     const q = `I don't have schema info for the transformer's source on "${base.sourceConnectionName}". Which table or collection should it transform?`;
-    const answer = findClarificationAnswer(clarifications, q);
+    const answer = findClarificationAnswer(chat, q);
     if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'transformer.source_table' });
-    pushBotMsg(chat, q);
-    pushUserMsg(chat, answer);
     const conn = (helpers.connections || []).find((c) => (c.id || c._id) === base.sourceConnectionId);
     if (conn) {
       base.sourceTableSchema = await loadSchemaSample(conn, answer, base.sourceSchema || null, helpers, warnings);
@@ -1372,7 +1416,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   }
 
   const dbType = base.sourceDbType;
-  const isNoSQL = dbType === 'mongodb' || dbType === 'nedb';
+  const isNoSQL = dbType === 'mongodb';
   const sourceSchemaInfo = describeTableSchema(base.sourceTableSchema);
 
   // Fetch installed transformer skills so the analyser can route through
@@ -1395,37 +1439,74 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
     return [];
   })();
 
+  // ── Who handles this turn? Decided ONCE here, never revisited in this run.
+  //
+  // `pendingSkill` is a skill dialog that paused mid-way — its accumulated state
+  // plus the exact question it asked. A sticky `skillId` on the node means an
+  // earlier build already settled on that skill. Either way routing is decided,
+  // so stage 1 is skipped: its only jobs are picking a skill and inferring
+  // settings the node already carries. `bypassSkills` overrides both.
+  const pendingSkill = bypassSkills
+    ? null
+    : ((pendingSkillArg && pendingSkillArg.skillId)
+        ? pendingSkillArg
+        : (existingConfig?.pendingSkill?.skillId ? existingConfig.pendingSkill : null));
+  const routedSkillId = bypassSkills
+    ? null
+    : (pendingSkill ? pendingSkill.skillId : stickySkillId(existingConfig, availableSkills));
+
   // Stage 1 — decide operationMode + storageLocation + custom table name.
-  const analysisPrompt = ChatPrompts.transfomer.transformationRequest(
-    stepPrompt,
-    sourceSchemaInfo,
-    dbType,
-    base.sourceConnectionType === 'file',
-    availableSkills,
-  );
-  const analysis = await callJson(helpers, analysisPrompt);
+  let analysis = null;
+  if (!routedSkillId) {
+    const analysisPrompt = ChatPrompts.transfomer.transformationRequest(
+      stepPrompt,
+      sourceSchemaInfo,
+      dbType,
+      base.sourceConnectionType === 'file',
+      availableSkills,
+    );
+    analysis = await callJsonResumable(helpers, analysisPrompt, { chatHistory }, { stage: 'transformer:analysis', resumed: resumedCalls });
+    console.log('buildTransformerConfig+analysis: ', analysis)
+  }
 
-  console.log('buildTransformerConfig+analysis: ', analysis)
+  // The analyser asked for more information — pause and put the question to the
+  // user instead of falling through with guessed inferredSettings (which is how
+  // a vague request ended up with an invented table name and a hallucinated
+  // transformation). TransformerNodeChat branches on `action` the same way. On
+  // the re-run the answer is already in the chat history the analyser sees, so
+  // it should return a real plan; if it stubbornly re-asks we already have the
+  // answer and fall through to generation.
+  if (analysis && (analysis.action === 'ask_questions' || analysis.action === 'answer_directly')) {
+    const q = clarificationQuestionFrom(analysis, 'Can you give me more detail about how this transformation should work?');
+    const answer = findClarificationAnswer(chat, q);
+    if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'transformer.analysis' });
+  }
 
-  const operationMode = analysis?.inferredSettings?.operationMode || 'new_table';
+  // Settings come from the analyser when it ran, otherwise from the node itself
+  // so a refinement can't silently relocate the target table or flip the write
+  // mode. An existing target name was already qualified when it was first built
+  // — don't run it through qualifyLocalTableName twice.
+  const prevSettings   = existingConfig?.transformationSettings || {};
+  const existingTarget = existingConfig?.targetTableName || existingConfig?.targetCollection || null;
+  const operationMode  = analysis?.inferredSettings?.operationMode || prevSettings.operationMode || 'new_table';
   const storageLocation = analysis?.inferredSettings?.storageLocation
+    || prevSettings.storageLocation
     || (base.sourceConnectionType === 'file' ? 'local' : 'database');
-  const targetTableName = analysis?.tableName || `transformer_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`;
+  const targetTableName = (!analysis && existingTarget)
+    ? existingTarget
+    : qualifyLocalTableName(
+        analysis?.tableName || existingTarget || `transformer_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`,
+        { workflowId, isLocal: storageLocation === 'local' },
+      );
   const transformationSettings = { userRequest: stepPrompt, operationMode, storageLocation, tableName: targetTableName };
 
-  // If the analyser routed this transformer through a skill, run the
-  // skill once. Four actions are possible:
-  //   execute        — got executable params, assemble the node now.
-  //   unrelateSkill  — skill says "not my territory"; fall through to the
-  //                    standard SQL/NoSQL path below.
-  //   ask_questions  — skill needs more user input; throw
-  //                    SkillSubagentRequired so the renderer can drive
-  //                    the skill conversation. Subsequent rounds come
-  //                    back via plan.skillResults (applySkillResult…
-  //                    builder) once the skill finally returns `execute`.
-  //   answer_directly — same: surface the answer and wait for the next
-  //                    user message via the skill subagent.
-  if (analysis?.usesSkill && analysis?.skillId && helpers?.pluginManager?.buildSkillPrompt) {
+  // ── Skill turn — one round per user message, handled exactly like a builder's
+  // own clarification. `execute` finishes the node here; a question pauses the
+  // build through ClarificationNeeded (carrying the skill's state so the next
+  // turn resumes it rather than restarting it); anything else hands the request
+  // back to the standard SQL/NoSQL path below, in THIS run.
+  const activeSkillId = routedSkillId || (analysis?.usesSkill ? analysis?.skillId : null);
+  if (activeSkillId && helpers?.pluginManager?.buildSkillPrompt) {
     const sourceConnection = (helpers.connections || []).find((c) => (c.id || c._id) === base.sourceConnectionId)
       || { id: base.sourceConnectionId, name: base.sourceConnectionName, dbType, connectionType: base.sourceConnectionType };
     const context = {
@@ -1439,10 +1520,18 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       tableName: targetTableName,
       isSourceLocal: base.sourceConnectionType === 'file',
     };
-    const result = await runSkillTurn(helpers, analysis.skillId, {
-      userRequest: stepPrompt,
-      currentState: analysis?.skillParams || {},
+    // The reply to the skill's OWN question is its input this turn. It is looked
+    // up by the exact question text we committed, so a reworded re-ask can never
+    // orphan the answer the user already gave.
+    const skillAnswer = pendingSkill?.question ? findClarificationAnswer(chat, pendingSkill.question) : null;
+    const result = await runSkillTurn(helpers, activeSkillId, {
+      userRequest: skillAnswer || stepPrompt,
+      currentState: pendingSkill ? (pendingSkill.state || {}) : (analysis?.skillParams || {}),
       context,
+      // Resumable like the analysis/gen calls: a skill turn that runs out
+      // of room is finished by Continue and replayed here verbatim.
+      stage: 'transformer:skill',
+      resumed: resumedCalls,
     });
 
     if (result.action === 'execute') {
@@ -1453,7 +1542,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       // destination that isn't the source connection. Detect that and
       // override targetConn so the executor reads the correct lancedb /
       // pinecone target instead of falling back to the Mongo source.
-      const isVectorSkill = !!(ep.vectorDbType) || analysis.skillId === 'vector-db-executor';
+      const isVectorSkill = !!(ep.vectorDbType) || activeSkillId === 'vector-db-executor';
       let targetConn = null;
       let resolvedTargetTableName = ep.targetTable || ep.targetTableName || targetTableName;
       if (isVectorSkill) {
@@ -1480,70 +1569,80 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
           }
         }
       }
-      // Non-vector skills that write to a local NeDB collection (e.g.
-      // javascript-executor with outputType "nedb") must target NeDB — NOT the
+      // Non-vector skills that write locally (e.g. javascript-executor with
+      // outputType "duckdb") must target the workflow's own database — NOT the
       // source's dbType. Without this, assembleTransformerConfig derives the
-      // target from the SQL/SQLite source and emits a SQL preview against a
-      // table that only ever exists in NeDB → "no such table" at preview time.
+      // target from the source connection and points the preview at a table
+      // that only ever exists locally → "no such table" at preview time.
       const skillOutputType = String(ep.outputType || '').toLowerCase();
-      const isNeDBSkill = !isVectorSkill && skillOutputType === 'nedb';
-      if (isNeDBSkill && !targetConn) {
+      const isLocalFileSkill = !isVectorSkill && skillOutputType === 'duckdb';
+      if (isLocalFileSkill && !targetConn) {
         targetConn = {
-          id: ep.targetConnectionId || 'local-nedb',
-          name: ep.targetConnectionName || 'Local NeDB',
+          id: ep.targetConnectionId || 'local-duckdb',
+          name: ep.targetConnectionName || 'Local file',
           type: 'file',
-          dbType: 'nedb',
+          dbType: 'duckdb',
           config: {},
         };
       }
-      // Treat NeDB-output skills as NoSQL so assembleTransformerConfig takes the
-      // collection branch (targetCollection + NeDB preview + localNeDBPath)
-      // instead of the SQL branch.
-      const skillIsNoSQL = isNeDBSkill ? true : isNoSQL;
+      // A DuckDB result is a table, so it takes the SQL branch of
+      // assembleTransformerConfig — targetTableName plus a SQL preview, the
+      // same shape every other local node writes.
+      const skillIsNoSQL = isLocalFileSkill ? false : isNoSQL;
 
       // For vector skills don't synthesise a Mongo aggregation operationType
       // (there is no nosqlOperation pipeline to run). The executor's
       // usesSkill branch short-circuits this anyway, but we don't want
-      // to write misleading values onto the config. NeDB-output skills need a
-      // truthy operationType so the NoSQL config branch is entered (the value
-      // itself is cosmetic — execution dispatches via the skill, not a pipeline).
+      // to write misleading values onto the config.
       const skillGen = {
-        explanation: result.explanation || ep.explanation || `Built via ${analysis.skillId}.`,
+        explanation: result.explanation || ep.explanation || `Built via ${activeSkillId}.`,
         ddl: ep.ddl || '',
         sql: ep.sql || '',
         insertSql: ep.insertSql || null,
         previewSql: ep.previewSql || null,
-        operationType: ep.operationType || (isVectorSkill ? null : (isNeDBSkill ? 'transform' : (isNoSQL ? 'aggregation' : null))),
+        operationType: ep.operationType || (isVectorSkill || isLocalFileSkill ? null : (isNoSQL ? 'aggregation' : null)),
         nosqlOperation: ep.nosqlOperation || null,
         transformFunction: ep.transformFunction || null,
       };
-      return assembleTransformerConfig({
+      return await assembleTransformerConfig({
         base, dbType, isNoSQL: skillIsNoSQL, helpers,
         operationMode, storageLocation,
         targetTableName: resolvedTargetTableName,
         targetConn,
         transformationSettings, stepPrompt, chat,
+        workflowId, nodeId,
         gen: skillGen,
         skillInfo: {
-          skillId:          analysis.skillId,
-          skillExplanation: analysis.skillExplanation || null,
+          skillId:          activeSkillId,
+          skillExplanation: analysis?.skillExplanation || existingConfig?.skillExplanation || null,
           executionParams:  ep,
           isVectorSkill,
         },
       });
     }
-    if (result.action === 'ask_questions' || result.action === 'answer_directly') {
-      throw new SkillSubagentRequired({
-        skillId:     analysis.skillId,
+
+    const asks     = result.action === 'ask_questions' || result.action === 'answer_directly';
+    const question = String(result.question || result.directAnswer || '').trim();
+    const rounds   = (pendingSkill?.rounds || 0) + 1;
+    if (asks && question && rounds <= MAX_SKILL_ROUNDS) {
+      throw new ClarificationNeeded(question, {
         nodeId,
-        question:    result.question,
-        directAnswer: result.directAnswer,
-        action:      result.action,
-        state:       result.state,
-        context,
+        kind:  `skill.${activeSkillId}`,
+        skill: { skillId: activeSkillId, state: result.state || {}, question, rounds },
       });
     }
-    // unrelateSkill — fall through to the standard SQL/NoSQL flow.
+
+    // unrelateSkill, a question with no text to show, or a dialog that never
+    // converges. Stop routing to the skill and fall through to the standard path
+    // below with the user's request intact. The note is tagged as context so the
+    // analyser reads it next turn and doesn't immediately re-pick the skill.
+    const why = result.action === 'unrelateSkill'
+      ? `Skill "${activeSkillId}" reported that this request isn't its territory — building with the standard path instead.`
+      : (asks && !question)
+        ? `Skill "${activeSkillId}" asked for more input without saying what it needed — building with the standard path instead.`
+        : `Skill "${activeSkillId}" kept asking without converging after ${MAX_SKILL_ROUNDS} rounds — building with the standard path instead.`;
+    warnings.push(why);
+    pushBotMsg(chat, why, { metadata: { context: true } });
   }
 
   // Stage 2 — generate the actual SQL / NoSQL operation. Local file targets
@@ -1551,30 +1650,47 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // file for them; everything else (Mongo / Postgres / MySQL / Snowflake /
   // MSSQL / BigQuery / …) goes through the plugin's getTransformPrompts so
   // the per-dialect prompt lives in exactly one place.
-  const settingsContext = `Operation mode: ${operationMode}\nStorage location: ${storageLocation}\nTarget name: ${targetTableName}`;
+  // The name the generated statements must address. An in-place update on a
+  // FILE has no table of its own: the file is staged under this node's name,
+  // so that is what the model writes against and what the executor creates —
+  // both derive it from `stagingTableFor`, so they cannot disagree. A source
+  // that is already a table is addressed by its real name.
+  // An in-place update on a FILE has no table of its own: the executor stages
+  // the file under a per-node table, and the prompt derives that same name from
+  // `{ nodeId }`. A source that is already a table is addressed by its real
+  // name; a new table by the generated one.
+  const inPlaceOnFile = operationMode === 'in_place' && !DuckDB.isWorkflowDb(base.sourceLocalPath);
+  const promptTableName = operationMode !== 'in_place'
+    ? targetTableName
+    : (inPlaceOnFile
+        ? { nodeId, fallback: targetTableName }
+        : (base.sourceTableName || base.sourceTableSchema?.tableName || targetTableName));
+
+  const displayTableName = typeof promptTableName === 'object'
+    ? DuckDB.stagingTableFor(promptTableName.nodeId, promptTableName.fallback)
+    : promptTableName;
+  const settingsContext = `Operation mode: ${operationMode}\nStorage location: ${storageLocation}\nTarget name: ${displayTableName}`;
   const usesLocalTemplate =
-    (dbType === 'nedb') ||
-    (dbType === 'sqlite') ||
+    (dbType === 'duckdb') ||
     (base.sourceConnectionType === 'file');
 
   let gen;
   if (usesLocalTemplate) {
-    const template = dbType === 'nedb' || isNoSQL
-      ? (operationMode === 'in_place'
-          ? ChatPrompts.transfomer.nedbTransformationInPlace
-          : ChatPrompts.transfomer.nedbTransformationNewTable)
-      : (operationMode === 'in_place'
-          ? ChatPrompts.transfomer.sqliteTransformationInPlace
-          : ChatPrompts.transfomer.sqliteTransformationNewTable);
-    gen = await callJson(
+    // One local template pair — DuckDB handles tabular and document data alike.
+    const template = operationMode === 'in_place'
+      ? ChatPrompts.transfomer.duckdbTransformationInPlace
+      : ChatPrompts.transfomer.duckdbTransformationNewTable;
+    gen = await callJsonResumable(
       helpers,
       template(
         { userRequest: stepPrompt },
         sourceSchemaInfo,
         settingsContext,
         base.sourceTableSchema || { tableName: base.sourceCollection || base.sourceTableName },
-        targetTableName,
+        promptTableName,
       ),
+      { chatHistory },
+      { stage: 'transformer:gen', resumed: resumedCalls },
     );
     console.log('buildTransformerConfig+gen: ', gen)
   } else {
@@ -1605,15 +1721,16 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
     if (!pluginPrompt) {
       throw new Error(`No transform prompt available for dbType="${dbType}". Plugin must export getTransformPrompts().`);
     }
-    gen = await callJson(helpers, pluginPrompt);
+    gen = await callJsonResumable(helpers, pluginPrompt, { chatHistory }, { stage: 'transformer:pluginGen', resumed: resumedCalls });
 
     console.log('buildTransformerConfig+gen: ', gen)
   }
 
-  return assembleTransformerConfig({
+  return await assembleTransformerConfig({
     base, dbType, isNoSQL, helpers,
     operationMode, storageLocation, targetTableName, targetConn: null,
     transformationSettings, stepPrompt, chat, gen, skillInfo: null,
+    workflowId, nodeId,
   });
 }
 
@@ -1622,18 +1739,30 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
 // an identical config shape downstream. `gen` is the operation envelope
 // (sql/ddl/nosqlOperation/transformFunction); `skillInfo` is set when the
 // transformer was built by a skill.
-function assembleTransformerConfig({
+async function assembleTransformerConfig({
   base, dbType, isNoSQL, helpers,
   operationMode, storageLocation, targetTableName, targetConn,
   transformationSettings, stepPrompt, chat, gen, skillInfo,
+  // Both are used to scope a local NeDB target file (localNeDBPath below).
+  // They MUST be threaded in from the caller — deriving them here is not
+  // possible, and referencing them undeclared throws at assembly time.
+  workflowId = null, nodeId = null,
 }) {
+  // An in-place update whose source is a FILE (not this workflow's .duckdb) has
+  // no table of its own — the executor stages the file under a per-node table
+  // that is dropped when the run ends. Recomputed here rather than threaded in
+  // from the caller: it is a pure function of two arguments this function
+  // already takes, so neither call site can forget it (see workflowId/nodeId
+  // above for the version of this that IS threaded, and why).
+  const inPlaceOnFile = operationMode === 'in_place' && !DuckDB.isWorkflowDb(base.sourceLocalPath);
+
   if (!targetConn) {
     const isInPlace = operationMode === 'in_place';
     const isLocal = storageLocation === 'local';
     if (isInPlace) targetConn = { id: base.sourceConnectionId, name: base.sourceConnectionName, type: base.sourceConnectionType, dbType, config: base.sourceDbConfig };
     else if (isLocal) {
       const localDb = isNoSQL ? 'nedb' : 'sqlite';
-      targetConn = { id: `local-${localDb}`, name: localDb === 'nedb' ? 'Local NeDB' : 'Local SQLite', type: 'file', dbType: localDb, config: {} };
+      targetConn = { id: 'local-duckdb', name: 'Local file', type: 'file', dbType: 'duckdb', config: {} };
     } else targetConn = { id: base.sourceConnectionId, name: base.sourceConnectionName, type: base.sourceConnectionType, dbType, config: base.sourceDbConfig };
   }
 
@@ -1699,25 +1828,14 @@ function assembleTransformerConfig({
       ? (base.sourceCollection || base.sourceTableName)
       : targetTableName;
     config.targetPreviewSql = nosqlPreviewQuery(config.targetCollection);
-    // Record targetLocalPath whenever the *resolved target* is NeDB — not just
-    // when the user asked for local storage or the source is NeDB. A NeDB-output
-    // skill (e.g. javascript-executor with outputType "nedb") can force a
-    // `local-nedb` target even when storageLocation is "database" and the source
-    // is a remote DB like MongoDB; config.targetDbType (== targetConn.dbType) is
-    // already 'nedb' here. Without consulting it, the data lands in a local NeDB
-    // file the config has no pointer to, and downstream nodes/previews that
-    // inherit sourceLocalPath from this target get nothing → "No data found in
-    // source table".
-    if (storageLocation === 'local' || dbType === 'nedb' || config.targetDbType === 'nedb') {
-      // "Modify locally" (in-place) keeps the data in the source's own file, so
-      // inherit its path. A new local collection is written to a fresh
-      // per-collection NeDB file by saveToLocalNeDB (or the NeDB-output skill,
-      // which honors this explicit path); record that deterministic path so
-      // downstream nodes and previews can locate it (the source may be a
-      // remote DB like MongoDB with no local path to inherit).
+    // Record targetLocalPath whenever the resolved target is local, so
+    // downstream nodes and previews can find the output before the workflow has
+    // run once. In-place updates the source where it lies, so that IS the
+    // output; a new dataset gets a table in this workflow's database.
+    if (storageLocation === 'local' || config.targetDbType === 'duckdb') {
       config.targetLocalPath = operationMode === 'in_place'
         ? (base.sourceLocalPath || null)
-        : localNeDBPath(config.targetCollection);
+        : localOutputPath(config.targetCollection, { workflowId, nodeId });
     }
   } else {
     config.targetDdl = gen?.ddl || '';
@@ -1727,14 +1845,21 @@ function assembleTransformerConfig({
     config.targetTableName = operationMode === 'in_place'
       ? (base.sourceTableName || base.sourceTableSchema?.tableName)
       : targetTableName;
-    config.targetPreviewSql = gen?.previewSql
-      || sqlPreviewQuery(config.targetTableName, config.targetSchema, targetConn.dbType, helpers);
-    // Local SQL storage materializes the result table in the shared SQLite
-    // workspace (userData/app-data.db, == appSqliteDbPath). Prefer a path
-    // inherited from the source; otherwise fall back to the default workspace so
-    // downstream nodes / previews can still locate the table even when the source
-    // is a remote DB (e.g. MSSQL) with no local path to inherit.
-    if (storageLocation === 'local') config.targetLocalPath = base.sourceLocalPath || defaultLocalSqlitePath() || null;
+    // The model's previewSql names whatever table its statements addressed. For
+    // an in-place FILE update that is the per-run staging table, which is
+    // dropped as soon as the run finishes — so preview the result by the name
+    // the updated file itself answers to.
+    config.targetPreviewSql = inPlaceOnFile
+      ? sqlPreviewQuery(config.targetTableName, null, targetConn.dbType, helpers)
+      : (gen?.previewSql
+        || sqlPreviewQuery(config.targetTableName, config.targetSchema, targetConn.dbType, helpers));
+    // In-place changes the source itself, so the source path is the output.
+    // A new table goes to this workflow's database.
+    if (storageLocation === 'local') {
+      config.targetLocalPath = operationMode === 'in_place'
+        ? (base.sourceLocalPath || null)
+        : localOutputPath(config.targetTableName, { workflowId, nodeId });
+    }
   }
 
   // Vector targets (LanceDB) address a *directory*, not a per-collection NeDB
@@ -1754,11 +1879,69 @@ function assembleTransformerConfig({
     };
   }
 
-  config.targetTableSchema = config.targetTableSchema || {
-    tableName: config.targetCollection || config.targetTableName,
-    columns: (base.sourceTableSchema?.columns || []).map((c) => ({ name: c.name, type: c.type || 'unknown' })),
-    sampleData: [],
-  };
+  // The next node is configured against THIS node's output, so the schema
+  // recorded here has to be the transformed one. For a local DuckDB transform
+  // the engine can tell us the exact result shape from a handful of rows;
+  // anything else (or a derivation that fails) falls back to the source's
+  // columns, which is at least the right starting point.
+  //
+  // The sample rows matter as much as the columns: they are what a downstream
+  // builder is shown as "Sample rows" for its source (see sourceTableSchema on
+  // the next node), and column names with no values give it far less to reason
+  // about — particularly for the transformed columns, which by definition do
+  // not appear anywhere in the upstream node's sample.
+  if (!config.targetTableSchema) {
+    const derived = (config.targetDbType === 'duckdb' || storageLocation === 'local')
+      ? await DuckDB.describeResult({
+        sourceLocalPath: base.sourceLocalPath,
+        sql: config.targetSql,
+        operationMode,
+        targetTableName: config.targetTableName || config.targetCollection,
+        sourceTableName: base.sourceTableName || base.sourceTableSchema?.tableName,
+        sourceFormat: config.sourceFormat || null,
+        workflowId,
+        nodeId,
+        sampleRows: SAMPLE_ROW_LIMIT,
+      })
+      : null;
+
+    config.targetTableSchema = {
+      tableName: config.targetCollection || config.targetTableName,
+      columns: derived?.columns
+        || (base.sourceTableSchema?.columns || []).map((c) => ({ name: c.name, type: c.type || 'unknown' })),
+      sampleData: derived?.sampleData || [],
+    };
+  }
+
+  // Completeness gate — a standard (non-skill) transformer must carry the
+  // statement that actually populates its target. A truncated/incomplete
+  // generation would otherwise be saved as an empty node that "runs" green but
+  // produces 0 rows (TLX-008 / the empty-config nodes seen in exports). Fail
+  // the build loudly instead. Skill-routed nodes execute via their skill
+  // params and legitimately have no targetSql.
+  if (!skillInfo) {
+    // This build used the standard path. Clear any earlier skill binding —
+    // the node route MERGES this config onto the node, so a stale
+    // `usesSkill`/`skillId` pair would keep the executor dispatching to a skill
+    // whose params no longer exist, and would keep re-routing future builds.
+    config.usesSkill  = false;
+    config.skillId    = null;
+    config.skillParams = null;
+    config.skillExplanation = null;
+    if (isNoSQL) {
+      const hasOp = (config.nosqlOperation && String(config.nosqlOperation).trim())
+        || (config.transformFunction && String(config.transformFunction).trim());
+      if (!hasOp) {
+        throw new Error(`Transformer "${targetTableName}" generation was incomplete — no operation was produced (the AI output was likely truncated). Try a simpler transform or fewer columns.`);
+      }
+    } else {
+      const hasSql = (config.targetSql && String(config.targetSql).trim())
+        || (config.targetInsertSql && String(config.targetInsertSql).trim());
+      if (!hasSql) {
+        throw new Error(`Transformer "${targetTableName}" generation was incomplete — no SQL was produced (the AI output was likely truncated). Try a simpler transform or fewer columns.`);
+      }
+    }
+  }
 
   const opSummary = isNoSQL
     ? `Operation: ${gen?.operationType || 'aggregation'}`
@@ -1823,10 +2006,14 @@ function resolveJoinSource(n) {
   };
 }
 
-async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, warnings, clarifications = [], chat, connectionId = null, bypassSkills = false }) {
+async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, warnings, chat, connectionId = null, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null }) {
   if (!upstreamNodes || upstreamNodes.length < 2) throw new Error('Join needs at least 2 upstream source nodes.');
 
   const sources = upstreamNodes.map((n) => resolveJoinSource(n));
+  // AI-facing history derived from the chat transcript. The analyser sees the
+  // prior Q&A through this (including any "Clarification by AI:" turns), so we
+  // no longer fold a separate clarifications list into the prompt.
+  const chatHistory = chatToHistory(chat);
 
   // Sources missing schema info → ask before running the analyser. Join keys
   // are derived from columns, so analysing without them yields hallucinated
@@ -1835,23 +2022,10 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   if (schemaless.length) {
     const names = schemaless.map((s) => s.sourceNodeLabel || s.sourceNodeId).join(', ');
     const q = `I don't have column information for the following join source(s): ${names}. Can you tell me the key column(s) each source contributes to the join (e.g. "orders.user_id = users.id")?`;
-    const answer = findClarificationAnswer(clarifications, q);
+    const answer = findClarificationAnswer(chat, q);
     if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'join.source_keys' });
-    pushBotMsg(chat, q);
-    pushUserMsg(chat, answer);
     // The answer becomes part of the step prompt so the analyser sees it.
     stepPrompt = `${stepPrompt}\n\nUser-provided join keys: ${answer}`;
-  }
-
-  // Fold any prior builder Q&A into the prompt so the analyser sees the user's
-  // answers. executeBuild restarts the whole build from scratch each time a
-  // clarification is answered, so without this the re-run's analyser wouldn't
-  // know what was already asked/answered and would re-ask the same question.
-  // (JoinNodeChat passes the chat history to the analyser for the same reason.)
-  for (const c of clarifications) {
-    if (c && c.question && c.answer) {
-      stepPrompt = `${stepPrompt}\n\nEarlier you asked: "${String(c.question).trim()}"\nThe user answered: "${String(c.answer).trim()}"`;
-    }
   }
 
   const sourcesInfo = sources.map((s, i) => `Source ${i + 1} (${s.sourceNodeLabel || s.sourceNodeId}):\n${describeTableSchema(s.sourceTableSchema)}`).join('\n\n');
@@ -1879,38 +2053,67 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     return [];
   })();
 
-  const analysisPrompt = ChatPrompts.join.joinAnalysisRequest(
-    stepPrompt,
-    sourcesInfo,
-    destinationCandidates,
-    'new_table',
-    availableJoinSkills,
-    {
-      hasVectorSource,
-      hasVectorDestination: false,
-    },
-  );
-  const analysis = await callJson(helpers, analysisPrompt);
-  console.log('buildJoinConfig+analysis: ', analysis)
+  // ── Who handles this turn? Decided ONCE here — see buildTransformerConfig for
+  // the full rationale. availableJoinSkills already excludes vector-db-executor,
+  // so a node that somehow stored it cannot be re-routed to it here either.
+  const pendingSkill = bypassSkills
+    ? null
+    : ((pendingSkillArg && pendingSkillArg.skillId)
+        ? pendingSkillArg
+        : (existingConfig?.pendingSkill?.skillId ? existingConfig.pendingSkill : null));
+  const routedSkillId = bypassSkills
+    ? null
+    : (pendingSkill ? pendingSkill.skillId : stickySkillId(existingConfig, availableJoinSkills));
 
-  // Mirror JoinNodeChat.analyzeJoinRequest exactly. Vector source/destination
-  // joins are handled INLINE by generateJoinQuery, not by the vector-db-executor
-  // skill — its buildSkillPrompt is built for single-source transformer flows and
-  // produces a garbled prompt when fed multi-source join params. Route those
-  // cases through the standard generate path instead.
-  if (analysis?.usesSkill && analysis?.skillId === 'vector-db-executor') {
-    analysis.usesSkill = false;
-    analysis.skillId = null;
-    if (analysis.action !== 'ask_questions' && analysis.action !== 'answer_directly') {
-      analysis.action = 'generate_join';
+  let analysis = null;
+  if (!routedSkillId) {
+    const analysisPrompt = ChatPrompts.join.joinAnalysisRequest(
+      stepPrompt,
+      sourcesInfo,
+      destinationCandidates,
+      'new_table',
+      availableJoinSkills,
+      {
+        hasVectorSource,
+        hasVectorDestination: false,
+      },
+    );
+    analysis = await callJsonResumable(helpers, analysisPrompt, { chatHistory }, { stage: 'join:analysis', resumed: resumedCalls });
+    console.log('buildJoinConfig+analysis: ', analysis)
+
+    // Mirror JoinNodeChat.analyzeJoinRequest exactly. Vector source/destination
+    // joins are handled INLINE by generateJoinQuery, not by the vector-db-executor
+    // skill — its buildSkillPrompt is built for single-source transformer flows and
+    // produces a garbled prompt when fed multi-source join params. Route those
+    // cases through the standard generate path instead.
+    if (analysis?.usesSkill && analysis?.skillId === 'vector-db-executor') {
+      analysis.usesSkill = false;
+      analysis.skillId = null;
+      if (analysis.action !== 'ask_questions' && analysis.action !== 'answer_directly') {
+        analysis.action = 'generate_join';
+      }
     }
   }
 
-  const inferred = analysis?.inferredSettings || {};
+  // Settings come from the analyser when it ran, otherwise from the node's saved
+  // joinSettings so a refinement can't silently move the destination or the
+  // target table.
+  const prevJoin = existingConfig?.joinSettings || {};
+  const inferred = analysis?.inferredSettings || {
+    destinationSelection: prevJoin.destinationSelection || existingConfig?.targetConnectionId || null,
+    operationMode:        prevJoin.operationMode || 'new_table',
+    targetTableName:      prevJoin.targetTableName || existingConfig?.targetTableName || existingConfig?.targetCollection || null,
+    joinType:             prevJoin.joinType || 'INNER',
+    joinColumns:          prevJoin.joinColumns || [],
+    selectedColumns:      prevJoin.selectedColumns || {},
+  };
   // The analyser is the single authority for whether this join needs
   // embedding/similarity-search code (Scenario B). Persist its verdict so the
-  // generation prompt below gates the vector path — same as JoinNodeChat.
-  inferred.vectorRequired = analysis?.vectorRequired === true;
+  // generation prompt below gates the vector path — same as JoinNodeChat. When
+  // it didn't run, keep whatever the node was built with.
+  inferred.vectorRequired = analysis
+    ? (analysis.vectorRequired === true)
+    : (existingConfig?.vectorRequired === true);
 
   // Honor the analyser's OWN decision instead of forcing a relational
   // "join keys" question. A vector similarity self-join has no join-key
@@ -1918,20 +2121,18 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // asked an irrelevant question while discarding the analyser's real
   // followUpQuestion (e.g. which embedding model to use). JoinNodeChat branches
   // purely on analysis.action; the headless builder now does the same.
-  if (analysis?.action === 'ask_questions' || analysis?.action === 'answer_directly') {
+  if (analysis && (analysis.action === 'ask_questions' || analysis.action === 'answer_directly')) {
     const q = String(
       analysis.followUpQuestion
       || analysis.directAnswer
       || 'Can you provide more details about how you want to join these sources?',
     ).trim();
-    const answer = findClarificationAnswer(clarifications, q);
-    // First time we hit this question → pause the build and ask the user.
-    // On the re-run the answer is already folded into stepPrompt above, so the
-    // analyser should return generate_join; if it stubbornly re-asks the same
-    // question we already have the answer and simply fall through to generation.
+    const answer = findClarificationAnswer(chat, q);
+    // First time we hit this question → pause the build and ask the user. On the
+    // re-run the answer is already in the chat history the analyser sees, so it
+    // should return generate_join; if it stubbornly re-asks we already have the
+    // answer and simply fall through to generation.
     if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'join.analysis' });
-    pushBotMsg(chat, q);
-    pushUserMsg(chat, answer);
   }
 
   // Planner-declared destination wins — skip the clarification round-trip
@@ -1941,15 +2142,24 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   if (connectionId) {
     inferred.destinationSelection = connectionId;
   }
+  // The analyser returns the whole inferredSettings block, so when it has no
+  // opinion on the destination it silently drops one the user already settled
+  // (picked in the assistant's destination picker, set via set_join_destination,
+  // or written by an earlier build). Fall back to it rather than re-asking a
+  // question the user has already answered. An analyser that DOES name a
+  // destination still wins — that is the user asking to move the output.
+  if (!inferred.destinationSelection) {
+    inferred.destinationSelection = prevJoin.destinationSelection
+      || existingConfig?.targetConnectionId
+      || null;
+  }
 
   // Ask for the destination only when neither the planner nor the analyser
   // picked one (legacy plans without connectionId on join).
   if (!inferred.destinationSelection) {
-    const q = `Where should the join result be written? Reply with a saved connection name, "local-sqlite", "local-nedb", or "local-lancedb" (a local vector table).`;
-    const answer = findClarificationAnswer(clarifications, q);
+    const q = `Where should the join result be written? Reply with a saved connection name, "local-duckdb" (a local DuckDB table), or "local-lancedb" (a local vector table).`;
+    const answer = findClarificationAnswer(chat, q);
     if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'join.destination' });
-    pushBotMsg(chat, q);
-    pushUserMsg(chat, answer);
     inferred.destinationSelection = answer.trim();
   }
 
@@ -1957,38 +2167,43 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // Mirror JoinNodeChat: a local-* destination has NO saved connection — it lands
   // in the local SQLite/NeDB workspace — so targetConn is null and the
   // destination's dbType / id come from the token (exactly like JoinNodeChat's
-  // local placeholder, and applySkillResultJoin below). resolveTargetConnection
-  // returns a fallback SOURCE connection for local tokens, which would wrongly
-  // mark every source as "already in the destination", so skip it for local.
+  // local placeholder). resolveTargetConnection returns a fallback SOURCE
+  // connection for local tokens, which would wrongly mark every source as
+  // "already in the destination", so skip it for local.
   const isLocalStorage = String(inferred.destinationSelection || '').startsWith('local-');
   const targetConn = isLocalStorage
     ? null
     : resolveTargetConnection(inferred.destinationSelection, helpers.connections, sources[0]);
   // The next four derivations are kept 1:1 with JoinNodeChat.js (generateJoin).
   const targetDbType = targetConn?.dbType
-    || (isLocalStorage ? inferred.destinationSelection.replace('local-', '') : 'sqlite');
+    || (isLocalStorage ? inferred.destinationSelection.replace('local-', '') : 'duckdb');
   const isNoSQL = targetDbType === 'mongodb' || targetDbType === 'nedb';
   const isVectorDestination = targetConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetDbType);
   const destinationConnectionId = targetConn?.id || targetConn?._id || inferred.destinationSelection;
-  const targetTableName = inferred.targetTableName || `join_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`;
+  // A name carried over from the existing node was already qualified when it was
+  // first built — don't run it through qualifyLocalTableName twice.
+  const targetTableName = (!analysis && inferred.targetTableName)
+    ? inferred.targetTableName
+    : qualifyLocalTableName(
+        inferred.targetTableName || `join_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`,
+        { workflowId, isLocal: isLocalStorage },
+      );
 
   const joinSettings = {
     userRequest: stepPrompt,
     operationMode: inferred.operationMode || 'new_table',
-    destinationSelection: inferred.destinationSelection || (targetConn?.id || targetConn?._id) || 'local-sqlite',
+    destinationSelection: inferred.destinationSelection || (targetConn?.id || targetConn?._id) || 'local-duckdb',
     targetTableName,
     joinType: inferred.joinType || 'INNER',
     joinColumns: inferred.joinColumns || [],
     selectedColumns: inferred.selectedColumns || {},
   };
 
-  // Skill-routed join: same four-action contract as the transformer
-  // skill branch above. `execute` builds the node now; `unrelateSkill`
-  // falls through to the standard generateJoinQuery path;
-  // `ask_questions` / `answer_directly` throw SkillSubagentRequired so
-  // the renderer can drive the skill conversation.
+  // ── Skill turn — one round per user message, handled exactly like a builder's
+  // own clarification (see buildTransformerConfig).
+  const activeSkillId = routedSkillId || (analysis?.usesSkill ? analysis?.skillId : null);
   let gen = null;
-  if (analysis?.usesSkill && analysis?.skillId && helpers?.pluginManager?.buildSkillPrompt) {
+  if (activeSkillId && helpers?.pluginManager?.buildSkillPrompt) {
     const context = {
       kind: 'join',
       sources,
@@ -1997,16 +2212,21 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
       operationType: isNoSQL ? 'nosql' : 'sql',
       isInsideJoinFlow: true,
     };
-    const result = await runSkillTurn(helpers, analysis.skillId, {
-      userRequest: stepPrompt,
-      currentState: analysis?.skillParams || {},
+    const skillAnswer = pendingSkill?.question ? findClarificationAnswer(chat, pendingSkill.question) : null;
+    const result = await runSkillTurn(helpers, activeSkillId, {
+      userRequest: skillAnswer || stepPrompt,
+      currentState: pendingSkill ? (pendingSkill.state || {}) : (analysis?.skillParams || {}),
       context,
+      // Resumable like the analysis/gen calls: a skill turn that runs out
+      // of room is finished by Continue and replayed here verbatim.
+      stage: 'join:skill',
+      resumed: resumedCalls,
     });
 
     if (result.action === 'execute') {
       const ep = result.executionParams || {};
       gen = {
-        explanation:       result.explanation || ep.explanation || `Built via ${analysis.skillId}.`,
+        explanation:       result.explanation || ep.explanation || `Built via ${activeSkillId}.`,
         joinColumns:       ep.joinColumns || joinSettings.joinColumns,
         sourcesConfig:     ep.sourcesConfig || [],
         joinSql:           ep.joinSql || null,
@@ -2015,21 +2235,32 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         transformFunction:  ep.transformFunction || null,
         previewSql:        ep.previewSql || null,
         vectorDestination: ep.vectorDestination || null,
-        _skillId:          analysis.skillId,
-        _skillExplanation: analysis.skillExplanation || null,
+        _skillId:          activeSkillId,
+        _skillExplanation: analysis?.skillExplanation || existingConfig?.skillExplanation || null,
       };
-    } else if (result.action === 'ask_questions' || result.action === 'answer_directly') {
-      throw new SkillSubagentRequired({
-        skillId:     analysis.skillId,
-        nodeId,
-        question:    result.question,
-        directAnswer: result.directAnswer,
-        action:      result.action,
-        state:       result.state,
-        context,
-      });
+    } else {
+      const asks     = result.action === 'ask_questions' || result.action === 'answer_directly';
+      const question = String(result.question || result.directAnswer || '').trim();
+      const rounds   = (pendingSkill?.rounds || 0) + 1;
+      if (asks && question && rounds <= MAX_SKILL_ROUNDS) {
+        throw new ClarificationNeeded(question, {
+          nodeId,
+          kind:  `skill.${activeSkillId}`,
+          skill: { skillId: activeSkillId, state: result.state || {}, question, rounds },
+        });
+      }
+      // unrelateSkill, a question with no text to show, or a dialog that never
+      // converges: gen stays null and generateJoinQuery below handles the request
+      // in this same run. The note is tagged as context so the analyser reads it
+      // next turn and doesn't immediately re-pick the skill.
+      const why = result.action === 'unrelateSkill'
+        ? `Skill "${activeSkillId}" reported that this request isn't its territory — building with the standard path instead.`
+        : (asks && !question)
+          ? `Skill "${activeSkillId}" asked for more input without saying what it needed — building with the standard path instead.`
+          : `Skill "${activeSkillId}" kept asking without converging after ${MAX_SKILL_ROUNDS} rounds — building with the standard path instead.`;
+      warnings.push(why);
+      pushBotMsg(chat, why, { metadata: { context: true } });
     }
-    // unrelateSkill — gen stays null, fall through to generateJoinQuery.
   }
 
   // Standard SQL/JS join generation when no skill was selected.
@@ -2083,7 +2314,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 
     // hasLocalConnection mirrors JoinNodeChat: any source with a local path, or a
     // destination whose dbType is a local file format (nedb / sqlite / lancedb).
-    const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['nedb', 'sqlite', 'lancedb']);
+    const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['duckdb', 'lancedb']);
     const genPrompt = ChatPrompts.join.generateJoinQuery(
       targetDbType,
       sourcesForPrompt,
@@ -2095,7 +2326,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         hasLocalConnection: sourcesForPrompt.some((s) => s.localPath) || LOCAL_DB_TYPES_FOR_PROMPT.has(targetDbType),
       },
     );
-    gen = await callJson(helpers, genPrompt);
+    gen = await callJsonResumable(helpers, genPrompt, { chatHistory }, { stage: 'join:gen', resumed: resumedCalls });
   }
   console.log('buildJoinConfig+gen: ', gen)
 
@@ -2109,6 +2340,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   return assembleJoinConfig({
     sources, stepPrompt, joinSettings, gen, warnings, chat,
     targetConn, isNoSQL, isLocalStorage, targetTableName, helpers,
+    workflowId, nodeId,
   });
 }
 
@@ -2158,18 +2390,18 @@ function enrichJoinSourcesConfig(sourcesConfig, sources, helpers) {
 function assembleJoinConfig({
   sources, stepPrompt, joinSettings, gen, warnings, chat,
   targetConn, isNoSQL, isLocalStorage, targetTableName, helpers,
+  // Scope this node's local output file. Threaded in from the caller —
+  // referencing them undeclared throws at assembly time.
+  workflowId = null, nodeId = null,
 }) {
-  // Resolve which local file format a local-* destination writes to. The token
-  // itself names the format (local-sqlite | local-nedb | local-lancedb), so a
-  // local VECTOR destination (LanceDB) is preserved instead of collapsing to
-  // SQLite. Mirrors JoinNodeChat's destination resolution (which derives the
-  // dbType from the destinationSelection token rather than the NoSQL flag).
+  // Which kind of local destination the token names. Only two exist: a local
+  // file (DuckDB) or a local vector table (LanceDB) — the vector case must be
+  // preserved rather than collapsing to a plain file. Mirrors JoinNodeChat's
+  // destination resolution.
   const localDbType = isLocalStorage
-    ? (String(joinSettings.destinationSelection || '').replace(/^local-/, '') || (isNoSQL ? 'nedb' : 'sqlite'))
+    ? (String(joinSettings.destinationSelection || '').replace(/^local-/, '') || 'duckdb')
     : null;
-  const localDestName = localDbType === 'nedb' ? 'Local NeDB'
-    : localDbType === 'lancedb' ? 'Local LanceDB'
-    : 'Local SQLite';
+  const localDestName = localDbType === 'lancedb' ? 'Local LanceDB' : 'Local file';
   const isVectorLocal = localDbType === 'lancedb';
 
   const config = {
@@ -2189,18 +2421,15 @@ function assembleJoinConfig({
     targetDbConfig: isLocalStorage ? {} : (targetConn?.dbConfig || {}),
   };
 
-  // Record the local file the join writes to (matches JoinNodeChat's
+  // Record the file the join writes to (matches JoinNodeChat's
   // config.targetLocalPath, which it sets from the execution result). The
-  // headless builder doesn't run the join, so derive the deterministic path:
-  // local SQLite → the shared userData/app-data.db workspace; local NeDB →
-  // userData/local-collections/<collection>.db. Without this, previewing the
-  // joined table (and downstream nodes that inherit sourceLocalPath) have no
-  // path to open.
+  // headless builder doesn't run the join, so derive the deterministic path —
+  // without it, previewing the joined result and downstream nodes that inherit
+  // sourceLocalPath have nothing to open.
   if (isLocalStorage) {
-    config.targetLocalPath =
-      localDbType === 'nedb' ? localNeDBPath(targetTableName)
-      : localDbType === 'lancedb' ? defaultLanceDBPath()
-      : defaultLocalSqlitePath();
+    config.targetLocalPath = localDbType === 'lancedb'
+      ? defaultLanceDBPath()
+      : localOutputPath(targetTableName, { workflowId, nodeId });
   }
 
   // Publish the joined table's schema so downstream nodes (output / transformer)
@@ -2229,6 +2458,11 @@ function assembleJoinConfig({
       targetLocalPath: config.targetLocalPath,
     };
   }
+  if (!gen?._skillId) {
+    // Standard path — drop any earlier skill binding (see assembleTransformerConfig).
+    config.skillId = null;
+    config.skillExplanation = null;
+  }
   if (gen?._skillId) {
     config.skillId = gen._skillId;
     if (gen._skillExplanation) config.skillExplanation = gen._skillExplanation;
@@ -2245,10 +2479,14 @@ function assembleJoinConfig({
     config.targetSqlExplanation = gen?.explanation || '';
   }
 
-  if (!gen?.joinSql && !gen?.javascriptFunction && !gen?.transformFunction) {
-    if (warnings && Array.isArray(warnings)) {
-      warnings.push('Join: AI did not return joinSql or javascriptFunction — open the join node in the editor to finish it.');
-    }
+  // Completeness gate — a join must carry a runnable operation: joinSql for a
+  // SQL destination, or a JS/transform function for NoSQL/vector. Skill-routed
+  // joins execute via their skill params and are exempt. Previously this only
+  // pushed a soft warning and still saved an empty join node (the empty-config
+  // join seen in the exports); fail the build loudly instead so no unrunnable
+  // node is persisted (TLX-012).
+  if (!gen?._skillId && !gen?.joinSql && !gen?.javascriptFunction && !gen?.transformFunction) {
+    throw new Error(`Join "${targetTableName}" generation was incomplete — the AI returned no joinSql or function (its output was likely truncated). Try a simpler join (exact-key match, fewer columns, no CTEs/temp tables).`);
   }
 
   const destLabel = isLocalStorage
@@ -2274,63 +2512,6 @@ function assembleJoinConfig({
   );
 
   return config;
-}
-
-/**
- * Skill-result builder for join steps. Mirrors applySkillResultTransformer.
- * Called by executeBuild when `plan.skillResults[stepIndex]` is present —
- * uses the pre-computed executionParams directly and skips the analyser
- * + generateJoinQuery entirely.
- */
-async function applySkillResultJoin({ stepPrompt, upstreamNodes, helpers, nodeId, skillResult, chat }) {
-  if (!upstreamNodes || upstreamNodes.length < 2) throw new Error('Join needs at least 2 upstream source nodes.');
-  if (!skillResult || !skillResult.executionParams) {
-    throw new Error('applySkillResultJoin requires skillResult.executionParams.');
-  }
-  const ep = skillResult.executionParams;
-  const sources = upstreamNodes.map((n) => resolveJoinSource(n));
-
-  const destinationSelection = ep.destinationSelection || skillResult.destinationSelection || (sources[0]?.sourceConnectionId);
-  const isLocalStorage = String(destinationSelection || '').startsWith('local-');
-  const targetTableName = ep.targetTableName || skillResult.targetTableName || `join_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`;
-  const targetConn = isLocalStorage ? null : resolveTargetConnection(destinationSelection, helpers.connections, sources[0]);
-  const isNoSQL = isLocalStorage
-    ? (destinationSelection === 'local-nedb')
-    : (targetConn?.dbType === 'mongodb' || targetConn?.dbType === 'nedb');
-
-  const joinSettings = {
-    userRequest: stepPrompt,
-    operationMode: ep.operationMode || 'new_table',
-    destinationSelection: destinationSelection || (targetConn?.id || targetConn?._id) || 'local-sqlite',
-    targetTableName,
-    joinType: ep.joinType || 'INNER',
-    joinColumns: ep.joinColumns || [],
-    selectedColumns: ep.selectedColumns || {},
-  };
-
-  const gen = {
-    explanation:       skillResult.explanation || ep.explanation || `Built via ${skillResult.skillId}.`,
-    joinColumns:       ep.joinColumns || joinSettings.joinColumns,
-    sourcesConfig:     ep.sourcesConfig || [],
-    joinSql:           ep.joinSql || null,
-    targetDdl:         ep.targetDdl || '',
-    javascriptFunction: ep.javascriptFunction || null,
-    transformFunction:  ep.transformFunction || null,
-    previewSql:        ep.previewSql || null,
-    vectorDestination: ep.vectorDestination || null,
-    _skillId:          skillResult.skillId,
-    _skillExplanation: skillResult.skillExplanation || null,
-  };
-
-  // Same enrichment as the standard path so a vector source carries its table
-  // name into execution (see enrichJoinSourcesConfig).
-  gen.sourcesConfig = enrichJoinSourcesConfig(gen.sourcesConfig, sources, helpers);
-
-  return assembleJoinConfig({
-    sources, stepPrompt, joinSettings, gen,
-    warnings: [], chat,
-    targetConn, isNoSQL, isLocalStorage, targetTableName, helpers,
-  });
 }
 
 function resolveTargetConnection(ref, connections, fallbackSource) {
@@ -2629,18 +2810,19 @@ The five node types (the only stepTypes you may emit) and how they relate:
     • REST API → an AI-generated fetch function pulls rows into a local
       collection (auth is injected at run time — never mention credentials).
     • Imported local file (CSV/Excel/JSON/Parquet/Avro/SQLite/NeDB/LanceDB) →
-      re-imported fresh each run into the local workspace.
+      re-imported fresh each run and read with DuckDB.
     • Cloud storage (GCS/S3/Dropbox/Drive) → can't be configured by chat;
-      at run time it lands locally as SQLite (tabular) or NeDB (JSON). No
-      vector-file import. See the picker-based rule below.
+      at run time it lands locally as a Parquet file. No vector-file import.
+      See the picker-based rule below.
     • Spreadsheet service (Google Sheets) → can't be configured by chat (same
-      rule below); lands locally as SQLite.
+      rule below); lands locally as a Parquet file.
 
 - transformer — takes exactly ONE upstream (a dataSource, transformer, or
   join) and reshapes it (filter, map, aggregate, rename, cast, derive, or
   in-place update/delete) across SQL, document, or local sources. It is a
   TERMINAL WRITE: the reshaped result is persisted to a table/collection (or a
-  local SQLite/NeDB file) as part of running — there is NO separate save step.
+  local Parquet file this node owns) as part of running — there is NO separate
+  save step.
   Its only vector ops are: vectorise/embed a column into a vector table, and
   in-place maintenance of a vector source (update/delete/tag its own records).
   Matching rows to OTHER rows by similarity is NOT a transformer — that's a
@@ -2684,22 +2866,29 @@ emits NULL columns, or writes to a place the next node can't read). Rules:
 
 - dataSource → no destination choice; it only materialises rows. Remote SQL/doc
   DBs read live; a vector source returns flattened id+metadata rows; API /
-  imported-file / picker sources land locally as SQLite (tabular) or NeDB
-  (document).
+  imported-file / picker sources land locally as a Parquet file, read with
+  DuckDB.
 
-- transformer → writes exactly ONE reshaped table, and the destination type is
-  constrained by HOW it computes:
+- transformer → writes exactly ONE reshaped table. Its destination is ONLY its
+  own SOURCE connection (storageLocation='database') or a LOCAL Parquet file
+  (storageLocation='local') — it has NO field to target a different saved
+  connection, so it can NEVER move data from connection A into connection B.
+  Copying/loading/replicating rows into a DIFFERENT connection (an ETL load with
+  no reshape) is an OUTPUT node (outputType='connection'), and a dataSource may
+  feed that output DIRECTLY (no transformer in between). Beyond that, the
+  destination type is constrained by HOW it computes:
     • Plain reshape (filter / map / aggregate / rename / cast / derive, or a
       MongoDB aggregation pipeline) → stays in the SAME engine: write back to
-      the source DB (storageLocation='database'), or to a local SQLite (tabular)
-      / NeDB (document) file (storageLocation='local'). A Mongo→Mongo aggregate
-      is fully expressible here — do NOT route it through a skill.
+      the source DB (storageLocation='database'), or to a local Parquet file
+      written and read by DuckDB (storageLocation='local'), which holds tabular
+      and document-shaped rows alike. A Mongo→Mongo aggregate is fully
+      expressible here — do NOT route it through a skill.
     • Per-row Node.js / crypto / SHA-256 / arbitrary JS logic → routed to the
-      javascript-executor skill, whose output is LOCAL-ONLY: nedb or lancedb. It
-      CANNOT write back to a SQL or Mongo server. So if you require a hash/JS
-      step AND the result must live in Mongo/SQL, that's two steps, or accept a
-      local (nedb) result. Never plan a JS-transform step that "writes back to
-      MongoDB".
+      javascript-executor skill, whose output is LOCAL-ONLY: a table in the
+      workflow's DuckDB database, or lancedb. It CANNOT write back to a SQL or
+      Mongo server. So if you require a hash/JS step AND the result must live in
+      Mongo/SQL, that's two steps, or accept a local result. Never plan a
+      JS-transform step that "writes back to MongoDB".
     • Embed / vectorise a column → routed to the vector-db-executor skill;
       output is a VECTOR table (local-lancedb, or a saved vector connection).
 
@@ -2707,15 +2896,15 @@ emits NULL columns, or writes to a place the next node can't read). Rules:
   the join KIND:
     • Plain keyed / equality join (Scenario A, incl. reading a vector source as
       a normal id+metadata table) → ANY destination: a saved connection,
-      local-sqlite, local-nedb, or local-lancedb.
+      local-duckdb, or local-lancedb.
     • Similarity / embedding join (Scenario B: "for each row find the most
       similar…", per-row embed + vector search) → the match runs as a JS
       function in Node, and the executor ONLY runs that function for a NoSQL or
-      VECTOR destination. Scenario B MUST use local-nedb, local-lancedb, or a
-      saved NoSQL/vector connection — NEVER local-sqlite or a SQL connection. A
+      VECTOR destination. Scenario B MUST use local-lancedb or a saved
+      vector connection — a plain relational destination cannot hold them. A
       SQL destination forces a static-SQL join that cannot embed or search, so
       the similarity columns come back NULL. If the user wants the FINAL match
-      result in SQLite / CSV, still write the join to local-nedb, then add an
+      result as a plain file / CSV, still write the join to local-lancedb, then add an
       Output node to export that file/format.
 
 - output → delivery only; it never computes. A file export (csv / json / excel /
@@ -2725,7 +2914,7 @@ emits NULL columns, or writes to a place the next node can't read). Rules:
 Rule of thumb: choose the destination from the KIND of execution, not just the
 data — "similarity / find-similar / semantic match" ⇒ nedb / lancedb / vector
 destination; "hash / per-row JS in a transformer" ⇒ nedb / lancedb; a plain SQL
-or Mongo reshape ⇒ that same engine or local-sqlite / local-nedb.
+or Mongo reshape ⇒ that same engine or local-duckdb.
 ${skillDocs ? `\n# Skills (optional execution paths a transformer/join may route through instead of plain SQL/NoSQL — only the ones relevant to this request are loaded)\n${skillDocs}\n` : ''}
 ${systemContext ? `# System & file-path context
 This is the user's actual machine and Ternlux's on-disk layout. When a step
@@ -2748,7 +2937,7 @@ Your output is consumed in two phases:
      envelope with ONE short follow-up. The chat assistant relays the
      question and the user answers. Prior Q&A pairs from earlier rounds
      of this same plan request live in the CHAT HISTORY — every assistant
-     message that begins with "Clarifying question:" is one of your prior
+     message that begins with "Clarification by AI:" is one of your prior
      questions, immediately followed by the user's answer. Treat that
      history as authoritative; do NOT re-ask anything already answered
      there, and do NOT expect a separate "clarifications" block in the
@@ -2875,7 +3064,7 @@ object / sheet, which only exists in the editor. The AI cannot set that path. So
   back to the original table), list both — but they must still be distinct.
 - IMPORTANT: a join IS a terminal write step for its own result. It
   ALREADY OUTPUTS the joined rows to its destination — a saved connection,
-  "local-sqlite", "local-nedb", or "local-lancedb" — as part of running
+  "local-duckdb" or "local-lancedb" — as part of running
   the join. It does
   NOT need, and MUST NOT be followed by, an Output node to persist that
   result. Same rule as transformer: do NOT chain an output step after a
@@ -2887,7 +3076,7 @@ object / sheet, which only exists in the editor. The AI cannot set that path. So
     DIFFERENT destination the join itself cannot write to: a file export
     in a format the join can't produce (csv / json / excel / parquet /
     avro), or a DIFFERENT database connection/table than the join wrote
-    to. A plain database/local-sqlite/local-nedb/local-lancedb table the
+    to. A plain database/local-duckdb/local-lancedb table the
     join already targets is NOT such a case — the join writes those
     directly (local-lancedb embeds + upserts the rows as vectors). A
     cloud-storage destination IS such a case but is MANUAL-ONLY (see the
@@ -2897,25 +3086,25 @@ object / sheet, which only exists in the editor. The AI cannot set that path. So
   Set it to ONE of:
   - The EXACT id of a saved connection from the connections list
     (the join result is written to that connection), OR
-  - The literal token "local-sqlite" — write to a local SQLite file, OR
-  - The literal token "local-nedb" — write to a local NeDB file, OR
+  - The literal token "local-duckdb" — write to a local DuckDB table, OR
   - The literal token "local-lancedb" — write to a local LanceDB vector
     table on disk (the join's rows are embedded and upserted as vectors).
   PICK THE TOKEN BY THE *KIND* OF DESTINATION THE USER ASKED FOR:
   - The user wants the result stored as a LOCAL VECTOR table — embeddings,
     a "lancedb table", something similarity-searchable, "vectorize and
     store locally" — and named no saved vector connection → "local-lancedb".
-    Do NOT downgrade a requested local vector table to "local-sqlite";
+    Do NOT downgrade a requested local vector table to "local-duckdb";
     that silently drops the embeddings. (A SAVED vector connection such as
     Pinecone is referenced by its connection id, not a local-* token.)
   - The user wants a relational / scratch table, or didn't mention
-    vectors → "local-sqlite". EXCEPTION: a SIMILARITY / embedding join
+    vectors → "local-duckdb". EXCEPTION: a SIMILARITY / embedding join
     (Scenario B — "for each row find the most similar", per-row vector
-    search) must NEVER use "local-sqlite" even though its output looks
+    search) must NEVER use "local-duckdb" even though its output looks
     tabular; a SQL destination can't run the per-row search and the match
-    columns come back NULL. Use "local-nedb" for it (then an Output node if
+    columns come back NULL. Use "local-lancedb" for it (then an Output node if
     the user wants a CSV/SQLite file of the result).
-  - The user wants a local document / NoSQL collection → "local-nedb".
+  - The user wants a local document collection → "local-duckdb" (DuckDB reads
+    nested JSON natively).
   This is the join's counterpart to 'connectionId' on dataSource —
   the builder reads it directly and does NOT re-pick the destination
   from the prompt text. If you don't know where the user wants the
@@ -2992,8 +3181,9 @@ Ask BEFORE planning if ANY of these are unknown:
   AND "manual" is not an obviously safe default for their phrasing.
 
 Ask exactly ONE short, specific question per turn (the user sees it
-verbatim in the chat). Build on previous clarifications — don't
-re-ask anything that's already in the clarifications list.
+verbatim in the chat). Build on the conversation — do NOT re-ask anything
+already answered in the chat history (your prior questions appear there
+prefixed "Clarification by AI:", each followed by the user's answer).
 
 # Output envelope
 
@@ -3022,7 +3212,7 @@ no fences.
       "stepType": "start" | "dataSource" | "transformer" | "join" | "output",
       "label": "<short human label shown in the plan UI>",
       "sources": [<stepIndex or existing nodeId>, ...],
-      "connectionId": "<REQUIRED for stepType='dataSource' (the source connection — exact id from the connections list) AND for stepType='join' (the destination — exact connection id from the list, OR the literal 'local-sqlite' / 'local-nedb' / 'local-lancedb'); omit for other stepTypes>",
+      "connectionId": "<REQUIRED for stepType='dataSource' (the source connection — exact id from the connections list) AND for stepType='join' (the destination — exact connection id from the list, OR the literal 'local-duckdb' / 'local-lancedb'); omit for other stepTypes>",
       "prompt": "<the EXACT instruction sent to the per-node builder; concrete, no placeholders>"
     }
   ],
@@ -3266,11 +3456,11 @@ function validatePlanEnvelope(out, { mode, wfSummary, connections }) {
 
     if (s.stepType === 'join') {
       if (!s.connectionId) {
-        throw new Error(`Step ${i} (join) must declare a "connectionId" — the destination where the join result is written. Use a saved connection id, or the literal "local-sqlite" / "local-nedb" / "local-lancedb".`);
+        throw new Error(`Step ${i} (join) must declare a "connectionId" — the destination where the join result is written. Use a saved connection id, or the literal "local-duckdb" / "local-lancedb".`);
       }
-      const isLocal = s.connectionId === 'local-sqlite' || s.connectionId === 'local-nedb' || s.connectionId === 'local-lancedb';
+      const isLocal = s.connectionId === 'local-duckdb' || s.connectionId === 'local-lancedb';
       if (!isLocal && connectionIds.size && !connectionIds.has(s.connectionId)) {
-        throw new Error(`Step ${i} (join) connectionId "${s.connectionId}" is not a saved connection nor "local-sqlite" / "local-nedb" / "local-lancedb". Pick one of: ${Array.from(connectionIds).join(', ')}, local-sqlite, local-nedb, local-lancedb.`);
+        throw new Error(`Step ${i} (join) connectionId "${s.connectionId}" is not a saved connection nor "local-duckdb" / "local-lancedb". Pick one of: ${Array.from(connectionIds).join(', ')}, local-duckdb, local-lancedb.`);
       }
     }
 
@@ -3331,7 +3521,7 @@ function validatePlanEnvelope(out, { mode, wfSummary, connections }) {
   });
 }
 
-async function planBuild({ userRequest, workflow, helpers, clarifications = [] }) {
+async function planBuild({ userRequest, workflow, helpers, chatHistory = [] }) {
   const connections = summarizeConnections(helpers.connections || []);
   const wfSummary = workflow ? slimWorkflowForPrompt(workflow) : null;
   const currentSteps = workflow ? summarizeWorkflowAsSteps(workflow) : null;
@@ -3346,13 +3536,19 @@ async function planBuild({ userRequest, workflow, helpers, clarifications = [] }
   // details. Skills ARE still injected (they're small and steer routing), so
   // we keep the tiny picker pass that selects only the relevant ones. Empty
   // array → no skill section is appended.
-  const relevantSkillIds = await pickRelevantSkillDocs({ helpers, userRequest, clarifications });
+  const relevantSkillIds = await pickRelevantSkillDocs({ helpers, userRequest, chatHistory });
   const skillDocs = skillDocsAsPromptSection(relevantSkillIds);
 
   const systemPrompt = buildPlannerSystemPrompt({ skillDocs, systemContext: buildSystemContext() });
-  const chatHistory  = clarificationsAsChatHistory(clarifications);
 
   let lastError = null;
+  let truncated = null;
+  // The model's raw text from the last attempt that failed on invalid JSON,
+  // read by the error envelope below. Must be declared: CommonJS modules are
+  // non-strict, so the assignment inside the loop would otherwise leak a global
+  // — and the error path would throw on reading it when no attempt ever failed
+  // that way, which is the ordinary case.
+  let lastRawResponse = '';
   for (let attempt = 0; attempt < PLAN_RETRIES; attempt++) {
     const userMessage = buildPlannerUserMessage({
       userRequest, mode, wfSummary, currentSteps, connections, lastError,
@@ -3364,7 +3560,21 @@ async function planBuild({ userRequest, workflow, helpers, clarifications = [] }
       out = await callJson(helpers, userMessage, { systemPrompt, chatHistory });
       console.log('::planBuild:: ', out)
     } catch (err) {
+      // The plan didn't fit in the output budget. Retrying just burns another
+      // call on the same too-long plan — stop and hand back everything needed
+      // to ask the model for the rest (surfaced as the chat's Continue button,
+      // finished by workflow:continuePlan).
+      if (err && err.code === 'MAX_TOKENS' && err.resume) {
+        // userRequest rides along so the resumed plan carries the same brief a
+        // first-try plan does (see out.userRequest below).
+        truncated = { ...err.resume, kind: 'plan', mode, userRequest, workflowId: workflow?.id || workflow?._id || null };
+        lastError = err.message;
+        break;
+      }
       attemptError = err.message;
+      // Keep the model's raw text when it wasn't valid JSON, so the chat can
+      // offer the same expandable "raw response" panel the node builders do.
+      if (err && err.invalidJson) lastRawResponse = err.rawResponse || '';
     }
 
     if (!attemptError) {
@@ -3399,6 +3609,11 @@ async function planBuild({ userRequest, workflow, helpers, clarifications = [] }
     if (mode === 'new' && !out.name) out.name = 'New Workflow';
     out.action = 'plan';
     out.mode = mode;
+    // The request this plan was actually built from. Carried on the envelope so
+    // the post-build reviewer can judge the workflow against the brief the
+    // planner worked to, rather than against whatever is in the chat panel at
+    // review time (which may be a different, later, or retried question).
+    out.userRequest = userRequest;
     return out;
   }
 
@@ -3409,7 +3624,66 @@ async function planBuild({ userRequest, workflow, helpers, clarifications = [] }
     action: 'error',
     message: lastError || 'Workflow planner could not produce a valid plan.',
     mode,
+    // The model's raw text when the failure was invalid JSON — shown in the
+    // chat's expandable "raw response" panel next to the retry prompt.
+    ...(lastRawResponse ? { invalidJson: true, rawResponse: lastRawResponse } : {}),
+    // Present only when the plan was cut off mid-JSON: the chat offers Continue,
+    // which finishes the envelope and re-validates it into a real plan.
+    ...(truncated ? { resume: truncated } : {}),
   };
+}
+
+/**
+ * Turn a plan envelope that was finished by a Continue round back into a
+ * validated plan — the resume path for a truncated `planBuild`.
+ *
+ * `text` is the full envelope (original partial + continuation, already
+ * joined). Validation is the same gate a first-try plan goes through, so a
+ * resumed plan is never held to a weaker standard than a fresh one.
+ *
+ * @returns {Object} the same shape planBuild returns: an `action: 'plan'`
+ *   envelope, or `action: 'error'` when the joined text still isn't a usable
+ *   plan (with `resume` when it's merely cut off again).
+ */
+function finalizePlanText({ text, mode, workflow, helpers, userRequest = '' }) {
+  const connections = summarizeConnections(helpers?.connections || []);
+  const wfSummary = workflow ? slimWorkflowForPrompt(workflow) : null;
+  const effMode = mode || (wfSummary ? 'modify' : 'new');
+
+  const body = extractFirstJsonObject(String(text || '').trim()) || String(text || '').trim();
+  let out;
+  try {
+    out = JSON.parse(body);
+  } catch (err) {
+    return {
+      action: 'error',
+      message: 'The continued plan still is not valid JSON. Try rephrasing the request, or ask for a smaller workflow.',
+      mode: effMode,
+    };
+  }
+
+  if (out.action === 'ask_questions' && out.followUpQuestion) {
+    return {
+      action: 'ask_questions',
+      followUpQuestion: String(out.followUpQuestion).trim(),
+      reasoning: out.reasoning || '',
+      mode: effMode,
+    };
+  }
+
+  try {
+    validatePlanEnvelope(out, { mode: effMode, wfSummary, connections });
+  } catch (err) {
+    return { action: 'error', message: err.message, mode: effMode };
+  }
+
+  if (effMode === 'new' && !out.name) out.name = 'New Workflow';
+  out.action = 'plan';
+  out.mode = effMode;
+  // Same brief a first-try plan carries — threaded through the resume payload
+  // so a continued plan is reviewed against the request, not the chat panel.
+  if (userRequest) out.userRequest = userRequest;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -3451,6 +3725,28 @@ function labelFor(stepType) {
   }
 }
 
+/**
+ * Carry a fact from the main chat into a node's own transcript.
+ *
+ * The builders only ever see `config.chat` — the main assistant's conversation
+ * is invisible to them. So a turn the assistant answered ITSELF ("orders has
+ * id, email, created_at") leaves no trace, and the next build request that
+ * refers back to it ("dedupe by those") reaches the builder with a dangling
+ * referent. This appends that fact as a tagged bot message so the next builder
+ * run reads it through chatToHistory.
+ *
+ * Written as a BOT message on purpose: findClarificationAnswer pairs a question
+ * with the next USER message, so injecting a user turn here would be mistaken
+ * for the answer to a still-open clarification.
+ */
+function noteNodeContext({ existingConfig = null, note }) {
+  const text = String(note || '').trim();
+  if (!text) throw new Error('note is required.');
+  const chat = Array.isArray(existingConfig?.chat) ? existingConfig.chat.map((m) => ({ ...m })) : [];
+  pushBotMsg(chat, text, { metadata: { context: true } });
+  return { chat };
+}
+
 function builderFor(stepType) {
   switch (stepType) {
     case 'start':       return buildStartConfig;
@@ -3459,6 +3755,92 @@ function builderFor(stepType) {
     case 'join':        return buildJoinConfig;
     case 'output':      return buildOutputConfig;
     default:            throw new Error(`Unknown step type: ${stepType}`);
+  }
+}
+
+/**
+ * Build (or refine) a SINGLE node's config directly — the entry point the chat
+ * assistant calls when a chat-based node is the focus: transformer, join, or a
+ * REST-API data source (File/Database data sources are form-configured, not
+ * chat-built). Routes through builderFor(nodeType) exactly like executeBuild
+ * does per step, but for one node and without assembling a whole plan.
+ *
+ * Returns one of:
+ *   { success:true, config, warnings }                         — node built
+ *   { success:false, needsClarification:true, question, kind } — ask the user
+ * A question raised by a SKILL comes back as needsClarification too, with
+ * `pendingSkill` attached so the next call resumes that skill's dialog.
+ *
+ * Follow-up answers are read straight from the node's chat history — there is
+ * no clarifications array. When a builder asks a question we commit it to the
+ * chat; the user's next reply (committed as input next turn) is its answer, and
+ * findClarificationAnswer locates it. `upstreamNodes` are the resolved upstream
+ * node objects (with data.config); `existingConfig` is the node's current
+ * config when refining (its `chat` seeds the transcript).
+ */
+async function buildNodeConfig({
+  nodeType, stepPrompt, upstreamNodes = [], helpers, nodeId,
+  existingConfig = null, connectionId = null, bypassSkills = false,
+  workflowId = null,
+}) {
+  if (nodeType !== 'transformer' && nodeType !== 'join' && nodeType !== 'dataSource') {
+    throw new Error(`buildNodeConfig supports only 'transformer', 'join', or 'dataSource' (REST API), got "${nodeType}".`);
+  }
+  const fn = builderFor(nodeType);
+  const warnings = [];
+
+  // The node's committed conversation is the single source of truth — there is
+  // NO separate clarifications array. Seed from the node's existing history so
+  // it "remembers" prior requests, then commit this turn's user input.
+  const chat = Array.isArray(existingConfig?.chat) ? existingConfig.chat.map((m) => ({ ...m })) : [];
+  if (stepPrompt && String(stepPrompt).trim()) {
+    pushUserMsg(chat, String(stepPrompt).trim(), { ref: nodeType === 'join' ? 'joinRequest' : 'transformationRequest' });
+  }
+
+  // The builder reads its follow-up answers straight from `chat`
+  // (findClarificationAnswer), derives its own AI-facing history from it
+  // (chatToHistory adds the "Clarification by AI:" prefix, which never touches
+  // this transcript), and appends only its final full-response summary.
+  try {
+    const config = await fn({
+      stepPrompt: stepPrompt || '',
+      helpers,
+      warnings,
+      nodeId,
+      upstreamNode: upstreamNodes[0] || null,
+      upstreamNodes,
+      connectionId,
+      chat,
+      existingConfig,
+      // A skill dialog parked on this node by a previous turn. Builders resume
+      // it instead of re-deciding how to build.
+      pendingSkill: existingConfig?.pendingSkill || null,
+      action: existingConfig ? 'modify' : 'add',
+      bypassSkills,
+      workflowId,
+    });
+    if (config && typeof config === 'object') {
+      config.chat = chat;
+      // The skill dialog (if any) converged — drop the parked state so a later
+      // edit of this node doesn't resume a finished conversation. The renderer
+      // MERGES this config onto the node, so the key must be written, not omitted.
+      config.pendingSkill = null;
+    }
+    return { success: true, config, chat, warnings };
+  } catch (err) {
+    if (err && err.isClarificationNeeded) {
+      // Commit the AI's follow-up question (tagged) so the user's next message
+      // is recorded right after it as the answer — the chat IS the memory.
+      // A question raised BY A SKILL is the same thing, and rides back with the
+      // skill's state (err.context.skill) so the next call resumes that dialog
+      // instead of restarting the skill cold.
+      pushBotMsg(chat, err.question, { responseRequired: true, metadata: { clarification: true } });
+      return {
+        success: false, needsClarification: true, question: err.question, chat, warnings,
+        pendingSkill: err.context?.skill || null,
+      };
+    }
+    throw err;
   }
 }
 
@@ -3611,6 +3993,13 @@ async function registerStartTriggers({ nodes, workflowId, helpers, warnings }) {
 
 async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
   const warnings = [];
+  // Resolve the workflow id UP FRONT. The persist step below used to mint it,
+  // but node builders write files (the REST API fetch materialises rows into
+  // local NeDB) long before that — so an id assigned at the end could never
+  // scope them. Reuse it verbatim when persisting.
+  const scopedWorkflowId = (plan.mode === 'modify' && workflow)
+    ? (workflow.id || workflow._id)
+    : `wf-${Date.now()}`;
   // Progress dispatch — the IPC layer forwards these to the renderer so the
   // chat can stream a live "build log" of each step. Never let a listener
   // error break the build.
@@ -3666,8 +4055,8 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
 
   // ── Resumable build cache.
   //
-  // A builder can pause the whole build by throwing ClarificationNeeded /
-  // SkillSubagentRequired. The renderer then asks the user, appends the answer
+  // A builder can pause the whole build by throwing ClarificationNeeded — its
+  // own question, or one raised by a skill. The renderer asks the user, appends the answer
   // to plan.clarifications, and calls executeBuild AGAIN. Without caching, that
   // restart re-runs (and re-pays the AI cost for) every node from step 0 — so a
   // 5-node plan where three nodes each ask a question rebuilds the whole thing
@@ -3835,6 +4224,21 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       seedChatForStep(stepChat, stepType, stepPrompt || label || '');
     }
 
+    // Builders read follow-up answers from the chat (findClarificationAnswer),
+    // not a side array. Seed any plan clarifications (accumulated across Accept
+    // retries) into the chat as tagged question → answer pairs so the builder
+    // finds them there. De-dupe against anything already inherited from the
+    // node's prior chat.
+    for (const c of stepClarifications) {
+      if (!c || !c.question) continue;
+      const qLower = String(c.question).trim().toLowerCase();
+      const already = stepChat.some((m) => m && m.sender === 'bot' && m.metadata && m.metadata.clarification
+        && String(m.text || '').trim().toLowerCase() === qLower);
+      if (already) continue;
+      pushBotMsg(stepChat, c.question, { responseRequired: true, metadata: { clarification: true } });
+      if (c.answer != null && String(c.answer).trim() !== '') pushUserMsg(stepChat, String(c.answer).trim());
+    }
+
     let config;
     try {
       const ctx = {
@@ -3844,34 +4248,27 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
         nodeId,
         upstreamNode: upstreamNodes[0] || null,
         upstreamNodes,
-        clarifications: stepClarifications,
         connectionId: connectionId || null,
         chat: stepChat,
-        chatHistory: existing ? extractBuilderPromptFromNode(existing) : [],
         existingConfig: existing?.data?.config || null,
+        // A skill dialog this plan paused on earlier (skillId + its accumulated
+        // state + the exact question asked). The builder resumes that dialog
+        // rather than re-deciding how to build the node. Same field the node
+        // route fills from config.pendingSkill.
+        pendingSkill: (plan.pendingSkills && (plan.pendingSkills[i] || plan.pendingSkills[nodeId])) || null,
         action,
         bypassSkills: !!(plan.skipSkills && (plan.skipSkills[i] || plan.skipSkills[nodeId])),
+        // Scope for any file this step writes (local NeDB collections).
+        workflowId: scopedWorkflowId,
+        // This step's finished-by-Continue AI calls, as { [stage]: result }.
+        // The builder returns each at its exact call site instead of re-asking
+        // the model, so repeated Continues accumulate rather than overwrite.
+        resumedCalls: (plan.resumedCalls && (plan.resumedCalls[i] || plan.resumedCalls[nodeId])) || null,
       };
-      // Skill-result switch: if the renderer's skill subagent already
-      // converged on execution params for this step, route through the
-      // skill-result builder INSTEAD of the main processor. The main
-      // builder (buildTransformerConfig / buildJoinConfig) is untouched.
-      const skillResult = plan.skillResults && (plan.skillResults[i] || plan.skillResults[nodeId]);
-      if (skillResult && skillResult.executionParams) {
-        ctx.skillResult = skillResult;
-        if (stepType === 'transformer') {
-          config = await applySkillResultTransformer(ctx);
-        } else if (stepType === 'join') {
-          config = await applySkillResultJoin(ctx);
-        } else {
-          throw new Error(`Skill-result builder not available for step type "${stepType}".`);
-        }
-      } else {
-        const fn = builderFor(stepType);
-        config = await fn(ctx);
-      }
+      const fn = builderFor(stepType);
+      config = await fn(ctx);
     } catch (err) {
-      if (err && (err.isClarificationNeeded || err.isSkillSubagentRequired)) {
+      if (err && err.isClarificationNeeded) {
         err.stepIndex = i;
         err.stepType = stepType;
         // Hand back everything built so far (steps 0..i-1) so the renderer can
@@ -3879,7 +4276,24 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
         err.builtSteps = builtStepsOut;
         throw err;
       }
-      throw new Error(`Step ${i} (${stepType}): ${err.message}`);
+      // This step's AI call ran out of output room. Same pause-and-resume shape
+      // as a clarification: keep the steps already built, and record which call
+      // inside this step stalled so Continue finishes only that one.
+      if (err && err.code === 'MAX_TOKENS') {
+        err.stepIndex = i;
+        err.stepType = stepType;
+        err.builtSteps = builtStepsOut;
+        err.message = `Step ${i} (${stepType}): ${err.message}`;
+        throw err;
+      }
+      const wrapped = new Error(`Step ${i} (${stepType}): ${err.message}`);
+      // Preserve the invalid-JSON raw response so the renderer can show the
+      // expandable "raw response" node for AI replies that weren't valid JSON.
+      if (err && err.invalidJson) {
+        wrapped.invalidJson = true;
+        wrapped.rawResponse = err.rawResponse;
+      }
+      throw wrapped;
     }
 
     pushBotMsg(stepChat, `Configuration saved!\n\n**${labelFor(stepType)} step:** ${stepPrompt || label || ''}`);
@@ -3984,9 +4398,8 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
 
   // ── Persist.
   const wfDb = getDb('workflows');
-  let workflowId;
+  let workflowId = scopedWorkflowId;
   if (plan.mode === 'modify' && workflow) {
-    workflowId = workflow.id || workflow._id;
     await wfDb.updateAsync(
       { $or: [{ id: workflowId }, { _id: workflowId }] },
       { $set: {
@@ -3997,7 +4410,6 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       } },
     );
   } else {
-    workflowId = `wf-${Date.now()}`;
     const doc = {
       id: workflowId,
       name: plan.name || 'New Workflow',
@@ -4044,7 +4456,12 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
 
 module.exports = {
   planBuild,
+  finalizePlanText,
+  parseBuilderJson,
   executeBuild,
+  builderFor,
+  buildNodeConfig,
+  noteNodeContext,
   computeEdgesFromFinalSteps,
   summarizeWorkflowAsSteps,
   loadNodeDocs,
@@ -4057,5 +4474,4 @@ module.exports = {
   slimWorkflowForPrompt,
   buildSystemContext,
   runSkillTurn,
-  SkillSubagentRequired,
 };

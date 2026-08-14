@@ -444,9 +444,127 @@ async function executeLocalSQLiteJoin(
   });
 }
 
+/** The file a local source is read from, or null when it isn't a local file. */
+function localFilePathOf(connection) {
+  if (!connection || connection.dbType !== 'duckdb') return null;
+  return connection.fileInfo?.filePath || connection.localPath || connection.dbConfig?.dbPath || null;
+}
+
+/**
+ * An empty relation with the right column names, so a join over a source that
+ * returned no rows still resolves instead of failing on an unknown table.
+ */
+function emptyViewSelect(selectedColumns) {
+  const columns = (selectedColumns || []).map((c) => (typeof c === 'string' ? c : c?.name)).filter(Boolean);
+  if (columns.length === 0) return 'SELECT NULL WHERE false';
+  const projection = columns.map((c) => `NULL::VARCHAR AS "${String(c).replace(/"/g, '""')}"`).join(', ');
+  return `SELECT ${projection} WHERE false`;
+}
+
+/**
+ * Run a join whose destination is local.
+ *
+ * Local file sources are registered as views straight over their files, so
+ * their rows are never copied into a staging table — the join reads the CSV or
+ * Parquet where it sits, and an upstream node's output is already a table in
+ * this workflow's database. Only genuinely remote sources are pulled across,
+ * and those land in a temporary Parquet file that is deleted afterwards.
+ *
+ * `joinSql` is a SELECT, and what it produces IS the result: it becomes this
+ * node's output table in its workflow's DuckDB database.
+ *
+ * @returns {Promise<{success, message, localPath, targetTableName, rowCount}>}
+ */
+async function executeLocalDuckDBJoin({
+  sourcesConfig,
+  joinSql,
+  targetTableName,
+  targetLocalPath,
+  pluginManager,
+  getFullConfig,
+  workflowId = null,
+  nodeId = null,
+}) {
+  const duck = require('../duckdb');
+  const DuckDB = require('../transfomers/DuckDB');
+
+  const views = [];
+  const stagedTables = [];
+  const outPath = DuckDB.resolveTargetDb(targetLocalPath, { workflowId, nodeId });
+
+  try {
+    if (!joinSql || !String(joinSql).trim()) throw new Error('Join SQL is empty');
+
+    for (const sourceConfig of sourcesConfig) {
+      const name = sourceConfig.tempTableName || sourceConfig.tableName;
+      if (!name) continue;
+
+      const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection || {};
+      const filePath = localFilePathOf(sourceConnection);
+      let body;
+
+      if (DuckDB.isWorkflowDb(filePath)) {
+        // An upstream node's output — already a table in this same database.
+        const ref = await duck.workflowTableRef(workflowId, sourceConfig.tableName || name);
+        body = `SELECT * FROM ${ref}`;
+      } else if (filePath) {
+        // The point of the whole change: read the file where it is.
+        body = `SELECT * FROM ${await duck.tableRef(filePath, sourceConnection.fileInfo?.format || null)}`;
+      } else {
+        // A source DuckDB can't read where it lies — a remote database, or a
+        // vector store. Its rows are pulled through the plugin and staged as a
+        // table in this workflow's own database, so the join never leaves
+        // DuckDB and nothing is written outside the workflow's file.
+        const rows = Array.isArray(sourceConfig._preloadedRows)
+          ? sourceConfig._preloadedRows
+          : await loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig);
+
+        if (!rows || rows.length === 0) {
+          body = emptyViewSelect(sourceConfig.selectedColumns);
+        } else {
+          const staged = `join_src_${views.length}_${name}`;
+          await duck.ingestRowsToStaging(rows, outPath, staged);
+          stagedTables.push(staged);
+          body = `SELECT * FROM ${await duck.stagingRef(outPath, staged)}`;
+        }
+      }
+
+      await duck.exec(`CREATE OR REPLACE VIEW ${duck.quoteIdentifier(name)} AS ${body}`);
+      views.push(name);
+    }
+
+    // The join result is this node's output: a table in the workflow database.
+    const rowCount = await duck.withWorkflowLock(workflowId, async () => {
+      await duck.createTableAs(workflowId, targetTableName, joinSql);
+      return duck.tableRowCount(workflowId, targetTableName);
+    });
+
+    return {
+      success: true,
+      message: `Join completed — ${rowCount} row(s) written to ${targetTableName}`,
+      localPath: outPath,
+      targetTableName,
+      rowCount,
+    };
+  } catch (error) {
+    console.error('[DuckDB Join] Error:', error);
+    return {
+      success: false,
+      message: `Local join failed: ${error.message}`,
+      error: error.stack,
+    };
+  } finally {
+    for (const name of views) {
+      try { await duck.exec(`DROP VIEW IF EXISTS ${duck.quoteIdentifier(name)}`); } catch { /* best effort */ }
+    }
+    await duck.dropStaging(outPath, stagedTables);
+  }
+}
+
 module.exports = {
   loadSourceData,
   loadSQLSourceInChunks,
   insertDataToTempTable,
-  executeLocalSQLiteJoin
+  executeLocalSQLiteJoin,
+  executeLocalDuckDBJoin
 };

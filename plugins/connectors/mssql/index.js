@@ -157,23 +157,87 @@ module.exports = {
   /**
    * Run SQL query
    */
-  runQuery: async (config, connectionId, queryObj) => {
-    try {
-      const pool = await getPool(config, connectionId);
-      // Extract SQL query from the query object
-      const sqlQuery = queryObj.query;
-      const result = await pool.request().query(sqlQuery);
-      const columns = result.recordset?.columns ? Object.keys(result.recordset.columns) : [];
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRows] - Stop after this many rows.
+   *
+   * The cap is applied by putting the request in streaming mode and cancelling
+   * it once enough rows have arrived, so the SQL the user wrote is the SQL SQL
+   * Server runs — no TOP is injected and no subquery is wrapped around it.
+   *
+   * The statement runs exactly ONCE on every path. A stream that fails is
+   * reported as a failure rather than retried unwrapped: re-running an
+   * arbitrary statement to work around a read problem is how an INSERT ends up
+   * applied twice.
+   */
+  runQuery: async (config, connectionId, queryObj, options = {}) => {
+    const maxRows = Number(options.maxRows);
+    const sqlQuery = queryObj.query;
 
-      return {
-        success: true,
-        rows: result.recordset,
-        columns,
-        rowCount: result.rowsAffected?.[0] ?? result.recordset?.length
-      };
+    if (!(maxRows > 0)) {
+      try {
+        const pool = await getPool(config, connectionId);
+        const result = await pool.request().query(sqlQuery);
+        const columns = result.recordset?.columns ? Object.keys(result.recordset.columns) : [];
+        return {
+          success: true,
+          rows: result.recordset,
+          columns,
+          rowCount: result.rowsAffected?.[0] ?? result.recordset?.length
+        };
+      } catch (error) {
+        return { success: false, message: error.message };
+      }
+    }
+
+    let pool;
+    try {
+      pool = await getPool(config, connectionId);
     } catch (error) {
       return { success: false, message: error.message };
     }
+
+    return new Promise((resolve) => {
+      const rows = [];
+      let columns = [];
+      let affected = 0;
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      try {
+        const request = pool.request();
+        request.stream = true;
+
+        request.on('recordset', (recordsetColumns) => {
+          columns = Object.keys(recordsetColumns || {});
+        });
+        request.on('row', (row) => {
+          // One past the cap, so "is there more?" is observed rather than
+          // assumed. Cancelling stops SQL Server sending the rest.
+          if (rows.length <= maxRows) rows.push(row);
+          if (rows.length > maxRows) request.cancel();
+        });
+        request.on('rowsaffected', (count) => { affected += count || 0; });
+        request.on('error', (err) => finish({ success: false, message: err.message }));
+        request.on('done', () => finish({
+          success: true,
+          rows: rows.slice(0, maxRows),
+          columns: columns.length ? columns : Object.keys(rows[0] || {}),
+          // A statement that returns no rows (DDL, or an UPDATE) reports its
+          // effect through `rowsaffected` — that is the only count there is.
+          rowCount: Math.min(rows.length, maxRows) || affected,
+          truncated: rows.length > maxRows,
+        }));
+
+        request.query(sqlQuery);
+      } catch (error) {
+        finish({ success: false, message: error.message });
+      }
+    });
   },
 
   /**
@@ -561,5 +625,35 @@ module.exports = {
    */
   getPreviewQuery: (tableName, limit = 100) => {
     return `SELECT TOP ${limit} * FROM ${tableName}`;
+  },
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
+   * function lists are unioned with the shared ANSI baseline, so only what is
+   * distinctly T-SQL belongs here.
+   */
+  explorer: {
+    language: 'sql',
+    sqlDialect: 'TransactSQL',
+    formatter: 'transactsql',
+    // runQuery honours { maxRows } by streaming and cancelling — see the note there.
+    maxRowsOption: true,
+    container: 'Schema',
+    objectLabel: 'Table',
+    // Bracket quoting comes from this connector's own quoteIdentifier; this is
+    // only the fallback, and T-SQL accepts double quotes under QUOTED_IDENTIFIER.
+    quote: '"',
+    keywords: [
+      'TOP', 'OFFSET ? ROWS', 'FETCH NEXT ? ROWS ONLY', 'OUTPUT', 'MERGE',
+      'CROSS APPLY', 'OUTER APPLY', 'PIVOT', 'UNPIVOT', 'WITH (NOLOCK)',
+      'IDENTITY', 'NVARCHAR', 'DECLARE', 'BEGIN', 'GO', 'EXEC', 'TRY_CAST',
+      'TRY_CONVERT', 'IIF', 'OVER', 'PARTITION BY',
+    ],
+    functions: [
+      'ISNULL', 'GETDATE', 'GETUTCDATE', 'SYSDATETIME', 'DATEADD', 'DATEDIFF',
+      'DATEPART', 'DATENAME', 'FORMAT', 'CONVERT', 'TRY_CONVERT', 'TRY_CAST',
+      'STRING_AGG', 'STRING_SPLIT', 'CHARINDEX', 'PATINDEX', 'STUFF', 'LEN',
+      'IIF', 'CHOOSE', 'NEWID', 'SCOPE_IDENTITY',
+    ],
   }
 };

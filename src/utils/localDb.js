@@ -256,6 +256,18 @@ export const executionsDb = {
   },
 
   /**
+   * Find the most recent still-running execution for a workflow, if any.
+   * Used to reflect an in-progress run when the editor is re-opened.
+   * @param {string} workflowId
+   * @returns {Promise<object|null>}
+   */
+  async getRunningByWorkflow(workflowId) {
+    if (!workflowId) return null;
+    const docs = await dbFind('executions', { workflowId, status: 'running' }, { startTime: -1 }, 1, 0);
+    return docs[0] || null;
+  },
+
+  /**
    * Update an execution by its executionId.
    * @param {string} executionId
    * @param {object} data - Fields to merge

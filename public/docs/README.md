@@ -43,7 +43,7 @@ anywhere except to the service the connection actually targets.
 | --- | --- |
 | [Architecture](architecture/README.md) | How Ternlux is structured, what runs locally, how runs are recorded |
 | [Plugins](plugins/README.md) | How Ternlux is extended with connectors and AI skills |
-| [Connections](connections/README.md) | Saved data sources, credential storage, OAuth |
+| [Connections](connections/README.md) | Saved data sources, credential storage, OAuth, querying a database directly |
 | [AI providers](ai-providers/README.md) | Which AI providers Ternlux supports and how it uses them |
 | [Nodes](nodes/README.md) | What each node type does and how it behaves at run time |
 | [Chat assistant](chat-assistant/README.md) | The app-wide AI assistant that answers questions, runs queries, and builds workflows |
@@ -66,6 +66,10 @@ In one workflow you can:
   generated automatically).
 - Run the whole workflow on demand, on a schedule, when a file changes,
   or in response to an HTTP webhook.
+
+Outside of workflows, you can also open any database connection in the
+[Data Explorer](connections/data-explorer.md) to browse its schema and
+run queries against it directly.
 
 Ternlux ships with a curated set of integrations and can install more
 on demand from the plugin catalog.

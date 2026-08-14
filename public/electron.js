@@ -39,17 +39,32 @@ const vectorEmbeddings = require('./lib/embeddings');
 const vectorLanceDB    = require('./lib/lancedb');
 const localNeDB        = require('./lib/nedb');
 const localSQLite      = require('./lib/sqlite');
+const localDuckDB      = require('./lib/duckdb');
 const { executeOutput } = require('./NodeExecution/outputExecutionHelpers');
 const { addExecutionLog, executeNode } = require('./NodeExecution/workflowExecutionHelpers');
 const nodeExecution = require('./NodeExecution/NodeExecution');
 const apiFetch = require('./NodeExecution/ApiFetch');
-const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, importCsvToSqlite } = require('./imports/importHelpers');
+const { runOutputValidation } = require('./NodeExecution/outputValidation');
+const {
+  importParquetToSqlite,
+  importAvroToSqlite,
+  importSpreadsheetToSqlite,
+  importCsvToSqlite,
+  importJsonToNeDB,
+  readDelimitedHead,
+  DELIMITED_EXTENSIONS,
+} = require('./imports/importHelpers');
 const SqliteConnectionPool = require('./SqliteConnectionPool');
 const { registerCronJob, unregisterCronJob, getActiveCronJobs, stopAllCronJobs } = require('./triggers/cronTriggers');
 const { registerFileWatcher, unregisterFileWatcher, getActiveFileWatchers, stopAllFileWatchers } = require('./triggers/fileWatchTriggers');
 const { registerAllWorkflowTriggers } = require('./triggers/registerAllTriggers');
 const chatAssistant = require('./chat/chatAssistant');
 const workflowBuilder = require('./chat/workflowBuilder');
+
+// Data Explorer IPC. Every `explorer:*` channel lives in public/database/,
+// which owns schema browsing, statement validation, execution and the
+// persistent query notepad. Registered below, once userData is resolvable.
+const { registerDatabaseIpc } = require('./database');
 
 // Chat prompt builders. These live in public/ChatPrompts/ and were previously
 // imported directly into the renderer. They're loaded here and exposed via
@@ -87,6 +102,26 @@ let sqlitePool = null;
 // on the same path races that rename and one fails with ENOENT. Sharing a
 // single instance per path serializes operations through NeDB's executor.
 const nedbInstanceCache = new Map();
+
+/**
+ * Adopt an already-loaded Datastore into the shared cache.
+ *
+ * A JSON import finishes with the entire collection already parsed in memory.
+ * Without this, that instance is dropped on the floor and the next reader
+ * (preview, explorer, a workflow node) goes through getOrLoadNedb, which
+ * builds a *second* Datastore and re-reads and re-parses the whole file —
+ * roughly 17 seconds of blocked main process for a 300 MB collection, after
+ * the import has already reported itself complete. Handing the loaded instance
+ * over means the data is usable the moment the progress bar finishes.
+ */
+function adoptNedbInstance(filePath, db) {
+  let mtimeMs = null;
+  try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch (_) {
+    // No file yet is fine; the next getOrLoadNedb will just reload.
+  }
+  nedbInstanceCache.set(filePath, { db, loaded: Promise.resolve(db), mtimeMs });
+}
+
 async function getOrLoadNedb(filePath) {
   // Bust the cache when the file changed on disk since we loaded it. A cached
   // instance holds an in-memory snapshot from its first load and never sees
@@ -192,6 +227,45 @@ function loadAiPrefs() {
 
 function loadDefaultProvider() {
   return loadAiPrefs().defaultProvider || null;
+}
+
+// The persisted model for the default provider (or null). Native providers
+// (openai/claude/gemini) store only the API key in llm-config.dat, so the
+// chosen model lives here — backend-internal calls read it to avoid falling
+// back to a hardcoded DEFAULT_MODELS entry (which may be a retired model).
+function loadDefaultModel() {
+  return loadAiPrefs().defaultModel || null;
+}
+
+// Fill provider + model from the persisted defaults when the caller didn't
+// specify them, so backend-internal AI calls (assistant, workflow builder,
+// titles, transforms) honor the user's saved choice instead of falling back
+// to provider priority order / a hardcoded default model. The persisted model
+// is only applied to NATIVE providers (openai/claude/gemini) and only when it
+// belongs to the default provider — compat ("Others") providers carry their
+// own model in the encrypted key entry, resolved downstream.
+function withPersistedAiDefaults(options = {}) {
+  const prefs = loadAiPrefs();
+  const provider = options.provider || prefs.defaultProvider || undefined;
+  let { model } = options;
+  if (!model && prefs.defaultModel) {
+    const p = String(provider || '').toLowerCase();
+    const isNative = ['openai', 'chatgpt', 'claude', 'gemini'].includes(p);
+    const isDefaultProvider =
+      !prefs.defaultProvider || p === String(prefs.defaultProvider).toLowerCase();
+    if (isNative && isDefaultProvider) model = prefs.defaultModel;
+  }
+  // The user's Max Tokens is the primary value for every AI call. A caller that
+  // passes its own (a 30-token title, say) still wins; when nobody specifies,
+  // aiProviders applies its own static fallback — or omits the field entirely
+  // for providers that don't require it.
+  const maxTokens = options.maxTokens || prefs.defaultMaxTokens || undefined;
+  return {
+    ...options,
+    provider,
+    ...(model ? { model } : {}),
+    ...(maxTokens ? { maxTokens } : {}),
+  };
 }
 
 // Encrypt and persist the full provider-key map to llm-config.dat.
@@ -659,6 +733,13 @@ ipcMain.handle('db:remove', async (_event, { collection, query = {}, options = {
     const matches = await db.findAsync(query);
     for (const m of (Array.isArray(matches) ? matches : [])) {
       deleteWorkflowCode(workflowDirName(m.name, m.id || m._id), codeBaseDir);
+      // The workflow's database goes with it — every node output it holds
+      // belonged to this workflow and nothing else can reach them.
+      try {
+        await require('./duckdb').dropWorkflowDb(m.id || m._id);
+      } catch (err) {
+        console.warn('[db:remove] could not drop workflow database:', err.message);
+      }
     }
   }
   return db.removeAsync(query, options);
@@ -680,6 +761,62 @@ ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 10
       };
     }
     console.log('storageType: ', storageType, filePath, sqlPreview, tableName)
+
+    // Read by DuckDB. Two shapes arrive here:
+    //
+    //   • a workflow database (.duckdb) — a node's output is a TABLE in it, so
+    //     `tableName` says which one.
+    //   • a data file (csv/json/parquet) — read in place, no import, and the
+    //     "collection" is the file itself.
+    //
+    // Either way this returns the same shape as the SQLite branch so the
+    // preview grid needs no special case.
+    //
+    // The stored preview statement is deliberately ignored: reading the output
+    // is what it was standing in for, and the rows it names have already been
+    // transformed by the time they land here.
+    if (storageType === 'duckdb') {
+      const duck = require('./duckdb');
+      try {
+        // A database — a workflow's .duckdb, or a SQLite file the user opened.
+        // Both hold several tables, so one has to be named; a connection scoped
+        // to its own tables passes one, and anything else previews the first.
+        if (/\.(duckdb|sqlite|sqlite3|db)$/i.test(filePath)) {
+          const tables = await duck.tablesAt(filePath);
+          const table = tableName || tables[0];
+          if (!table) {
+            return { success: false, message: `${path.basename(filePath)} holds no tables.` };
+          }
+          const result = await duck.readTableHeadAt(filePath, table, limit);
+          return {
+            success: true,
+            rows: result.rows,
+            rowCount: result.rowCount,
+            json: false,
+            tables,
+            currentTable: table,
+            columns: result.columns,
+          };
+        }
+
+        const result = await duck.readHead(filePath, limit);
+        const name = tableName || path.basename(filePath, path.extname(filePath));
+        return {
+          success: true,
+          rows: result.rows,
+          rowCount: result.rowCount,
+          json: false,
+          tables: [name],
+          currentTable: name,
+          // DuckDB knows the real column types, so callers don't have to infer
+          // them from the first row the way the NeDB path has to.
+          columns: result.columns,
+        };
+      } catch (error) {
+        return { success: false, message: `Failed to read ${path.basename(filePath)}: ${error.message}` };
+      }
+    }
+
     // Use passed storageType parameter instead of file extension
     const isSqlite = storageType === 'sqlite';
 
@@ -859,11 +996,11 @@ ipcMain.handle('dialog:save-file', async (_event, defaultFileName = 'output.json
     case 'excel':
       filters.push({ name: 'Excel Files', extensions: ['xlsx'] });
       break;
-    case 'nedb':
-      filters.push({ name: 'NeDB Files', extensions: ['nedb', 'db'] });
+    case 'duckdb':
+      filters.push({ name: 'DuckDB Files', extensions: ['duckdb'] });
       break;
     case 'sqlite':
-      filters.push({ name: 'SQLite Files', extensions: ['sqlite', 'db'] });
+      filters.push({ name: 'SQLite Files', extensions: ['sqlite', 'sqlite3', 'db'] });
       break;
     case 'parquet':
       filters.push({ name: 'Parquet Files', extensions: ['parquet'] });
@@ -896,6 +1033,25 @@ ipcMain.handle('dialog:save-file', async (_event, defaultFileName = 'output.json
 ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
   try {
     const XLSX = require('xlsx');
+    const duck = require('./duckdb');
+
+    // Anything DuckDB reads natively is read straight off disk — it touches
+    // only as much of the file as `limit` needs, so a 5 GB CSV previews as
+    // fast as a small one. This also covers parquet and json, which used to
+    // fall through to XLSX.readFile and simply fail.
+    if (duck.isReadable(filePath)) {
+      const { rows, columns } = await duck.readHead(filePath, limit);
+      const sheetName = path.basename(filePath, path.extname(filePath)) || 'Sheet1';
+      return {
+        success: true,
+        sheets: [sheetName],
+        data: { [sheetName]: { columns: columns.map((c) => c.name), rows } },
+      };
+    }
+
+    // Excel is the remaining case: DuckDB can't read it, and a registered
+    // workbook has already been converted to Parquet, so this only runs for a
+    // raw .xls/.xlsx path (e.g. a preview before the file is added).
     const workbook = XLSX.readFile(filePath, { sheetRows: limit + 1, cellDates: true, raw: false });
     const data = {};
     workbook.SheetNames.forEach(sheetName => {
@@ -922,12 +1078,48 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
 });
 
 /**
+ * Build the onProgress callback handed to the streaming importers. Each batch
+ * they commit sends one event back to the window that asked for the import, so
+ * the form can show real progress instead of a guessed timer. `importId` lets
+ * a renderer with several imports in flight tell them apart.
+ */
+/**
+ * file:register-local — record a local file as a data source.
+ *
+ * This replaces importing. CSV / JSON / Parquet are registered by path and
+ * never copied, so adding a 5 GB file is instant; Excel and Avro are converted
+ * to Parquet once because DuckDB cannot read them directly.
+ *
+ * Returns { success, format, converted, tables: [{ name, path, rowCount, schema }] }
+ */
+ipcMain.handle('file:register-local', async (_event, { filePath, importId = null }) => {
+  try {
+    const { registerLocalFile } = require('./imports/toParquet');
+    return await registerLocalFile(filePath, app.getPath('userData'), {
+      onProgress: makeImportProgressReporter(_event, importId),
+    });
+  } catch (error) {
+    console.error('Register local file error:', error);
+    return { success: false, message: error.message || 'Failed to register file' };
+  }
+});
+
+function makeImportProgressReporter(event, importId) {
+  if (!importId || !event?.sender || event.sender.isDestroyed()) return null;
+  return (info) => {
+    if (event.sender.isDestroyed()) return;
+    event.sender.send('import:progress', { importId, ...info });
+  };
+}
+
+/**
  * import-to-sqlite — Import CSV/Excel/Parquet/Avro file to internal SQLite database
  * Returns { success, dbPath, tableName, rowCount, message }
  */
-ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileType, sheets = [] }) => {
+ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileType, sheets = [], importId = null }) => {
   try {
     const path = require('path');
+    const onProgress = makeImportProgressReporter(_event, importId);
 
     // Use the app-wide SQLite database
     if (!appSqliteDbPath) {
@@ -969,13 +1161,13 @@ ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileTyp
     return await sqlitePool.executeWrite(async (db) => {
       // Route to appropriate parser based on file type
       if (detectedFileType === 'parquet') {
-        return await importParquetToSqlite(filePath, sanitizedTableName, db, dbPath);
+        return await importParquetToSqlite(filePath, sanitizedTableName, db, dbPath, { onProgress });
       } else if (detectedFileType === 'avro') {
-        return await importAvroToSqlite(filePath, sanitizedTableName, db, dbPath);
+        return await importAvroToSqlite(filePath, sanitizedTableName, db, dbPath, { onProgress });
       } else {
         // Default: CSV/Excel import
         // sheets parameter: empty array = import all sheets, specific sheets = import only those
-        return await importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets);
+        return await importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets, { onProgress });
       }
     });
   } catch (error) {
@@ -992,7 +1184,7 @@ ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileTyp
  * import-to-nedb — Import JSON file to internal NeDB database
  * Returns { success, dbPath, collectionName, docCount, message }
  */
-ipcMain.handle('import-to-nedb', async (_event, { filePath, collectionName }) => {
+ipcMain.handle('import-to-nedb', async (_event, { filePath, collectionName, importId = null }) => {
   try {
     // Create internal databases directory
     const userDataPath = app.getPath('userData');
@@ -1004,50 +1196,28 @@ ipcMain.handle('import-to-nedb', async (_event, { filePath, collectionName }) =>
     // Create database file
     const dbPath = path.join(dbDir, `${collectionName}.nedb`);
 
-    return new Promise((resolve, reject) => {
-      // Read JSON file
-      const jsonContent = fs.readFileSync(filePath, 'utf8');
-      let documents;
+    const db = new Datastore({ filename: dbPath });
+    await db.loadDatabaseAsync();
 
-      try {
-        const parsed = JSON.parse(jsonContent);
-        // Handle both array of documents and single document
-        documents = Array.isArray(parsed) ? parsed : [parsed];
-      } catch (parseErr) {
-        return resolve({
-          success: false,
-          message: `Invalid JSON format: ${parseErr.message}`
-        });
-      }
-
-      if (documents.length === 0) {
-        return resolve({
-          success: false,
-          message: 'No documents found in JSON file'
-        });
-      }
-
-      // Create NeDB datastore
-      const db = new Datastore({ filename: dbPath, autoload: true });
-
-      // Insert documents
-      db.insert(documents, (err, newDocs) => {
-        if (err) {
-          return resolve({
-            success: false,
-            message: `Failed to insert documents: ${err.message}`
-          });
-        }
-
-        resolve({
-          success: true,
-          dbPath,
-          collectionName,
-          docCount: newDocs.length,
-          message: `Imported ${newDocs.length} documents to NeDB`
-        });
-      });
+    // Streams a top-level JSON array in and inserts it in batches, so a large
+    // file never lands in memory as raw text plus parsed documents at once.
+    const result = await importJsonToNeDB(filePath, db, {
+      onProgress: makeImportProgressReporter(_event, importId),
     });
+
+    if (!result.success) return result;
+
+    // The collection is already loaded here — hand it to the shared cache so
+    // the first preview doesn't re-parse the file from scratch.
+    adoptNedbInstance(dbPath, db);
+
+    return {
+      success: true,
+      dbPath,
+      collectionName,
+      docCount: result.docCount,
+      message: result.message,
+    };
   } catch (err) {
     console.error('Import to NeDB error:', err);
     return { success: false, message: err.message };
@@ -1109,6 +1279,29 @@ async function getFullConfig(connectionId, baseConfig = {}) {
     // If no connectionId, assume baseConfig already has everything (e.g., test connection before saving)
     console.log('[getFullConfig] No connectionId, returning baseConfig:');
     return baseConfig;
+  }
+
+  // A local file connection keeps its location in fileInfo, not dbConfig, and
+  // most callers hand us dbConfig (which is empty for a file). Fill in the path
+  // here so any connector call for a file connection is addressable, rather
+  // than making every call site remember to reshape the config.
+  if (!baseConfig?.dbPath) {
+    try {
+      const conn = (await loadConnectionsFromDb()).find(
+        (c) => (c.id || c._id) === connectionId,
+      );
+      if (conn?.connectionType === 'file' && conn.fileInfo?.filePath) {
+        baseConfig = {
+          ...baseConfig,
+          dbPath: conn.fileInfo.filePath,
+          tables: conn.fileInfo.tables || null,
+          tablePaths: conn.fileInfo.tablePaths || null,
+          format: conn.fileInfo.format || null,
+        };
+      }
+    } catch (err) {
+      console.warn('[getFullConfig] Could not resolve file connection path:', err.message);
+    }
   }
 
   try {
@@ -1987,6 +2180,19 @@ ipcMain.handle('dbconn:list-plugins', async () => {
   }
 });
 
+// Data Explorer — registers every `explorer:*` channel. Placed here because it
+// needs getFullConfig (defined above) to resolve stored credentials the same
+// way the dbconn handlers do.
+registerDatabaseIpc({
+  ipcMain,
+  pluginManager,
+  getFullConfig,
+  getUserDataDir: () => app.getPath('userData'),
+  // Lets the explorer show a local-file connection alongside its siblings, so
+  // files can be joined to each other rather than browsed one at a time.
+  listConnections: loadConnectionsFromDb,
+});
+
 /**
  * plugins:install — download and install a plugin from the backend server
  * Returns { success, message }
@@ -2161,9 +2367,10 @@ ipcMain.handle('ai:call', async (_event, { prompt, options = {} } = {}) => {
     if (!apiKeys) {
       return { success: false, message: 'No API keys configured. Set one up in settings.' };
     }
-    // Fall back to the persisted default provider when the renderer didn't send one.
-    const provider = options.provider || loadDefaultProvider() || undefined;
-    const text = await aiProviders.callAIWithKeys(prompt, { ...options, provider, apiKeys });
+    // Fall back to the persisted default provider + model when the renderer
+    // didn't send them, so the saved choice is honored everywhere.
+    const merged = withPersistedAiDefaults(options);
+    const text = await aiProviders.callAIWithKeys(prompt, { ...merged, apiKeys });
     return { success: true, text };
   } catch (err) {
     console.error('[ai:call]', err);
@@ -2203,7 +2410,7 @@ ipcMain.handle('ai:listModels', async (_event, { provider } = {}) => {
  * ai:getDefaultProvider — the persisted "Default AI Provider" choice (or null).
  */
 ipcMain.handle('ai:getDefaultProvider', async () => {
-  return { success: true, provider: loadDefaultProvider() };
+  return { success: true, provider: loadDefaultProvider(), model: loadDefaultModel() };
 });
 
 /**
@@ -2263,13 +2470,42 @@ ipcMain.handle('ai:saveCompatProvider', async (_event, { provider, config = {} }
 });
 
 /**
+ * ai:setMaxTokens — persist the user's Max Tokens choice so backend-internal AI
+ * calls (chat, planner, node builders) use it, not just renderer calls. Stored
+ * alongside the default provider/model in the same prefs file.
+ */
+ipcMain.handle('ai:setMaxTokens', async (_event, { maxTokens } = {}) => {
+  try {
+    const value = Number(maxTokens);
+    if (!Number.isFinite(value) || value <= 0) {
+      return { success: false, error: 'maxTokens must be a positive number' };
+    }
+    const prefs = loadAiPrefs();
+    prefs.defaultMaxTokens = value;
+    fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+    return { success: true };
+  } catch (err) {
+    console.error('[ai:setMaxTokens]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+/**
  * ai:setDefaultProvider — persist the user's default provider so backend-internal
  * AI calls (chat, titles, workflow builds) use it when no provider is specified.
  */
-ipcMain.handle('ai:setDefaultProvider', async (_event, { provider } = {}) => {
+ipcMain.handle('ai:setDefaultProvider', async (_event, { provider, model } = {}) => {
   try {
     const prefs = loadAiPrefs();
     prefs.defaultProvider = provider || null;
+    // Only persist a model when it belongs to the provider we're setting. A
+    // caller that omits `model` (e.g. saving just the default-provider choice)
+    // must not wipe a previously-saved model for that same provider.
+    if (typeof model === 'string' && model) {
+      prefs.defaultModel = model;
+    } else if (!provider) {
+      prefs.defaultModel = null;
+    }
     fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
     return { success: true };
   } catch (err) {
@@ -2295,6 +2531,7 @@ ipcMain.handle('chat:step', async (_event, {
   agentMode = 'main',
   workflowSession = null,
   triggerPlanWorkflowBuild = null,
+  targetNode = null,
 } = {}) => {
   try {
     const helpers = await buildSkillHelpers();
@@ -2307,11 +2544,159 @@ ipcMain.handle('chat:step', async (_event, {
       agentMode,
       workflowSession,
       triggerPlanWorkflowBuild,
+      targetNode,
       getDb,
       helpers,
     });
   } catch (err) {
     console.error('[chat:step]', err);
+    // A turn cut off by the output limit is resumable — pass the system prompt,
+    // chat history and partial output back so the UI can offer "Continue" and
+    // finish it through ai:continue.
+    if (err && err.code === 'MAX_TOKENS') {
+      return { success: false, message: err.message, code: 'MAX_TOKENS', resume: err.resume || null };
+    }
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * chat:run-approved-javascript — execute AI-generated code the USER approved.
+ *
+ * run_javascript only ever generates and parks a function; this is the one
+ * path that runs it, and it exists solely to be called from the renderer's
+ * Approve button. The model cannot reach it — it is not a tool.
+ */
+ipcMain.handle('chat:run-approved-javascript', async (_event, { runToken, provider = null } = {}) => {
+  try {
+    if (!runToken) return { success: false, message: 'runToken is required' };
+    const helpers = await buildSkillHelpers();
+    const result = await chatAssistant.runApprovedJavascript({ runToken, helpers, provider });
+    return { success: true, result };
+  } catch (err) {
+    console.error('[chat:run-approved-javascript]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * chat:discard-javascript — drop a parked function the user declined, so the
+ * code and the source rows it captured don't sit in memory until they age out.
+ */
+ipcMain.handle('chat:discard-javascript', async (_event, { runToken } = {}) => {
+  try {
+    return { success: true, discarded: chatAssistant.discardPendingJavascript(runToken) };
+  } catch (err) {
+    return { success: false, message: err.message };
+  }
+});
+
+/**
+ * ai:continue — the one place a cut-off answer gets finished.
+ *
+ * Every truncation hands back a `resume` payload (system prompt, chat history,
+ * original prompt, partial output). `resume.kind` says what the finished text
+ * has to become before it's useful to the caller:
+ *
+ *   undefined  plain text  → the chat shows the joined answer
+ *   'plan'     a workflow plan envelope → re-validated into a plan card
+ *   'build'    one AI call inside a build → parsed and returned as
+ *              `resumedCall`, which the renderer parks on
+ *              plan.resumedCalls[stepIndex] so the re-run skips straight to it
+ *
+ * If the continuation is itself cut off, a fresh `resume` comes back carrying
+ * everything produced so far — plus this payload's own kind/context — so
+ * Continue can be pressed again.
+ */
+ipcMain.handle('ai:continue', async (_event, { resume = null } = {}) => {
+  try {
+    if (!resume || !resume.partialText) {
+      return { success: false, message: 'Nothing to continue — no partial output was captured.' };
+    }
+    const apiKeys = loadApiKeys();
+    if (!apiKeys) {
+      return { success: false, message: 'No API keys configured. Set one up in settings.' };
+    }
+
+    const text = await aiProviders.continueAI(resume, { apiKeys });
+
+    if (resume.kind === 'plan') {
+      const helpers = await buildSkillHelpers();
+      let workflow = null;
+      if (resume.workflowId) {
+        const wfDb = getDb('workflows');
+        workflow = await wfDb.findOneAsync({ $or: [{ id: resume.workflowId }, { _id: resume.workflowId }] });
+      }
+      const plan = workflowBuilder.finalizePlanText({
+        text, mode: resume.mode, workflow, helpers, userRequest: resume.userRequest || '',
+      });
+      if (plan.action === 'plan') {
+        return {
+          success: true,
+          workflowPlan: plan,
+          message: `Here's the plan I'd build (${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'}). Accept to apply it, or Cancel.`,
+        };
+      }
+      if (plan.action === 'ask_questions') {
+        return { success: true, message: plan.followUpQuestion, clarification: true };
+      }
+      return { success: false, message: `I couldn't produce a valid workflow plan: ${plan.message}` };
+    }
+
+    if (resume.kind === 'validation') {
+      const wfDb = getDb('workflows');
+      const workflow = await wfDb.findOneAsync({ $or: [{ id: resume.workflowId }, { _id: resume.workflowId }] });
+      if (!workflow) return { success: false, message: `Workflow not found: ${resume.workflowId}` };
+      const helpers = await buildSkillHelpers();
+      // Re-enter the author loop with the finished turn: the scratchpad replays
+      // what was already investigated, and `resumedTurn` stands in for the call
+      // that ran out of room, so nothing before it is paid for twice.
+      const gen = await chatAssistant.generateValidationFunction({
+        workflow,
+        helpers,
+        getDb,
+        scratchpad: pendingValidationScratchpads.get(String(resume.workflowId)) || [],
+        resumedTurn: text,
+      });
+      pendingValidationScratchpads.delete(String(resume.workflowId));
+      return {
+        success: true,
+        outputValidation: await persistOutputValidation(workflow, gen),
+        message: 'Validation function generated.',
+      };
+    }
+
+    if (resume.kind === 'build') {
+      let value = text;
+      if (resume.format !== 'text') {
+        // JSON calls feed a parsed object straight into the builder, so the
+        // build can only resume once the joined text actually parses —
+        // otherwise the same call would just fail again on re-entry.
+        value = workflowBuilder.parseBuilderJson(text);
+        if (!value) {
+          return { success: false, message: 'The continued response still is not valid JSON. Raise Max Tokens in Settings → AI Provider and rebuild.' };
+        }
+      }
+      return {
+        success: true,
+        stepIndex: resume.stepIndex ?? null,
+        resumedCall: { stage: resume.stage || null, value },
+      };
+    }
+
+    return { success: true, text };
+  } catch (err) {
+    console.error('[ai:continue]', err);
+    if (err && err.code === 'MAX_TOKENS') {
+      // Cut off again. Keep any investigation the re-entered run added, then
+      // carry this payload's kind/context onto the extended partial so another
+      // Continue lands in the same branch above.
+      if (resume.kind === 'validation' && err.scratchpad) {
+        pendingValidationScratchpads.set(String(resume.workflowId), err.scratchpad);
+      }
+      const next = err.resume ? { ...resume, ...err.resume } : null;
+      return { success: false, message: err.message, code: 'MAX_TOKENS', resume: next };
+    }
     return { success: false, message: err.message };
   }
 });
@@ -2395,60 +2780,208 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
         stepIndex: err.stepIndex,
         stepType: err.stepType || null,
         kind: err.context?.kind || null,
+        // Set when the question came from a SKILL: { skillId, state, question,
+        // rounds }. The renderer parks it on plan.pendingSkills[stepIndex] so the
+        // resumed build continues that skill dialog instead of restarting it.
+        pendingSkill: err.context?.skill || null,
         // Nodes already built this pass — the renderer passes them back so the
         // resumed build skips them instead of rebuilding from step 0.
         builtSteps: err.builtSteps || null,
       };
     }
-    // Skill subagent required — surface enough state for the renderer to
-    // drive the skill conversation via chat:skillStep until the skill
-    // either returns `execute` (re-run executeBuild with plan.skillResults)
-    // or the user closes out (re-run with plan.skipSkills).
-    if (err && err.isSkillSubagentRequired) {
+    // A step's AI call ran out of output room. Like a clarification, this is a
+    // pause rather than a failure: hand back the steps already built plus the
+    // payload needed to finish that one call, so Continue resumes right there.
+    if (err && err.code === 'MAX_TOKENS') {
+      console.warn('[workflow:executeBuild] truncated at step', err.stepIndex, err.resumeStage);
       return {
         success: false,
-        needsSkillSubagent: true,
-        skillId:   err.skillId,
-        nodeId:    err.nodeId,
-        stepIndex: err.stepIndex,
-        stepType:  err.stepType || null,
-        action:    err.action,
-        question:  err.question,
-        directAnswer: err.directAnswer,
-        state:     err.state || {},
-        context:   err.context || {},
-        // See needsClarification above — lets the resumed build skip rebuilt nodes.
+        code: 'MAX_TOKENS',
+        message: err.message,
+        stepIndex: err.stepIndex ?? null,
+        stepType: err.stepType || null,
         builtSteps: err.builtSteps || null,
+        // Everything ai:continue needs, in one payload: kind routes it to the
+        // build branch, stage says which call inside the step stalled.
+        resume: err.resume
+          ? {
+              ...err.resume,
+              kind: 'build',
+              stage: err.resumeStage || null,
+              // 'json' calls must parse before the build can resume; 'text'
+              // calls (skill turns) are replayed verbatim.
+              format: err.resumeFormat || 'json',
+              stepIndex: err.stepIndex ?? null,
+            }
+          : null,
       };
     }
     console.error('[workflow:executeBuild]', err);
+    return {
+      success: false,
+      message: err.message,
+      // Surface the raw AI reply when it wasn't valid JSON, so the renderer can
+      // show it in an expandable "raw response" node.
+      ...(err.invalidJson ? { invalidJson: true, rawResponse: err.rawResponse || '' } : {}),
+    };
+  }
+});
+
+/**
+ * workflow:generateValidation — author (or re-author) a workflow's output-
+ * validation function via chatAssistant.generateValidationFunction, then persist
+ * it onto the workflow doc. Wired from the save-screen "Generate validation"
+ * button. Streams progress on the shared workflow:buildProgress channel.
+ */
+// Investigation done by a validation-author run that stopped at the output
+// limit, keyed by workflow id. Kept main-side so the (potentially large, and
+// tool-result-bearing) scratchpad never has to survive an IPC round trip — the
+// renderer only carries the small resume payload. Cleared once the run lands.
+const pendingValidationScratchpads = new Map();
+
+// Persist an authored validation onto its workflow. Shared by the initial run
+// and the Continue path so both write exactly the same record.
+async function persistOutputValidation(workflow, gen) {
+  const wfDb = getDb('workflows');
+  const outputValidation = {
+    enabled: true,
+    goal: gen.goal,
+    validationFunction: gen.validationFunction,
+    explanation: gen.explanation,
+    generatedAt: new Date().toISOString(),
+    signature: chatAssistant.workflowSignature(workflow),
+  };
+  await wfDb.updateAsync(
+    { $or: [{ id: workflow.id || workflow._id }, { _id: workflow._id || workflow.id }] },
+    { $set: { outputValidation, updatedAt: new Date().toISOString() } },
+    {},
+  );
+  return outputValidation;
+}
+
+ipcMain.handle('workflow:generateValidation', async (event, { workflowId } = {}) => {
+  try {
+    if (!workflowId) return { success: false, message: 'workflowId is required' };
+    const wfDb = getDb('workflows');
+    const workflow = await wfDb.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+    if (!workflow) return { success: false, message: `Workflow not found: ${workflowId}` };
+
+    const helpers = await buildSkillHelpers();
+    const onProgress = (evt) => {
+      try {
+        if (!event.sender.isDestroyed()) event.sender.send('workflow:buildProgress', evt);
+      } catch (_) { /* best-effort */ }
+    };
+    const gen = await chatAssistant.generateValidationFunction({ workflow, helpers, getDb, onProgress });
+
+    pendingValidationScratchpads.delete(String(workflowId));
+    return { success: true, outputValidation: await persistOutputValidation(workflow, gen) };
+  } catch (err) {
+    // Out of output room mid-authoring: park the investigation and hand back a
+    // resume payload so the editor can offer Continue.
+    if (err && err.code === 'MAX_TOKENS' && err.resume) {
+      pendingValidationScratchpads.set(String(workflowId), err.scratchpad || []);
+      return {
+        success: false,
+        code: 'MAX_TOKENS',
+        message: err.message,
+        resume: { ...err.resume, kind: 'validation', workflowId: String(workflowId) },
+      };
+    }
+    console.error('[workflow:generateValidation]', err);
     return { success: false, message: err.message };
   }
 });
 
 /**
- * chat:skillStep — one round-trip with a skill subagent. The renderer
- * calls this for every user reply while a skill subagent is active.
- * Returns { success, action, question?, directAnswer?, executionParams?,
- * state, explanation? } where action is one of
- *   execute | ask_questions | answer_directly | unrelateSkill.
+ * workflow:validateChange — review a just-applied change before it runs.
+ *
+ * Called from the chat after a workflow is created, after one is modified, and
+ * after a single node is rebuilt. Answers "does this pipeline actually do what
+ * the user asked for?" using the slimmed workflow plus the conversation that
+ * produced it, and — when the workflow carries an output-validation function —
+ * whether that function has drifted from the edited pipeline.
+ *
+ * `pendingNode` overlays a node config the renderer has applied but not yet
+ * persisted, so a node edit is reviewed as the user sees it rather than against
+ * a stale document.
  */
-ipcMain.handle('chat:skillStep', async (_event, { skillId, userMessage, currentState = {}, context = {} } = {}) => {
+ipcMain.handle('workflow:validateChange', async (_event, {
+  workflowId, change = {}, chatHistory = [], pendingNode = null,
+} = {}) => {
   try {
-    if (!skillId) return { success: false, message: 'skillId is required' };
-    if (!userMessage || !String(userMessage).trim()) {
-      return { success: false, message: 'userMessage is required' };
+    if (!workflowId) return { success: false, message: 'workflowId is required' };
+    const wfDb = getDb('workflows');
+    const workflow = await wfDb.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+    if (!workflow) return { success: false, message: `Workflow not found: ${workflowId}` };
+
+    // Overlay the in-flight node config (applied in the editor, not yet saved).
+    let reviewed = workflow;
+    if (pendingNode && pendingNode.nodeId && pendingNode.config) {
+      const nodes = workflow.nodes || [];
+      const found = nodes.some((n) => n.id === pendingNode.nodeId);
+      reviewed = {
+        ...workflow,
+        nodes: found
+          ? nodes.map((n) => (
+            n.id === pendingNode.nodeId
+              ? { ...n, data: { ...(n.data || {}), config: { ...(n.data?.config || {}), ...pendingNode.config } } }
+              : n
+          ))
+          // A node added on the canvas and configured from chat has never been
+          // saved, so there is nothing to overlay onto. Appending it is the
+          // whole point of pendingNode: reviewing against a document that does
+          // not contain the node under review can only ever report it missing.
+          : [...nodes, {
+            id: pendingNode.nodeId,
+            type: pendingNode.nodeType || pendingNode.config.nodeType || 'transformer',
+            data: { label: pendingNode.label || pendingNode.nodeId, config: pendingNode.config },
+          }],
+      };
     }
+
     const helpers = await buildSkillHelpers();
-    const result = await workflowBuilder.runSkillTurn(helpers, skillId, {
-      userRequest:  String(userMessage),
-      currentState,
-      context,
+    const review = await chatAssistant.validateWorkflowChange({
+      workflow: reviewed, helpers, change, chatHistory,
     });
-    return { success: true, ...result };
+
+    // Only meaningful once a validation function exists; checkValidationDrift
+    // short-circuits (no AI call) when the structure signature is unchanged.
+    let drift = { drifted: false, reason: '' };
+    if (reviewed.outputValidation && reviewed.outputValidation.enabled) {
+      drift = await chatAssistant.checkValidationDrift({ workflow: reviewed, helpers });
+    }
+
+    return { success: true, ...review, drift };
   } catch (err) {
-    console.error('[chat:skillStep]', err);
-    return { success: false, message: err.message };
+    console.error('[workflow:validateChange]', err);
+    // Never block the user's work on a failed review.
+    return {
+      success: true,
+      valid: true,
+      inconclusive: true,
+      reason: `Could not review the change: ${err.message}`,
+      issues: [],
+      remediation: [],
+      drift: { drifted: false, reason: '' },
+    };
+  }
+});
+
+/**
+ * workflow:checkValidationDrift — lightweight check (one AI call, skipped when
+ * structure is unchanged) of whether an edited workflow has drifted from the
+ * goal its saved validation function was written for. Called on save from the
+ * editor. `workflow` is the in-progress edited doc (may be unsaved).
+ */
+ipcMain.handle('workflow:checkValidationDrift', async (_event, { workflow } = {}) => {
+  try {
+    if (!workflow) return { drifted: false, reason: '' };
+    const helpers = await buildSkillHelpers();
+    return await chatAssistant.checkValidationDrift({ workflow, helpers });
+  } catch (err) {
+    console.error('[workflow:checkValidationDrift]', err);
+    return { drifted: false, reason: '' };
   }
 });
 
@@ -2525,8 +3058,9 @@ async function buildSkillHelpers(defaultDbPath = null) {
   const apiKeys = loadApiKeys() || {};
   const connections = await loadConnectionsFromDb();
 
-  const LOCAL_DB_TYPES = new Set(['nedb', 'sqlite', 'lancedb']);
+  const LOCAL_DB_TYPES = new Set(['duckdb', 'nedb', 'sqlite', 'lancedb']);
   const localLib = (dbType) => {
+    if (dbType === 'duckdb')  return localDuckDB;
     if (dbType === 'nedb')    return localNeDB;
     if (dbType === 'sqlite')  return localSQLite;
     if (dbType === 'lancedb') return vectorLanceDB;
@@ -2542,12 +3076,27 @@ async function buildSkillHelpers(defaultDbPath = null) {
    * matching nedb/sqlite/lancedb, or an object that carries a matching
    * `dbType`.
    */
+  /**
+   * Local stores are addressed by dbType ('sqlite'), but the app itself refers
+   * to them two other ways: the config token a node stores as its destination
+   * (`local-duckdb`) and the display name it generates (`Local file`). Both
+   * appear in node configs, so AI-authored code reaches for them and lands in
+   * the saved-connection lookup, which fails with "Connection not found:
+   * Local SQLite". Treat them as what they are — the same local store.
+   * Anything else still falls through to the saved-connection path.
+   */
+  const localDbTypeFromAlias = (value) => {
+    if (typeof value !== 'string') return null;
+    const key = value.trim().toLowerCase().replace(/^local[-\s]+/, '');
+    return LOCAL_DB_TYPES.has(key) ? key : null;
+  };
+
   const resolveLocal = (connection, perCallDbPath) => {
     const dbPath = perCallDbPath || defaultDbPath;
     if (!dbPath) return null;
     let dbType = null;
-    if (typeof connection === 'string' && LOCAL_DB_TYPES.has(connection)) {
-      dbType = connection;
+    if (typeof connection === 'string') {
+      dbType = localDbTypeFromAlias(connection);
     } else if (connection && typeof connection === 'object' && LOCAL_DB_TYPES.has(connection.dbType)) {
       dbType = connection.dbType;
     }
@@ -2670,9 +3219,32 @@ async function buildSkillHelpers(defaultDbPath = null) {
 
   /** Call AI from inside a skill or from generated code. Routes through aiProviders. */
   async function callAI(prompt, options = {}) {
-    // Honor the user's "Default AI Provider" when the caller didn't specify one.
-    const provider = options.provider || loadDefaultProvider() || undefined;
-    return aiProviders.callAIWithKeys(prompt, { ...options, provider, apiKeys });
+    // Honor the user's saved "Default AI Provider" (and its model) when the
+    // caller didn't specify them.
+    const merged = withPersistedAiDefaults(options);
+    return aiProviders.callAIWithKeys(prompt, { ...merged, apiKeys });
+  }
+
+  /**
+   * Native tool-calling variant for agent loops: takes neutral turns + tool
+   * schemas, returns structured tool calls. Only for providers with a real tool
+   * API — check aiSupportsTools first; this throws for the rest.
+   */
+  async function callAITools(options = {}) {
+    const merged = withPersistedAiDefaults(options);
+    return aiProviders.callAIToolsWithKeys({ ...merged, apiKeys });
+  }
+
+  /**
+   * Whether the provider that WOULD actually serve this call supports tools.
+   * Resolves the same way callAITools does — through the user's saved default
+   * and the configured keys — so a caller passing no provider gets an answer
+   * about the provider it will really reach, not about undefined.
+   */
+  function aiSupportsTools(provider) {
+    const merged = withPersistedAiDefaults(provider ? { provider } : {});
+    const picked = aiProviders.pickProvider(apiKeys, merged.provider);
+    return !!picked && aiProviders.providerSupportsTools(picked.provider);
   }
 
   /** Generate embeddings using the shared vector-embeddings library. */
@@ -2701,6 +3273,8 @@ async function buildSkillHelpers(defaultDbPath = null) {
     connections,                               // [{ _id/id, name, dbType, dbCategory, dbConfig, ... }]
     getConnection: requireConnection,
     callAI,
+    callAITools,
+    aiSupportsTools,
     runQuery,
     getTables,
     getColumns,
@@ -3082,41 +3656,32 @@ ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fil
         collectionName
       });
 
-      result = await new Promise((resolve) => {
-        // Reuse existing import-to-nedb logic
-        const userDataPath = app.getPath('userData');
-        const dbDir = path.join(userDataPath, 'internal_databases');
-        if (!fs.existsSync(dbDir)) {
-          fs.mkdirSync(dbDir, { recursive: true });
-        }
+      // Reuse the streaming import-to-nedb logic
+      const userDataPath = app.getPath('userData');
+      const dbDir = path.join(userDataPath, 'internal_databases');
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+      }
 
-        const dbPath = path.join(dbDir, `${collectionName}.db`);
+      const dbPath = path.join(dbDir, `${collectionName}.db`);
+
+      try {
         const db = new Datastore({ filename: dbPath });
-
-        db.loadDatabase((err) => {
-          if (err) {
-            resolve({ success: false, message: err.message });
-            return;
+        await db.loadDatabaseAsync();
+        const importResult = await importJsonToNeDB(tmpFilePath, db);
+        if (importResult.success) adoptNedbInstance(dbPath, db);
+        result = importResult.success
+          ? {
+            success: true,
+            localPath: dbPath,
+            dbType: 'nedb',
+            tables: [collectionName],
+            message: importResult.message,
           }
-
-          const jsonData = JSON.parse(fs.readFileSync(tmpFilePath, 'utf8'));
-          const docs = Array.isArray(jsonData) ? jsonData : [jsonData];
-
-          db.insert(docs, (insertErr, newDocs) => {
-            if (insertErr) {
-              resolve({ success: false, message: insertErr.message });
-            } else {
-              resolve({
-                success: true,
-                localPath: dbPath,
-                dbType: 'nedb',
-                tables: [collectionName],
-                message: `Imported ${newDocs.length} documents`
-              });
-            }
-          });
-        });
-      });
+          : importResult;
+      } catch (err) {
+        result = { success: false, message: err.message };
+      }
     } else {
       // Import to SQLite (CSV, Excel, Parquet, Avro, etc.) with container prefix
       const baseTableName = path.basename(baseFileName, ext).replace(/[^a-zA-Z0-9_]/g, '_');
@@ -3236,6 +3801,51 @@ ipcMain.handle('dbconn:execute-output', async (_event, sourceConnection, sourceT
  * Execute an entire workflow using executionSteps from the workflow
  * Logs each step to the executions collection
  */
+/**
+ * workflow:executeNode — run ONE node, exactly the way a full workflow run
+ * would run it (same executeNode dispatch, same helpers bundle).
+ *
+ * This is what the chat assistant's "Run this node" button calls after the user
+ * approves a config it built. It is deliberately not recorded as an execution:
+ * nothing was scheduled and no other node ran, so an executions row would
+ * misreport the workflow's history. Upstream nodes are NOT run — the node reads
+ * whatever its sources last produced, which is what makes the approval
+ * meaningful (the user is agreeing to this one write, not a cascade).
+ */
+ipcMain.handle('workflow:executeNode', async (_event, { workflowId, nodeId, nodes, edges } = {}) => {
+  try {
+    if (!nodeId || !Array.isArray(nodes)) {
+      return { success: false, message: 'nodeId and nodes are required.' };
+    }
+    const nodeMap = new Map();
+    nodes.forEach((n) => nodeMap.set(n.id, n));
+    const node = nodeMap.get(nodeId);
+    if (!node) return { success: false, message: `Node ${nodeId} is not part of this workflow.` };
+
+    const helpers = {
+      pluginManager,
+      getFullConfig,
+      getDb,
+      appSqliteDbPath,
+      sqlitePool,
+      buildSkillHelpers,
+      workflowId,
+    };
+
+    const started = Date.now();
+    const result = await executeNode(node, nodeMap, edges || [], helpers);
+    return {
+      success: !!result?.success,
+      message: result?.message || (result?.success ? 'Node executed successfully.' : 'Node execution failed.'),
+      recordsProcessed: result?.recordsProcessed || 0,
+      duration: Date.now() - started,
+    };
+  } catch (err) {
+    console.error('[workflow:executeNode]', err);
+    return { success: false, message: err.message || String(err) };
+  }
+});
+
 ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, nodes, edges, executionSteps }) => {
   const executionsDb = getDb('executions');
   const startTime = new Date().toISOString();
@@ -3295,7 +3905,8 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       getDb,
       appSqliteDbPath,
       sqlitePool,
-      buildSkillHelpers          // available for output / vector skill calls
+      buildSkillHelpers,         // available for output / vector skill calls
+      workflowId                 // scopes local NeDB output per workflow/node
     };
 
     // Execute each node in order from executionSteps
@@ -3371,6 +3982,26 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
         await addExecutionLog(executionsDb, executionId, 'error', `Node execution failed: ${nodeError.message}`, nodeId);
         throw nodeError;
       }
+    }
+
+    // Output validation — every node has produced its output, so run the
+    // workflow's validate(ctx) function (if enabled) before marking the run
+    // completed. A failed validation never fails the run: we keep status
+    // 'completed' and record the result for the UI to surface.
+    try {
+      const wfDoc = await getDb('workflows').findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+      const validation = await runOutputValidation({ workflow: wfDoc, helpers });
+      if (validation) {
+        executionRecord.validation = validation;
+        executionRecord.results.validation = validation;
+        await addExecutionLog(
+          executionsDb, executionId,
+          validation.valid ? 'info' : 'warning',
+          validation.valid ? 'Output validation passed' : `Output validation failed: ${validation.reason}`,
+        );
+      }
+    } catch (validationErr) {
+      console.error('[Workflow Execution] Output validation error:', validationErr);
     }
 
     // Workflow completed successfully
@@ -3541,7 +4172,8 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       getDb,
       appSqliteDbPath,
       sqlitePool,
-      buildSkillHelpers          // available for output / vector skill calls
+      buildSkillHelpers,         // available for output / vector skill calls
+      workflowId                 // scopes local NeDB output per workflow/node
     };
 
     let totalRecordsProcessed = 0;
@@ -3627,6 +4259,24 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       }
     }
 
+    // Output validation — run the workflow's validate(ctx) function (if
+    // enabled) now that every node has produced its output. Never fails the
+    // run; the result is recorded for the UI.
+    let validation = null;
+    try {
+      validation = await runOutputValidation({ workflow, helpers });
+      if (validation) {
+        await addExecutionLog(
+          executionsDb,
+          executionId,
+          validation.valid ? 'info' : 'warning',
+          validation.valid ? 'Output validation passed' : `Output validation failed: ${validation.reason}`,
+        );
+      }
+    } catch (validationErr) {
+      console.error('[Trigger] Output validation error:', validationErr);
+    }
+
     // Mark as completed
     const endTime = new Date().toISOString();
     const duration = new Date(endTime) - new Date(startTime);
@@ -3639,7 +4289,8 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
           endTime,
           duration,
           'results.totalRecordsProcessed': totalRecordsProcessed,
-          'results.summary': `Workflow completed successfully. Processed ${totalRecordsProcessed} records.`
+          'results.summary': `Workflow completed successfully. Processed ${totalRecordsProcessed} records.`,
+          ...(validation ? { validation, 'results.validation': validation } : {})
         }
       }
     );
@@ -3822,9 +4473,13 @@ function createWindow() {
     return { action: 'deny' };
   });
 
-  // Tear down any editor code watchers this window registered.
+  // Tear down any editor code watchers this window registered. The id is read
+  // now, not inside the handler: by the time 'destroyed' fires the WebContents
+  // is gone, and touching it throws "Object has been destroyed" — which, on
+  // quit, takes the whole process down with it.
+  const webContentsId = win.webContents.id;
   win.webContents.on('destroyed', () => {
-    unwatchAllForWebContents(win.webContents.id).catch((err) =>
+    unwatchAllForWebContents(webContentsId).catch((err) =>
       console.error('[CodeWatch] cleanup on window close failed:', err));
   });
 }
@@ -3954,6 +4609,15 @@ app.on('before-quit', async (event) => {
     console.log('[Electron] Closing SQLite connection pool...');
     await sqlitePool.close();
     sqlitePool = null;
+  }
+
+  // Checkpoint every attached workflow database so none is left with a
+  // write-ahead log beside it, then release the DuckDB connection.
+  try {
+    console.log('[Electron] Closing DuckDB...');
+    await require('./duckdb').close();
+  } catch (err) {
+    console.warn('[Electron] DuckDB close failed:', err.message);
   }
 
   app.exit(0);

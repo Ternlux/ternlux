@@ -40,14 +40,14 @@ The user just wants to read records (id + metadata fields) and join them by equa
 The user wants embeddings or similarity search to participate in the join logic itself: "find rows similar to …", "for each customer match the most relevant article", "embed this column and upsert", "vectorize the bio column", "semantic match on the description".
 - The actual embedding + similarity-search code runs **locally in Node**, inside an async \`javascriptFunction\` you'll emit at the next step. The function uses \`ctx.vectorize(texts, ...)\` to embed and \`ctx.runQuery(connection, { operation: 'queryVectors', queryVector, topK }, dbPath?)\` to search the vector source — per row, ad hoc, no SQL needed.
 - Once the function returns, the executor inserts the rows it returned into the destination. The destination DB does NO compute here — it is only the place the final rows get written.
-- This means **NeDB / MongoDB are perfectly valid destinations for Scenario B** even though they don't natively do SQL or vectors. **Do NOT ask the user to pick Postgres+pgvector / DuckDB / Snowflake / "a vector engine that can run the embedding"** — none of that matters; the embedding and search happen in the function before insert.
+- This means **MongoDB and a local vector table are perfectly valid destinations for Scenario B** even though they don't natively do SQL or vectors. **Do NOT ask the user to pick Postgres+pgvector / Snowflake / "a vector engine that can run the embedding"** — none of that matters; the embedding and search happen in the function before insert.
 - Do not try to express the embedding/search as a fixed SQL search query or a one-shot \`searchQuery\` — emit a \`javascriptFunction\` instead.
 - Confirm with the user only what's actually needed for their intent: which column to embed / search by, which vector source to query, an embedding provider/model if there's a choice, and the desired \`topK\`. The destination itself is fine as long as it's NoSQL or a vector DB.
 
 Always handle vector cases inline — set \`usesSkill: false\`.
 ` : `
 ## Vector context
-No vector source or destination is configured. If the user asks for embeddings, similarity search, or vectorising a column, set \`vectorRequired: true\`. The embedding / similarity-search code runs locally in Node inside the \`javascriptFunction\` (using \`ctx.vectorize\` and \`ctx.runQuery\`), and the destination DB is only used to store the final rows — so a NoSQL destination (Mongo / NeDB) is fine, and vector destinations are also fine. Ask the user to pick a NoSQL or vector destination if they haven't yet; do NOT ask them to switch to a SQL engine that can "execute embeddings" — that's not how this runs. If neither vector source nor destination is configured and the user does NOT mention embeddings/similarity, leave \`vectorRequired\` as false.
+No vector source or destination is configured. If the user asks for embeddings, similarity search, or vectorising a column, set \`vectorRequired: true\`. The embedding / similarity-search code runs locally in Node inside the \`javascriptFunction\` (using \`ctx.vectorize\` and \`ctx.runQuery\`), and the destination DB is only used to store the final rows — so a NoSQL destination (Mongo) is fine, and vector destinations are also fine. Ask the user to pick a NoSQL or vector destination if they haven't yet; do NOT ask them to switch to a SQL engine that can "execute embeddings" — that's not how this runs. If neither vector source nor destination is configured and the user does NOT mention embeddings/similarity, leave \`vectorRequired\` as false.
 `}
 ${availableSkills.length > 0 ? `**Available Skills**:
 You have access to these special join skills that can be used instead of standard SQL/NoSQL joins:
@@ -73,7 +73,7 @@ Analyze the user's request and conversation history to determine the next steps.
   "skillExplanation": "Brief explanation of why this skill is being used (only if usesSkill is true)",
   "vectorRequired": false | true,   // true ONLY when this join needs runtime embedding / similarity search (Scenario B). Defaults to false. Read the user's intent — a vector source on its own does NOT imply vectorRequired.
   "inferredSettings": {
-    "destinationSelection": "connection_id or local-sqlite or local-nedb or local-lancedb" (optional; use local-lancedb when the user wants the result stored as a LOCAL vector table — embeddings / a lancedb table / similarity-searchable — and named no saved vector connection. Do NOT downgrade a requested local vector table to local-sqlite),
+    "destinationSelection": "connection_id or local-duckdb or local-lancedb" (optional; use local-lancedb when the user wants the result stored as a LOCAL vector table — embeddings / a lancedb table / similarity-searchable — and named no saved vector connection. Do NOT downgrade a requested local vector table to local-duckdb),
     "operationMode": "new_table" | "merge_existing" (optional),
     "targetTableName": "table_name" ${operationMode === 'new_table' ? '(REQUIRED for new_table mode)' : '(optional)'},
     "joinType": "INNER" | "LEFT" | "FULL" (optional),
@@ -134,9 +134,9 @@ ${operationMode === 'new_table' ? `
      * "Which columns would you like in the final result? For example, from Customers: [list columns], from Orders: [list columns]"
 
 5. NoSQL Destination Joins:
-   - If destination is MongoDB or NeDB (local-nedb), note that joins will be performed using JavaScript execution in the local environment
+   - If destination is MongoDB, the join is performed with JavaScript in the local environment
    - Data from all sources will be loaded locally, joined using JavaScript, then uploaded to the destination
-   - This allows for complex join logic that MongoDB/NeDB don't natively support
+   - This allows for complex join logic that MongoDB doesn't natively support
 
 5b. Vector / embedding scenarios (only when there is a vector source/destination or the user mentions embeddings, similarity, vectorising):
    - First, decide which scenario applies (see "Vector / embedding context detected" above): A) treat the vector DB as a regular DB, or B) do embedding/similarity search inside the join.
@@ -227,7 +227,7 @@ The destination DB does NO compute here — it is only the place the final rows 
        • NoSQL destination → bulk insert into the target collection
        • Vector destination → embed the chosen column and upsert vectors (you also emit a \`vectorDestination\` block — see below)
 
-So if the user picks NeDB / MongoDB as the destination, that's fine. NeDB doesn't need to "execute SQL" or "generate embeddings" — your function does, in Node, before the rows are inserted. Do NOT ask the user to switch to Postgres+pgvector / DuckDB / Snowflake / etc. for this reason; pick whichever destination they chose and put the embedding + search logic inside the function.
+So if the user picks MongoDB as the destination, that's fine. It doesn't need to "execute SQL" or "generate embeddings" — your function does, in Node, before the rows are inserted. Do NOT ask the user to switch to Postgres+pgvector / Snowflake / etc. for this reason; pick whichever destination they chose and put the embedding + search logic inside the function.
 
 Function contract:
 
@@ -245,6 +245,14 @@ The \`ctx\` argument is appended after all source-data arrays. It exposes simple
     Saved connection (dbPath omitted):
       SQL:    ctx.runQuery('warehouse', 'SELECT id, email FROM users')
       NoSQL:  ctx.runQuery('mongo-prod', { collection: 'users', filter: {}, limit: 100 })
+    Local file (duckdb / lancedb) — pass the dbType in place of the connection
+    name, plus the absolute path as dbPath. A node writing locally shows
+    targetConnectionId "local-duckdb" / targetConnectionName "Local file"; use
+    its targetLocalPath here:
+      duckdb:  ctx.runQuery('duckdb', 'SELECT COUNT(*) AS c FROM orders', '/abs/path/orders.csv')
+               (the file is queried where it sits — csv, json or parquet — and
+                is addressable by its own base name, here "orders")
+      lancedb: ctx.runQuery('lancedb', { operation: 'list', tableName: 'docs', limit: 100 }, '/abs/path/lancedir')
 - await ctx.getTables(connection, dbPath?)
 - await ctx.getColumns(connection, table, schema?, dbPath?)
 - await ctx.askAi(prompt, { provider?, model?, systemPrompt?, maxTokens? })
@@ -253,19 +261,18 @@ The \`ctx\` argument is appended after all source-data arrays. It exposes simple
 - ctx.log(...args)
 
 \`connection\` accepts either the saved connection's name/id, OR — when reading
-a local file — the dbType string ('nedb' | 'sqlite' | 'lancedb'). Source data
+a local file — the dbType string ('duckdb' | 'lancedb'). Source data
 arrays passed as the leading arguments are already loaded — use them as-is
 unless you genuinely need fresh data.${destinationConfig.hasLocalConnection ? `
 
 Local files are part of this join (one or more sources / the destination is a
-local nedb / sqlite / lancedb file). For those, you MUST pass the absolute
-\`dbPath\` as the trailing argument and use the dbType string in place of the
-connection name. Each source's path is provided in the source list above as
-\`localPath\` — copy that value verbatim. Examples:
+local file). For those, you MUST pass the absolute \`dbPath\` as the trailing
+argument and use the dbType string in place of the connection name. Each
+source's path is provided in the source list above as \`localPath\` — copy that
+value verbatim. Examples:
 
-  ctx.runQuery('nedb', { filter: {}, limit: 1000 }, '/abs/path/file.db')
-  ctx.runQuery('nedb', { operation: 'insert', mode: 'replace', docs: rows }, '/abs/path/out.db')
-  ctx.runQuery('sqlite', { query: 'SELECT * FROM customers' }, '/abs/path/store.db')
+  ctx.runQuery('duckdb', 'SELECT * FROM customers LIMIT 1000', '/abs/path/customers.csv')
+  ctx.runQuery('duckdb', { query: 'SELECT count(*) AS n FROM orders' }, '/abs/path/orders.parquet')
   ctx.runQuery('lancedb', { operation: 'queryVectors', tableName: 'docs', queryVector: v, topK: 5 }, '/abs/path/lancedir')
   ctx.runQuery('lancedb', { operation: 'upsert',  tableName: 'docs', data: records },          '/abs/path/lancedir')` : ''}
 
@@ -347,7 +354,7 @@ All sources are loaded into memory and joined with JavaScript. The skill embeds 
     "embeddingModel": "text-embedding-3-small"
   }
 }
-` : (dbType === 'mongodb' || dbType === 'nedb' ? `
+` : (dbType === 'mongodb' ? `
 FOR NOSQL DESTINATION:
 All sources are loaded into memory and joined using JavaScript.
 
@@ -383,6 +390,68 @@ Example (NoSQL source + SQL source):
   "javascriptFunction": "function joinData(usersData, ordersData) { const results = []; for (const user of usersData) { for (const order of ordersData) { if (user.user_id === order.user_id) { results.push({ user_id: user.user_id, name: user.name, order_id: order.order_id, total: order.total }); } } } return results; }",
   "targetCollection": "user_orders",
   "selectedColumns": {"node-abc-123": ["user_id", "name"], "node-def-456": ["order_id", "total"]}
+}
+` : (dbType === 'duckdb' ? `
+FOR A LOCAL FILE DESTINATION:
+Every source is queryable by name and the result is written as a file, so there
+are no temp tables, no CREATE TABLE, and no INSERT. Write ONE SELECT.
+
+- A local file source is already readable under its "tempTableName" — just
+  reference that name in the join. Give it no "sql" and no "ddl".
+- A remote source (Postgres, Mongo, …) still needs its rows fetched: give it a
+  "sql" (ending with {LIMIT_OFFSET_HERE}) or "nosqlOperation", plus
+  "selectedColumns". It becomes readable under its "tempTableName" too.
+- "joinSql" is a plain SELECT. The rows it returns ARE the result.
+
+{
+  "explanation": "Description of join logic",
+  "sourcesConfig": [
+    {
+      "sourceNodeId": "...",
+      "tempTableName": "orders",          // the name you reference in joinSql
+      "sql": "SELECT ... {LIMIT_OFFSET_HERE}",  // ONLY for remote sources
+      "selectedColumns": ["col1", "col2"]       // ONLY for remote sources
+    }
+  ],
+  "joinSql": "SELECT ... FROM orders o JOIN customers c ON o.customer_id = c.id",
+  "previewSql": "SELECT ... FROM orders o JOIN customers c ON o.customer_id = c.id LIMIT 100",
+  "joinColumns": [{"orders": "customer_id", "customers": "id"}],
+  "selectedColumns": {"sourceNodeId1": ["col1"], "sourceNodeId2": ["col2"]}
+}
+
+The dialect is DuckDB (PostgreSQL-flavoured). Useful extras: SELECT * EXCLUDE
+(col), SELECT * REPLACE (expr AS col), QUALIFY, GROUP BY ALL. Nested values
+read as STRUCT/LIST — reach into them with dot notation (addr.city) or [1].
+
+Example 1 (two local files):
+{
+  "explanation": "Join local orders with local customers on customer_id",
+  "sourcesConfig": [
+    { "sourceNodeId": "node-abc-123", "tempTableName": "orders" },
+    { "sourceNodeId": "node-def-456", "tempTableName": "customers" }
+  ],
+  "joinSql": "SELECT o.order_id, o.total, c.name, c.email FROM orders o INNER JOIN customers c ON o.customer_id = c.id",
+  "previewSql": "SELECT o.order_id, o.total, c.name, c.email FROM orders o INNER JOIN customers c ON o.customer_id = c.id LIMIT 100",
+  "joinColumns": [{"orders": "customer_id", "customers": "id"}],
+  "selectedColumns": {"node-abc-123": ["order_id", "total"], "node-def-456": ["name", "email"]}
+}
+
+Example 2 (a local file enriched from a remote database):
+{
+  "explanation": "Attach region names from Postgres to the local orders file",
+  "sourcesConfig": [
+    { "sourceNodeId": "node-abc-123", "tempTableName": "orders" },
+    {
+      "sourceNodeId": "node-def-456",
+      "tempTableName": "regions",
+      "sql": "SELECT city, region FROM dim_region {LIMIT_OFFSET_HERE}",
+      "selectedColumns": ["city", "region"]
+    }
+  ],
+  "joinSql": "SELECT r.region, count(*) AS orders, round(sum(o.amount), 2) AS revenue FROM orders o LEFT JOIN regions r ON o.city = r.city GROUP BY r.region ORDER BY revenue DESC",
+  "previewSql": "SELECT r.region, count(*) AS orders, round(sum(o.amount), 2) AS revenue FROM orders o LEFT JOIN regions r ON o.city = r.city GROUP BY r.region ORDER BY revenue DESC LIMIT 100",
+  "joinColumns": [{"orders": "city", "regions": "city"}],
+  "selectedColumns": {"node-abc-123": ["city", "amount"], "node-def-456": ["region"]}
 }
 ` : `
 FOR SQL DESTINATION:
@@ -474,7 +543,7 @@ Example 2 (NoSQL source needing temp table for SQL destination):
   "joinColumns": [{"temp_node_abc_123": "user_id", "temp_node_def_456": "user_id"}],
   "selectedColumns": {"node-abc-123": ["user_id", "name"], "node-def-456": ["order_id"]}
 }
-`)}
+`))}
 
 User Request Context: "${joinSettings.userRequest}"
 

@@ -573,6 +573,22 @@ const ChatMessage = ({
                             </Box>
                         )}
 
+                        {/* Invalid AI response — expandable raw text the model
+                            returned when it wasn't valid JSON. Lets the user
+                            inspect exactly what came back without cluttering the
+                            message with a wall of broken JSON. */}
+                        {!isUser && message.metadata?.invalidJson && (
+                            <CodeSection
+                                {...sectionProps}
+                                field="invalidJson"
+                                label="raw response"
+                                code={message.metadata.invalidJson}
+                                language="json"
+                                color="error.main"
+                                bgTint="rgba(211, 47, 47, 0.08)"
+                            />
+                        )}
+
                         {/* Code sections (collapsible inline + popup-expandable) */}
                         {!isUser && message.metadata?.ddl && (
                             <CodeSection

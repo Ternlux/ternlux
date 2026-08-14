@@ -1,7 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { message as antdMessage } from 'antd';
 import { connectionsDb } from '../../../utils/localDb';
-import ChatArea from '../../Chat/ChatArea';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
 import CloudStorageBrowser from '../CloudStorageBrowser';
 import {
@@ -21,22 +20,52 @@ import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/
 import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
 import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
 import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
+import {
+  FORM_ACCENT, GROUP_COLOR,
+  FormScope, FormBody, FormFooter, Card, Fields, Field,
+  Segmented, SelectInput, TextInput, PathPicker, Note, Handoff, HandoffBody,
+  Picked, CloudButton, EmptyState, ConnList, ConnGroupToggle, ConnRow, IconFolder,
+} from './_formShared';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Output Node Chat Component
-// Handles workflow output (export to file or insert to connection)
+// Output Node configuration form
+// Local Environment → format + native save dialog.
+// Connection       → grouped destination list, then a table name (databases),
+//                    an index name (vector) or a browsed upload path (cloud).
+// Saving runs the output first, then persists the config.
 // ─────────────────────────────────────────────────────────────────────────────
-
-const DESTINATION_GROUP_COLOR = {
-  'Cloud Storage': '#0891b2',
-  APIs: '#2563eb',
-  Vector: '#16a34a',
-  Databases: '#7c3aed',
-  'Local Files': '#d97706',
-  Other: '#5a6678',
-};
 
 const VECTOR_DB_TYPES = new Set(['lancedb', 'pinecone']);
+
+const FORMAT_OPTIONS = [
+  { label: 'JSON — export as JSON file', value: 'json' },
+  { label: 'CSV — export as CSV file', value: 'csv' },
+  { label: 'Excel — export as .xlsx', value: 'excel' },
+  { label: 'NeDB — local NeDB database', value: 'nedb' },
+  { label: 'SQLite — local SQLite database', value: 'sqlite' },
+  { label: 'LanceDB — local vector database', value: 'lancedb' },
+  { label: 'Parquet — export as Parquet file', value: 'parquet' },
+  { label: 'Avro — export as Avro file', value: 'avro' },
+];
+
+const GROUP_ORDER = ['Databases', 'Vector', 'Cloud Storage', 'APIs', 'Local Files', 'Other'];
+
+/**
+ * Undo the pre-quoting an earlier build applied before saving. The executor
+ * quotes and schema-qualifies the name itself, so a stored `db`.`tbl` came back
+ * doubled up ("Table 'db.tbl' doesn't exist"). Strip the quote characters and,
+ * if the leading segment is just this connection's own database/schema, drop
+ * it too — that qualifier gets re-added at run time.
+ */
+const normalizeSavedTableName = (raw, conn) => {
+  if (!raw || !conn) return raw;
+  const bare = String(raw).replace(/[`"[\]]/g, '');
+  const parts = bare.split('.');
+  if (parts.length !== 2) return bare;
+  const qualifier = (conn.dbConfig?.database || conn.dbConfig?.schema || '').toLowerCase();
+  if (qualifier && parts[0].toLowerCase() === qualifier) return parts[1];
+  return bare;
+};
 
 const categorizeConnection = (conn) => {
   if (!conn) return 'Other';
@@ -67,244 +96,94 @@ const getDbIcon = (dbType) => {
 const getConnectionIcon = (connection) => {
   if (!connection) return null;
   const category = categorizeConnection(connection);
-  if (category === 'APIs') return <ApiOutlined style={{ fontSize: 18 }} />;
-  if (category === 'Vector') return <AppstoreOutlined style={{ fontSize: 18 }} />;
+  if (category === 'APIs') return <ApiOutlined style={{ fontSize: 16 }} />;
+  if (category === 'Vector') return <AppstoreOutlined style={{ fontSize: 16 }} />;
   if (category === 'Cloud Storage') {
     const IconComponent = getDbIcon(connection.dbType);
-    return IconComponent
-      ? <IconComponent style={{ width: 20, height: 20 }} />
-      : <CloudOutlined style={{ fontSize: 18 }} />;
+    return IconComponent ? <IconComponent /> : <CloudOutlined style={{ fontSize: 16 }} />;
   }
   if (connection.connectionType === 'file') {
     const fileName = connection.fileInfo?.fileName?.toLowerCase() || '';
-    if (fileName.endsWith('.csv')) {
-      return <FileTextOutlined style={{ fontSize: 20 }} />;
-    }
+    if (fileName.endsWith('.csv')) return <FileTextOutlined style={{ fontSize: 16 }} />;
     const IconComponent = getDbIcon(connection.dbType);
-    if (IconComponent) {
-      return <IconComponent style={{ width: 20, height: 20 }} />;
-    }
-    return <FileExcelOutlined style={{ fontSize: 20 }} />;
+    return IconComponent ? <IconComponent /> : <FileExcelOutlined style={{ fontSize: 16 }} />;
   }
   const IconComponent = getDbIcon(connection.dbType);
-  return IconComponent
-    ? <IconComponent style={{ width: 20, height: 20 }} />
-    : <DatabaseOutlined style={{ fontSize: 18 }} />;
-};
-
-const formatTimestamp = (ts) => {
-  const diff = Math.floor((Date.now() - new Date(ts)) / 60000);
-  if (diff < 1) return 'Just now';
-  if (diff < 60) return `${diff}m`;
-  return `${Math.floor(diff / 60)}h`;
+  return IconComponent ? <IconComponent /> : <DatabaseOutlined style={{ fontSize: 16 }} />;
 };
 
 const OutputNodeChat = ({
   node,
   nodes,
   edges,
-  initialChat,
+  initialConfig,
   onSave,
-  onConfigUpdate,
+  onCancel,
+  onDirtyChange,
   executeOutput,
   executingInd,
-  executing = false
+  executing = false,
 }) => {
-  const messagesEndRef = useRef(null);
-  const chatContainerRef = useRef(null);
-  const inputRef = useRef(null);
   const initialized = useRef(false);
 
-  const [chat, setChat] = useState(initialChat);
-  const [inputValue, setInputValue] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [sourceError, setSourceError] = useState(null);
 
   // Source node (output requires exactly 1 input)
   const [sourceNode, setSourceNode] = useState(null);
   const [sourceConnection, setSourceConnection] = useState(null);
   const [sourceTableSchema, setSourceTableSchema] = useState(null);
 
-  // Available connections for connection output
+  // Destinations that can receive output
   const [availableConnections, setAvailableConnections] = useState([]);
-
-  // Output configuration state
-  const [outputSettings, setOutputSettings] = useState({
-    outputType: null,           // "connection" or "local"
-    format: null,               // For local: "json", "csv", "excel", "nedb", "sqlite", "lancedb", "parquet", "avro"
-    savePath: null,             // For local: file path
-    connectionId: null,         // For connection: target connection ID
-    tableName: null,            // For connection: target table name
-  });
-
-  const [pendingChoices, setPendingChoices] = useState([]);
-  const [saveState, setSaveState] = useState(false);
-  const [disableInput, setDisableInput] = useState(false);
-  const [executionError, setExecutionError] = useState(null);
-
-  // Cloud storage browser state
-  const [cloudStorageBrowserOpen, setCloudStorageBrowserOpen] = useState(false);
-  const [cloudStorageConnection, setCloudStorageConnection] = useState(null);
   const [pluginManager, setPluginManager] = useState(null);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Initialize
-  // ─────────────────────────────────────────────────────────────────────────
+  const saved = initialConfig?.outputSettings || null;
+  const [outputSettings, setOutputSettings] = useState({
+    outputType: saved?.outputType || 'local',
+    format: saved?.format || null,
+    savePath: saved?.savePath || null,
+    connectionId: saved?.connectionId || null,
+    tableName: saved?.tableName || null,
+  });
 
-  const initializationFunc = async () => {
-    const sourceDetectionResult = await detectSourceNode();
+  const [dirty, setDirty] = useState(false);
+  const [attempted, setAttempted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [executionError, setExecutionError] = useState(null);
 
-    // Restore state from saved config if reopening a saved node
-    const savedConfig = node?.data?.config;
-    if (savedConfig && initialChat.length > 0) {
-      console.log('Restoring saved output config:', savedConfig);
+  const [cloudStorageBrowserOpen, setCloudStorageBrowserOpen] = useState(false);
 
-      // Restore output settings
-      if (savedConfig.outputSettings) {
-        setOutputSettings(savedConfig.outputSettings);
-      }
-    } else {
-      // New node - start with output type selection
-      if (initialChat.length === 0 && sourceDetectionResult) {
-        setDisableInput(true);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
-        const choices = [
-          {
-            label: 'Connection',
-            value: 'connection',
-            description: 'Insert data into a database connection',
-            variant: 'outlined',
-            fullWidth: true
-          },
-          {
-            label: 'Local Environment',
-            value: 'local',
-            description: 'Export data to a local file',
-            variant: 'outlined',
-            fullWidth: true
-          }
-        ];
-
-        const questionText = `I detected a data source connected to this output node.\n\n**Where would you like to output the data?**`;
-
-        setPendingChoices(choices);
-        addBotMessage(questionText, true, 'choice', 'outputType', '', null);
-
-        setDisableInput(false);
-      }
-    }
-  };
-
-  useEffect(() => {
-    if (!initialized.current) {
-      initialized.current = true;
-      initializationFunc();
-    }
+  const patch = useCallback((next) => {
+    setDirty(true);
+    setExecutionError(null);
+    setOutputSettings((prev) => ({ ...prev, ...next }));
   }, []);
 
-  // Load plugin manager on mount
-  useEffect(() => {
-    const loadPluginManager = async () => {
-      if (window.electronAPI?.dbConnect?.listPlugins) {
-        try {
-          const result = await window.electronAPI.dbConnect.listPlugins();
-          if (result.success) {
-            const manager = {
-              getConnector: (dbType) => {
-                const connector = result.connectors?.find(c => c.id === dbType);
-                return connector || null;
-              }
-            };
-            setPluginManager(manager);
-          }
-        } catch (error) {
-          console.error('Failed to load plugin manager:', error);
-        }
-      }
-    };
-    loadPluginManager();
-  }, []);
+  // ── Detect the source node and load destinations ─────────────────────────
 
-  // Sync chat state with initialChat prop when node changes
-  useEffect(() => {
-    if (initialized.current && initialChat.length > 0) {
-      setChat(initialChat);
-    }
-  }, [node?.id, initialChat]);
-
-  // Auto-scroll to bottom when chat messages change
-  useEffect(() => {
-    if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [chat]);
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Core Functions
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const addBotMessage = (text, responseRequired = false, responseType = 'text', ref = '', placeholder = '', metadata = null) => {
-    setChat(prev => [...prev, {
-      id: `bot-${Date.now()}-${Math.random()}`,
-      sender: 'bot',
-      text,
-      timestamp: new Date(),
-      responseRequired,
-      responseType,
-      ref,
-      placeholder: placeholder || 'Type your response…',
-      metadata,
-    }]);
-  };
-
-  const addUserMessage = (text, ref, value, data = null) => {
-    const userMsg = {
-      id: `user-${Date.now()}-${Math.random()}`,
-      sender: 'user',
-      text,
-      timestamp: new Date(),
-      ref,
-      value: value || text,
-      data,
-    };
-    setChat(prev => [...prev, userMsg]);
-    return userMsg;
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Detect Source Node
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const detectSourceNode = async () => {
-    setLoading(true);
-
-    // Find connected source node (must have exactly 1 for output)
-    const connectedEdges = edges.filter(e => e.target === node.id);
+  const detectSourceNode = useCallback(async () => {
+    const connectedEdges = edges.filter((e) => e.target === node.id);
     if (connectedEdges.length === 0) {
-      addBotMessage('An output node requires a connected data source. Please connect a source.', false);
-      setLoading(false);
-      return null;
+      setSourceError('An output node requires a connected data source. Connect a source, then reopen this node.');
+      return;
     }
-
     if (connectedEdges.length > 1) {
-      addBotMessage('An output node can only have one connected source. Please remove extra connections.', false);
-      setLoading(false);
-      return null;
+      setSourceError('An output node can only have one connected source. Remove the extra connections.');
+      return;
     }
 
-    const edge = connectedEdges[0];
-    const source = nodes.find(n => n.id === edge.source);
-
+    const source = nodes.find((n) => n.id === connectedEdges[0].source);
     if (!source || !source.data?.config) {
-      addBotMessage(`Source node "${source?.data?.label}" is not configured. Please configure the source first.`, false);
-      setLoading(false);
-      return null;
+      setSourceError(`Source node "${source?.data?.label || 'upstream'}" is not configured. Configure the source first.`);
+      return;
     }
 
     const sourceConfig = source.data.config;
-    const nodeType = sourceConfig.nodeType;
-    const isDataSource = nodeType === 'datasource';
+    const isDataSource = sourceConfig.nodeType === 'datasource';
 
-    // Extract connection info (use target for transformers/joins, source for data sources)
     const connection = {
       id: isDataSource ? sourceConfig.sourceConnectionId : sourceConfig.targetConnectionId,
       name: isDataSource ? sourceConfig.sourceConnectionName : sourceConfig.targetConnectionName,
@@ -312,14 +191,11 @@ const OutputNodeChat = ({
         ? (sourceConfig.sourceConnectionType || 'database')
         : (sourceConfig.targetConnectionType || 'database'),
       dbType: isDataSource ? sourceConfig.sourceDbType : sourceConfig.targetDbType,
-      dbConfig: isDataSource
-        ? (sourceConfig.sourceDbConfig || {})
-        : (sourceConfig.targetDbConfig || {}),
+      dbConfig: isDataSource ? (sourceConfig.sourceDbConfig || {}) : (sourceConfig.targetDbConfig || {}),
       localPath: isDataSource ? sourceConfig.sourceLocalPath : sourceConfig.targetLocalPath,
-      fileInfo: sourceConfig.fileInfo
+      fileInfo: sourceConfig.fileInfo,
     };
 
-    // Get schema from saved config
     const savedSchema = isDataSource ? sourceConfig.sourceTableSchema : sourceConfig.targetTableSchema;
 
     let schema;
@@ -327,17 +203,15 @@ const OutputNodeChat = ({
       schema = {
         sourceNodeId: source.id,
         sourceNodeLabel: source.data.label,
-        tableName: (isDataSource ? sourceConfig.sourceTableName : sourceConfig.targetTableName) ||
-                   (isDataSource ? sourceConfig.sourceCollection : sourceConfig.targetCollection) ||
-                   savedSchema.tableName,
+        tableName: (isDataSource ? sourceConfig.sourceTableName : sourceConfig.targetTableName)
+          || (isDataSource ? sourceConfig.sourceCollection : sourceConfig.targetCollection)
+          || savedSchema.tableName,
         columns: savedSchema.columns,
         sampleData: savedSchema.sampleData,
-        // Include the stored query for use in output execution
         query: isDataSource ? sourceConfig.sourceSql : sourceConfig.targetSql,
-        sheetName: savedSchema.sheetName
+        sheetName: savedSchema.sheetName,
       };
     } else {
-      // Load schema from database
       schema = await loadSourceTableSchema(source, connection);
       if (schema) {
         schema.sourceNodeId = source.id;
@@ -346,96 +220,21 @@ const OutputNodeChat = ({
     }
 
     if (!schema) {
-      addBotMessage(`Failed to load schema for source "${source.data.label}".`, false);
-      setLoading(false);
-      return null;
+      setSourceError(`Failed to load the schema for source "${source.data.label}".`);
+      return;
     }
-    console.log('schema: ', schema)
 
     setSourceNode(source);
     setSourceConnection(connection);
     setSourceTableSchema(schema);
-
-    // Load all database connections for connection output option
-    const token = localStorage.getItem('auth-token');
-    let allConnections = [];
-    // if (!token) {
-      allConnections = await connectionsDb.getAll();
-    // } else {
-    //   const res = await axios.post('/workflow/connections', { transformer: false }, {
-    //     headers: { 'auth-token': token },
-    //   });
-    //   allConnections = res.data || [];
-    // }
-
-    // Load plugins to get dbCategory for each connection
-    let pluginsMap = new Map();
-    if (window.electronAPI?.dbConnect?.listPlugins) {
-      try {
-        const pluginsResult = await window.electronAPI.dbConnect.listPlugins();
-        if (pluginsResult.success && pluginsResult.connectors) {
-          pluginsResult.connectors.forEach(plugin => {
-            pluginsMap.set(plugin.id, plugin);
-          });
-        }
-      } catch (error) {
-        console.error('Failed to load plugins:', error);
-      }
-    }
-
-    // Enrich connections with plugin metadata
-    const enrichedConnections = allConnections.map(conn => {
-      const plugin = pluginsMap.get(conn.dbType);
-      return {
-        ...conn,
-        dbCategory: plugin?.dbCategory || null,
-        storageType: plugin?.storageType || null
-      };
-    });
-
-    const connections = enrichedConnections
-      .filter(conn => {
-        // Include database connections, cloud storage connections, and vector databases
-        return conn.connectionType === 'database' ||
-               conn.dbCategory === 'CloudStorage' ||
-               conn.dbCategory === 'Vector';
-      })
-      .map(conn => {
-        const isCloudStorage = conn.dbCategory === 'CloudStorage';
-        const isVector = conn.dbCategory === 'Vector';
-        const group = categorizeConnection(conn);
-        return {
-          id: conn.id,
-          label: conn.name,
-          value: conn.id,
-          description: isCloudStorage
-            ? `Upload to ${conn.name} (${conn.dbType})`
-            : isVector
-              ? `Insert vectors into ${conn.name} (${conn.dbType})`
-              : `Insert into ${conn.name} (${conn.dbType})`,
-          connection: conn,
-          icon: getConnectionIcon(conn),
-          group,
-          groupColor: DESTINATION_GROUP_COLOR[group] || DESTINATION_GROUP_COLOR.Other,
-        };
-      });
-
-    setAvailableConnections(connections);
-    setLoading(false);
-
-    return { source, schema };
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Load Source Table Schema
-  // ─────────────────────────────────────────────────────────────────────────
+    setSourceError(null);
+  }, [edges, nodes, node.id]);
 
   const loadSourceTableSchema = async (source, connection) => {
     if (!window.electronAPI?.dbConnect && connection.connectionType === 'database') {
       console.warn('Database API not available');
       return null;
     }
-
     try {
       const sourceConfig = source?.data?.config || {};
       const isNoSQL = connection.dbType === 'mongodb' || connection.dbType === 'nedb';
@@ -446,19 +245,12 @@ const OutputNodeChat = ({
       let queryConnection = connection;
 
       if (isNoSQL) {
-        tableName = sourceConfig.targetCollection ||
-                    sourceConfig.sourceCollection ||
-                    sourceConfig.table;
+        tableName = sourceConfig.targetCollection || sourceConfig.sourceCollection || sourceConfig.table;
         localPath = sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath;
-
-        if (connection.dbType === 'nedb') {
-          queryConnection = { ...connection, dbType: 'mongodb' };
-        }
+        if (connection.dbType === 'nedb') queryConnection = { ...connection, dbType: 'mongodb' };
       } else {
         tableSchema = sourceConfig.targetSchema || sourceConfig.sourceSchema || connection.dbConfig?.schema;
-        tableName = sourceConfig.targetTableName ||
-                    sourceConfig.sourceTableName ||
-                    sourceConfig.table;
+        tableName = sourceConfig.targetTableName || sourceConfig.sourceTableName || sourceConfig.table;
       }
 
       if (!tableName && !localPath) {
@@ -466,339 +258,207 @@ const OutputNodeChat = ({
         return null;
       }
 
-      const schema = await loadTableSchema({
-        connection: queryConnection,
-        tableName,
-        tableSchema,
-        localPath,
-        limit: 5
-      });
-
-      return schema;
+      return await loadTableSchema({ connection: queryConnection, tableName, tableSchema, localPath, limit: 5 });
     } catch (error) {
       console.error('Failed to load source schema:', error);
       return null;
     }
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Handle User Responses
-  // ─────────────────────────────────────────────────────────────────────────
+  const loadDestinations = useCallback(async () => {
+    const allConnections = await connectionsDb.getAll();
 
-  const handleUserResponse = async (text, ref, value, data) => {
-    const userMsg = addUserMessage(text, ref, value, data);
-
-    if (ref === 'outputType') {
-      await handleOutputTypeResponse(value);
-    } else if (ref === 'format') {
-      await handleFormatResponse(value);
-    } else if (ref === 'savePath') {
-      await handleSavePathResponse(text);
-    } else if (ref === 'connectionSelection') {
-      await handleConnectionResponse(value, data);
-    } else if (ref === 'tableName') {
-      await handleTableNameResponse(text);
-    }
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Choice Response Handlers
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const handleOutputTypeResponse = async (value) => {
-    const updatedSettings = {
-      ...outputSettings,
-      outputType: value
-    };
-
-    setOutputSettings(updatedSettings);
-    setPendingChoices([]);
-
-    if (value === 'local') {
-      // Show format choices
-      const formatChoices = [
-        { label: 'JSON', value: 'json', description: 'Export as JSON file', variant: 'outlined', fullWidth: true },
-        { label: 'CSV', value: 'csv', description: 'Export as CSV file', variant: 'outlined', fullWidth: true },
-        { label: 'Excel', value: 'excel', description: 'Export as Excel file (.xlsx)', variant: 'outlined', fullWidth: true },
-        { label: 'NeDB', value: 'nedb', description: 'Export to local NeDB database', variant: 'outlined', fullWidth: true },
-        { label: 'SQLite', value: 'sqlite', description: 'Export to local SQLite database', variant: 'outlined', fullWidth: true },
-        { label: 'LanceDB', value: 'lancedb', description: 'Export to local LanceDB vector database', variant: 'outlined', fullWidth: true },
-        { label: 'Parquet', value: 'parquet', description: 'Export as Parquet file', variant: 'outlined', fullWidth: true },
-        { label: 'Avro', value: 'avro', description: 'Export as Avro file', variant: 'outlined', fullWidth: true },
-      ];
-
-      setPendingChoices(formatChoices);
-      addBotMessage(
-        'Select the output format:',
-        true,
-        'choice',
-        'format',
-        '',
-        null
-      );
-    } else if (value === 'connection') {
-      // Show connection choices
-      if (availableConnections.length === 0) {
-        addBotMessage('No database connections available. Please create a connection first.', false);
-        return;
+    const pluginsMap = new Map();
+    if (window.electronAPI?.dbConnect?.listPlugins) {
+      try {
+        const pluginsResult = await window.electronAPI.dbConnect.listPlugins();
+        if (pluginsResult.success && pluginsResult.connectors) {
+          pluginsResult.connectors.forEach((plugin) => pluginsMap.set(plugin.id, plugin));
+          setPluginManager({
+            getConnector: (dbType) => pluginsResult.connectors.find((c) => c.id === dbType) || null,
+          });
+        }
+      } catch (error) {
+        console.error('Failed to load plugins:', error);
       }
-
-      const connectionChoices = availableConnections.map(conn => ({
-        label: conn.label,
-        value: conn.value,
-        description: conn.description,
-        _data: conn,
-        variant: 'outlined',
-        fullWidth: true,
-        icon: conn.icon,
-        group: conn.group,
-        groupColor: conn.groupColor,
-      }));
-
-      setPendingChoices(connectionChoices);
-      addBotMessage(
-        'Select the destination connection:',
-        true,
-        'choice',
-        'connectionSelection',
-        '',
-        null
-      );
     }
+
+    const enriched = allConnections.map((conn) => {
+      const plugin = pluginsMap.get(conn.dbType);
+      return { ...conn, dbCategory: plugin?.dbCategory || null, storageType: plugin?.storageType || null };
+    });
+
+    // Only databases, vector stores and cloud storage can receive output. A
+    // REST API is read-only as far as the output node is concerned, and it can
+    // carry connectionType 'database', so exclude it explicitly.
+    const destinations = enriched
+      .filter((conn) => conn.dbCategory !== 'API' && conn.dbType !== 'rest-api')
+      .filter((conn) => conn.connectionType === 'database'
+        || conn.dbCategory === 'CloudStorage'
+        || conn.dbCategory === 'Vector')
+      .map((conn) => {
+        const group = categorizeConnection(conn);
+        const isCloudStorage = conn.dbCategory === 'CloudStorage';
+        const isVector = conn.dbCategory === 'Vector';
+        return {
+          id: conn.id,
+          name: conn.name,
+          meta: isCloudStorage
+            ? `Upload to ${conn.name} (${conn.dbType})`
+            : isVector
+              ? `Insert vectors into ${conn.name} (${conn.dbType})`
+              : `Insert into ${conn.name} (${conn.dbType})`,
+          connection: conn,
+          icon: getConnectionIcon(conn),
+          group,
+        };
+      });
+
+    setAvailableConnections(destinations);
+    return destinations;
+  }, []);
+
+  useEffect(() => {
+    if (initialized.current) return;
+    initialized.current = true;
+    (async () => {
+      setLoading(true);
+      await detectSourceNode();
+      const destinations = await loadDestinations();
+
+      // Repair a table name pre-quoted by an older build.
+      const savedTable = saved?.tableName;
+      if (saved?.outputType === 'connection' && savedTable) {
+        const dest = destinations.find((d) => d.id === saved.connectionId);
+        if (dest && dest.group !== 'Cloud Storage') {
+          const fixed = normalizeSavedTableName(savedTable, dest.connection);
+          if (fixed !== savedTable) {
+            setOutputSettings((prev) => ({ ...prev, tableName: fixed }));
+          }
+        }
+      }
+      setLoading(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectSourceNode, loadDestinations]);
+
+  // ── Derived selection state ──────────────────────────────────────────────
+
+  const selectedDestination = useMemo(
+    () => availableConnections.find((c) => c.id === outputSettings.connectionId) || null,
+    [availableConnections, outputSettings.connectionId],
+  );
+
+  const destKind = useMemo(() => {
+    if (!selectedDestination) return null;
+    const group = selectedDestination.group;
+    if (group === 'Cloud Storage') return 'cloud';
+    if (group === 'Vector') return 'vector';
+    return 'database';
+  }, [selectedDestination]);
+
+  const grouped = useMemo(() => {
+    const buckets = new Map();
+    availableConnections.forEach((c) => {
+      if (!buckets.has(c.group)) buckets.set(c.group, []);
+      buckets.get(c.group).push(c);
+    });
+    buckets.forEach((list) => list.sort((a, b) => String(a.name).localeCompare(
+      String(b.name), undefined, { sensitivity: 'base', numeric: true },
+    )));
+    return GROUP_ORDER.filter((g) => buckets.has(g)).map((g) => [g, buckets.get(g)]);
+  }, [availableConnections]);
+
+  // Categories collapse so a long destination list stays navigable. Open the
+  // group holding the current selection, else the first one.
+  const [openGroups, setOpenGroups] = useState({});
+  const groupsSeeded = useRef(false);
+  useEffect(() => {
+    if (groupsSeeded.current || loading || grouped.length === 0) return;
+    groupsSeeded.current = true;
+    const selectedGroup = availableConnections.find((c) => c.id === outputSettings.connectionId)?.group;
+    setOpenGroups({ [selectedGroup || grouped[0][0]]: true });
+  }, [grouped, availableConnections, outputSettings.connectionId, loading]);
+
+  const toggleGroup = (group) => setOpenGroups((prev) => ({ ...prev, [group]: !prev[group] }));
+
+  const dbType = selectedDestination?.connection?.dbType;
+
+  // ── Validation ───────────────────────────────────────────────────────────
+
+  const missing = useMemo(() => {
+    const out = {};
+    if (outputSettings.outputType === 'local') {
+      if (!outputSettings.format) out.format = true;
+      if (!outputSettings.savePath) out.savePath = true;
+    } else {
+      if (!outputSettings.connectionId) out.connectionId = true;
+      else if (!outputSettings.tableName) out.tableName = true;
+    }
+    return out;
+  }, [outputSettings]);
+
+  const missingCount = Object.keys(missing).length;
+  const invalid = (key) => attempted && !!missing[key];
+
+  // Cloud destinations can't be saved until a path has been browsed to.
+  const needsCloudPick = outputSettings.outputType === 'connection' && destKind === 'cloud';
+  const cloudBlocked = needsCloudPick && !outputSettings.tableName;
+
+  // `executing` is panel-level (the header Run button shares it); `submitting`
+  // is this form's own click guard.
+  const running = executing || submitting;
+
+  const gateMessage = running
+    ? 'Running the output…'
+    : cloudBlocked
+    ? 'Pick an upload path to enable Save'
+    : executionError
+      ? executionError
+      : attempted && missingCount > 0
+        ? `${missingCount} field${missingCount === 1 ? '' : 's'} still needed`
+        : null;
+
+  // ── Actions ──────────────────────────────────────────────────────────────
+
+  const changeOutputType = (value) => {
+    // Switching sides drops whatever the other side had picked.
+    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null });
+    setAttempted(false);
   };
 
-  const handleFormatResponse = async (format) => {
-    const updatedSettings = {
-      ...outputSettings,
-      format
-    };
+  const changeDestination = (conn) => {
+    patch({ connectionId: conn.id, tableName: null });
+    setAttempted(false);
+  };
 
-    setOutputSettings(updatedSettings);
-    setPendingChoices([]);
-
-    // Open file dialog for save path
-    const fileExtension = format === 'excel' ? 'xlsx' : format;
+  const browseSavePath = async () => {
+    if (!outputSettings.format) {
+      antdMessage.warning('Choose an output format first.');
+      return;
+    }
+    const fileExtension = outputSettings.format === 'excel' ? 'xlsx' : outputSettings.format;
     const defaultFileName = `output_${node.id.slice(0, 8)}.${fileExtension}`;
-
     try {
       const result = await window.electronAPI.selectSavePath(defaultFileName, fileExtension);
-
-      if (result.canceled) {
-        addBotMessage('File selection canceled. Please select a file path.', false);
-        // Re-show format selection
-        const formatChoices = [
-          { label: 'JSON', value: 'json', description: 'Export as JSON file', variant: 'outlined', fullWidth: true },
-          { label: 'CSV', value: 'csv', description: 'Export as CSV file', variant: 'outlined', fullWidth: true },
-          { label: 'Excel', value: 'excel', description: 'Export as Excel file (.xlsx)', variant: 'outlined', fullWidth: true },
-          { label: 'NeDB', value: 'nedb', description: 'Export to local NeDB database', variant: 'outlined', fullWidth: true },
-          { label: 'SQLite', value: 'sqlite', description: 'Export to local SQLite database', variant: 'outlined', fullWidth: true },
-          { label: 'LanceDB', value: 'lancedb', description: 'Export to local LanceDB vector database', variant: 'outlined', fullWidth: true },
-          { label: 'Parquet', value: 'parquet', description: 'Export as Parquet file', variant: 'outlined', fullWidth: true },
-          { label: 'Avro', value: 'avro', description: 'Export as Avro file', variant: 'outlined', fullWidth: true },
-        ];
-        setPendingChoices(formatChoices);
-        return;
-      }
-
-      const savePath = result.filePath;
-      const finalSettings = {
-        ...updatedSettings,
-        savePath
-      };
-
-      setOutputSettings(finalSettings);
-      setSaveState(true);
-
-      addBotMessage(`✓ Configuration complete!\n\nOutput will be saved to: ${savePath}`, false);
-      addBotMessage('Click Run & Save Configuration when ready.', false);
-
+      if (result.canceled) return;
+      patch({ savePath: result.filePath });
     } catch (error) {
       console.error('Error selecting save path:', error);
-      addBotMessage('Failed to open file dialog. Please try again.', false);
+      antdMessage.error('Failed to open the save dialog.');
     }
-  };
-
-  const handleSavePathResponse = async (savePath) => {
-    const updatedSettings = {
-      ...outputSettings,
-      savePath
-    };
-
-    setOutputSettings(updatedSettings);
-    setSaveState(true);
-
-    addBotMessage(`✓ Configuration complete!\n\nOutput will be saved to: ${savePath}`, false);
-    addBotMessage('Click Run & Save Configuration when ready.', false);
-  };
-
-  const handleConnectionResponse = async (value, data) => {
-    const connection = data || availableConnections.find(c => c.value === value);
-    if (!connection) {
-      addBotMessage('Invalid connection selection. Please try again.', false);
-      return;
-    }
-
-    const updatedSettings = {
-      ...outputSettings,
-      connectionId: value
-    };
-
-    setOutputSettings(updatedSettings);
-    setPendingChoices([]);
-    console.log('connection.connection: ', connection.connection, data, availableConnections)
-
-    // Check if this is a cloud storage connection
-    const isCloudStorage = connection.connection?.dbCategory === 'CloudStorage';
-    const isVector = connection.connection?.dbCategory === 'Vector';
-
-    if (isCloudStorage) {
-      // Open cloud storage browser for path selection
-      setCloudStorageConnection(connection.connection);
-      setCloudStorageBrowserOpen(true);
-      addBotMessage(`Opening cloud storage browser to select output path...`, false);
-      return;
-    }
-
-    if (isVector) {
-      // For vector databases, ask for index/table name
-      const dbType = connection.connection?.dbType;
-      let prompt = '';
-      let placeholder = '';
-
-      if (dbType === 'pinecone') {
-        prompt = 'What Pinecone index should the vectors be inserted into?\n\n**Note**: Use format `index-name` or `index-name/namespace` to specify a namespace';
-        placeholder = 'index-name or index-name/namespace';
-      } else {
-        // LanceDB or other vector databases
-        prompt = 'What table name should the vectors be inserted into?';
-        placeholder = 'Enter table name...';
-      }
-
-      addBotMessage(prompt, true, 'text', 'tableName', placeholder);
-      return;
-    }
-
-    // For database connections, ask for table name
-    // Check if this database needs schema qualification
-    const needsSchemaInfo = connection.connection?.dbType === 'bigquery'
-      ? '\n\n**Note**: For BigQuery, use the format `dataset.table_name`'
-      : connection.connection?.dbType === 'snowflake'
-      ? '\n\n**Note**: For Snowflake, you can use `schema.table_name` or just `table_name`'
-      : '';
-
-    addBotMessage(
-      `What table name should the data be inserted into?${needsSchemaInfo}`,
-      true,
-      'text',
-      'tableName',
-      connection.connection?.dbType === 'bigquery' ? 'dataset.table_name' : 'Enter table name...'
-    );
-  };
-
-  const handleTableNameResponse = async (tableName) => {
-    // Get the connection to access dbType and dbConfig
-    const selectedConnection = availableConnections.find(c => c.value === outputSettings.connectionId);
-
-    let quotedTableName = tableName;
-
-    // Use quoteIdentifier to add schema qualification for databases that need it
-    if (selectedConnection?.connection) {
-      const conn = selectedConnection.connection;
-      const dbType = conn.dbType;
-      const dbConfig = conn.dbConfig || {};
-
-      try {
-        // Parse schema from table name if user provided it (e.g., "dataset.table" or "schema.table")
-        let parsedSchema = null;
-        let parsedTableName = tableName;
-
-        if (tableName.includes('.')) {
-          const parts = tableName.split('.');
-          if (parts.length === 2) {
-            // format: schema.table
-            [parsedSchema, parsedTableName] = parts;
-          } else if (parts.length === 3 && dbType === 'bigquery') {
-            // format: project.dataset.table (BigQuery)
-            parsedTableName = tableName; // Keep full format for BigQuery
-          }
-        }
-
-        // Determine schema to use
-        let schema = parsedSchema || dbConfig.schema;
-
-        // Apply default schemas for specific database types if not provided
-        if (!schema) {
-          if (dbType === 'mssql') {
-            schema = 'dbo';
-          } else if (dbType === 'bigquery') {
-            schema = dbConfig.dataset;
-          }
-        }
-
-        // Only call quoteIdentifier if we have a simple table name (not already qualified)
-        if (!tableName.includes('.') || (tableName.includes('.') && dbType !== 'bigquery')) {
-          const result = await window.electronAPI.dbConnect.quoteIdentifier(
-            dbType,
-            parsedTableName,
-            schema,
-            dbConfig,
-            conn.id
-          );
-
-          if (result.success) {
-            quotedTableName = result.quotedIdentifier;
-          }
-        } else {
-          // User provided fully qualified name (e.g., dataset.table for BigQuery)
-          // Use it as-is
-          quotedTableName = tableName;
-        }
-      } catch (err) {
-        console.log('Could not quote identifier, using table name as-is:', err);
-      }
-    }
-
-    const updatedSettings = {
-      ...outputSettings,
-      tableName: quotedTableName
-    };
-
-    setOutputSettings(updatedSettings);
-    setSaveState(true);
-
-    addBotMessage(`✓ Configuration complete!\n\nData will be inserted into table: ${quotedTableName}`, false);
-    addBotMessage('Click Run & Save Configuration when ready.', false);
   };
 
   const handleCloudStoragePathSelect = (pathInfo) => {
     setCloudStorageBrowserOpen(false);
-
-    // pathInfo contains: { containerName, objectPath, fullPath }
-    const tableName = pathInfo.fullPath;
-
-    const updatedSettings = {
-      ...outputSettings,
-      tableName
-    };
-    console.log('updatedSettings: ', updatedSettings)
-    setOutputSettings(updatedSettings);
-    setSaveState(true);
-
-    addBotMessage(`✓ Configuration complete!\n\nData will be uploaded to: ${tableName}`, false);
-    addBotMessage('Click Run & Save Configuration when ready.', false);
+    patch({ tableName: pathInfo.fullPath });
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Build Configuration
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const buildConfig = () => {
+  const buildConfig = (finalSettings) => {
     if (!sourceNode || !sourceConnection) return {};
-
-    const config = {
+    return {
       nodeType: 'output',
 
-      // Source information
       sourceNodeId: sourceNode.id,
       sourceNodeLabel: sourceNode.data?.label,
       sourceConnectionId: sourceConnection.id,
@@ -806,233 +466,272 @@ const OutputNodeChat = ({
       sourceConnectionType: sourceConnection.connectionType,
       sourceDbType: sourceConnection.dbType,
       sourceDbConfig: sourceConnection.dbConfig,
-      sourceTableSchema: sourceTableSchema,
+      sourceTableSchema,
       sourceTableName: sourceTableSchema?.tableName,
       sourceCollection: sourceTableSchema?.tableName,
       sourceLocalPath: sourceConnection.localPath,
 
-      // Output settings
-      outputSettings: outputSettings,
+      outputSettings: finalSettings,
     };
-
-    return config;
   };
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Execute Output
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // Run the output, then persist — the footer action is "Run & Save".
   const handleSave = async () => {
-    setSaveState(false);
+    setAttempted(true);
+    if (missingCount > 0 || cloudBlocked) return;
+    if (submitting) return; // guard against a double click racing the first run
+
     setExecutionError(null);
+    setSubmitting(true);
+
+    // The table name goes through as the user typed it. insertToConnection
+    // quotes and schema-qualifies it itself, and hands the RAW name to
+    // batchInsert — pre-quoting here produced `db`.`tbl` which then got
+    // re-qualified, so CREATE TABLE failed silently and the insert reported
+    // "table doesn't exist".
+    const finalSettings = outputSettings;
 
     executingInd(true);
-
-    const result = await executeOutput({
-      sourceConnection,
-      sourceTableSchema,
-      outputSettings,
-      onSuccess: (res) => {
-        addBotMessage(`✓ ${res.message}`, false);
-        if (res.filePath) {
-          addBotMessage(`📁 File saved at: ${res.filePath}`, false);
-        }
-      },
-      onError: (err) => {
-        addBotMessage(`✗ Output failed: ${err.error || err.message}`, false);
-        setExecutionError({
-          error: err.error || err.message
-        });
-      }
-    });
-
-    executingInd(false);
-
-    if (!result.success) return;
-
-    setSaveState(false);
-
-    // Save configuration
-    const config = buildConfig();
-    console.log('Saving output config:', config);
-    onSave(config, chat);
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // UI Helpers
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const getCurrentQuestion = () => {
-    for (let i = 0; i < chat.length; i++) {
-      const msg = chat[i];
-      if (msg.sender === 'bot' && msg.responseRequired) {
-        const nextMsg = chat[i + 1];
-        if (!nextMsg || nextMsg.sender !== 'user') {
-          return msg;
-        }
-      }
-    }
-    return null;
-  };
-
-  const currentQ = getCurrentQuestion();
-
-  const getPlaceholder = () => {
-    if (!currentQ) return '';
-    return currentQ.placeholder || 'Type your response…';
-  };
-
-  const handleSendMessage = () => {
-    const text = inputValue.trim();
-    if (!text || !currentQ) return;
-    setInputValue('');
-    handleUserResponse(text, currentQ.ref, text, null);
-  };
-
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
-    }
-  };
-
-  const displayChoices = () => {
-    if (loading || executing) return [];
-
-    if (pendingChoices.length > 0) {
-      return pendingChoices;
-    }
-
-    if (executionError) {
-      return [{
-        label: '🔄 Retry Configuration',
-        value: 'retry',
-        variant: 'outlined',
-        fullWidth: true
-      }];
-    }
-
-    if (saveState) {
-      return [{ label: 'Run & Save Configuration', value: 'save', variant: 'contained', fullWidth: true }];
-    }
-
-    return [];
-  };
-
-  const handleChoiceClick = (choice) => {
-    if (choice.value === 'save') {
-      handleSave();
-      return;
-    }
-
-    if (choice.value === 'retry') {
-      // Reset to start
-      setPendingChoices([]);
-      setOutputSettings({
-        outputType: null,
-        format: null,
-        savePath: null,
-        connectionId: null,
-        tableName: null,
+    try {
+      const result = await executeOutput({
+        sourceConnection,
+        sourceTableSchema,
+        outputSettings: finalSettings,
+        onSuccess: (res) => {
+          antdMessage.success(res.message || 'Output complete.');
+          if (res.filePath) antdMessage.info(`File saved at: ${res.filePath}`);
+        },
+        onError: (err) => {
+          setExecutionError(`Output failed: ${err.error || err.message}`);
+        },
       });
-      setExecutionError(null);
-      initializationFunc();
-      return;
+
+      if (!result.success) return;
+
+      onSave(buildConfig(finalSettings), []);
+      setDirty(false);
+      setAttempted(false);
+    } finally {
+      executingInd(false);
+      setSubmitting(false);
     }
-
-    const currentQ = getCurrentQuestion();
-    if (!currentQ) return;
-
-    handleUserResponse(
-      choice.label,
-      currentQ.ref,
-      choice.value,
-      choice._data || null
-    );
   };
 
-  const displayMessages = chat.map(m => ({
-    id: m.id,
-    text: m.text,
-    metadata: m.metadata,
-    sender: m.sender,
-    timestamp: m.timestamp || new Date(),
-  }));
+  // ── Render ───────────────────────────────────────────────────────────────
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Code popup wiring
-  // ─────────────────────────────────────────────────────────────────────────
-  const handleCodeSave = useCallback((field, value, message) => {
-    setChat(prev => prev.map(m =>
-      m.id === message?.id
-        ? { ...m, metadata: { ...m.metadata, [field]: value } }
-        : m
-    ));
+  if (loading) {
+    return (
+      <FormScope>
+        <FormBody><EmptyState>Loading the connected source…</EmptyState></FormBody>
+      </FormScope>
+    );
+  }
 
-    if (!onConfigUpdate || !node?.id) return;
+  if (sourceError) {
+    return (
+      <FormScope>
+        <FormBody>
+          <Card label="Source"><Note>{sourceError}</Note></Card>
+        </FormBody>
+      </FormScope>
+    );
+  }
 
-    let update;
-    switch (field) {
-      case 'sql':
-        update = { targetSql: value };
-        break;
-      case 'ddl':
-      case 'targetDdl':
-        update = { targetDdl: value };
-        break;
-      default:
-        update = { [field]: value };
-    }
-    onConfigUpdate(node.id, update);
-  }, [onConfigUpdate, node?.id]);
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
+  const isLocal = outputSettings.outputType === 'local';
 
   return (
-    <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <ChatArea
-        hideHeader
-        isFullscreen={false}
-        currentChatTitle=""
-        multiStepData={null}
-        handleFullscreen={() => {}}
-        handleToggleChat={() => {}}
-        chatContainerRef={chatContainerRef}
-        messages={displayMessages}
-        isLoading={loading}
-        progressInfo={{ progress: 0, stage: loading ? 'Processing...' : '' }}
-        messagesEndRef={messagesEndRef}
-        inputRef={inputRef}
-        inputValue={inputValue}
-        setInputValue={setInputValue}
-        handleKeyPress={handleKeyPress}
-        handleSendMessage={handleSendMessage}
-        formatTimestamp={formatTimestamp}
-        onSaveToMain={null}
-        choices={displayChoices()}
-        onChoiceSelect={handleChoiceClick}
-        inputPlaceholder={getPlaceholder()}
-        disableInput={disableInput}
-        showRunButton={false}
-        onRun={null}
-        runButtonLoading={false}
-        onCodeSave={handleCodeSave}
+    <FormScope>
+      <FormBody>
+        <Card label="Output">
+          <Fields>
+            <Field
+              label="Where would you like to output the data?"
+              hint="Export to a local file, or insert into a saved connection."
+            >
+              <Segmented
+                value={outputSettings.outputType}
+                options={[
+                  { label: 'Local Environment', value: 'local' },
+                  { label: 'Connection', value: 'connection' },
+                ]}
+                onChange={changeOutputType}
+              />
+            </Field>
+            <Note>
+              Source: <strong>{sourceNode?.data?.label || sourceTableSchema?.tableName}</strong>
+              {' '}— an output node takes exactly one input.
+            </Note>
+          </Fields>
+        </Card>
+
+        {isLocal && (
+          <Card label="Local file">
+            <Fields>
+              <Field label="Output format" required invalid={invalid('format')}>
+                <SelectInput
+                  value={outputSettings.format ?? ''}
+                  placeholder="Select a format…"
+                  options={FORMAT_OPTIONS}
+                  // Changing the format invalidates a path with the old extension.
+                  onChange={(v) => patch({ format: v, savePath: null })}
+                />
+              </Field>
+              <Field
+                label="Save to"
+                required
+                invalid={invalid('savePath')}
+                hint={<>Opens the native save dialog. Defaults to <code>output_{'{node}'}.{'{ext}'}</code>.</>}
+              >
+                <PathPicker
+                  value={outputSettings.savePath}
+                  placeholder="Choose where to write the file…"
+                  onChange={(v) => patch({ savePath: v || null })}
+                  onBrowse={browseSavePath}
+                  browseTitle="Choose save location"
+                />
+              </Field>
+            </Fields>
+          </Card>
+        )}
+
+        {!isLocal && (
+          <Card label="Destination connection">
+            {availableConnections.length === 0 ? (
+              <EmptyState>
+                No database, vector or cloud-storage connection is available. Create one from the Connections tab.
+              </EmptyState>
+            ) : (
+              <>
+                <ConnList grouped>
+                  {grouped.map(([group, conns]) => (
+                    <React.Fragment key={group}>
+                      <ConnGroupToggle
+                        label={group}
+                        color={GROUP_COLOR[group]}
+                        count={conns.length}
+                        open={!!openGroups[group]}
+                        onToggle={() => toggleGroup(group)}
+                      />
+                      {openGroups[group] && conns.map((c) => (
+                        <ConnRow
+                          key={c.id}
+                          icon={c.icon}
+                          name={c.name}
+                          meta={c.meta}
+                          selected={c.id === outputSettings.connectionId}
+                          onClick={() => changeDestination(c)}
+                        />
+                      ))}
+                    </React.Fragment>
+                  ))}
+                </ConnList>
+                <div className="tlx-hint" style={{ marginTop: 8 }}>
+                  Only database, vector and cloud-storage connections can receive output.
+                </div>
+              </>
+            )}
+          </Card>
+        )}
+
+        {!isLocal && destKind === 'database' && (
+          <Card label="Target table">
+            <Fields>
+              <Field
+                label="What table should the data be inserted into?"
+                required
+                invalid={invalid('tableName')}
+                hint={
+                  dbType === 'bigquery'
+                    ? <>BigQuery expects <code>dataset.table_name</code>.</>
+                    : dbType === 'snowflake'
+                      ? <>Snowflake accepts <code>schema.table_name</code> or a bare name.</>
+                      : 'Quoted and schema-qualified for you when the output runs. Created if it does not exist.'
+                }
+              >
+                <TextInput
+                  mono
+                  value={outputSettings.tableName}
+                  placeholder={dbType === 'bigquery' ? 'dataset.table_name' : 'orders_enriched'}
+                  onChange={(v) => patch({ tableName: v })}
+                />
+              </Field>
+            </Fields>
+          </Card>
+        )}
+
+        {!isLocal && destKind === 'vector' && (
+          <Card label="Target index">
+            <Fields>
+              <Field
+                label="What table should the vectors be inserted into?"
+                required
+                invalid={invalid('tableName')}
+                hint={dbType === 'pinecone'
+                  ? <>Pinecone takes <code>index-name</code> or <code>index-name/namespace</code>.</>
+                  : null}
+              >
+                <TextInput
+                  mono
+                  value={outputSettings.tableName}
+                  placeholder={dbType === 'pinecone' ? 'index-name or index-name/namespace' : 'Enter table name…'}
+                  onChange={(v) => patch({ tableName: v })}
+                />
+              </Field>
+            </Fields>
+          </Card>
+        )}
+
+        {!isLocal && destKind === 'cloud' && (
+          <Card label="Upload path">
+            <Handoff
+              color={FORM_ACCENT.source}
+              icon={<IconFolder color={FORM_ACCENT.source} size={14} />}
+              title="Choose where to upload"
+            >
+              <HandoffBody>
+                Browse the bucket and pick the container and object path the results are written to.
+                Save stays disabled until a path is chosen.
+              </HandoffBody>
+              {outputSettings.tableName ? (
+                <Picked>Uploading to <code>{outputSettings.tableName}</code></Picked>
+              ) : null}
+              <CloudButton
+                onClick={() => setCloudStorageBrowserOpen(true)}
+                disabled={!pluginManager}
+              >
+                {outputSettings.tableName ? 'Change location' : 'Open storage browser'}
+              </CloudButton>
+            </Handoff>
+          </Card>
+        )}
+      </FormBody>
+
+      <FormFooter
+        error={gateMessage}
+        onCancel={onCancel}
+        cancelDisabled={running}
+        onSave={handleSave}
+        saveLabel={running ? 'Running…' : 'Run & Save Configuration'}
+        saveDisabled={running || cloudBlocked}
+        saveDisabledReason={running
+          ? 'The output is running — wait for it to finish.'
+          : cloudBlocked
+            ? 'Pick an upload path in the storage browser first.'
+            : undefined}
       />
 
-      {cloudStorageBrowserOpen && cloudStorageConnection && pluginManager && (
+      {cloudStorageBrowserOpen && selectedDestination?.connection && pluginManager && (
         <CloudStorageBrowser
           open={cloudStorageBrowserOpen}
           onClose={() => setCloudStorageBrowserOpen(false)}
-          connection={cloudStorageConnection}
+          connection={selectedDestination.connection}
           onFileSelect={handleCloudStoragePathSelect}
           pluginManager={pluginManager}
           mode="output"
           sourceDbType={sourceConnection?.dbType}
         />
       )}
-    </div>
+    </FormScope>
   );
 };
 

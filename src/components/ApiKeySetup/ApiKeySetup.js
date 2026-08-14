@@ -17,6 +17,10 @@ import {
   Alert,
   Divider,
   Avatar,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
 } from '@mui/material';
 import {
   Visibility,
@@ -32,6 +36,7 @@ import {
   Logout,
 } from '@mui/icons-material';
 import { saveApiKey } from '../../utils/apiKeyStorage';
+import { DEFAULT_MAX_TOKENS, buildTokenOptions, saveMaxTokens } from '../../utils/aiProviders';
 import OthersProviderForm from './OthersProviderForm';
 import {
   register as registerAccount,
@@ -788,14 +793,51 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
+  // After the key is saved, the user MUST pick a model before continuing so we
+  // never silently fall back to a hardcoded (possibly retired) default model.
+  const [phase, setPhase] = useState('key');        // 'key' -> 'model'
+  const [models, setModels] = useState([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [selectedModel, setSelectedModel] = useState('');
+  const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
+  const [continuing, setContinuing] = useState(false);
+
+  // Output ceiling published for the chosen model (Anthropic/Google expose it;
+  // OpenAI doesn't) — bounds the Max Tokens choices below.
+  const selectedModelCap = models.find((m) => m.value === selectedModel)?.maxOutputTokens || null;
 
   const provider = PROVIDERS.find(p => p.id === selectedProvider);
   const canSave = selectedProvider && apiKey.trim().length > 0 && !saving;
+  // 'chatgpt' is the onboarding tile id; the rest of the app stores 'openai'.
+  const normalizedProvider = selectedProvider === 'chatgpt' ? 'openai' : selectedProvider;
 
   const handleProviderSelect = (id) => {
     setSelectedProvider(id);
     setApiKey('');
     setError('');
+    setSaved(false);
+    setPhase('key');
+    setModels([]);
+    setSelectedModel('');
+  };
+
+  const loadModels = async () => {
+    setModelsLoading(true);
+    setModels([]);
+    setSelectedModel('');
+    try {
+      const res = await window.electronAPI?.ai?.listModels?.(selectedProvider);
+      if (res?.success && Array.isArray(res.models) && res.models.length) {
+        setModels(res.models);
+        setSelectedModel(res.models[0].value);  // sensible preselect; user can change
+      } else {
+        setModels([]);  // no list available — fall back to manual entry in the UI
+      }
+    } catch (e) {
+      setModels([]);
+    } finally {
+      setModelsLoading(false);
+    }
   };
 
   const handleSave = async () => {
@@ -809,11 +851,29 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
         return;
       }
       setSaved(true);
-      setTimeout(() => onComplete({ provider: selectedProvider, key: apiKey.trim() }), 900);
+      // Advance to the required model-selection step instead of finishing.
+      setPhase('model');
+      loadModels();
     } catch (err) {
       setError(err.message || 'An unexpected error occurred.');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleModelContinue = async () => {
+    if (!selectedModel.trim()) return;
+    setContinuing(true);
+    try {
+      // Persist provider + chosen model so every AI feature uses it.
+      await window.electronAPI?.ai?.setDefaultProvider?.(normalizedProvider, selectedModel.trim());
+      // Same store Settings writes to, clamped to the model's published limit.
+      await saveMaxTokens(maxTokens, selectedModelCap);
+    } catch (e) {
+      console.warn('[ApiKeySetup] Could not persist default model:', e);
+    } finally {
+      setContinuing(false);
+      onComplete({ provider: selectedProvider, key: apiKey.trim(), model: selectedModel.trim() });
     }
   };
 
@@ -974,6 +1034,7 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
               type={showKey ? 'text' : 'password'}
               autoComplete="off"
               autoFocus
+              disabled={phase === 'model'}
               error={Boolean(error)}
               helperText={error || `Keys for ${provider.name} typically start with "${provider.keyPrefix}"`}
               InputProps={{
@@ -994,20 +1055,101 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
               </Alert>
             )}
 
-            <Button
-              variant="contained"
-              size="large"
-              onClick={handleSave}
-              disabled={!canSave || saved}
-              startIcon={saving ? <CircularProgress size={18} color="inherit" /> : <CheckCircle />}
-              sx={{
-                bgcolor: provider.borderColor,
-                '&:hover': { bgcolor: provider.borderColor, filter: 'brightness(0.9)' },
-                px: 4, py: 1.2, fontWeight: 700, fontSize: 15, borderRadius: 2,
-              }}
-            >
-              {saving ? 'Saving...' : saved ? 'Saved!' : 'Save & Continue'}
-            </Button>
+            {phase !== 'model' ? (
+              <Button
+                variant="contained"
+                size="large"
+                onClick={handleSave}
+                disabled={!canSave}
+                startIcon={saving ? <CircularProgress size={18} color="inherit" /> : <CheckCircle />}
+                sx={{
+                  bgcolor: provider.borderColor,
+                  '&:hover': { bgcolor: provider.borderColor, filter: 'brightness(0.9)' },
+                  px: 4, py: 1.2, fontWeight: 700, fontSize: 15, borderRadius: 2,
+                }}
+              >
+                {saving ? 'Saving...' : 'Save & Continue'}
+              </Button>
+            ) : (
+              <Box>
+                <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
+                  Choose your default model
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                  Every AI feature uses this model. You can change it anytime in Settings → AI Provider.
+                </Typography>
+
+                {modelsLoading ? (
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 3 }}>
+                    <CircularProgress size={18} />
+                    <Typography variant="body2" color="text.secondary">Loading available models…</Typography>
+                  </Box>
+                ) : models.length > 0 ? (
+                  <FormControl fullWidth sx={{ mb: 3 }}>
+                    <InputLabel id="onboarding-model-label">Model</InputLabel>
+                    <Select
+                      labelId="onboarding-model-label"
+                      label="Model"
+                      value={selectedModel}
+                      onChange={(e) => setSelectedModel(e.target.value)}
+                    >
+                      {models.map((m) => (
+                        <MenuItem key={m.value} value={m.value}>{m.label || m.value}</MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                ) : (
+                  // Live model list unavailable — require an explicit model id so
+                  // we still never fall back to a hardcoded default.
+                  <TextField
+                    fullWidth
+                    label="Model ID"
+                    placeholder={`e.g. ${normalizedProvider === 'gemini' ? 'gemini-2.5-flash' : normalizedProvider === 'claude' ? 'claude-sonnet-4-5-20250929' : 'gpt-4.1'}`}
+                    value={selectedModel}
+                    onChange={(e) => setSelectedModel(e.target.value)}
+                    helperText="Couldn't fetch the model list. Enter the exact model name to use."
+                    sx={{ mb: 3 }}
+                  />
+                )}
+
+                {/* Same setting as Settings → AI Provider → Max Tokens, saved
+                    to the same place. Options are bounded by the selected
+                    model's published output limit when it has one. */}
+                <FormControl fullWidth sx={{ mb: 1 }}>
+                  <InputLabel id="onboarding-max-tokens-label">Max Tokens</InputLabel>
+                  <Select
+                    labelId="onboarding-max-tokens-label"
+                    label="Max Tokens"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(e.target.value)}
+                  >
+                    {buildTokenOptions(selectedModelCap).map((o) => (
+                      <MenuItem key={o.value} value={o.value}>{o.label}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+                  Longest answer the AI can produce. Reasoning models spend part of
+                  this budget thinking before they reply, so low values can cut an
+                  answer short.
+                </Typography>
+
+                <Button
+                  variant="contained"
+                  size="large"
+                  onClick={handleModelContinue}
+                  disabled={!selectedModel.trim() || continuing || modelsLoading}
+                  startIcon={continuing ? <CircularProgress size={18} color="inherit" /> : <CheckCircle />}
+                  sx={{
+                    bgcolor: provider.borderColor,
+                    '&:hover': { bgcolor: provider.borderColor, filter: 'brightness(0.9)' },
+                    px: 4, py: 1.2, fontWeight: 700, fontSize: 15, borderRadius: 2,
+                  }}
+                >
+                  {continuing ? 'Saving…' : 'Continue'}
+                </Button>
+              </Box>
+            )}
           </Box>
         )}
       </Box>

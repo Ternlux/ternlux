@@ -78,7 +78,22 @@ export const loadTableSchema = async ({
     // Handle local files (NeDB for MongoDB, SQLite for SQL transformations)
     if (localPath && window.electronAPI?.db?.readLocalCollection) {
       // Determine storage type from connection dbType
-      const storageType = connection.dbType === 'sqlite' ? 'sqlite' : 'nedb';
+      const storageType = connection.dbType === 'sqlite' ? 'sqlite' : connection.dbType === 'duckdb' ? 'duckdb' : 'nedb';
+
+      // DuckDB reads the file in place and reports its own column types, so a
+      // single read gives both the schema and the sample — no PRAGMA, and no
+      // guessing types from the first row the way the NeDB path has to.
+      if (storageType === 'duckdb') {
+        const result = await window.electronAPI.db.readLocalCollection(localPath, limit, 'duckdb', null, tableName || null);
+        if (!result.success || !result.rows) return null;
+        return {
+          tableName: tableName || result.currentTable,
+          columns: (result.columns || []).map(({ name, type }) => ({
+            name, type, nullable: true, isPrimary: false,
+          })),
+          sampleData: result.rows.slice(0, limit),
+        };
+      }
 
       if (storageType === 'sqlite' && tableName) {
         // Remove schema prefix if present (e.g., "public.tablename" -> "tablename")

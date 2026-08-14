@@ -3,19 +3,50 @@ const path = require('path');
 const Datastore = require('@seald-io/nedb');
 const { app } = require('electron');
 
+const sanitizePathSegment = (value) => String(value || '')
+  .replace(/[^a-zA-Z0-9._-]+/g, '_')
+  .replace(/^[._]+|[._]+$/g, '')
+  .slice(0, 80);
+
+/**
+ * Where a local NeDB collection lives.
+ *
+ * Scoped per workflow AND per node — `local-collections/<workflowId>/<nodeId>.db`
+ * — because the flat layout keyed only on a collection name let two nodes
+ * collide whenever their names sanitized to the same string, and each run
+ * deletes the file first in new_table mode, so one node would silently wipe
+ * another's data.
+ *
+ * The scope is optional on purpose: connection imports and error paths have no
+ * workflow, and those keep the original flat layout so nothing that already
+ * works starts resolving somewhere new.
+ */
+function resolveLocalCollectionPath(targetCollection, scope = {}) {
+  const root = path.join(app.getPath('userData'), 'local-collections');
+  const workflowId = sanitizePathSegment(scope.workflowId);
+  const nodeId = sanitizePathSegment(scope.nodeId);
+
+  if (workflowId && nodeId) return path.join(root, workflowId, `${nodeId}.db`);
+  if (workflowId) return path.join(root, workflowId, `${sanitizePathSegment(targetCollection)}.db`);
+  return path.join(root, `${targetCollection}.db`);
+}
+
 /**
  * Helper function to save documents to local NeDB file
  * Sanitizes MongoDB ObjectIds and Dates for NeDB compatibility
+ *
+ * `scope` is { workflowId, nodeId } — both optional. An explicit
+ * targetLocalPath always wins, so already-saved nodes keep reading and writing
+ * the exact file recorded in their config.
  */
-async function saveToLocalNeDB(targetCollection, documents, operationMode, totalProcessed, targetLocalPath = null) {
+async function saveToLocalNeDB(targetCollection, documents, operationMode, totalProcessed, targetLocalPath = null, scope = {}) {
   // Honor the caller's configured target path so the writer and every reader
   // (preview via db:read-local-collection, downstream output/join nodes) all
-  // point at the same file. Fall back to the userData default only when no
+  // point at the same file. Fall back to the scoped default only when no
   // path was configured. Without this, a targetLocalPath outside
   // userData/local-collections leaves the data here while readers look there.
   // console.log("saveToLocalNeDB: ", targetCollection, targetLocalPath, )
-  const localDbPath = targetLocalPath
-    || path.join(app.getPath('userData'), 'local-collections', `${targetCollection}.db`);
+  const localDbPath = targetLocalPath || resolveLocalCollectionPath(targetCollection, scope);
   const localDbDir = path.dirname(localDbPath);
 
   // Ensure directory exists
@@ -125,7 +156,10 @@ async function transformNeDB({
     operationType,
     nosqlOperation,
     transformFunction,
-    operationMode
+    operationMode,
+    // Optional scope for the local NeDB fallback path.
+    workflowId = null,
+    nodeId = null
   }) {
     console.log({
       sourceLocalPath,
@@ -273,7 +307,8 @@ async function transformNeDB({
                 transformedDocs,
                 operationMode,
                 docs.length,
-                targetLocalPath
+                targetLocalPath,
+                { workflowId, nodeId }
               );
               resolve(result);
             });
@@ -340,4 +375,4 @@ async function transformNeDB({
       };
     }
   }
-  module.exports = {transformNeDB, saveToLocalNeDB}
+  module.exports = {transformNeDB, saveToLocalNeDB, resolveLocalCollectionPath}

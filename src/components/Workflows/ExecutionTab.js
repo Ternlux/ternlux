@@ -315,10 +315,9 @@ const DetailPanel = ({ ex, onClose }) => {
         backdropFilter: 'blur(2px)',
       }} />
       <div style={{
-        position: 'fixed', top: '50%', left: '50%', zIndex: 1400,
-        transform: 'translate(-50%,-50%)',
-        width: 720, maxWidth: 'calc(100vw - 48px)',
-        maxHeight: 'calc(100vh - 96px)',
+        // Fills its containing block — the app column when the assistant is
+        // pinned, the window otherwise — leaving a 5% gap all round.
+        position: 'fixed', inset: '1%', zIndex: 1400,
         background: '#fff', borderRadius: 8,
         border: `1px solid ${C.border}`,
         boxShadow: '0 24px 64px rgba(0,0,0,0.18)',
@@ -405,6 +404,25 @@ const DetailPanel = ({ ex, onClose }) => {
             {I('table', C.green, 12)}
             <span style={{ fontSize: 11, color: C.green, fontWeight: 500 }}>Output:</span>
             <code style={{ fontSize: 11, fontFamily: MONO, color: C.green }}>{ex.outputTableName}</code>
+          </div>
+        )}
+        {ex.validation && (
+          <div style={{
+            padding: '9px 20px',
+            background: ex.validation.valid ? C.gD : C.amD,
+            borderBottom: `1px solid ${ex.validation.valid ? C.gB : 'rgba(217,119,6,0.18)'}`,
+            display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+          }}>
+            {I(ex.validation.valid ? 'check' : 'x', ex.validation.valid ? C.green : C.amber, 12)}
+            <span style={{
+              fontSize: 11, fontWeight: 500,
+              color: ex.validation.valid ? C.green : C.amber,
+            }}>
+              {ex.validation.valid ? 'Output validated' : 'Validation failed:'}
+            </span>
+            {!ex.validation.valid && ex.validation.reason && (
+              <span style={{ fontSize: 11, color: C.amber }}>{ex.validation.reason}</span>
+            )}
           </div>
         )}
         {errorMsg && (
@@ -592,8 +610,10 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Focus the chat assistant on the open execution; passing null (on close)
+  // takes it back out of focus.
   const reportSelected = (execution) => {
-    if (!execution) return;
+    if (!execution) { onContextChange(null); return; }
     onContextChange({
       kind: 'execution',
       id: execution.executionId || execution.id || execution._id,
@@ -636,6 +656,34 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
       }
     }
   };
+
+  // While a running execution is open, keep pulling its record so its logs and
+  // node statuses stream in live. Stops once it is no longer running or closed.
+  useEffect(() => {
+    const ex = selectedExecution;
+    if (!ex || ex.status !== 'running') return;
+    const executionId = ex.executionId || ex.id;
+    if (!executionId) return;
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const fresh = await executionsDb.getById(executionId);
+        if (cancelled || !fresh) return;
+        setSelectedExecution(fresh);
+        // Keep the list row in sync (status/duration/records) as it finishes.
+        setExecutions(prev => prev.map(e =>
+          (e.executionId || e.id) === executionId ? { ...e, ...fresh } : e));
+        if (fresh.status !== 'running') fetchStats();
+      } catch (err) {
+        console.error('Error polling execution:', err);
+      }
+    }, 2000);
+
+    return () => { cancelled = true; clearInterval(interval); };
+    // Re-run only when a different execution is opened or its running state flips.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedExecution?.executionId || selectedExecution?.id, selectedExecution?.status]);
 
   // Distinct workflows / users for filter dropdowns
   const workflowOptions = useMemo(
@@ -749,7 +797,7 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
       </div>
 
       {selectedExecution && (
-        <DetailPanel ex={selectedExecution} onClose={() => setSelectedExecution(null)} />
+        <DetailPanel ex={selectedExecution} onClose={() => { setSelectedExecution(null); reportSelected(null); }} />
       )}
     </div>
   );

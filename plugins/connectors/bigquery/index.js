@@ -121,20 +121,37 @@ module.exports = {
   /**
    * Run SQL query
    */
-  runQuery: async (config, connectionId, queryObj) => {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxRows] - Stop after this many rows.
+   *
+   * BigQuery caps natively: `maxResults` bounds the page the job returns, so
+   * the SQL the user wrote is the SQL BigQuery runs — no LIMIT is appended and
+   * no subquery is wrapped around it. `autoPaginate: false` is what keeps the
+   * client from fetching every remaining page behind our back.
+   *
+   * The statement runs exactly ONCE on every path.
+   */
+  runQuery: async (config, connectionId, queryObj, options = {}) => {
     try {
       const bigquery = getClient(config, connectionId);
 
       // Extract SQL query from the query object
       const sqlQuery = queryObj.query;
+      const maxRows = Number(options.maxRows);
 
-      const options = {
+      const jobOptions = {
         query: sqlQuery,
         location: config.location || 'US',
       };
 
-      const [job] = await bigquery.createQueryJob(options);
-      const [rows] = await job.getQueryResults();
+      const [job] = await bigquery.createQueryJob(jobOptions);
+      // One past the cap, so "is there more?" is observed rather than assumed.
+      const [allRows] = maxRows > 0
+        ? await job.getQueryResults({ maxResults: maxRows + 1, autoPaginate: false })
+        : await job.getQueryResults();
+
+      const rows = maxRows > 0 ? allRows.slice(0, maxRows) : allRows;
 
       // Extract column names from the first row or from job metadata
       let columns = [];
@@ -146,7 +163,8 @@ module.exports = {
         success: true,
         rows: rows,
         columns: columns,
-        rowCount: rows.length
+        rowCount: rows.length,
+        ...(maxRows > 0 ? { truncated: allRows.length > maxRows } : {})
       };
     } catch (error) {
       console.error('BigQuery runQuery error:', error);
@@ -554,5 +572,34 @@ module.exports = {
    */
   getPreviewQuery: (tableName, limit = 100) => {
     return `SELECT * FROM ${tableName} LIMIT ${limit}`;
+  },
+
+  /**
+   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
+   * function lists are unioned with the shared ANSI baseline, so only what is
+   * distinctly BigQuery belongs here.
+   */
+  explorer: {
+    language: 'sql',
+    sqlDialect: 'BigQuery',
+    formatter: 'bigquery',
+    // runQuery honours { maxRows } via maxResults — see the note there.
+    maxRowsOption: true,
+    // BigQuery's container above a table is the dataset.
+    container: 'Dataset',
+    objectLabel: 'Table',
+    quote: '`',
+    keywords: [
+      'QUALIFY', 'UNNEST', 'STRUCT', 'ARRAY', 'EXCEPT DISTINCT', 'SELECT AS STRUCT',
+      'PIVOT', 'UNPIVOT', 'TABLESAMPLE SYSTEM', 'PARTITION BY', 'CLUSTER BY',
+      'FOR SYSTEM_TIME AS OF', 'ASSERT', 'DECLARE', 'MERGE', 'WINDOW',
+    ],
+    functions: [
+      'ARRAY_AGG', 'ARRAY_LENGTH', 'STRING_AGG', 'GENERATE_ARRAY', 'UNNEST',
+      'PARSE_JSON', 'JSON_VALUE', 'JSON_EXTRACT', 'TO_JSON_STRING',
+      'DATE_TRUNC', 'DATE_ADD', 'DATE_DIFF', 'TIMESTAMP_TRUNC', 'TIMESTAMP_DIFF',
+      'CURRENT_DATE', 'FORMAT_DATE', 'PARSE_DATE', 'SAFE_CAST', 'IFNULL',
+      'APPROX_COUNT_DISTINCT', 'APPROX_QUANTILES', 'NET.HOST',
+    ],
   }
 };

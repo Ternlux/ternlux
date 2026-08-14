@@ -1,7 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { MergeOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, getLatestUserQuestion } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, truncate } from './nodeCardShared';
 
 const COLOR = '#d97706';
 const MONO = "'JetBrains Mono', monospace";
@@ -11,35 +11,40 @@ const BORDER = '#e2e6eb';
 const GREEN = '#059669';
 
 const JoinNode = ({ data, selected }) => {
-  const isConfigured = !!(data.config?.sourcesConfig || data.config?.joinSql || data.config?.javascriptFunction);
+  // Matches how the Data Preview decides a join is configured. The chat saves
+  // the generated function as `transformFunction`; `javascriptFunction` is
+  // only the AI's field name and never lands on the config.
+  const config = data.config || {};
+  const isConfigured = !!(
+    config.sourcesConfig ||
+    config.joinSql ||
+    config.targetSql ||
+    config.aggregationPipeline ||
+    config.transformFunction ||
+    config.javascriptFunction
+  );
 
+  // The node's own label names it — the destination table/collection it writes
+  // is the summary's job. A hand-dropped node starts on the generic type name,
+  // so that one case still defers to whatever the config was named.
   const getDisplayName = () => {
-    const config = data.config;
-
-    if (config?.targetTableName) {
-      return config.targetTableName;
-    }
-    if (config?.targetCollection) {
-      return config.targetCollection;
-    }
-    if (config?.node_name) {
-      return config.node_name;
-    }
-
-    return data.label || 'Join';
+    const label = String(data.label || '').trim();
+    if (label && label.toLowerCase() !== 'join') return label;
+    return config.node_name || label || 'Join';
   };
 
   const getSummary = () => {
     if (!isConfigured) return 'Click to configure join operation';
 
-    const config = data.config;
+    // Which sources are joined and where the result lands, named from the
+    // config — the same rows the Data Preview's Details tab lists.
+    const described = describeNode('join', config);
+    if (described) return described;
 
-    const explanation = config?.explanation || getLatestUserQuestion(config?.chat);
-    if (explanation) {
-      return explanation.length > 100 ? explanation.slice(0, 100) + '...' : explanation;
-    }
+    const explanation = config.explanation || config.joinRequest || config.joinDescription;
+    if (explanation) return truncate(explanation);
 
-    if (config?.sourcesConfig && config.sourcesConfig.length > 0) {
+    if (config.sourcesConfig?.length > 0) {
       const sourceCount = config.sourcesConfig.length;
       const targetName = config.targetTableName || config.targetCollection || 'result';
       return `Joining ${sourceCount} source${sourceCount > 1 ? 's' : ''} into ${targetName}`;

@@ -26,6 +26,23 @@
 const fs = require('fs');
 const path = require('path');
 
+// Write `val` to `abs` only when it differs from what's already on disk.
+// Rewriting an unchanged file still bumps its mtime and makes fs watchers
+// (workflowCodeWatcher / fileWatchTriggers) fire a spurious "change" event, so
+// every save of a workflow would otherwise emit one event per externalized code
+// file even when nothing changed. Skipping no-op writes keeps the watchers quiet
+// and avoids the reload/autosave feedback loop in the editor.
+function writeIfChanged(abs, val) {
+  try {
+    if (fs.existsSync(abs) && fs.readFileSync(abs, 'utf8') === val) return false;
+  } catch (_) {
+    // Unreadable/racy — fall through and (over)write.
+  }
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, val, 'utf8');
+  return true;
+}
+
 // Canonical code-only config fields → file extension.
 const CODE_FIELDS = {
   // DataSource node
@@ -151,8 +168,7 @@ function externalizeSourcesConfig(sourcesConfig, nodeDir, workflowDir, baseDir) 
       const fileName = `${field}.${ext}`;
       const rel = `${workflowDir}/${nodeDir}/sourcesConfig/${key}/${fileName}`;
       const abs = path.join(baseDir, workflowDir, nodeDir, 'sourcesConfig', key, fileName);
-      fs.mkdirSync(path.dirname(abs), { recursive: true });
-      fs.writeFileSync(abs, val, 'utf8');
+      writeIfChanged(abs, val);
       if (!entryOut) entryOut = { ...entry };
       entryOut[field] = { __codeFile: rel };
     }
@@ -174,8 +190,7 @@ function externalizeConfig(config, nodeDir, workflowDir, baseDir) {
     const fileName = `${field}.${ext}`;
     const rel = `${workflowDir}/${nodeDir}/${fileName}`;
     const abs = path.join(baseDir, workflowDir, nodeDir, fileName);
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, val, 'utf8');
+    writeIfChanged(abs, val);
     if (!out) out = { ...config };
     out[field] = { __codeFile: rel };
   }

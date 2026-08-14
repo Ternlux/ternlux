@@ -57,21 +57,94 @@ const safeStringify = (value) => {
   }
 };
 
-/**
- * Walk the chat backwards and return the text of the most recent user
- * message. Used as a fallback for the node summary when no AI explanation
- * is available yet — we'd rather show the user's last question than a
- * generic "Configured" string.
- */
-export const getLatestUserQuestion = (chat) => {
-  if (!Array.isArray(chat) || chat.length === 0) return '';
-  for (let i = chat.length - 1; i >= 0; i--) {
-    const m = chat[i];
-    if (m?.sender === 'user' && typeof m.text === 'string' && m.text.trim()) {
-      return m.text.trim();
-    }
-  }
+// ── Node summaries ──────────────────────────────────────────────────────────
+// The second line of a card answers "what does this node do?", and the only
+// honest source for that is the node's own config — the same fields the Data
+// Preview names in its header and Details tab. Cards used to fall back to the
+// last message in the chat, which records what the user ASKED rather than what
+// the node ended up configured to do, and goes stale the moment the config is
+// changed from the form.
+
+const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+
+/** "schema.table", or the bare table when the source has no schema. */
+const qualified = (schema, name) => (nonEmpty(schema) ? `${schema}.${name}` : name);
+
+/** The dataset a node reads. Same precedence as the Data Preview header. */
+export const sourceDatasetOf = (config = {}) => {
+  if (nonEmpty(config.sourceCollection)) return config.sourceCollection;
+  if (nonEmpty(config.sourceTableName)) return qualified(config.sourceSchema, config.sourceTableName);
+  if (nonEmpty(config.sourceIndexName)) return config.sourceIndexName;
+  if (nonEmpty(config.table)) return config.table;
+  if (nonEmpty(config.sourceDataset)) return config.sourceDataset;
+  if (nonEmpty(config.dataset)) return config.dataset;
   return '';
+};
+
+/** The dataset a node writes. */
+export const targetDatasetOf = (config = {}) => {
+  if (nonEmpty(config.targetCollection)) return config.targetCollection;
+  if (nonEmpty(config.targetTableName)) return qualified(config.targetSchema, config.targetTableName);
+  return '';
+};
+
+const describeDataSource = (config) => {
+  // A REST API source has no table to name — the endpoint identifies it, and
+  // the collection it caches into is where downstream nodes read from.
+  const api = config.apiConnectionPublicConfig;
+  if (api || config.sourceConnectionType === 'api') {
+    if (!nonEmpty(config.apiFetchCode)) return 'REST API — describe the request in the chat';
+    const into = nonEmpty(config.sourceCollection) ? ` into ${config.sourceCollection}` : '';
+    return `Fetches ${nonEmpty(api?.baseUrl) ? api.baseUrl : 'the API'}${into}`;
+  }
+  const dataset = sourceDatasetOf(config);
+  return dataset ? `Reads ${dataset}` : '';
+};
+
+const describeTransformer = (config) => {
+  const src = sourceDatasetOf(config);
+  const target = targetDatasetOf(config);
+  if (config.usesSkill && nonEmpty(config.skillId)) {
+    return src ? `Runs ${config.skillId} on ${src}` : `Runs ${config.skillId}`;
+  }
+  if (config.transformationSettings?.operationMode === 'in_place' && src) {
+    return `Updates ${src} in place`;
+  }
+  if (src && target) return `Transforms ${src} → ${target}`;
+  if (target) return `Writes ${target}`;
+  return src ? `Transforms ${src}` : '';
+};
+
+const describeJoin = (config) => {
+  const names = Array.isArray(config.sources)
+    ? config.sources
+      .map((s) => s?.sourceTableName || s?.sourceCollection || s?.sourceNodeLabel || s?.sourceConnectionName)
+      .filter(nonEmpty)
+    : [];
+  const target = targetDatasetOf(config);
+  const into = target ? ` → ${target}` : '';
+  if (names.length === 0) return target ? `Writes ${target}` : '';
+  // Past three the names crowd out the target, which is the more useful half.
+  const from = names.length > 3 ? `${names.length} sources` : names.join(' + ');
+  return `Joins ${from}${into}`;
+};
+
+/**
+ * One line naming what a node reads and writes, built from its config. Returns
+ * '' when the config has nothing to identify yet, so callers can fall back to
+ * an AI explanation or their own placeholder.
+ */
+export const describeNode = (type, config = {}) => {
+  if (type === 'dataSource') return describeDataSource(config);
+  if (type === 'transformer') return describeTransformer(config);
+  if (type === 'join') return describeJoin(config);
+  return '';
+};
+
+/** Card summaries are one clamped paragraph — keep prose from running away. */
+export const truncate = (text, max = 100) => {
+  const str = String(text || '').trim();
+  return str.length > max ? `${str.slice(0, max)}...` : str;
 };
 
 // ── Syntax highlighting ─────────────────────────────────────────────────────

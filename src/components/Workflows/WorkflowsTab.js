@@ -1,12 +1,13 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Modal, message, Spin } from 'antd';
 import WorkflowEditor from './WorkflowEditor';
 import axios from 'axios';
 import moment from 'moment';
 import { workflowsDb, connectionsDb } from '../../utils/localDb';
 import {
-  C, MONO, Btn, Tag, MetaItem, MoreMenu, PageHeader,
+  C, MONO, Btn, Tag, MetaItem, MoreMenu, PageHeader, fullscreenModalProps,
 } from './_designShared';
+import { collectDroppableFiles, fileDragHandlers, FileDropOverlay } from './connections/localFileDrop';
 
 const TYPE_COLORS = {
   transformation: { color: C.accent,  bg: C.aD,                       border: 'rgba(37,99,235,0.18)' },
@@ -77,13 +78,14 @@ const WorkflowsTab = ({
   onContextChange = () => {},
   pendingOpenWorkflow = null,           // { id, bump } — signal from ChatAssistant via Workflows.js
   onPendingOpenHandled = () => {},      // call after we've handled the signal so it doesn't re-fire
-  onNodeChatOpenChange = () => {},      // forwarded from Workflows.js so the top-level ChatAssistant can hide
+  onFilesDropped = () => {},            // hands a validated data-file drop to the Connections tab
 }) => {
   const [workflows, setWorkflows] = useState([]);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [editingWorkflow, setEditingWorkflow] = useState(null);
   const [loading, setLoading] = useState(false);
   const [uploadedDataSource, setUploadedDataSource] = useState(null);
+  const [isDragOver, setIsDragOver] = useState(false);
   const workflowCloseHandlerRef = useRef(null);
   const importInputRef = useRef(null);
 
@@ -394,6 +396,7 @@ const WorkflowsTab = ({
       setIsEditorOpen(false);
       setEditingWorkflow(null);
       setUploadedDataSource(null);
+      onContextChange(null);
     } catch (error) {
       if (error.message === 'Duplicate workflow name') throw error;
       if (handleAuthError(error)) return;
@@ -427,17 +430,41 @@ const WorkflowsTab = ({
     setEditingWorkflow(null);
     setUploadedDataSource(null);
     workflowCloseHandlerRef.current = null;
-    // Closing the modal tears down WorkflowEditor (destroyOnClose) so its
-    // sidebar effect's cleanup fires false too; this is just belt-and-braces.
-    onNodeChatOpenChange(false);
+    // Nothing is open any more — drop the chat assistant's focus chip.
+    onContextChange(null);
   };
 
   const registerWorkflowCloseHandler = (handler) => {
     workflowCloseHandlerRef.current = handler;
   };
 
+  // A data file dropped here isn't a workflow, so there is nothing to do with
+  // it on this tab. Validate it with the same rules the Connections tab uses,
+  // then hand the batch over and let the app switch there, where the import
+  // popups open. The editor renders in a portal, so its own canvas drops never
+  // reach this handler.
+  // The editor renders inside this tab's modal and handles its own canvas
+  // drops, so this target stands down entirely while it is open.
+  const { onDragOver, onDragLeave } = useMemo(
+    () => fileDragHandlers(setIsDragOver, isEditorOpen), [isEditorOpen]);
+
+  const onDrop = (event) => {
+    if (isEditorOpen) return;
+    event.preventDefault();
+    setIsDragOver(false);
+    const validFiles = collectDroppableFiles(event);
+    if (validFiles.length > 0) onFilesDropped(validFiles);
+  };
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: C.surface }}>
+    <div
+      style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: C.surface, position: 'relative' }}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {isDragOver && <FileDropOverlay title="Drop a file to create a data source" />}
+
       <PageHeader
         title="Workflows"
         sub="Create and manage your data processing workflows"
@@ -486,9 +513,11 @@ const WorkflowsTab = ({
         open={isEditorOpen}
         onCancel={handleModalClose}
         footer={null}
-        width="95%"
-        style={{ top: 50 }}
-        bodyStyle={{ height: 'calc(100vh - 120px)', padding: 0 }}
+        {...fullscreenModalProps({ bodyPadding: 0 })}
+        // The editor draws its own ✕ in its header, next to Execute / Save,
+        // where it has room to breathe — antd's floating one would land on
+        // top of those buttons.
+        closable={false}
         destroyOnClose
         maskClosable={false}
       >
@@ -499,7 +528,6 @@ const WorkflowsTab = ({
           onAutoSave={handleAutoSave}
           onCancel={handleWorkflowClose}
           onCloseRequest={registerWorkflowCloseHandler}
-          onSidebarOpenChange={onNodeChatOpenChange}
         />
       </Modal>
     </div>

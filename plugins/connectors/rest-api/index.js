@@ -17,8 +17,18 @@
 
 const axios = require('axios');
 
+// Upper bound on the key/value list the connection form offers. Kept here
+// because the form reads it off the schema.
+const MAX_API_PARAMS = 50;
+
 // ── Auth helpers ────────────────────────────────────────────────────────────
 
+/**
+ * Legacy auth header, for connections saved before the open-ended
+ * `apiParams` list replaced the fixed authType fields. New connections carry
+ * no authType, so this returns null and the request authored on the node
+ * supplies its own headers via placeholders.
+ */
 function buildAuthHeader(config) {
   const authType = config && config.authType;
   if (authType === 'bearer' && config.bearerToken) {
@@ -55,9 +65,11 @@ module.exports = {
   authType: 'custom',
 
   /**
-   * Ping the configured base URL with the resolved auth header.
-   * If no base URL is set we can't meaningfully test — report success with a
-   * note and defer validation to the first fetch.
+   * Ping the configured base URL. We can only send credentials automatically
+   * for legacy authType connections — a key/value pair could be a header, a
+   * query parameter or a body field, and only the request authored on the
+   * DataSource node knows which. So the test checks reachability and reports
+   * an auth challenge as reachable-but-unauthenticated rather than a failure.
    */
   async testConnection(config /*, connectionId */) {
     try {
@@ -65,9 +77,12 @@ module.exports = {
       if (!baseUrl) {
         return {
           success: true,
-          message: 'No base URL configured — auth will be validated on first fetch.',
+          message: 'No base URL configured — credentials will be applied on first fetch.',
         };
       }
+      const paramCount = Array.isArray(config && config.apiParams)
+        ? config.apiParams.filter(p => p && String(p.key || '').trim()).length
+        : 0;
       const headers = headersFromConfig(config);
       const res = await axios.get(baseUrl, {
         headers,
@@ -77,9 +92,17 @@ module.exports = {
       if (res.status >= 200 && res.status < 400) {
         return { success: true, message: `HTTP ${res.status}` };
       }
+      if ((res.status === 401 || res.status === 403) && paramCount > 0) {
+        return {
+          success: true,
+          message: `Base URL reachable (HTTP ${res.status}). This test does not send your `
+            + `${paramCount} saved parameter${paramCount === 1 ? '' : 's'} — the request authored `
+            + 'on the node decides where each one goes, so auth is validated on first fetch.',
+        };
+      }
       return {
         success: false,
-        message: `Base URL responded with HTTP ${res.status}. Check the URL and auth.`,
+        message: `Base URL responded with HTTP ${res.status}. Check the URL and credentials.`,
       };
     } catch (err) {
       return { success: false, message: err.message || 'Connection failed' };
@@ -174,66 +197,28 @@ module.exports = {
         helpText: 'Optional. Endpoints authored on the DataSource node can reference this as {{BASE_URL}}.',
       },
       {
-        name: 'authType',
-        type: 'select',
-        label: 'Authentication',
-        required: true,
-        sensitive: false,
-        default: 'none',
-        options: [
-          { value: 'none', label: 'None' },
-          { value: 'bearer', label: 'Bearer Token' },
-          { value: 'apiKey', label: 'API Key (header)' },
-          { value: 'basic', label: 'Basic Auth' },
-        ],
-        helpText: 'Selects which credential fields below are used.',
-      },
-      // bearer
-      {
-        name: 'bearerToken',
-        type: 'password',
-        label: 'Bearer Token',
+        name: 'apiParams',
+        type: 'keyValue',
+        label: 'Parameters & Credentials',
         required: false,
         sensitive: true,
-        helpText: 'Stored encrypted via safeStorage. Never leaves the main process after save.',
-        visibleWhen: { authType: 'bearer' },
+        maxPairs: MAX_API_PARAMS,
+        keyPlaceholder: 'Key (e.g. Authorization, X-API-Key, tenant_id)',
+        valuePlaceholder: 'Value',
+        publicKeysField: 'apiParamKeys',
+        helpText:
+          'Anything the endpoint needs — auth headers, API keys, tenant ids, query parameters. '
+          + `Up to ${MAX_API_PARAMS} entries, one value per key. Values are encrypted via safeStorage `
+          + 'and never sent to the chat; the assistant sees only the key names and references them '
+          + 'as {{PLACEHOLDER}} tokens (e.g. a key "X-API-Key" becomes {{X_API_KEY}}).',
       },
-      // apiKey
       {
-        name: 'apiKeyName',
-        type: 'string',
-        label: 'API Key Header Name',
-        placeholder: 'X-API-Key',
-        required: false,
+        // Key names only, mirrored into the saved connection so the chat can
+        // advertise the placeholder vocabulary without touching the values.
+        // Written by the form; never rendered.
+        name: 'apiParamKeys',
+        type: 'internal',
         sensitive: false,
-        visibleWhen: { authType: 'apiKey' },
-      },
-      {
-        name: 'apiKeyValue',
-        type: 'password',
-        label: 'API Key Value',
-        required: false,
-        sensitive: true,
-        helpText: 'Stored encrypted via safeStorage.',
-        visibleWhen: { authType: 'apiKey' },
-      },
-      // basic
-      {
-        name: 'basicUser',
-        type: 'string',
-        label: 'Basic Auth Username',
-        required: false,
-        sensitive: false,
-        visibleWhen: { authType: 'basic' },
-      },
-      {
-        name: 'basicPassword',
-        type: 'password',
-        label: 'Basic Auth Password',
-        required: false,
-        sensitive: true,
-        helpText: 'Stored encrypted via safeStorage.',
-        visibleWhen: { authType: 'basic' },
       },
     ],
   },
