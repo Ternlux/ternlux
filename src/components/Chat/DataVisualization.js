@@ -96,8 +96,11 @@ const DataVisualization = ({ visualizationData, onSaveToMain, boxClickFunction, 
     const [anchorEl, setAnchorEl] = useState(null);
     const open = Boolean(anchorEl);
 
-    // Use responsive height in compact mode (for reports/presentations)
-    const chartHeight = compact ? '90%' : '400px';
+    // Charts need a definite height to render. In the chat's `bare` panel the
+    // surrounding container is capped by maxHeight (no fixed height), so a
+    // percentage would collapse — use a definite pixel height there instead.
+    // Reports/presentations keep the responsive 90%; dashboards use 400px.
+    const chartHeight = bare ? '340px' : compact ? '90%' : '400px';
 
     if (!visualizationData) {
         return null;

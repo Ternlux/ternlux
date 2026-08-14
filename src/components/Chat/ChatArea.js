@@ -246,6 +246,7 @@ const ChatArea = ({
     hideHeader = false,
     inputPlaceholder = 'Message...',
     disableInput = false,
+    hideInput = false,     // when true, omit the text input area entirely (choice-only flows)
     // ── workflow execution ──
     showRunButton = false,
     onRun = null,
@@ -652,7 +653,8 @@ const ChatArea = ({
                 )}
             </Box>
 
-            {/* Input area */}
+            {/* Input area — omitted entirely in choice-only flows (hideInput) */}
+            {!hideInput && (
             <Box
                 sx={{
                     px: isFullscreen ? 6 : 2,
@@ -721,6 +723,7 @@ const ChatArea = ({
                     />
                 </Box>
             </Box>
+            )}
 
             {/* Multi-step Clean Report Dialog */}
             {hasCompletedMultiStep && (
