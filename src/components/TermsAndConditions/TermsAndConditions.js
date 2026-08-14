@@ -28,7 +28,9 @@ const TERMS_VERSION = '1.0';
 
 const TermsAndConditions = ({ onComplete }) => {
   const [accepted, setAccepted] = useState(false);
-  const [analyticsOptIn, setAnalyticsOptIn] = useState(true);
+  // Analytics is opt-IN and off by default (matches the Terms copy below and
+  // the Privacy settings default). The user must affirmatively enable it.
+  const [analyticsOptIn, setAnalyticsOptIn] = useState(false);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
