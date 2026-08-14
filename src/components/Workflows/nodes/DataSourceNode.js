@@ -1,12 +1,16 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
-import { DatabaseOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, getLatestUserQuestion } from './nodeCardShared';
+import {
+  DatabaseOutlined, ApiOutlined, FileOutlined, FileTextOutlined, FileExcelOutlined,
+} from '@ant-design/icons';
+import { ExpandableCodes, extractLatestCodes, describeNode, truncate } from './nodeCardShared';
 import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
 import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
 import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
 import { ReactComponent as MongodbIcon } from '../../ConnectorImages/Mongodb.svg';
 import { ReactComponent as SqlliteIcon } from '../../ConnectorImages/Sqllite.svg';
+import { ReactComponent as ParquetIcon } from '../../ConnectorImages/Parquet.svg';
+import { ReactComponent as AvroIcon } from '../../ConnectorImages/Avro.svg';
 import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/GoogleCloudStorage.svg';
 import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
 import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
@@ -26,6 +30,7 @@ const getDbIcon = (dbType) => {
     mssql: MssqlIcon,
     mongodb: MongodbIcon,
     sqlite: SqlliteIcon,
+    nedb: SqlliteIcon,
     gcs: GoogleCloudStorageIcon,
     dropbox: DropboxIcon,
     'google-drive': GoogleDriveIcon,
@@ -34,15 +39,56 @@ const getDbIcon = (dbType) => {
   return iconMap[dbType?.toLowerCase()] || null;
 };
 
-const DataSourceNode = ({ data, selected }) => {
-  const isConfigured = data.config?.sourceConnectionId &&
-    (data.config?.sourceType === 'csv' || data.config?.table || data.config?.dataset || data.config?.sourceType);
+const FILE_ICONS = {
+  csv: FileTextOutlined,
+  excel: FileExcelOutlined,
+  json: FileTextOutlined,
+  parquet: ParquetIcon,
+  avro: AvroIcon,
+  sqlite: SqlliteIcon,
+  nedb: SqlliteIcon,
+};
 
-  const DbIconComponent = data.config?.dbType ? getDbIcon(data.config.dbType) : null;
+/**
+ * The format a local file source was added as. Every one of them is read by
+ * DuckDB, so `sourceDbType` is the same for a CSV and a Parquet file and can't
+ * tell them apart — `sourceType` carries the connection's own file type, and
+ * since 'spreadsheet' covers CSV and Excel alike, the read format breaks that
+ * tie (an Excel workbook is converted to Parquet on import, a CSV is not).
+ */
+const fileTypeOf = (config) => {
+  if (config.sourceConnectionType !== 'file') return null;
+  if (config.sourceType === 'spreadsheet') return config.sourceFormat === 'csv' ? 'csv' : 'excel';
+  if (FILE_ICONS[config.sourceType]) return config.sourceType;
+  return config.sourceFormat || null; // csv | json | parquet
+};
+
+/**
+ * A node config records its connector as `sourceDbType`; a bare `dbType` is
+ * the shape a saved *connection* has, so the old lookup never matched and
+ * every source on the canvas fell back to the generic database glyph.
+ */
+const getSourceIcon = (config) => {
+  if (config.sourceConnectionType === 'api') return ApiOutlined;
+  const fileType = fileTypeOf(config);
+  if (fileType && FILE_ICONS[fileType]) return FILE_ICONS[fileType];
+  const dbIcon = getDbIcon(config.sourceDbType || config.dbType);
+  if (dbIcon) return dbIcon;
+  // A file whose format didn't survive the import — a cloud download, say —
+  // is still a file, not a database.
+  return config.sourceConnectionType === 'file' ? FileOutlined : null;
+};
+
+const DataSourceNode = ({ data, selected }) => {
+  const config = data.config || {};
+  const isConfigured = config.sourceConnectionId &&
+    (config.sourceType === 'csv' || config.table || config.dataset || config.sourceType);
+
+  const SourceIconComponent = getSourceIcon(config);
 
   const getDisplayName = () => {
-    if (data.config?.sourceConnectionName) {
-      return data.config.sourceConnectionName;
+    if (config.sourceConnectionName) {
+      return config.sourceConnectionName;
     }
     return isConfigured ? 'Configured Data Source' : 'Data Source';
   };
@@ -50,26 +96,18 @@ const DataSourceNode = ({ data, selected }) => {
   const getSummary = () => {
     if (!isConfigured) return 'Click to configure data source';
 
-    const config = data.config;
-    // Prefer AI-written explanations over user questions so the card
-    // describes what the node *does*, not what was asked.
+    // What this node reads, named from its own config — the same fields the
+    // Data Preview header shows. An explanation only fills in when the config
+    // has nothing to identify yet.
+    const described = describeNode('dataSource', config);
+    if (described) return described;
+
     const explanation =
       config.apiFetchExplanation ||
       config.sourceExplanation ||
       config.sourceSqlExplanation ||
-      config.sourceQueryDescription ||
-      getLatestUserQuestion(config.chat);
-    if (explanation) {
-      return explanation.length > 100 ? explanation.slice(0, 100) + '...' : explanation;
-    }
-
-    if (config.sourceTable) {
-      return `Loading data from ${config.sourceTable}`;
-    }
-
-    if (config.dataset) {
-      return `Loading dataset: ${config.sourceDataset}`;
-    }
+      config.sourceQueryDescription;
+    if (explanation) return truncate(explanation);
 
     return 'Data source configured';
   };
@@ -114,8 +152,10 @@ const DataSourceNode = ({ data, selected }) => {
         alignItems: 'center',
         gap: 7,
       }}>
-        {DbIconComponent ? (
-          <DbIconComponent style={{ width: 12, height: 12, fill: COLOR }} />
+        {/* One style for both kinds of icon: an imported SVG paints from
+            width/height/fill, an antd glyph from fontSize/color. */}
+        {SourceIconComponent ? (
+          <SourceIconComponent style={{ width: 12, height: 12, fill: COLOR, fontSize: 12, color: COLOR }} />
         ) : (
           <DatabaseOutlined style={{ fontSize: 12, color: COLOR }} />
         )}
