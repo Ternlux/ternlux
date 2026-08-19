@@ -36,17 +36,19 @@
     "eject": "react-scripts eject",
     "electron-dev": "concurrently \"cross-env BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3000 && electron .\"",
     "minify-dist": "node scripts/minify-dist.js",
-    "electron-pack": "react-scripts build && node scripts/minify-dist.js && electron-builder",
-    "dist:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
-    "dist:linux": "react-scripts build && node scripts/minify-dist.js && electron-builder --linux",
-    "dist:win": "react-scripts build && node scripts/minify-dist.js && electron-builder --win",
-    "dist:all": "react-scripts build && node scripts/minify-dist.js && electron-builder --mac --linux --win",
-    "pack:mac": "node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
-    "pack:linux": "node scripts/minify-dist.js && electron-builder --linux",
-    "pack:win": "node scripts/minify-dist.js && electron-builder --win",
+    "electron-pack": "node scripts/fetch-duckdb-extensions.js && react-scripts build && node scripts/minify-dist.js && electron-builder",
+    "dist:mac": "node scripts/fetch-duckdb-extensions.js osx_arm64 osx_amd64 && node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "dist:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && electron-builder --linux",
+    "dist:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && react-scripts build && node scripts/minify-dist.js && electron-builder --win",
+    "dist:all": "node scripts/fetch-duckdb-extensions.js --all && react-scripts build && node scripts/minify-dist.js && electron-builder --mac --linux --win",
+    "pack:mac": "node scripts/fetch-duckdb-extensions.js osx_arm64 osx_amd64 && node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "pack:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && node scripts/minify-dist.js && electron-builder --linux",
+    "pack:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/minify-dist.js && electron-builder --win",
     "release:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac --publish always -c.directories.output=$HOME/Ternlux-dist; }",
     "release:win": "react-scripts build && node scripts/minify-dist.js && electron-builder --win --publish always",
-    "release:linux": "react-scripts build && node scripts/minify-dist.js && electron-builder --linux --publish always"
+    "release:linux": "react-scripts build && node scripts/minify-dist.js && electron-builder --linux --publish always",
+    "fetch-duckdb-extensions": "node scripts/fetch-duckdb-extensions.js",
+    "postinstall": "node scripts/fetch-duckdb-extensions.js --optional"
   },
   "build": {
     "appId": "com.ternlux.app",
@@ -152,7 +154,13 @@
       ],
       "icon": "assets/icon.png",
       "category": "Office"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "resources/duckdb-extensions",
+        "to": "duckdb-extensions"
+      }
+    ]
   },
   "eslintConfig": {
     "extends": [
