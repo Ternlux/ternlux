@@ -19,6 +19,32 @@ const OpenAI = require('openai');
 const PROMPT_LOG_PATH = path.join(__dirname, '..', 'dev-logs', 'ai-prompts.json');
 const promptLogEntries = [];
 let promptLogInitialized = false;
+
+/**
+ * Drop keys that carry no information, recursively.
+ *
+ * A logged turn is read by a person looking for what differed between two
+ * calls, and `"text": ""` / `"chatHistory": []` / `"thinkingTokens": null` are
+ * noise they have to read past every time. `false` and `0` are KEPT — "not
+ * truncated" and "no cache hit" are findings, not absences.
+ */
+function compactLogValue(value) {
+  if (Array.isArray(value)) {
+    const out = value.map(compactLogValue).filter((v) => v !== undefined);
+    return out.length ? out : undefined;
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      const c = compactLogValue(v);
+      if (c !== undefined) out[k] = c;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  if (value === null || value === undefined || value === '') return undefined;
+  return value;
+}
+
 function logPromptToFile(entry) {
   if (process.env.NODE_ENV === 'production') return;
   try {
@@ -27,11 +53,32 @@ function logPromptToFile(entry) {
       promptLogEntries.length = 0;
       promptLogInitialized = true;
     }
-    promptLogEntries.push(entry);
+    promptLogEntries.push(compactLogValue(entry) || {});
     fs.writeFileSync(PROMPT_LOG_PATH, JSON.stringify(promptLogEntries, null, 2));
   } catch (_err) {
     // intentional: never propagate logging errors
   }
+}
+
+/**
+ * What a log entry records about the prompt itself.
+ *
+ * With a `promptMeta` (built by chat/prompts.js) the entry carries the prompt's
+ * KIND and the PARAMETERS it was built from — `{ kind: 'main', params: { toolMode:
+ * true, isNewChat: false, focusedNodeType: 'join', ... } }` — and drops the
+ * rendered text. That text is the same thousands of tokens on every call; what
+ * actually differs between two calls, and what you need when reading the log, is
+ * the parameters.
+ *
+ * Without one (skills, generated code, anything not routed through the registry)
+ * the old verbatim behaviour is kept so nothing silently stops being logged.
+ */
+function promptDescriptor({ promptMeta, systemPrompt = null, prompt = null }) {
+  if (promptMeta) return { promptMeta };
+  return {
+    ...(systemPrompt !== null ? { systemPrompt } : {}),
+    ...(prompt !== null ? { prompt } : {}),
+  };
 }
 
 // OpenAI-compatible providers. Each exposes a `/chat/completions` endpoint that
@@ -360,9 +407,24 @@ function stripMarkdownCodeBlocks(text) {
   return text;
 }
 
-async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], onUsage = null) {
+async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], onUsage = null, jsonMode = false) {
   const genAI = new GoogleGenerativeAI(apiKey);
   const generationConfig = maxTokens ? { maxOutputTokens: maxTokens } : {};
+  // Gemini has no tool API in this app (see TOOL_CAPABLE_PROVIDERS), so every
+  // agent turn it serves is a JSON contract parsed out of free text — which is
+  // exactly where it wraps the object in prose or markdown fences. JSON mode
+  // constrains decoding to a well-formed JSON value, so the reply parses on the
+  // first try instead of needing stripMarkdownCodeBlocks + a repair round trip.
+  // No responseSchema: our contracts are unions ("answer_directly" OR a plan,
+  // Schema A OR Schema B) that a single fixed schema can't express without
+  // forcing fields the model shouldn't emit.
+  //
+  // Gemini 1.0 is the one family that rejects responseMimeType outright, so a
+  // user who picked one from the (dynamic) model list keeps the old fenced-text
+  // path instead of getting a hard request failure.
+  if (jsonMode && !/^gemini-(pro|1\.0)/i.test(String(model || ''))) {
+    generationConfig.responseMimeType = 'application/json';
+  }
   // Gemini's equivalent of Anthropic's `system` / OpenAI's system message. It
   // MUST be sent: for every agent path in this app the system prompt carries the
   // turn contract (the JSON envelope the reply has to match, the tool catalogue,
@@ -500,7 +562,7 @@ async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null,
   throw new Error(`Claude returned no text content (stop_reason: ${message?.stop_reason || 'unknown'}).`);
 }
 
-async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onUsage = null) {
+async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onUsage = null, jsonMode = false) {
   const OpenAICtor = OpenAI.default || OpenAI;
   // Local servers (Ollama, LM Studio) need no real key, but the SDK rejects an
   // empty apiKey — pass a placeholder when none was supplied.
@@ -524,6 +586,7 @@ async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null,
   }
   // Optional for OpenAI — only send when the caller specified a cap.
   applyMaxTokens(params, maxTokens, baseURL);
+  applyJsonMode(params, jsonMode, baseURL);
   const completion = await openai.chat.completions.create(params);
 
   if (typeof onUsage === 'function') {
@@ -565,6 +628,32 @@ function applyMaxTokens(params, maxTokens, baseURL) {
   if (!maxTokens) return params;
   if (baseURL) params.max_tokens = maxTokens;
   else params.max_completion_tokens = maxTokens;
+  return params;
+}
+
+/**
+ * Constrain decoding to a well-formed JSON object for calls whose reply is
+ * parsed rather than displayed.
+ *
+ * Two deliberate narrowings, both of which turn a possible request FAILURE back
+ * into the status quo (a fenced or prose-wrapped reply the existing
+ * stripMarkdownCodeBlocks + repair path already handles):
+ *
+ *  - OpenAI proper only. `response_format` is an unknown field to many
+ *    OpenAI-COMPATIBLE servers and the strict ones reject the whole request —
+ *    the same trap `applyMaxTokens` documents. `baseURL != null` is exactly
+ *    "not api.openai.com", so it is the discriminator here too.
+ *  - The word "json" must appear in what we send. OpenAI rejects
+ *    `json_object` outright when it doesn't ("messages must contain the word
+ *    'json'"), and not every builder prompt says it.
+ */
+function applyJsonMode(params, jsonMode, baseURL) {
+  if (!jsonMode || baseURL) return params;
+  const mentionsJson = (params.messages || []).some(
+    (m) => typeof m.content === 'string' && /json/i.test(m.content)
+  );
+  if (!mentionsJson) return params;
+  params.response_format = { type: 'json_object' };
   return params;
 }
 
@@ -721,7 +810,7 @@ function humanizeAIError(err, provider, model) {
  * Provider-agnostic dispatcher. Caller supplies the apiKey explicitly.
  */
 async function callAI(prompt, options = {}) {
-  const { provider, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onTrim = null } = options;
+  const { provider, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onTrim = null, jsonMode = false, promptMeta = null } = options;
   if (!provider) throw new Error('provider is required');
   const compatConf = OPENAI_COMPAT_PROVIDERS[provider.toLowerCase()];
   // Keyless OpenAI-compatible providers (local servers) may run without a key.
@@ -754,9 +843,13 @@ async function callAI(prompt, options = {}) {
     maxTokens:   maxTokens || null,
     maxTokensSent: effectiveMaxTokens(provider, sendMaxTokens),
     contextWindow: limits.contextWindow,
-    systemPrompt,
+    // A caller that built its prompt through chat/prompts.js supplies the
+    // descriptor for it — which prompt, and what was switched on. That replaces
+    // the prompt TEXT here: the text is a constant of the build, re-recording it
+    // on every call is what made this log unreadable (and enormous). Callers
+    // that don't build through the registry still log verbatim.
+    ...promptDescriptor({ promptMeta, systemPrompt, prompt }),
     chatHistory: trimmedHistory,
-    prompt,
   };
   logPromptToFile(requestEntry);
 
@@ -771,14 +864,14 @@ async function callAI(prompt, options = {}) {
   try {
     switch (provider.toLowerCase()) {
       case 'gemini':
-        response = await callGemini(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage);
+        response = await callGemini(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage, jsonMode);
         break;
       case 'claude':
         response = await callClaude(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage);
         break;
       case 'openai':
       case 'chatgpt':
-        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, null, onUsage);
+        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, null, onUsage, jsonMode);
         break;
       default: {
         // Any OpenAI-compatible provider (OpenRouter, Groq, Together, Mistral,
@@ -789,7 +882,9 @@ async function callAI(prompt, options = {}) {
         const url = baseURL || compatConf.baseURL;
         if (!url) throw new Error(`Provider "${provider}" requires a base URL. Set one in AI provider settings.`);
         if (!model) throw new Error(`Provider "${provider}" requires a model name.`);
-        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, url, onUsage);
+        // jsonMode is forwarded but applyJsonMode drops it for any non-OpenAI
+        // base URL — the policy lives there, not in a second place here.
+        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, url, onUsage, jsonMode);
         break;
       }
     }
@@ -804,10 +899,12 @@ async function callAI(prompt, options = {}) {
     ts:       new Date().toISOString(),
     provider,
     model:    model || null,
-    maxTokensSent: effectiveMaxTokens(provider, sendMaxTokens),
-    // `truncated: true` means the answer stopped because it hit the ceiling
-    // above, not because the model was finished.
-    ...(usage ? { usage, truncated: !!usage.truncated } : {}),
+    // Which prompt this is the answer to, so a response can be matched to its
+    // request without counting entries. `maxTokensSent` is deliberately NOT
+    // repeated here — it is on the matching request, and `usage.truncated`
+    // already says whether that ceiling was hit.
+    ...(promptMeta?.kind ? { promptKind: promptMeta.kind } : {}),
+    ...(usage ? { usage } : {}),
     ...(callError
       // A truncation throws rather than returning, so the text the model DID
       // produce would otherwise never reach the log — record it under its own
@@ -963,9 +1060,16 @@ function pickProvider(apiKeys = {}, requested) {
  * @param {number} [options.maxTokens]
  * @param {string} [options.systemPrompt]
  * @param {Array}  [options.chatHistory]
+ * @param {boolean} [options.jsonMode] Set on calls whose reply is PARSED, never
+ *   displayed. Constrains decoding to JSON on the providers that support it
+ *   (Gemini, OpenAI proper). Must stay false for prose replies — titles, and
+ *   skill turns that may answer in text.
  */
 async function callAIWithKeys(prompt, options = {}) {
-  const { apiKeys = {}, provider: requestedProvider, model, maxTokens, systemPrompt, chatHistory, onTrim } = options;
+  const {
+    apiKeys = {}, provider: requestedProvider, model, maxTokens,
+    systemPrompt, chatHistory, onTrim, jsonMode, promptMeta,
+  } = options;
   const picked = pickProvider(apiKeys, requestedProvider);
   if (!picked) {
     throw new Error('No AI provider available. Configure an API key for openai, claude, or gemini.');
@@ -979,6 +1083,8 @@ async function callAIWithKeys(prompt, options = {}) {
     systemPrompt,
     chatHistory,
     onTrim,
+    jsonMode,
+    promptMeta,
   });
 }
 
@@ -1190,6 +1296,16 @@ async function callClaudeTools({ model, maxTokens, apiKey, systemPrompt, turns, 
     .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text).join('').trim();
 
+  // The model's reasoning, for display only. `raw` already carries these blocks
+  // for verbatim replay; pulling the readable part out here is what keeps the
+  // renderer from having to know Anthropic's block shapes. `redacted_thinking`
+  // blocks are encrypted — they still count as thinking that happened, but
+  // there is nothing to show, so they're reported as a count instead.
+  const thinking = blocks
+    .filter((b) => b && b.type === 'thinking' && typeof b.thinking === 'string')
+    .map((b) => b.thinking).join('\n\n').trim();
+  const redactedThinking = blocks.filter((b) => b && b.type === 'redacted_thinking').length;
+
   if (res?.stop_reason === 'max_tokens') {
     // A tool_use block cut in half has no valid arguments, so unlike a prose
     // answer there is nothing to stitch onto. The turn has to be re-run.
@@ -1207,6 +1323,8 @@ async function callClaudeTools({ model, maxTokens, apiKey, systemPrompt, turns, 
 
   return {
     text,
+    thinking: thinking || null,
+    redactedThinking: redactedThinking || 0,
     toolCalls: blocks
       .filter((b) => b && b.type === 'tool_use')
       .map((b) => ({ id: b.id, tool: b.name, args: b.input || {} })),
@@ -1215,11 +1333,82 @@ async function callClaudeTools({ model, maxTokens, apiKey, systemPrompt, turns, 
   };
 }
 
+/**
+ * Neutral turns → the Responses API's flat `input` list.
+ *
+ * Unlike chat.completions, a tool call and its result are not nested inside an
+ * assistant/tool MESSAGE — they are items in their own right, paired by
+ * `call_id`. An assistant turn therefore expands to (at most) one message item
+ * plus one `function_call` item per call it made.
+ */
+function toResponsesInput(turns) {
+  const input = [];
+  for (const turn of turns || []) {
+    if (turn.role === 'tool') {
+      for (const r of turn.results || []) {
+        input.push({ type: 'function_call_output', call_id: r.id, output: String(r.content ?? '') });
+      }
+      continue;
+    }
+    if (turn.role === 'assistant') {
+      // An assistant turn that only made tool calls has no text; emitting an
+      // empty message item would be rejected, so skip it.
+      if (turn.text) input.push({ role: 'assistant', content: turn.text });
+      for (const c of turn.toolCalls || []) {
+        input.push({
+          type: 'function_call',
+          call_id: c.id,
+          name: c.tool,
+          arguments: JSON.stringify(c.args || {}),
+        });
+      }
+      continue;
+    }
+    input.push({ role: 'user', content: turn.text || '' });
+  }
+  return input;
+}
+
+/**
+ * Tool schemas for /v1/responses — flat, where chat.completions nests them
+ * under `function`.
+ *
+ * `strict: false` is deliberate: strict mode additionally requires every
+ * property to be listed in `required` and `additionalProperties: false` on
+ * every object, which the tool schemas in this app do not all satisfy. Opting
+ * in would turn a working tool definition into a request-time rejection.
+ */
+function toResponsesTools(tools) {
+  return (tools || []).map((t) => ({
+    type: 'function',
+    name: t.name,
+    description: t.description,
+    parameters: t.input_schema,
+    strict: false,
+  }));
+}
+
 async function callOpenAITools({ model, maxTokens, apiKey, systemPrompt, turns, tools, baseURL, onUsage }) {
   const OpenAICtor = OpenAI.default || OpenAI;
   const clientOptions = { apiKey: apiKey || 'not-needed' };
   if (baseURL) clientOptions.baseURL = baseURL;
   const openai = new OpenAICtor(clientOptions);
+
+  // OpenAI proper goes through /v1/responses. Its reasoning models refuse
+  // function tools on /v1/chat/completions unless reasoning is switched off
+  // ("Function tools with reasoning_effort are not supported for <model> in
+  // /v1/chat/completions"), and turning reasoning off is not something we want
+  // to do on the user's behalf.
+  //
+  // The chat.completions branch below is currently UNREACHABLE: only the
+  // providers in TOOL_CAPABLE_PROVIDERS get here, and of those `openai` /
+  // `chatgpt` never carry a baseURL (resolveProviderEntry returns a bare
+  // { apiKey } for them). It is kept because OpenAI-compatible servers
+  // implement chat.completions and NOT /v1/responses, so it is the branch they
+  // would need the day TOOL_CAPABLE_PROVIDERS is widened to include one.
+  if (!baseURL) {
+    return callOpenAIToolsViaResponses(openai, { model, maxTokens, systemPrompt, turns, tools, onUsage });
+  }
 
   const params = { model, messages: toOpenAIMessages(turns, systemPrompt) };
   if (tools?.length) params.tools = toOpenAITools(tools);
@@ -1266,9 +1455,91 @@ async function callOpenAITools({ model, maxTokens, apiKey, systemPrompt, turns, 
 
   return {
     text: (msg.content || '').trim(),
+    thinking: null,      // chat.completions exposes no reasoning text.
+    redactedThinking: 0,
     toolCalls,
     raw: null,           // OpenAI turns rebuild losslessly from text + toolCalls.
     stopReason: choice?.finish_reason || null,
+  };
+}
+
+/**
+ * One tool-calling turn over /v1/responses — the OpenAI-proper path.
+ *
+ * Same neutral contract in and out as the chat.completions branch above; only
+ * the wire shape differs. Notable renames: `messages` → `input`, the system
+ * prompt → `instructions`, `max_completion_tokens` → `max_output_tokens`,
+ * `choices[0]` → the `output` item list, and truncation is reported by
+ * `incomplete_details.reason` rather than a `finish_reason` of "length".
+ */
+async function callOpenAIToolsViaResponses(openai, { model, maxTokens, systemPrompt, turns, tools, onUsage }) {
+  const params = { model, input: toResponsesInput(turns) };
+  if (systemPrompt) params.instructions = systemPrompt;
+  if (tools?.length) params.tools = toResponsesTools(tools);
+  if (maxTokens) params.max_output_tokens = maxTokens;
+
+  const res = await openai.responses.create(params);
+
+  const truncated = res?.incomplete_details?.reason === 'max_output_tokens';
+
+  if (typeof onUsage === 'function') {
+    const u = res.usage || {};
+    onUsage({
+      inputTokens:    u.input_tokens ?? null,
+      outputTokens:   u.output_tokens ?? null,
+      // Reasoning is billed against the output cap here exactly as it is on
+      // chat.completions, just under a different key.
+      thinkingTokens: u.output_tokens_details?.reasoning_tokens ?? null,
+      cacheReadInputTokens: u.input_tokens_details?.cached_tokens ?? null,
+      finishReason:   res?.incomplete_details?.reason || res?.status || null,
+      truncated,
+    });
+  }
+
+  // `output_text` is the SDK's concatenation of every output_text part, which
+  // is what the neutral contract's `text` means.
+  const text = String(res?.output_text || '').trim();
+
+  if (truncated) {
+    const e = new Error(`The model ran out of output space (${maxTokens || 'default'} tokens) before finishing this turn.`);
+    e.code = 'MAX_TOKENS';
+    e.maxTokens = maxTokens || null;
+    e.partialText = text || null;
+    e.resumable = false;
+    throw e;
+  }
+
+  const toolCalls = [];
+  for (const item of res?.output || []) {
+    if (item?.type !== 'function_call') continue;
+    let args = {};
+    try {
+      // Arguments arrive as a STRING here too, and a weaker model can emit one
+      // that does not parse. Surface it as a per-call error the loop can report
+      // back rather than failing the whole turn.
+      args = item.arguments ? JSON.parse(item.arguments) : {};
+    } catch (_err) {
+      args = { __invalidArguments: item.arguments || '' };
+    }
+    // `call_id` is the id that pairs with function_call_output — NOT `item.id`,
+    // which identifies the output item itself and is rejected when echoed back.
+    toolCalls.push({ id: item.call_id, tool: item.name, args });
+  }
+
+  return {
+    text,
+    // No reasoning text to show: /v1/responses only returns reasoning summaries
+    // when the request asks for them (`reasoning: { summary: ... }`), which we
+    // don't. Null keeps the contract's shape identical across providers.
+    thinking: null,
+    redactedThinking: 0,
+    toolCalls,
+    // Rebuilt from text + toolCalls by toResponsesInput, same as the
+    // chat.completions branch. Reasoning items are NOT carried across turns —
+    // preserving them would mean threading this payload through the agent
+    // loop's neutral turn format.
+    raw: null,
+    stopReason: res?.status || null,
   };
 }
 
@@ -1279,12 +1550,15 @@ async function callOpenAITools({ model, maxTokens, apiKey, systemPrompt, turns, 
  * @param {Array}  options.turns    Neutral turns, oldest first (see format above).
  * @param {Array}  options.tools    Tool schemas: { name, description, input_schema }.
  * @param {Function} [options.onTrim] Reports steps whose results had to be removed.
- * @returns {Promise<{text: string, toolCalls: Array, raw: any, stopReason: string}>}
+ * @returns {Promise<{text: string, thinking: string|null, redactedThinking: number,
+ *   toolCalls: Array, raw: any, stopReason: string}>} `thinking` is the model's
+ *   reasoning as plain text when the provider exposes it (Claude only today),
+ *   for display; it is never fed back as input — `raw` handles replay.
  */
 async function callAITools(options = {}) {
   const {
     provider, model, maxTokens, apiKey, systemPrompt = null,
-    turns = [], tools = [], baseURL = null, onTrim = null,
+    turns = [], tools = [], baseURL = null, onTrim = null, promptMeta = null,
   } = options;
   if (!provider) throw new Error('provider is required');
   if (!providerSupportsTools(provider)) {
@@ -1310,7 +1584,7 @@ async function callAITools(options = {}) {
     maxTokens: maxTokens || null,
     maxTokensSent: effectiveMaxTokens(provider, sendMaxTokens),
     contextWindow: limits.contextWindow,
-    systemPrompt,
+    ...promptDescriptor({ promptMeta, systemPrompt }),
     tools: (tools || []).map((t) => t.name),
     turns: trimmedTurns,
   });
@@ -1334,11 +1608,19 @@ async function callAITools(options = {}) {
     ts: new Date().toISOString(),
     provider,
     model: model || null,
-    maxTokensSent: effectiveMaxTokens(provider, sendMaxTokens),
-    ...(usage ? { usage, truncated: !!usage.truncated } : {}),
+    ...(promptMeta?.kind ? { promptKind: promptMeta.kind } : {}),
+    ...(usage ? { usage } : {}),
     ...(callError
       ? { error: callError.message, ...(callError.partialText ? { partialResponse: callError.partialText } : {}) }
-      : { response: { text: result.text, toolCalls: result.toolCalls } }),
+      // `id` is the provider's own call id — needed to pair a result on the
+      // wire, meaningless when reading the log. Empty `text` (a turn that only
+      // made tool calls) and an empty toolCalls list are dropped by compaction.
+      : {
+          response: {
+            text: result.text,
+            toolCalls: (result.toolCalls || []).map((c) => ({ tool: c.tool, args: c.args })),
+          },
+        }),
   });
 
   if (callError) throw humanizeAIError(callError, provider, model);

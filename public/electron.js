@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification, dialog } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification, dialog, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
@@ -9,6 +9,7 @@ const analytics = require('./analytics');
 const {
   externalizeWorkflowCode,
   externalizeUpdateCode,
+  extractWorkflowId,
   inlineWorkflowCode,
   deleteWorkflowCode,
   workflowDirName,
@@ -18,6 +19,7 @@ const {
   unwatchWorkflowCode,
   unwatchAllForWebContents,
   stopAllCodeWatchers,
+  suppressWorkflowCodeEvents,
 } = require('./lib/workflowCodeWatcher');
 
 // Ternlux API. Packaged builds never have BACKEND_URL set, so the fallback is
@@ -251,8 +253,11 @@ function withPersistedAiDefaults(options = {}) {
   if (!model && prefs.defaultModel) {
     const p = String(provider || '').toLowerCase();
     const isNative = ['openai', 'chatgpt', 'claude', 'gemini'].includes(p);
-    const isDefaultProvider =
-      !prefs.defaultProvider || p === String(prefs.defaultProvider).toLowerCase();
+    // The model is only usable with the provider it was chosen for.
+    // `defaultModelProvider` records that explicitly; prefs written before it
+    // existed fall back to comparing against the default provider.
+    const owner = prefs.defaultModelProvider || prefs.defaultProvider || null;
+    const isDefaultProvider = !owner || p === String(owner).toLowerCase();
     if (isNative && isDefaultProvider) model = prefs.defaultModel;
   }
   // The user's Max Tokens is the primary value for every AI call. A caller that
@@ -644,6 +649,9 @@ function wrapKeySafeDb(raw) {
   const overrides = {
     insertAsync: (doc) => {
       const wfId = doc && (doc.id || doc._id);
+      // Tell the code watcher these files are ours before we touch them, so the
+      // editor doesn't treat our own write as an external edit and reload.
+      suppressWorkflowCodeEvents(wfId);
       const externalized = wfId ? externalizeWorkflowCode(doc, wfId, codeBaseDir) : doc;
       return raw.insertAsync(encodeDotKeys(externalized)).then(decodeDotKeys).then(inline);
     },
@@ -659,7 +667,16 @@ function wrapKeySafeDb(raw) {
         if (wfName === undefined) {
           const existing = await raw.findOneAsync(query);
           wfName = existing && existing.name;
+          // A watcher is registered under whichever id the renderer opened the
+          // workflow with, and a caller may update by the other one — so
+          // suppress both while we have the document in hand.
+          if (existing) {
+            suppressWorkflowCodeEvents(existing.id);
+            suppressWorkflowCodeEvents(existing._id);
+          }
         }
+        // Same as insertAsync: this rewrite is the app's, not an outside edit.
+        suppressWorkflowCodeEvents(extractWorkflowId(query));
         externalized = externalizeUpdateCode(query, update, codeBaseDir, wfName);
       }
       const res = await raw.updateAsync(query, encodeUpdate(externalized), options);
@@ -799,7 +816,11 @@ ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 10
           };
         }
 
-        const result = await duck.readHead(filePath, limit);
+        // A workbook holds a table per sheet, and the caller's table name is
+        // the sheet — without it every sheet would preview as the first one.
+        const result = await duck.readHead(filePath, limit, null, {
+          sheet: duck.sheetFor(filePath, tableName),
+        });
         const name = tableName || path.basename(filePath, path.extname(filePath));
         return {
           success: true,
@@ -1040,6 +1061,24 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
     // fast as a small one. This also covers parquet and json, which used to
     // fall through to XLSX.readFile and simply fail.
     if (duck.isReadable(filePath)) {
+      // A workbook is many sheets in one file, and each is previewed on its own
+      // terms. An empty sheet has nothing for DuckDB to describe, and comes back
+      // empty rather than taking the whole preview down with it.
+      if (duck.isWorkbook(filePath)) {
+        const data = {};
+        const sheets = [];
+        for (const sheet of duck.listSheets(filePath)) {
+          try {
+            const { rows, columns } = await duck.readHead(filePath, limit, null, { sheet });
+            data[sheet] = { columns: columns.map((c) => c.name), rows };
+          } catch (_err) {
+            data[sheet] = { columns: [], rows: [] };
+          }
+          sheets.push(sheet);
+        }
+        return { success: true, sheets, data };
+      }
+
       const { rows, columns } = await duck.readHead(filePath, limit);
       const sheetName = path.basename(filePath, path.extname(filePath)) || 'Sheet1';
       return {
@@ -1049,9 +1088,9 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
       };
     }
 
-    // Excel is the remaining case: DuckDB can't read it, and a registered
-    // workbook has already been converted to Parquet, so this only runs for a
-    // raw .xls/.xlsx path (e.g. a preview before the file is added).
+    // Only the formats DuckDB will not open reach here — .xls and .xlsb. They
+    // are refused when a connection is added, but a preview can still be asked
+    // for a raw path, and showing one is better than an error.
     const workbook = XLSX.readFile(filePath, { sheetRows: limit + 1, cellDates: true, raw: false });
     const data = {};
     workbook.SheetNames.forEach(sheetName => {
@@ -1086,15 +1125,15 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
 /**
  * file:register-local — record a local file as a data source.
  *
- * This replaces importing. CSV / JSON / Parquet are registered by path and
- * never copied, so adding a 5 GB file is instant; Excel and Avro are converted
- * to Parquet once because DuckDB cannot read them directly.
+ * This replaces importing. Every supported format — csv / json / parquet /
+ * xlsx / avro — is registered by path and never copied, so adding a 5 GB file
+ * is instant. A workbook comes back as one table per sheet.
  *
- * Returns { success, format, converted, tables: [{ name, path, rowCount, schema }] }
+ * Returns { success, format, tables: [{ name, path, sheet, schema }] }
  */
 ipcMain.handle('file:register-local', async (_event, { filePath, importId = null }) => {
   try {
-    const { registerLocalFile } = require('./imports/toParquet');
+    const { registerLocalFile } = require('./imports/registerFile');
     return await registerLocalFile(filePath, app.getPath('userData'), {
       onProgress: makeImportProgressReporter(_event, importId),
     });
@@ -1296,6 +1335,7 @@ async function getFullConfig(connectionId, baseConfig = {}) {
           dbPath: conn.fileInfo.filePath,
           tables: conn.fileInfo.tables || null,
           tablePaths: conn.fileInfo.tablePaths || null,
+          tableSheets: conn.fileInfo.tableSheets || null,
           format: conn.fileInfo.format || null,
         };
       }
@@ -2497,14 +2537,23 @@ ipcMain.handle('ai:setMaxTokens', async (_event, { maxTokens } = {}) => {
 ipcMain.handle('ai:setDefaultProvider', async (_event, { provider, model } = {}) => {
   try {
     const prefs = loadAiPrefs();
+    const previous = prefs.defaultProvider || null;
     prefs.defaultProvider = provider || null;
-    // Only persist a model when it belongs to the provider we're setting. A
-    // caller that omits `model` (e.g. saving just the default-provider choice)
-    // must not wipe a previously-saved model for that same provider.
+    // A stored model belongs to ONE provider, so remember which. Sending
+    // "claude-opus-5" to OpenAI is what produced "the selected OpenAI model
+    // isn't available" after switching the default provider.
     if (typeof model === 'string' && model) {
       prefs.defaultModel = model;
+      prefs.defaultModelProvider = provider || null;
     } else if (!provider) {
       prefs.defaultModel = null;
+      prefs.defaultModelProvider = null;
+    } else if (String(provider).toLowerCase() !== String(previous || '').toLowerCase()) {
+      // Switching providers without naming a model: drop the old provider's
+      // model so downstream falls back to this provider's own default rather
+      // than reusing a model id the new provider has never heard of.
+      prefs.defaultModel = null;
+      prefs.defaultModelProvider = null;
     }
     fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
     return { success: true };
@@ -2532,6 +2581,7 @@ ipcMain.handle('chat:step', async (_event, {
   workflowSession = null,
   triggerPlanWorkflowBuild = null,
   targetNode = null,
+  isNewChat = false,
 } = {}) => {
   try {
     const helpers = await buildSkillHelpers();
@@ -2545,6 +2595,9 @@ ipcMain.handle('chat:step', async (_event, {
       workflowSession,
       triggerPlanWorkflowBuild,
       targetNode,
+      // Makes the main prompt ask for a chat title with this turn's answer; it
+      // comes back as `chatTitle`. See chatTitleSection in chat/prompts.js.
+      isNewChat,
       getDb,
       helpers,
     });
@@ -2701,35 +2754,35 @@ ipcMain.handle('ai:continue', async (_event, { resume = null } = {}) => {
   }
 });
 
+// NOTE: there is no chat:generateTitle handler any more. A conversation is
+// named by the main agent on its first turn, as a field of that turn's answer
+// (chatTitleSection in chat/prompts.js) — one call instead of two, and one
+// place the naming rules live. chat:step returns it as `chatTitle`.
+
 /**
- * chat:generateTitle — produce a 3-5 word topic title for a freshly-started
- * conversation. The renderer calls this once, on the user's first message,
- * so the chat sidebar shows something more descriptive than a truncated
- * prefix of the user's text.
+ * Tell the renderer a build stopped before it finished — paused on a question
+ * the user has to answer, or failed outright. executeBuild only emits progress
+ * while it is running, so without this its last word on a paused build is a
+ * step that started and never ended: the live canvas would keep a node glowing
+ * as though work were still going on. Best-effort, like every progress send.
+ *
+ * @param {object} event   the IPC event whose sender started the build
+ * @param {Error}  err     the error that ended it (carries buildWorkflowId)
+ * @param {'paused'|'failed'} phase
  */
-ipcMain.handle('chat:generateTitle', async (_event, { message, provider = null } = {}) => {
+function emitBuildStopped(event, err, phase) {
   try {
-    if (!message || !String(message).trim()) {
-      return { success: false, message: 'message is required' };
-    }
-    const helpers = await buildSkillHelpers();
-    const prompt = `Write a 3-5 word title that summarises the TOPIC of this conversation. ` +
-      `Reply with ONLY the title — no quotes, no trailing punctuation, no prefix like "Title:". ` +
-      `Use title case.\n\nUser's first message: "${String(message).trim()}"`;
-    const raw = await helpers.callAI(prompt, { maxTokens: 30, provider });
-    const cleaned = String(raw || '')
-      .trim()
-      .replace(/^["'`]+|["'`]+$/g, '')
-      .replace(/^title:\s*/i, '')
-      .replace(/[.!?]+$/g, '')
-      .split('\n')[0]
-      .trim();
-    return { success: true, title: cleaned || 'New chat' };
-  } catch (err) {
-    console.error('[chat:generateTitle]', err);
-    return { success: false, message: err.message };
-  }
-});
+    if (event.sender.isDestroyed()) return;
+    event.sender.send('workflow:buildProgress', {
+      phase,
+      workflowId: err?.buildWorkflowId || null,
+      nodeId: err?.pausedNodeId || null,
+      stepIndex: Number.isInteger(err?.stepIndex) ? err.stepIndex : null,
+      question: err?.question || '',
+      message: err?.message || '',
+    });
+  } catch (_) { /* best-effort */ }
+}
 
 /**
  * workflow:executeBuild — apply a previously-returned workflow plan directly,
@@ -2773,6 +2826,10 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
     // it through as a structured response so the renderer can prompt the
     // user and retry with plan.clarifications appended.
     if (err && err.isClarificationNeeded) {
+      // Tell the canvas the build has stopped and why. Without this the node
+      // it paused on keeps its "building" glow while nothing is happening,
+      // and the preview looks like a live build the user can interact with.
+      emitBuildStopped(event, err, 'paused');
       return {
         success: false,
         needsClarification: true,
@@ -2780,6 +2837,9 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
         stepIndex: err.stepIndex,
         stepType: err.stepType || null,
         kind: err.context?.kind || null,
+        // The id this attempt built under. The renderer hands it back on the
+        // retry so every attempt at one plan shares a workflow id.
+        buildWorkflowId: err.buildWorkflowId || null,
         // Set when the question came from a SKILL: { skillId, state, question,
         // rounds }. The renderer parks it on plan.pendingSkills[stepIndex] so the
         // resumed build continues that skill dialog instead of restarting it.
@@ -2794,6 +2854,7 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
     // payload needed to finish that one call, so Continue resumes right there.
     if (err && err.code === 'MAX_TOKENS') {
       console.warn('[workflow:executeBuild] truncated at step', err.stepIndex, err.resumeStage);
+      emitBuildStopped(event, err, 'paused');
       return {
         success: false,
         code: 'MAX_TOKENS',
@@ -2801,6 +2862,7 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
         stepIndex: err.stepIndex ?? null,
         stepType: err.stepType || null,
         builtSteps: err.builtSteps || null,
+        buildWorkflowId: err.buildWorkflowId || null,
         // Everything ai:continue needs, in one payload: kind routes it to the
         // build branch, stage says which call inside the step stalled.
         resume: err.resume
@@ -2817,6 +2879,7 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
       };
     }
     console.error('[workflow:executeBuild]', err);
+    emitBuildStopped(event, err, 'failed');
     return {
       success: false,
       message: err.message,
@@ -2907,7 +2970,7 @@ ipcMain.handle('workflow:generateValidation', async (event, { workflowId } = {})
  * a stale document.
  */
 ipcMain.handle('workflow:validateChange', async (_event, {
-  workflowId, change = {}, chatHistory = [], pendingNode = null,
+  workflowId, change = {}, chatHistory = [], pendingNode = null, fixRounds = 0,
 } = {}) => {
   try {
     if (!workflowId) return { success: false, message: 'workflowId is required' };
@@ -2942,7 +3005,7 @@ ipcMain.handle('workflow:validateChange', async (_event, {
 
     const helpers = await buildSkillHelpers();
     const review = await chatAssistant.validateWorkflowChange({
-      workflow: reviewed, helpers, change, chatHistory,
+      workflow: reviewed, helpers, change, chatHistory, fixRounds,
     });
 
     // Only meaningful once a validation function exists; checkValidationDrift
@@ -3616,6 +3679,42 @@ ipcMain.handle('cloud-storage:get-picker-credentials', async (_event, { connecti
 });
 
 // Import file from cloud storage to local SQLite/NeDB
+/**
+ * cloud-storage:save-and-register — keep a cloud file, then treat it as local.
+ *
+ * The bytes are written to the path the user chose and handed to the same
+ * registration a file picked off disk goes through, so from here on there is
+ * nothing cloud-specific about it: DuckDB reads it in place, a workbook still
+ * becomes a table per sheet, and an edit writes back into the file the user can
+ * see in their own filesystem.
+ *
+ * This replaces importing a cloud file into the shared app SQLite database,
+ * where it was a copy the user could neither find nor open.
+ */
+ipcMain.handle('cloud-storage:save-and-register', async (_event, { data, targetPath }) => {
+  try {
+    if (!targetPath) return { success: false, message: 'No save location was chosen' };
+
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, Buffer.from(data));
+
+    const { registerLocalFile } = require('./imports/registerFile');
+    const result = await registerLocalFile(targetPath, app.getPath('userData'));
+
+    // A file that cannot be registered is not left lying around pretending to
+    // be a data source — but only if we are the ones who just wrote it.
+    if (!result.success) {
+      try { fs.unlinkSync(targetPath); } catch (_err) { /* already gone */ }
+      return result;
+    }
+
+    return { ...result, filePath: targetPath };
+  } catch (error) {
+    console.error('Cloud save-and-register error:', error);
+    return { success: false, message: error.message || 'Failed to save the file' };
+  }
+});
+
 ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fileType, sheetName, sheets = [], containerName, connectionName }) => {
   try {
     const tmpDir = path.join(app.getPath('temp'), 'ternlux-cloud-imports');
@@ -3920,7 +4019,16 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       }
 
       const nodeStartTime = Date.now();
-      const nodeLabel = step.customName || step.nodeLabel || node.data?.label || node.id;
+      // The node's own name comes first: `nodeLabel` is a snapshot taken when
+      // the execution step was created and goes stale the moment the node is
+      // rebuilt, and `data.label` is the creation-time type name ("Transformer")
+      // that nothing ever updates. `config.node_name` is written on every save
+      // (see withPersistedNodeNames) and is what the canvas shows.
+      const nodeLabel = step.customName
+        || node.data?.config?.node_name
+        || step.nodeLabel
+        || node.data?.label
+        || node.id;
 
       await addExecutionLog(executionsDb, executionId, 'info', `Executing node: ${nodeLabel} (${node.type})`);
 
@@ -4184,7 +4292,16 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       if (!node) continue;
 
       const nodeStartTime = Date.now();
-      const nodeLabel = step.customName || step.nodeLabel || node.data?.label || node.id;
+      // The node's own name comes first: `nodeLabel` is a snapshot taken when
+      // the execution step was created and goes stale the moment the node is
+      // rebuilt, and `data.label` is the creation-time type name ("Transformer")
+      // that nothing ever updates. `config.node_name` is written on every save
+      // (see withPersistedNodeNames) and is what the canvas shows.
+      const nodeLabel = step.customName
+        || node.data?.config?.node_name
+        || step.nodeLabel
+        || node.data?.label
+        || node.id;
 
       await addExecutionLog(
         executionsDb,
@@ -4435,6 +4552,35 @@ ipcMain.handle('workflow:watchCode', async (event, { workflowId } = {}) => {
 /** Stop watching a workflow's code folder for the calling renderer. */
 ipcMain.handle('workflow:unwatchCode', async (event, { workflowId } = {}) => {
   return unwatchWorkflowCode({ webContentsId: event.sender.id, workflowId });
+});
+
+/**
+ * ui:showTextContextMenu — the native Copy/Paste menu, opened at the pointer.
+ *
+ * Electron windows have NO context menu unless one is built, which is why a
+ * right-click in the app did nothing. Built from Electron ROLES rather than
+ * click handlers: roles drive the focused WebContents' own clipboard machinery,
+ * so they copy exactly what the selection is and paste through the same path as
+ * ⌘V — a hand-rolled handler would need clipboard permissions the renderer
+ * doesn't have, and would mishandle rich selections.
+ *
+ * Enablement mirrors what the caller found under the pointer: Copy needs a
+ * selection, Paste needs an editable target. Both stay VISIBLE either way, so
+ * the menu doesn't change shape as you right-click around.
+ */
+ipcMain.handle('ui:showTextContextMenu', async (event, { hasSelection = false, isEditable = false } = {}) => {
+  try {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) return { success: false, error: 'no window for this renderer' };
+    Menu.buildFromTemplate([
+      { role: 'copy', enabled: !!hasSelection },
+      { role: 'paste', enabled: !!isEditable },
+    ]).popup({ window: win });
+    return { success: true };
+  } catch (err) {
+    console.error('[ui:showTextContextMenu]', err);
+    return { success: false, error: err.message };
+  }
 });
 
 // ---------------------------------------------------------------------------

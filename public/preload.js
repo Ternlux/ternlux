@@ -506,17 +506,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
       // whole branch — every field the renderer sends must be listed.
       triggerPlanWorkflowBuild = null,
       targetNode = null,
+      // First message of a brand-new conversation. The main agent then returns
+      // the chat's name as `chatTitle` alongside its answer — there is no
+      // separate naming call.
+      isNewChat = false,
     } = {}) => ipcRenderer.invoke('chat:step', {
       message, history, scratchpad, activeContext, provider, agentMode, workflowSession,
-      triggerPlanWorkflowBuild, targetNode,
+      triggerPlanWorkflowBuild, targetNode, isNewChat,
     }),
-    /**
-     * Ask the AI to produce a 3-5 word topic title for a new conversation.
-     * Returns { success, title } — fall back to a synchronous truncation
-     * if success=false.
-     */
-    generateTitle: ({ message, provider = null } = {}) =>
-      ipcRenderer.invoke('chat:generateTitle', { message, provider }),
 
     /**
      * Execute AI-generated JavaScript the user has just approved.
@@ -584,15 +581,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * @returns {Promise<{ success, valid, reason, issues, remediation,
      *                     inconclusive?, drift: { drifted, reason } }>}
      */
-    validateChange: ({ workflowId, change = {}, chatHistory = [], pendingNode = null } = {}) =>
-      ipcRenderer.invoke('workflow:validateChange', { workflowId, change, chatHistory, pendingNode }),
+    validateChange: ({ workflowId, change = {}, chatHistory = [], pendingNode = null, fixRounds = 0 } = {}) =>
+      ipcRenderer.invoke('workflow:validateChange', { workflowId, change, chatHistory, pendingNode, fixRounds }),
 
     /**
      * Subscribe to live build-progress events emitted by executeBuild while a
      * plan is being applied. The callback receives one event object per step:
-     *   { phase: 'start', mode, totalSteps }
-     *   { phase: 'step', status: 'running'|'done', stepIndex, stepType, label, action }
+     *   { phase: 'start', mode, workflowId, workflowName, totalSteps }
+     *   { phase: 'step', status: 'running'|'done', stepIndex, stepType, label,
+     *     action, nodeId, nodeType, position, sources }
+     *   { phase: 'graph', workflowId, nodes: [{ id, type, position, label }], edges }
+     *   { phase: 'paused', workflowId, nodeId, stepIndex, question }
+     *   { phase: 'failed', workflowId, nodeId, stepIndex, message }
      *   { phase: 'done', workflowId, workflowName, nodeCount, edgeCount }
+     * A build that pauses for a clarification ends on 'paused' and resumes with
+     * a fresh 'start' carrying the same workflowId.
+     * The chat folds these into its build log; the workflow canvas uses the
+     * node fields to draw each node as it is built (see WorkflowEditor's live
+     * build overlay). Note that workflow:generateValidation streams on this
+     * same channel with { phase: 'investigating'|'done', thought } — those
+     * events carry no workflowId, which is how consumers tell them apart.
      * Returns an unsubscribe function — call it on cleanup to avoid leaks.
      * @param {(evt: object) => void} callback
      * @returns {() => void}
@@ -747,6 +755,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     importFile: (params) =>
       ipcRenderer.invoke('cloud-storage:import-file', params),
 
+    /**
+     * Write downloaded bytes to a path the user chose and register the result
+     * as a local data source — the same treatment a file picked off disk gets.
+     * Returns { success, filePath, format, tables: [{ name, path, sheet, schema }] }.
+     */
+    saveAndRegister: (params) =>
+      ipcRenderer.invoke('cloud-storage:save-and-register', params),
+
     /** Analyze Excel file for sheet names. Returns { success, sheets: string[] }. */
     analyzeExcelFile: (fileData) =>
       ipcRenderer.invoke('cloud-storage:analyze-excel', fileData),
@@ -857,5 +873,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
      */
     getActiveTriggers: () =>
       ipcRenderer.invoke('start-trigger:get-active'),
+  },
+
+  /**
+   * Window chrome the renderer can't draw itself.
+   */
+  ui: {
+    /**
+     * Open the native Copy/Paste menu at the pointer. Electron ships no default
+     * context menu, so a right-click does nothing until something calls this.
+     * @param {object} params - { hasSelection, isEditable }
+     */
+    showTextContextMenu: (params) =>
+      ipcRenderer.invoke('ui:showTextContextMenu', params),
   },
 });
