@@ -1,0 +1,99 @@
+/**
+ * Recording a local file as a data source.
+ *
+ * Nothing is imported and nothing is converted. Every format the app accepts —
+ * csv, json, parquet, xlsx and avro — is one DuckDB can read where it lies, so
+ * adding a file is a matter of working out what tables it holds and asking
+ * DuckDB to describe them. Adding a 5 GB file is as quick as a 5 KB one.
+ *
+ * This replaces the old convert-to-Parquet step. Excel and Avro used to be
+ * rewritten as Parquet under userData because DuckDB could not read them; it
+ * can now (public/duckdb/extensions.js ships the extensions), and reading the
+ * real file is what lets an edit be written back INTO it.
+ *
+ * A workbook is the one file that holds more than one table: each sheet becomes
+ * a table of its own, all sharing the workbook's path and told apart by name.
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const duck = require('../duckdb');
+
+/**
+ * Describe one table, or explain why it can't be read.
+ *
+ * A sheet with nothing in it is the ordinary case — real workbooks carry them —
+ * and DuckDB says so plainly (`No rows found in xlsx file`). Such a sheet is
+ * dropped rather than failing the whole file.
+ */
+async function describeTable(table, format) {
+  const schema = await duck.fileSchema(table.path, { format, sheet: table.sheet });
+  schema.tableName = table.name;
+  return { ...table, schema };
+}
+
+/**
+ * Everything the app needs to record a local file as a connection.
+ *
+ * @param {string} filePath
+ * @param {string} _userDataDir - unused now that nothing is converted; kept so
+ *   the IPC handler's call site does not have to change shape.
+ * @param {{ onProgress?: (info: object) => void }} options
+ * @returns {Promise<{ success, format, tables: Array<{name, path, sheet, schema}> }>}
+ */
+async function registerLocalFile(filePath, _userDataDir, { onProgress = null } = {}) {
+  if (!fs.existsSync(filePath)) {
+    return { success: false, message: `File not found: ${filePath}` };
+  }
+  // Said before the generic "unsupported" below, because a user with a .xls has
+  // a fix available and deserves to be told what it is.
+  if (duck.isLegacyWorkbook(filePath)) {
+    return { success: false, message: duck.legacyWorkbookMessage(filePath) };
+  }
+  if (!duck.isReadable(filePath)) {
+    return {
+      success: false,
+      message: `Unsupported file type: ${path.extname(filePath) || filePath}`,
+    };
+  }
+
+  try {
+    const format = duck.detectFormat(filePath);
+
+    // A workbook is many tables in one file; everything else is one table named
+    // after the file.
+    const candidates = format === 'xlsx'
+      ? duck.listSheets(filePath).map((sheet) => ({ name: sheet, path: filePath, sheet }))
+      : [{ name: path.basename(filePath, path.extname(filePath)), path: filePath, sheet: null }];
+
+    if (candidates.length === 0) throw new Error('No sheets found in workbook');
+
+    const tables = [];
+    for (const [index, candidate] of candidates.entries()) {
+      if (onProgress) {
+        onProgress({
+          phase: 'describing',
+          sheet: candidate.sheet,
+          rows: index,
+          total: candidates.length,
+        });
+      }
+      try {
+        tables.push(await describeTable(candidate, format));
+      } catch (error) {
+        if (candidates.length === 1) throw error;
+        console.warn(`[registerLocalFile] Skipped sheet "${candidate.sheet}": ${error.message}`);
+      }
+    }
+
+    if (tables.length === 0) throw new Error(`No readable data found in ${path.basename(filePath)}`);
+
+    return { success: true, format, tables };
+  } catch (error) {
+    console.error('[registerLocalFile]', error);
+    return { success: false, message: error.message };
+  }
+}
+
+module.exports = { registerLocalFile };
