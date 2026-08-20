@@ -11,6 +11,48 @@ const { executeOutput } = require('./outputExecutionHelpers');
 const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, importCsvToSqlite } = require('../imports/importHelpers');
 
 /**
+ * Node types that MATERIALISE something when they run — a table, a collection,
+ * a file. Their config names an output (targetTableName / targetPreviewSql /
+ * outputSettings) from the moment they are built, but nothing is behind that
+ * name until the node has actually executed. `config.executed` is what tells
+ * the two apart, and only these types carry it.
+ */
+const MATERIALIZING_NODE_TYPES = new Set(['transformer', 'join', 'output']);
+
+/**
+ * Record in the saved workflow that this node's output now exists.
+ *
+ * Every way a workflow runs — the Execute button, a chat "run this node", a
+ * CRON schedule, a file watcher — comes through executeNode, so writing the
+ * flag here covers all of them at once. The stored workflow is the only place
+ * it can live: a triggered run has no canvas to tell, and the node object we
+ * were handed is a copy that is thrown away when the run ends.
+ *
+ * Never throws. A run that produced real data must not be reported as failed
+ * because a bookkeeping write did.
+ */
+async function markNodeExecuted(node, helpers) {
+  try {
+    const workflowId = helpers?.workflowId;
+    const getDb = helpers?.getDb;
+    if (!workflowId || typeof getDb !== 'function') return;
+
+    const db = getDb('workflows');
+    const workflow = await db.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+    if (!workflow || !Array.isArray(workflow.nodes)) return;
+
+    const nodes = workflow.nodes.map((n) => (
+      n.id === node.id
+        ? { ...n, data: { ...(n.data || {}), config: { ...(n.data?.config || {}), executed: true } } }
+        : n
+    ));
+    await db.updateAsync({ _id: workflow._id }, { $set: { nodes } }, {});
+  } catch (err) {
+    console.warn(`[Workflow Execution] could not flag node ${node?.id} as executed:`, err.message);
+  }
+}
+
+/**
  * Detect a node that was placed on the canvas but never configured (empty or
  * near-empty config). Such a node would otherwise fail deep in execution with a
  * vague message like "Database type not configured". Returns a clear per-node
@@ -20,7 +62,9 @@ const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, im
  */
 function checkNodeConfigured(node, kind) {
   const config = node?.data?.config || {};
-  const label = node?.data?.label || node?.id || 'Node';
+  // Same preference as the execution log — the persisted name, not the
+  // creation-time type label, is what the user recognises.
+  const label = node?.data?.config?.node_name || node?.data?.label || node?.id || 'Node';
   const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== '';
 
   let configured = false;
@@ -245,7 +289,29 @@ async function executeDataSourceNode(node, helpers) {
         };
       }
 
-      
+      // A cloud file saved to disk is refreshed IN PLACE: the bytes replace the
+      // file the user chose, and DuckDB reads it from there. Nothing is
+      // imported into the app's SQLite database, which is what the branch below
+      // still does for sources recorded before this became the way.
+      const savedPath = config.cloudSource.localPath
+        || (config.sourceDbType === 'duckdb' ? (config.sourceFilePath || config.sourceLocalPath) : null);
+
+      if (savedPath) {
+        const duck = require('../duckdb');
+        fs.mkdirSync(path.dirname(savedPath), { recursive: true });
+        fs.writeFileSync(savedPath, Buffer.from(downloadResult.data));
+
+        const sourceTable = config.sourceTableName || config.sourceTableSchema?.tableName;
+        const rowCount = await duck.countRows(savedPath, config.sourceFormat || null, {
+          sheet: duck.sheetFor(savedPath, sourceTable),
+        });
+        return {
+          success: true,
+          message: `${path.basename(savedPath)} refreshed from ${dbType} — ${rowCount} row(s), read in place`,
+          recordsProcessed: rowCount,
+        };
+      }
+
       const fileExt = path.extname(objectName).toLowerCase();
 
       let fileType;
@@ -447,7 +513,11 @@ async function executeDataSourceNode(node, helpers) {
       }
       const rowCount = isDb
         ? await duck.tableRowCountAt(localPath, sourceTable)
-        : await duck.countRows(localPath, config.sourceFormat || null);
+        // A workbook's sheets share one path, so the table name is what says
+        // which of them this source is; null for every other format.
+        : await duck.countRows(localPath, config.sourceFormat || null, {
+          sheet: duck.sheetFor(localPath, sourceTable),
+        });
       return {
         success: true,
         message: isDb
@@ -738,7 +808,7 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     if (!dbType) {
       return {
         success: false,
-        message: `Node "${node.data?.label || node.id}" is not fully configured (no target database). Open it and complete its setup before running.`,
+        message: `Node "${node.data?.config?.node_name || node.data?.label || node.id}" is not fully configured (no target database). Open it and complete its setup before running.`,
         recordsProcessed: 0
       };
     }
@@ -1154,6 +1224,13 @@ async function executeNode(node, nodeMap, edges, helpers) {
     default:
       console.log(`[Workflow Execution] Skipping node type: ${node.type}`);
       nodeResult = { success: true, message: `Skipped ${node.type} node` };
+  }
+
+  // Transformer / join / output write a table, collection or file that nothing
+  // could read until this moment. Flag it in the saved workflow so readers —
+  // the Data Preview above all — know the output is really there now.
+  if (nodeResult?.success && MATERIALIZING_NODE_TYPES.has(node.type)) {
+    await markNodeExecuted(node, helpers);
   }
 
   return nodeResult;

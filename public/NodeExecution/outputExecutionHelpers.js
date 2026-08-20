@@ -6,7 +6,7 @@
 const Datastore = require('@seald-io/nedb');
 const { Parser } = require('@json2csv/plainjs');
 const fs = require('fs');
-const XLSX = require('xlsx');
+const path = require('path');
 const parquet = require('parquetjs');
 const avro = require('avsc');
 
@@ -312,7 +312,7 @@ function inferAvroSchema(data) {
  * Execute output operation - export to local file or insert to database connection
  * @param {Object} sourceConnection - Source connection configuration
  * @param {Object} sourceTableSchema - Source table schema with columns and tableName
- * @param {Object} outputSettings - Output settings (outputType, format, savePath, connectionId, tableName)
+ * @param {Object} outputSettings - Output settings (outputType, format, savePath, connectionId, tableName, sheetName)
  * @param {Object} pluginManager - Plugin manager instance
  * @param {Function} getFullConfig - Function to get full config with credentials
  * @param {Function} getDb - Function to get NeDB database instance by collection name
@@ -329,7 +329,7 @@ async function executeOutput(
   skillHelpers = null
 ) {
   try {
-    const { outputType, format, savePath, connectionId, tableName } = outputSettings;
+    const { outputType, format, savePath, connectionId, tableName, sheetName } = outputSettings;
 
     console.log(`[Output] Starting ${outputType} output operation`);
 
@@ -426,7 +426,12 @@ async function executeOutput(
                 sourceTableSchema?.tableName || sourceConnection.tableName,
                 1000000,
               )
-            : await duck.readHead(sourceConnection.localPath, 1000000);
+            : await duck.readHead(sourceConnection.localPath, 1000000, null, {
+              sheet: duck.sheetFor(
+                sourceConnection.localPath,
+                sourceTableSchema?.tableName || sourceConnection.tableName,
+              ),
+            });
           sourceData = result.rows;
         } else if (sourceConnection.dbType === 'nedb') {
           // Local NeDB file
@@ -510,8 +515,14 @@ async function executeOutput(
 
 
     if (outputType === 'local') {
-      // Export to local file
-      return await exportToLocalFile(sourceData, format, savePath, pluginManager, skillHelpers);
+      // Export to local file. An Excel sheet name falls back to the source
+      // table when the node never got one — an older node, or one the AI built
+      // before the field existed — so a workbook still gets a meaningful tab
+      // rather than every node fighting over "Data".
+      return await exportToLocalFile(
+        sourceData, format, savePath, pluginManager, skillHelpers,
+        sheetName || sourceTableSchema?.tableName || null,
+      );
     } else if (outputType === 'connection') {
       // Insert to database connection
       return await insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers);
@@ -537,9 +548,11 @@ async function executeOutput(
  * @param {Array} sourceData - Array of data rows
  * @param {string} format - File format (json, csv, excel, nedb, sqlite, parquet, avro)
  * @param {string} savePath - File path to save to
+ * @param {string} [sheetName] - Excel only: the sheet to write. Other formats
+ *   hold one table per file and ignore it.
  * @returns {Promise<Object>} Result with success, message, filePath
  */
-async function exportToLocalFile(sourceData, format, savePath, pluginManager, skillHelpers = null) {
+async function exportToLocalFile(sourceData, format, savePath, pluginManager, skillHelpers = null, sheetName = null) {
 
   if (format === 'json') {
     fs.writeFileSync(savePath, JSON.stringify(sourceData, null, 2), 'utf8');
@@ -558,14 +571,20 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
       filePath: savePath
     };
   } else if (format === 'excel') {
-    const worksheet = XLSX.utils.json_to_sheet(sourceData);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
-    XLSX.writeFile(workbook, savePath);
+    // One sheet per output node, named by the node. An existing workbook keeps
+    // every other sheet — writing a fresh book would throw the user's other
+    // sheets away while reporting success — so several output nodes can build
+    // up one file, a sheet each, by pointing at the same path with different
+    // sheet names. A path with no file at it gets a new workbook.
+    const xlsxFile = require('../duckdb/xlsx');
+    const sheet = xlsxFile.sanitizeSheetName(sheetName);
+    const columns = Object.keys(sourceData[0] || {});
+    xlsxFile.writeSheet(savePath, sheet, sourceData, columns);
     return {
       success: true,
-      message: `Successfully exported ${sourceData.length} rows to Excel`,
-      filePath: savePath
+      message: `Successfully exported ${sourceData.length} rows to sheet "${sheet}" in ${path.basename(savePath)}`,
+      filePath: savePath,
+      sheetName: sheet
     };
   } else if (format === 'nedb') {
     const db = new Datastore({ filename: savePath, autoload: false });
