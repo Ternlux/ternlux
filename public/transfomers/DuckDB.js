@@ -73,27 +73,36 @@ const isWorkflowDb = (filePath) => /\.duckdb$/i.test(String(filePath || ''));
  * disk; both end up as a view under the expected name. A file is also
  * registered under its own basename, since the two don't always agree.
  */
-async function registerSource(sourceLocalPath, tableName, format = null, { workflowId = null } = {}) {
+async function registerSource(sourceLocalPath, tableName, format = null, { workflowId = null, connectionName = null } = {}) {
   if (!sourceLocalPath) throw new Error('DuckDB transform requires a source');
 
-  // Upstream node output — already a table in a workflow database.
+  // Upstream node output — already a table in a workflow database. The attach
+  // makes `<workflowAlias>.<table>` resolve on its own, so only the bare view
+  // has to be added. There is no connection to name a schema after.
   if (isWorkflowDb(sourceLocalPath)) {
     if (!tableName) throw new Error('Reading a workflow table requires its name');
     const ref = await duck.workflowTableRef(workflowId, tableName);
-    await duck.exec(`CREATE OR REPLACE VIEW ${duck.quoteIdentifier(tableName)} AS SELECT * FROM ${ref}`);
+    await duck.registerAddressableViews({
+      body: `SELECT * FROM ${ref}`,
+      names: [tableName],
+    });
     return ref;
   }
 
   if (!fs.existsSync(sourceLocalPath)) throw new Error(`Source file not found: ${sourceLocalPath}`);
-  const ref = await duck.tableRef(sourceLocalPath, format);
-  const names = new Set([
-    tableName,
-    path.basename(sourceLocalPath, path.extname(sourceLocalPath)),
-  ].filter(Boolean));
-
-  for (const name of names) {
-    await duck.exec(`CREATE OR REPLACE VIEW ${duck.quoteIdentifier(name)} AS SELECT * FROM ${ref}`);
-  }
+  // For a workbook the table name is the sheet; for everything else it is just
+  // a label and this resolves to null.
+  const ref = await duck.tableRef(sourceLocalPath, format, {
+    sheet: duck.sheetFor(sourceLocalPath, tableName),
+  });
+  // Bare AND `<connection>.<table>`, so SQL written against what the Data
+  // Explorer displays runs here too. `connectionName` falls back to the file's
+  // own basename, which is what registerLocalFile names an imported file after.
+  await duck.registerAddressableViews({
+    body: `SELECT * FROM ${ref}`,
+    names: [tableName, path.basename(sourceLocalPath, path.extname(sourceLocalPath))],
+    connectionName: connectionName || path.basename(sourceLocalPath, path.extname(sourceLocalPath)),
+  });
   return ref;
 }
 
@@ -132,6 +141,9 @@ async function describeResult({
   targetTableName,
   sourceTableName = null,
   sourceFormat = null,
+  // Names the schema the source is also registered under, so SQL written as
+  // `<connection>.<table>` (what the Data Explorer shows) resolves here too.
+  connectionName = null,
   workflowId = null,
   nodeId = null,
   sampleRows = 0,
@@ -148,7 +160,7 @@ async function describeResult({
     if (operationMode !== 'in_place') {
       const clean = String(sql).replace(/;\s*$/, '');
       return await duck.withSession(async () => {
-        await registerSource(sourceLocalPath, sourceName, sourceFormat, { workflowId });
+        await registerSource(sourceLocalPath, sourceName, sourceFormat, { workflowId, connectionName });
         const columns = asColumns(await duck.describe(`(${clean})`));
         let sampleData = [];
         if (limit > 0) {
@@ -180,7 +192,11 @@ async function describeResult({
       const ref = await duck.stagingRef(stagingDb, stageTable);
       const from = isWorkflowDb(sourceLocalPath)
         ? await duck.workflowTableRef(workflowId, sourceName)
-        : await duck.tableRef(sourceLocalPath, sourceFormat);
+        // The preview has to read the same sheet the real run will, or it
+        // describes a shape the transform never sees.
+        : await duck.tableRef(sourceLocalPath, sourceFormat, {
+          sheet: duck.sheetFor(sourceLocalPath, sourceName),
+        });
       await duck.exec(`CREATE OR REPLACE TABLE ${ref} AS SELECT * FROM ${from} LIMIT ${limit}`);
       try {
         await duck.execInStaging(stagingDb, sql);
@@ -227,6 +243,9 @@ async function createLocalTable({
   targetLocalPath = null,
   sourceTableName = null,
   sourceFormat = null,
+  // Names the schema the source is also registered under, so SQL written as
+  // `<connection>.<table>` (what the Data Explorer shows) resolves here too.
+  connectionName = null,
   workflowId = null,
   nodeId = null,
 }) {
@@ -237,7 +256,7 @@ async function createLocalTable({
   const sourceName = sourceTableName || targetTableName;
 
   const rowCount = await duck.withWorkflowLock(workflowId, async () => {
-    await registerSource(sourceLocalPath, sourceName, sourceFormat, { workflowId });
+    await registerSource(sourceLocalPath, sourceName, sourceFormat, { workflowId, connectionName });
     await duck.createTableAs(workflowId, targetTableName, sql);
     return duck.tableRowCount(workflowId, targetTableName);
   });
@@ -319,16 +338,21 @@ async function inPlaceLocalUpdate({
   const format = sourceFormat || duck.detectFormat(target);
   const stagingDb = resolveOutputPath(null, { workflowId, nodeId });
 
+  // A workbook holds a table per sheet, so the table name is what says WHICH
+  // sheet this node reads and writes. Without it the read takes the first sheet
+  // whatever the node meant, and the write replaces the entire workbook.
+  const sheet = duck.sheetFor(target, dbTableName);
+
   const rowCount = await duck.withWorkflowLock(workflowId, async () => {
     // The scratch copy is a staging table in this workflow's own database. It
     // gives the statements something they can modify and takes the file out of
     // the picture before it is rewritten.
     const ref = await duck.stagingRef(stagingDb, stageTable);
-    const fileRef = await duck.tableRef(target, format);
+    const fileRef = await duck.tableRef(target, format, { sheet });
     await duck.exec(`CREATE OR REPLACE TABLE ${ref} AS SELECT * FROM ${fileRef}`);
     try {
       await duck.execInStaging(stagingDb, sql);
-      await duck.copyToFile(`SELECT * FROM ${ref}`, target, format);
+      await duck.copyToFile(`SELECT * FROM ${ref}`, target, format, { sheet });
       const { rows } = await duck.query(`SELECT count(*) AS c FROM ${ref}`);
       return Number(rows[0]?.c ?? 0);
     } finally {
