@@ -28,6 +28,16 @@ transfomer: {
 
         ${sourceTableInfo}
 
+        Those sample rows are the output of a DuckDB query, not the raw file or
+        document. They show how a value ENCODES on the way into JSON, which is
+        not always how it is typed — the Columns list above is what your SQL
+        binds against, so trust it over the sample when they disagree:
+        - a MAP prints as its entries, [{"key": …, "value": …}], and is still a
+          MAP: reach into it with attrs['k'] or map_entries(attrs), never with
+          list functions
+        - DECIMAL, and integers too large for a JSON number, print as quoted
+          strings; those columns are still numeric and need no cast
+
         ${settingsContext}
 
         Source: ${sourceTableSchema.tableName}  (readable by that name)
@@ -44,16 +54,37 @@ transfomer: {
         - Column types come from the file; DuckDB infers them, so you do not declare them
         - DuckDB speaks PostgreSQL-flavoured SQL, and adds conveniences worth using:
           SELECT * EXCLUDE (col), SELECT * REPLACE (expr AS col), QUALIFY, GROUP BY ALL
-        - Nested values read as STRUCT/LIST — reach into them with dot notation (addr.city) or [1]
+        - Nested values read as STRUCT, LIST or MAP. Reach into them with:
+            STRUCT  dot notation      addr.city
+            LIST    1-based index     items[1]      (unnest(items) to expand to rows)
+            MAP     bracket by key    attrs['color']
+          A key/value object becomes a STRUCT when its keys are few and stable, and a
+          MAP once there are 200+ distinct keys across the data. The schema above tells
+          you which one you have — read it, do not assume.
+        - You CANNOT assign to a nested path. \`SET addr.city = 'x'\` is a parser error
+          ("Qualified column names in UPDATE .. SET not supported"), and struct_insert
+          fails on a key that already exists. To change one field, rebuild the whole value
+          and carry every sibling forward — anything you leave out is lost:
+            STRUCT  SET addr = struct_pack(city := 'Munich', geo := addr.geo)
+            MAP     SET attrs = map_from_entries(list_transform(map_entries(attrs),
+                      e -> CASE WHEN e.key = 'color'
+                             THEN struct_pack(key := e.key, value := 'blue') ELSE e END))
         - For explanations text to bolden key points use **text** and to break lines use \\n
         - Placeholders like {{current_date}}, {{current_timestamp}} are replaced at runtime
 
         CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
 
+        "targetColumns" is every column your SELECT produces, in order — the names it
+        actually emits, aliases included. Downstream nodes are configured from this
+        list, so a name here that the SELECT does not produce becomes SQL further
+        down the pipeline that selects a column nothing has. Write "*" only when the
+        SELECT genuinely returns the source unchanged.
+
         Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of the transformation approach",
           "sql": "SELECT statement producing the transformed rows",
+          "targetColumns": [{"name": "col", "type": "TYPE"}],
           "previewSql": "The same SELECT with LIMIT 100, for previewing"
         }
 
@@ -63,20 +94,23 @@ transfomer: {
         {
           "explanation": "Keep **active** customers and compute their total spending",
           "sql": "SELECT customer_id, name, email, purchase_count * avg_purchase AS total_spending FROM customers WHERE status = 'active'",
+          "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "VARCHAR"}, {"name": "email", "type": "VARCHAR"}, {"name": "total_spending", "type": "DOUBLE"}],
           "previewSql": "SELECT customer_id, name, email, purchase_count * avg_purchase AS total_spending FROM customers WHERE status = 'active' LIMIT 100"
         }
 
-        Aggregate:
+        Aggregate — note the columns are the GROUPED shape, not the source's:
         {
           "explanation": "Revenue per city, highest first",
           "sql": "SELECT city, count(*) AS orders, round(sum(amount), 2) AS revenue FROM orders GROUP BY city ORDER BY revenue DESC",
+          "targetColumns": [{"name": "city", "type": "VARCHAR"}, {"name": "orders", "type": "BIGINT"}, {"name": "revenue", "type": "DOUBLE"}],
           "previewSql": "SELECT city, count(*) AS orders, round(sum(amount), 2) AS revenue FROM orders GROUP BY city ORDER BY revenue DESC LIMIT 100"
         }
 
-        Drop a column and rename another:
+        Drop a column and rename another — "*" is expanded, so list the real result:
         {
           "explanation": "Remove the internal **raw_blob** column and rename **cust_nm**",
           "sql": "SELECT * EXCLUDE (raw_blob), cust_nm AS customer_name FROM orders",
+          "targetColumns": [{"name": "order_id", "type": "INTEGER"}, {"name": "amount", "type": "DOUBLE"}, {"name": "customer_name", "type": "VARCHAR"}],
           "previewSql": "SELECT * EXCLUDE (raw_blob), cust_nm AS customer_name FROM orders LIMIT 100"
         }
 
@@ -92,6 +126,16 @@ transfomer: {
         User's transformation request: "${settings.userRequest}"
 
         ${sourceTableInfo}
+
+        Those sample rows are the output of a DuckDB query, not the raw file or
+        document. They show how a value ENCODES on the way into JSON, which is
+        not always how it is typed — the Columns list above is what your SQL
+        binds against, so trust it over the sample when they disagree:
+        - a MAP prints as its entries, [{"key": …, "value": …}], and is still a
+          MAP: reach into it with attrs['k'] or map_entries(attrs), never with
+          list functions
+        - DECIMAL, and integers too large for a JSON number, print as quoted
+          strings; those columns are still numeric and need no cast
 
         ${settingsContext}
 
@@ -124,31 +168,54 @@ transfomer: {
         - Do NOT write CREATE TABLE or INSERT — the table already exists
         - Changes are permanent; the previous contents are not kept
         - DuckDB speaks PostgreSQL-flavoured SQL
+        - Nested values read as STRUCT, LIST or MAP. Reach into them with:
+            STRUCT  dot notation      addr.city
+            LIST    1-based index     items[1]      (unnest(items) to expand to rows)
+            MAP     bracket by key    attrs['color']
+          A key/value object becomes a STRUCT when its keys are few and stable, and a
+          MAP once there are 200+ distinct keys across the data. The schema above tells
+          you which one you have — read it, do not assume.
+        - You CANNOT assign to a nested path. \`SET addr.city = 'x'\` is a parser error
+          ("Qualified column names in UPDATE .. SET not supported"), and struct_insert
+          fails on a key that already exists. To change one field, rebuild the whole value
+          and carry every sibling forward — anything you leave out is lost:
+            STRUCT  UPDATE t SET addr = struct_pack(city := 'Munich', geo := addr.geo);
+            MAP     UPDATE t SET attrs = map_from_entries(list_transform(map_entries(attrs),
+                      e -> CASE WHEN e.key = 'color'
+                             THEN struct_pack(key := e.key, value := 'blue') ELSE e END));
         - For explanations text to bolden key points use **text** and to break lines use \\n
         - Placeholders like {{current_date}}, {{current_timestamp}} are replaced at runtime
 
         CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Put all explanatory prose inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
 
+        "targetColumns" is the table's columns AFTER your statements run — downstream
+        nodes are configured from it. Use "*" when the shape is untouched (a plain
+        UPDATE or DELETE); list every column, not just the new ones, when an ALTER
+        adds, drops, or renames any.
+
         Return your response in exactly this JSON format:
         {
           "explanation": "Brief explanation of what will change and why",
           "sql": "The statement(s) to run, separated by semicolons",
+          "targetColumns": [{"name": "col", "type": "TYPE"}],
           "previewSql": "A SELECT showing the table after the change, with LIMIT 100"
         }
 
         **Examples**:
 
-        Remove rows:
+        Remove rows — shape untouched:
         {
           "explanation": "Delete all **cancelled** orders",
           "sql": "DELETE FROM orders WHERE status = 'cancelled';",
+          "targetColumns": "*",
           "previewSql": "SELECT * FROM orders LIMIT 100"
         }
 
-        Add a derived column:
+        Add a derived column — every column, not just the added one:
         {
           "explanation": "Add **full_name**, combining first and last names",
           "sql": "ALTER TABLE customers ADD COLUMN full_name VARCHAR; UPDATE customers SET full_name = first_name || ' ' || last_name;",
+          "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "first_name", "type": "VARCHAR"}, {"name": "last_name", "type": "VARCHAR"}, {"name": "full_name", "type": "VARCHAR"}],
           "previewSql": "SELECT * FROM customers LIMIT 100"
         }
 
@@ -157,6 +224,13 @@ transfomer: {
           "explanation": "Normalise **email** to lowercase",
           "sql": "UPDATE customers SET email = lower(trim(email));",
           "previewSql": "SELECT email FROM customers LIMIT 100"
+        }
+
+        Change one field inside a nested value (rebuild it, siblings and all):
+        {
+          "explanation": "Set **customer.address.city** to Munich, leaving the rest of the address alone",
+          "sql": "UPDATE orders SET customer = struct_pack(\\"name\\" := customer.name, address := struct_pack(city := 'Munich', geo := customer.address.geo)) WHERE id = 1;",
+          "previewSql": "SELECT customer.address.city, customer.address.geo FROM orders LIMIT 100"
         }
 
         Provide working DuckDB SQL.`,
