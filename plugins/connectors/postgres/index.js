@@ -420,6 +420,7 @@ ORDER BY c.ordinal_position
       "explanation": "Brief explanation of the transformation approach",
       "ddl": "CREATE TABLE statement",
       "sql": "INSERT INTO statement with SELECT query",
+      "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
       "previewSql": "SELECT query to preview the transformed data (LIMIT 100)"
     }`
       : `**Instructions for Local SQLite Storage**:
@@ -448,6 +449,7 @@ ORDER BY c.ordinal_position
       "ddl": "SQLite CREATE TABLE ${fullTableName.split('.').pop()} (...columns...)",
       "sql": "PostgreSQL SELECT query to fetch transformed data",
       "insertSql": "SQLite table INSERT INTO ${fullTableName.split('.').pop()} (...columns...) VALUES (?, ?, ...)",
+      "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
       "previewSql": "SQLite table SELECT * FROM ${fullTableName.split('.').pop()} LIMIT 100"
     }
 
@@ -457,6 +459,7 @@ ORDER BY c.ordinal_position
       "ddl": "CREATE TABLE customers_transformed (customer_id INTEGER, name TEXT, email TEXT, total_spending REAL)",
       "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) as total_spending FROM public.customers WHERE status = 'active'",
       "insertSql": "INSERT INTO customers_transformed (customer_id, name, email, total_spending) VALUES (?, ?, ?, ?)",
+      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, {"name": "email", "type": "TEXT"}, {"name": "total_spending", "type": "REAL"}],
       "previewSql": "SELECT * FROM customers_transformed LIMIT 100"
     }`}
 
@@ -506,6 +509,7 @@ ORDER BY c.ordinal_position
       "explanation": "Brief explanation of the transformation approach",
       "ddl": "ALTER TABLE statement (null if not needed)",
       "sql": "UPDATE or DELETE statement (null if not needed)",
+      "targetColumns": [{"name": "col", "type": "TYPE"}],   // the table columns AFTER the change, or "*" if the shape is unchanged (plain UPDATE / DELETE)
       "previewSql": "SELECT query to preview the modified table (LIMIT 100)"
     }
 
@@ -516,6 +520,7 @@ ORDER BY c.ordinal_position
       "explanation": "Delete all cancelled orders",
       "ddl": null,
       "sql": "DELETE FROM ${fullTableName} WHERE status = 'cancelled'",
+      "targetColumns": "*",
       "previewSql": "SELECT * FROM ${fullTableName} LIMIT 100"
     }
 
@@ -532,6 +537,7 @@ ORDER BY c.ordinal_position
       "explanation": "Add **total_amount** column to track order totals",
       "ddl": "ALTER TABLE ${fullTableName} ADD COLUMN total_amount NUMERIC(10,2) DEFAULT 0.00",
       "sql": null,
+      "targetColumns": [{"name": "order_id", "type": "INT"}, {"name": "total_amount", "type": "DECIMAL(10,2)"}, {"name": "discount_rate", "type": "DECIMAL(5,2)"}],   // ALL columns the table now has, not just the new one
       "previewSql": "SELECT * FROM ${fullTableName} LIMIT 100"
     }
 
