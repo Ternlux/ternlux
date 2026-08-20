@@ -2,9 +2,14 @@
  * DuckDB — the query engine for local files.
  *
  * Local files are no longer imported into SQLite/NeDB before they can be used.
- * They stay where the user put them and are queried in place: a CSV, JSON or
- * Parquet file is addressed by path and read straight off disk, so opening a
- * 5 GB file costs the same as opening a 5 MB one.
+ * They stay where the user put them and are queried in place: a CSV, JSON,
+ * Parquet, Excel or Avro file is addressed by path and read straight off disk,
+ * so opening a 5 GB file costs the same as opening a 5 MB one.
+ *
+ * Excel and Avro were once converted to Parquet at add time. They no longer
+ * are: DuckDB's `excel` and `avro` extensions ship with the app (see
+ * ./extensions), so a workbook is read where it lies — one table per sheet —
+ * and an edit to it is written back into the workbook itself.
  *
  * The instance itself is in-memory: source files are read where they lie, so
  * there is nothing to persist at this level.
@@ -21,8 +26,13 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Formats DuckDB reads natively. Anything else is converted to Parquet once,
-// at add time, by public/imports/toParquet.js.
+const { EXTENSION_FOR_FORMAT, ensureExtension, resetExtensions } = require('./extensions');
+const xlsxFile = require('./xlsx');
+
+// Formats DuckDB reads. csv / json / parquet are built in; xlsx and avro need
+// an extension, which ships with the app and is loaded on first use — see
+// ./extensions. Nothing is converted on the way in any more: every one of these
+// is read, and written, where the user put it.
 const FORMAT_BY_EXT = {
   '.csv': 'csv',
   '.tsv': 'csv',
@@ -31,6 +41,9 @@ const FORMAT_BY_EXT = {
   '.ndjson': 'json',
   '.jsonl': 'json',
   '.parquet': 'parquet',
+  '.xlsx': 'xlsx',
+  '.xlsm': 'xlsx',
+  '.avro': 'avro',
 };
 
 // DuckDB type names that should render and aggregate as numbers.
@@ -95,6 +108,10 @@ const isFatalError = (err) => /^(INTERNAL|FATAL) Error/.test(String(err && err.m
 function resetConnection() {
   connectionPromise = null;
   attached.clear();
+  // Extensions are loaded into an INSTANCE, so the new one starts without them.
+  // Leaving the cache populated would have the next xlsx read skip the LOAD it
+  // now needs and fail on an unknown function instead.
+  resetExtensions();
 }
 
 /**
@@ -125,20 +142,172 @@ const isReadable = (filePath) => detectFormat(filePath) !== null;
 /**
  * The FROM expression for a file — this is what makes a path behave like a
  * table. `union_by_name` keeps JSON files with varying keys readable.
+ *
+ * A workbook holds several tables in one file, so `sheet` picks which. Omitted,
+ * DuckDB reads the first one. `header = true` is not optional: without it the
+ * header row comes back AS DATA and the columns are named `A1`, `B1`, …
+ *
+ * Building the expression is all this does. For xlsx and avro the extension
+ * behind it still has to be loaded, which is why `tableRef` is what call sites
+ * should reach for.
  */
-function sourceRef(filePath, format = null) {
+function sourceRef(filePath, format = null, { sheet = null, allVarchar = false } = {}) {
   const resolved = format || detectFormat(filePath);
   const literal = quoteLiteral(filePath);
   switch (resolved) {
     case 'csv':
       return `read_csv_auto(${literal})`;
     case 'json':
-      return `read_json_auto(${literal}, union_by_name = true)`;
+      // `sample_size = -1` for the same reason the staged read uses it: the
+      // schema is inferred from a leading sample by default, and a field that
+      // first appears past it is dropped from the table with no error. A JSON
+      // file has to be parsed in full to be read at all, so full inference
+      // costs a fraction more (measured: 293ms → 314ms for a preview of a
+      // 19 MB file) rather than the extra pass it would cost a columnar format.
+      return `read_json_auto(${literal}, union_by_name = true, sample_size = -1)`;
     case 'parquet':
       return `read_parquet(${literal})`;
+    case 'xlsx':
+      return `read_xlsx(${literal}${sheet ? `, sheet = ${quoteLiteral(sheet)}` : ''}, header = true`
+        + `${allVarchar ? ', all_varchar = true' : ''})`;
+    case 'avro':
+      return `read_avro(${literal})`;
     default:
-      throw new Error(`DuckDB cannot read "${path.basename(String(filePath))}" directly — convert it to Parquet first`);
+      throw new Error(
+        `DuckDB cannot read "${path.basename(String(filePath))}" — supported formats are `
+        + 'csv, json, parquet, xlsx and avro',
+      );
   }
+}
+
+// ── workbook type repair ───────────────────────────────────────────────────
+//
+// read_xlsx infers each column's type from a sample of leading rows. A column
+// that is empty for the first several hundred rows gets typed from nothing —
+// DOUBLE, in practice — and the first real value then fails the read OUTRIGHT:
+// `Failed to parse cell 'K1500'`. One stray cell makes the whole sheet
+// unreadable, and no projection avoids it: selecting only the other columns
+// fails exactly the same way.
+//
+// The reader takes no per-column type override, and its two escape hatches are
+// each wrong on their own:
+//
+//   ignore_errors = true  keeps the sniffed type and NULLS everything that
+//     disagrees with it, so the mistyped column comes back empty. Measured on
+//     a real 200k-row sheet: 133 notes in, 0 out. Silent, total loss.
+//
+//   all_varchar = true    reads every column as text, which costs the sheet's
+//     other types — and dates arrive as raw Excel serials ("46055"), which is
+//     worse than useless to something expecting a date.
+//
+// So the repair is: read as text, then put back the type the sniffer asked for,
+// but only on the columns where every value actually supports it. A column that
+// disagrees stays text and keeps its contents — nothing is dropped, and nothing
+// is mistyped. The check costs ONE pass, and only for a sheet the plain read
+// cannot handle; a sheet that reads cleanly keeps using the native reader.
+
+// Excel keeps dates and times as days since this epoch. (Workbooks written in
+// the old Mac "1904 date system" count from 1904-01-01 instead; the flag lives
+// in workbook.xml and is not worth a full parse to recover, so those dates land
+// four years early on the rare file that is both 1904-based AND mistyped.)
+const EXCEL_EPOCH = "DATE '1899-12-30'";
+
+const isVarcharType = (type) => /^VARCHAR/i.test(String(type));
+const isTemporalType = (type) => /^(DATE|TIMESTAMP|TIME)/i.test(String(type));
+
+/** Put a column back into the type the sniffer reported, from its text form. */
+function repairedColumn(name, type) {
+  const col = quoteIdentifier(name);
+  if (/^DATE$/i.test(type)) return `(${EXCEL_EPOCH} + CAST(${col} AS INTEGER))`;
+  if (isTemporalType(type)) {
+    // A fractional serial is the time of day, so the whole number is carried
+    // through seconds rather than truncated to a day.
+    return `(${EXCEL_EPOCH}::TIMESTAMP + INTERVAL 1 SECOND * (CAST(${col} AS DOUBLE) * 86400))`;
+  }
+  return `CAST(${col} AS ${type})`;
+}
+
+/** Counts the values in one column that do NOT support its sniffed type. */
+function disagreeingValues(name, type) {
+  const col = quoteIdentifier(name);
+  // A temporal column is stored as a NUMBER, so "does this hold a date?" is
+  // really "is this numeric?" — casting the text "46055" to DATE would fail on
+  // a column that is in fact perfectly good.
+  const target = isTemporalType(type) ? 'DOUBLE' : type;
+  return `count(*) FILTER (WHERE ${col} IS NOT NULL AND TRY_CAST(${col} AS ${target}) IS NULL)`;
+}
+
+// path@mtime#sheet → promise of the FROM expression to use for it.
+const xlsxRefCache = new Map();
+
+/**
+ * The FROM expression for one sheet: the native read where that works, and a
+ * repaired one where it does not.
+ *
+ * Cached per file version and sheet, because the connector re-registers its
+ * views on every query and the verifying pass must not be paid again.
+ */
+function xlsxRef(filePath, sheet) {
+  const key = `${cacheKeyFor(filePath)}#${sheet || ''}`;
+  if (!xlsxRefCache.has(key)) {
+    const pending = (async () => {
+      const native = sourceRef(filePath, 'xlsx', { sheet });
+
+      // The sniffer's own answer. LIMIT 0 reads no rows, so this succeeds even
+      // on a sheet whose data cannot be read — which is what makes it usable
+      // as the starting point for repairing that sheet.
+      const columns = await describe(native);
+      const claimed = columns.filter((c) => !isVarcharType(c.type));
+      if (claimed.length === 0) return native;
+
+      const asText = sourceRef(filePath, 'xlsx', { sheet, allVarchar: true });
+      const probes = claimed.map((c, i) => `${disagreeingValues(c.name, c.type)} AS c${i}`);
+      const { rows } = await query(`SELECT ${probes.join(', ')} FROM ${asText}`);
+
+      const disagrees = new Set(
+        claimed.filter((c, i) => Number(rows[0][`c${i}`] || 0) > 0).map((c) => c.name),
+      );
+      // Every column holds what it claims, so the native reader would have
+      // managed. Prefer it — it is the engine's own conversion, not ours.
+      if (disagrees.size === 0) return native;
+
+      const projection = columns.map((c) => {
+        const col = quoteIdentifier(c.name);
+        if (disagrees.has(c.name) || isVarcharType(c.type)) return col;
+        return `${repairedColumn(c.name, c.type)} AS ${col}`;
+      });
+      console.warn(
+        `[duckdb] ${path.basename(filePath)}${sheet ? ` (${sheet})` : ''}: `
+        + `read as text for ${[...disagrees].join(', ')} — the values there do not match the `
+        + 'type Excel implies, and would otherwise fail the read',
+      );
+      return `(SELECT ${projection.join(', ')} FROM ${asText})`;
+    })().catch((err) => {
+      xlsxRefCache.delete(key); // let a later call retry
+      throw err;
+    });
+    xlsxRefCache.set(key, pending);
+  }
+  return xlsxRefCache.get(key);
+}
+
+/**
+ * The sheet a table name means, for a file whose tables are sheets.
+ *
+ * A workbook's tables are registered under their sheet names, unchanged — so
+ * for a caller that already knows which table it wants, the sheet is that name.
+ * Every other format has one table per file and gets null, which reads the file
+ * whole. This is what lets a call site that only ever had a path and a table
+ * name address the right sheet without carrying a new field.
+ */
+const sheetFor = (filePath, tableName) => (
+  tableName && xlsxFile.isWorkbook(filePath) ? tableName : null
+);
+
+/** Load the extension a format needs, if it needs one. */
+async function ensureFormatSupport(format) {
+  const extension = EXTENSION_FOR_FORMAT[format];
+  if (extension) await ensureExtension(extension, { exec, query });
 }
 
 // A CSV column whose values overflow BIGINT is sniffed as DOUBLE, which
@@ -190,9 +359,15 @@ async function csvTypeOverrides(filePath) {
  * Prefer this over `sourceRef` wherever the call site can await — it is what
  * keeps long numeric ids intact. `sourceRef` remains the raw primitive.
  */
-async function tableRef(filePath, format = null) {
+async function tableRef(filePath, format = null, { sheet = null } = {}) {
   const resolved = format || detectFormat(filePath);
-  if (resolved !== 'csv') return sourceRef(filePath, resolved);
+  if (resolved !== 'csv') {
+    await ensureFormatSupport(resolved);
+    // A workbook's columns are typed by a sniffer that only sees the first
+    // rows, so the expression it takes to read one is worked out per sheet.
+    if (resolved === 'xlsx') return xlsxRef(filePath, sheet);
+    return sourceRef(filePath, resolved, { sheet });
+  }
 
   const overrides = await csvTypeOverrides(filePath);
   if (overrides.length === 0) return sourceRef(filePath, resolved);
@@ -216,18 +391,94 @@ const describeColumns = (reader) => {
   }));
 };
 
-/** Undo the string-encoding of integer columns where it is safe to do so. */
-function coerceRows(rows, columns) {
-  const integerCols = columns.filter((c) => INTEGER_TYPES.test(c.type)).map((c) => c.name);
-  if (integerCols.length === 0) return rows;
+const isIntegerType = (type) => INTEGER_TYPES.test(String(type));
+
+/**
+ * Does this type hold a string-encoded integer anywhere inside it?
+ *
+ * Answered once per column so a result with nothing to convert — the common
+ * case — is handed back untouched rather than rebuilt row by row.
+ */
+function containsIntegerType(type) {
+  if (!type) return false;
+  if (Array.isArray(type.entryTypes)) return type.entryTypes.some(containsIntegerType);
+  if (type.keyType || type.valueType) {
+    return containsIntegerType(type.keyType) || containsIntegerType(type.valueType);
+  }
+  return isIntegerType(type);
+}
+
+/**
+ * Undo the string-encoding of one value, following its TYPE.
+ *
+ * The type is what decides, never the value: a string is the encoding for a
+ * large integer AND for an ordinary VARCHAR, so reading the value alone would
+ * turn a zip code of "007" into 7. Walking the declared type means only columns
+ * that really are integers are touched.
+ *
+ * STRUCT, LIST, ARRAY and MAP carry their children on the type object
+ * (`entryTypes`, `valueType`, `keyType`), so nesting is followed to any depth.
+ */
+function coerceValue(value, type) {
+  if (value === null || value === undefined || !type) return value;
+
+  // STRUCT — children addressed by name.
+  if (Array.isArray(type.entryNames) && Array.isArray(type.entryTypes)) {
+    if (typeof value !== 'object' || Array.isArray(value)) return value;
+    const out = {};
+    for (const key of Object.keys(value)) {
+      const at = type.entryNames.indexOf(key);
+      out[key] = at === -1 ? value[key] : coerceValue(value[key], type.entryTypes[at]);
+    }
+    return out;
+  }
+
+  // MAP — arrives as a list of { key, value } entries, and either side can be
+  // an integer.
+  if (type.keyType && type.valueType) {
+    if (!Array.isArray(value)) return value;
+    return value.map((entry) => (entry && typeof entry === 'object' && !Array.isArray(entry)
+      ? { ...entry, key: coerceValue(entry.key, type.keyType), value: coerceValue(entry.value, type.valueType) }
+      : entry));
+  }
+
+  // LIST / ARRAY — one child type for every element.
+  if (type.valueType) {
+    return Array.isArray(value) ? value.map((item) => coerceValue(item, type.valueType)) : value;
+  }
+
+  if (typeof value !== 'string' || value === '' || !isIntegerType(type)) return value;
+  const num = Number(value);
+  return Number.isSafeInteger(num) ? num : value;
+}
+
+/**
+ * Undo the string-encoding of integers, at every depth.
+ *
+ * getRowObjectsJson emits the types a JS number cannot hold exactly — BIGINT,
+ * HUGEINT, UBIGINT and DECIMAL — as strings, so nothing is lost coming out of
+ * C++. Anything that fits a JS number safely is converted back, and genuinely
+ * huge ids stay strings rather than losing their last digits. DECIMAL keeps its
+ * string: exactness a double cannot represent is the whole reason to use one.
+ *
+ * This used to look only at top-level columns, which left a BIGINT inside a
+ * STRUCT, LIST or MAP quoted — `{"qty": "1"}` in a preview, and in the sample
+ * rows handed to the model, which reads as a text column that needs casting.
+ */
+function coerceRows(rows, reader) {
+  const names = reader.deduplicatedColumnNames
+    ? reader.deduplicatedColumnNames()
+    : reader.columnNames();
+  const types = reader.columnTypes();
+
+  const affected = names
+    .map((name, i) => [name, types[i]])
+    .filter(([, type]) => containsIntegerType(type));
+  if (affected.length === 0) return rows;
+
   return rows.map((row) => {
     const out = { ...row };
-    for (const name of integerCols) {
-      const value = out[name];
-      if (typeof value !== 'string' || value === '') continue;
-      const num = Number(value);
-      if (Number.isSafeInteger(num)) out[name] = num;
-    }
+    for (const [name, type] of affected) out[name] = coerceValue(out[name], type);
     return out;
   });
 }
@@ -243,7 +494,7 @@ async function query(sql, { params = null } = {}) {
       ? await connection.runAndReadAll(sql, params)
       : await connection.runAndReadAll(sql);
     const columns = describeColumns(reader);
-    const rows = coerceRows(reader.getRowObjectsJson(), columns);
+    const rows = coerceRows(reader.getRowObjectsJson(), reader);
     return { rows, columns, rowCount: rows.length, ms: Date.now() - started };
   });
 }
@@ -276,7 +527,7 @@ async function queryUpTo(sql, maxRows, { params = null } = {}) {
     await reader.readUntil(cap + 1);
 
     const columns = describeColumns(reader);
-    const all = coerceRows(reader.getRowObjectsJson(), columns);
+    const all = coerceRows(reader.getRowObjectsJson(), reader);
     const rows = all.slice(0, cap);
 
     return {
@@ -409,14 +660,14 @@ async function describe(fromExpression) {
 }
 
 /** First `limit` rows of a file, plus its columns. The preview primitive. */
-async function readHead(filePath, limit = 1000, format = null) {
-  const ref = await tableRef(filePath, format);
+async function readHead(filePath, limit = 1000, format = null, { sheet = null } = {}) {
+  const ref = await tableRef(filePath, format, { sheet });
   return query(`SELECT * FROM ${ref} LIMIT ${Number(limit) || 1000}`);
 }
 
 /** Total rows in a file. Cheap for Parquet (metadata), a scan for CSV/JSON. */
-async function countRows(filePath, format = null) {
-  const ref = await tableRef(filePath, format);
+async function countRows(filePath, format = null, { sheet = null } = {}) {
+  const ref = await tableRef(filePath, format, { sheet });
   const { rows } = await query(`SELECT count(*) AS c FROM ${ref}`);
   return Number(rows[0]?.c ?? 0);
 }
@@ -425,8 +676,8 @@ async function countRows(filePath, format = null) {
  * Schema in the `{ tableName, columns, sampleData }` shape the node chats,
  * prompts and preview grid all already speak.
  */
-async function fileSchema(filePath, { sampleLimit = 5, format = null } = {}) {
-  const { rows, columns } = await readHead(filePath, sampleLimit, format);
+async function fileSchema(filePath, { sampleLimit = 5, format = null, sheet = null } = {}) {
+  const { rows, columns } = await readHead(filePath, sampleLimit, format, { sheet });
   const sampleData = rows.map((row) => {
     const trimmed = {};
     for (const key of Object.keys(row)) {
@@ -450,7 +701,7 @@ function ensureDir(filePath) {
 }
 
 /** COPY options per format, so a file is rewritten in the format it already is. */
-function copyOptionsFor(format, outPath) {
+function copyOptionsFor(format, outPath, { sheet = null } = {}) {
   switch (format) {
     case 'csv': {
       // Keep the delimiter the file already uses; .tsv is still 'csv' to us.
@@ -462,8 +713,15 @@ function copyOptionsFor(format, outPath) {
       return /\.(ndjson|jsonl)$/i.test(outPath) ? 'FORMAT JSON' : 'FORMAT JSON, ARRAY true';
     case 'parquet':
       return 'FORMAT PARQUET';
+    case 'xlsx':
+      // HEADER is not a nicety here. Reads use `header = true`, so a sheet
+      // written without one comes back with its first data row consumed as the
+      // column names.
+      return `FORMAT xlsx, HEADER true${sheet ? `, SHEET ${quoteLiteral(sheet)}` : ''}`;
+    case 'avro':
+      return 'FORMAT avro';
     default:
-      throw new Error(`Cannot write ${format || 'this format'} — expected csv, json or parquet`);
+      throw new Error(`Cannot write ${format || 'this format'} — expected csv, json, parquet, xlsx or avro`);
   }
 }
 
@@ -473,10 +731,59 @@ function copyOptionsFor(format, outPath) {
  * The write goes to a sibling temp file and is renamed into place, so a failed
  * run can't leave a half-written file behind, and so a caller can safely
  * overwrite the same path it read from.
+ *
+ * A workbook with more than one sheet is the exception, and takes the other
+ * path below: DuckDB's xlsx writer builds a whole new file out of what it is
+ * given, so writing one sheet through it would drop every other sheet.
  */
-async function copyToFile(selectSql, outPath, format = null) {
+async function copyToFile(selectSql, outPath, format = null, { sheet = null } = {}) {
   const resolved = format || detectFormat(outPath);
-  const options = copyOptionsFor(resolved, outPath);
+  await ensureFormatSupport(resolved);
+
+  if (resolved === 'xlsx' && fs.existsSync(outPath)) {
+    return writeIntoWorkbook(selectSql, outPath, sheet);
+  }
+
+  return copyThroughTemp(selectSql, outPath, copyOptionsFor(resolved, outPath, { sheet }));
+}
+
+/**
+ * Write into a workbook that already exists, without losing the rest of it.
+ *
+ * DuckDB's xlsx writer builds a NEW workbook out of whatever it is handed, so
+ * COPYing one sheet over an existing file keeps that sheet and drops every
+ * other. Which means a caller that forgets to say WHICH sheet it is writing
+ * does not get a mistake — it gets a workbook with one sheet in it, named
+ * `Sheet1`, and no error. That is a data loss this refuses to perform: the
+ * guard lives here rather than at each call site precisely because forgetting
+ * is the failure mode.
+ */
+async function writeIntoWorkbook(selectSql, outPath, sheet) {
+  const sheets = xlsxFile.listSheets(outPath);
+
+  // A single-sheet workbook has no ambiguity — the one sheet is the target,
+  // and naming it keeps it from being renamed `Sheet1` on the way through.
+  const target = sheet || (sheets.length === 1 ? sheets[0] : null);
+
+  if (!target) {
+    throw new Error(
+      `Refusing to write ${path.basename(outPath)}: it holds ${sheets.length} sheets `
+      + `(${sheets.join(', ')}) and no sheet was named, so the write would keep only one.`,
+    );
+  }
+
+  // Several sheets means the workbook has to be rewritten around this one.
+  if (sheets.length > 1) return replaceWorkbookSheet(selectSql, outPath, target);
+
+  return copyThroughTemp(selectSql, outPath, copyOptionsFor('xlsx', outPath, { sheet: target }));
+}
+
+/**
+ * COPY to a sibling temp file and rename into place, so a failed run can't
+ * leave a half-written file behind and a caller can safely overwrite the same
+ * path it read from.
+ */
+async function copyThroughTemp(selectSql, outPath, options) {
   ensureDir(outPath);
   const tempPath = `${outPath}.tmp-${process.pid}-${Date.now()}`;
   try {
@@ -487,6 +794,20 @@ async function copyToFile(selectSql, outPath, format = null) {
     throw error;
   }
   return outPath;
+}
+
+/**
+ * Rewrite one sheet of a multi-sheet workbook, keeping the others.
+ *
+ * The rows come back into this process to do it, which is the cost of not
+ * losing the rest of the book — a sheet is capped at about a million rows by
+ * the format itself, and the xlsx package holds the whole workbook in memory
+ * regardless, so the ceiling is the file's, not ours.
+ */
+async function replaceWorkbookSheet(selectSql, outPath, sheet) {
+  const { rows, columns } = await query(selectSql);
+  ensureDir(outPath);
+  return xlsxFile.replaceSheet(outPath, sheet, rows, columns.map((c) => c.name));
 }
 
 const copyToParquet = (selectSql, outPath) => copyToFile(selectSql, outPath, 'parquet');
@@ -538,27 +859,44 @@ async function stageRowsAsNdjson(rows, { onProgress = null } = {}) {
   }
 }
 
-/** The FROM expression that reads a staged NDJSON file back. */
+/**
+ * The FROM expression that reads a staged NDJSON file back.
+ *
+ * `sample_size = -1` infers the schema from the WHOLE file rather than the
+ * first ~20k rows. Documents out of a schemaless source do not agree about
+ * their shape, and a field that first appears after the sample is otherwise
+ * dropped from the table with no error at all — measured: a field introduced at
+ * row 30,001 is simply absent, at the top level and inside a nested struct
+ * alike. The cost is one more pass over a file we already write and read in
+ * full; losing columns silently is the one outcome worth paying to avoid.
+ */
 const stagedRef = (stagePath) =>
-  `read_json_auto(${quoteLiteral(stagePath)}, format = 'newline_delimited', union_by_name = true)`;
+  `read_json_auto(${quoteLiteral(stagePath)}, format = 'newline_delimited', `
+  + 'union_by_name = true, sample_size = -1)';
 
 /**
- * Write rows from an async iterable to Parquet.
+ * Write rows from an async iterable to a data file, in the format its path
+ * implies.
  *
- * Used for the formats DuckDB can't read (xls/xlsx/avro) at import time. Node
- * outputs no longer come through here — those are tables in the workflow's own
- * database (see ingestRowsToTable).
+ * The format is detected rather than assumed: writing Parquet bytes into a file
+ * the user named `.csv` or `.xlsx` produces something nothing can open, and
+ * says nothing about it. A workbook goes through copyToFile, so writing one
+ * sheet of an existing book keeps the others.
+ *
+ * Node outputs do not come through here — those are tables in the workflow's
+ * own database (see ingestRowsToTable).
  *
  * @param {AsyncIterable<object>|Iterable<object>} rows
  * @param {string} outPath
- * @param {{ onProgress?: (info: {rows: number}) => void }} options
+ * @param {{ onProgress?: (info: {rows: number}) => void, format?: string, sheet?: string }} options
  */
-async function ingestRows(rows, outPath, { onProgress = null } = {}) {
+async function ingestRows(rows, outPath, { onProgress = null, format = null, sheet = null } = {}) {
   ensureDir(outPath);
+  const resolved = format || detectFormat(outPath) || 'parquet';
   const { stagePath, count } = await stageRowsAsNdjson(rows, { onProgress });
   try {
     if (count === 0) throw new Error('No rows to write');
-    await copyToParquet(`SELECT * FROM ${stagedRef(stagePath)}`, outPath);
+    await copyToFile(`SELECT * FROM ${stagedRef(stagePath)}`, outPath, resolved, { sheet });
     if (onProgress) onProgress({ rows: count });
     return { rowCount: count, path: outPath };
   } finally {
@@ -591,6 +929,99 @@ async function ingestRows(rows, outPath, { onProgress = null } = {}) {
 const sanitizeIdentifier = (value) => String(value || '')
   .replace(/[^a-zA-Z0-9_]/g, '_')
   .slice(0, 80);
+
+/**
+ * The schema a connection's tables live under — `sales_csv.orders`.
+ *
+ * USER-FACING: it is what the Data Explorer's tree shows, what a double-click
+ * puts in the editor, and therefore what anyone (a person or a model reading
+ * their SQL) learns to type. It lives here, in the core, rather than in the
+ * connector, because the workflow executor has to arrive at the SAME name — a
+ * qualified name the Explorer displayed but the executor rejects is the whole
+ * bug this exists to prevent.
+ *
+ * Returns null when the name sanitizes to nothing; callers fall back to the
+ * bare table name.
+ */
+function sanitizeSchemaName(name) {
+  const cleaned = String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48);
+  if (!cleaned) return null;
+  return /^[0-9]/.test(cleaned) ? `f_${cleaned}` : cleaned;
+}
+
+/**
+ * Expose one source under every name that can legitimately address it.
+ *
+ * `body` is the SELECT that reads it — `SELECT * FROM read_csv_auto('…')` for a
+ * file, `SELECT * FROM "wf_123"."orders"` for an upstream node's table.
+ *
+ * Two addressing styles have to work, because the app teaches both:
+ *
+ *   bare            `FROM orders`            — the Data Explorer puts the open
+ *                                              connection's schema on the
+ *                                              search_path, so this is what a
+ *                                              worksheet writes.
+ *   schema-qualified `FROM sales_csv.orders` — the connection's own schema. It
+ *                                              is what the tree DISPLAYS, what
+ *                                              reaches a file you don't have
+ *                                              open, and what a model copies
+ *                                              out of either.
+ *
+ * The executor used to register only the bare form, so a perfectly ordinary
+ * `FROM sales_csv.orders` failed with 'schema "sales_csv" does not exist'.
+ * Registering both makes the executor agree with the Explorer.
+ *
+ * @param {string}   body            SELECT expression that reads the source.
+ * @param {string[]} names           Bare names it should answer to (table name,
+ *                                   file basename, a join's temp-table alias).
+ * @param {string}   [connectionName] Owning connection; omit for a node output,
+ *                                   which has no connection and is already
+ *                                   reachable as `<workflowAlias>.<table>`.
+ * @returns {Promise<{schema: string|null, created: string[]}>} `created` holds
+ *          quoted refs, ready to hand back to `dropViews`.
+ */
+async function registerAddressableViews({ body, names = [], connectionName = null }) {
+  if (!body) throw new Error('registerAddressableViews requires a body SELECT');
+  const bare = [...new Set((names || []).filter(Boolean).map(String))];
+  if (bare.length === 0) throw new Error('registerAddressableViews requires at least one name');
+
+  const created = [];
+  for (const name of bare) {
+    const ref = quoteIdentifier(name);
+    await exec(`CREATE OR REPLACE VIEW ${ref} AS ${body}`);
+    created.push(ref);
+  }
+
+  const schema = sanitizeSchemaName(connectionName);
+  if (schema) {
+    await exec(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schema)}`);
+    for (const name of bare) {
+      const ref = `${quoteIdentifier(schema)}.${quoteIdentifier(name)}`;
+      await exec(`CREATE OR REPLACE VIEW ${ref} AS ${body}`);
+      created.push(ref);
+    }
+  }
+  return { schema: schema || null, created };
+}
+
+/**
+ * Drop views registered by registerAddressableViews. Best-effort per view: one
+ * that has already gone must not stop the rest being cleaned up, or a name
+ * left behind would shadow whatever answers to it next.
+ *
+ * The SCHEMA is deliberately left in place. It is empty, it costs nothing, and
+ * dropping it would race any other source of the same connection.
+ */
+async function dropViews(created = []) {
+  for (const ref of created) {
+    try { await exec(`DROP VIEW IF EXISTS ${ref}`); } catch { /* best effort */ }
+  }
+}
 
 /** Where a workflow's database lives. */
 function workflowDbPath(workflowId) {
@@ -959,6 +1390,11 @@ module.exports = {
   tableRef,
   detectFormat,
   isReadable,
+  sheetFor,
+  listSheets: xlsxFile.listSheets,
+  isWorkbook: xlsxFile.isWorkbook,
+  isLegacyWorkbook: xlsxFile.isLegacyWorkbook,
+  legacyWorkbookMessage: xlsxFile.legacyMessage,
   quoteLiteral,
   quoteIdentifier,
   close,
@@ -996,4 +1432,10 @@ module.exports = {
   STAGING_SCHEMA,
   dropWorkflowDb,
   sanitizeIdentifier,
+  // Addressing — shared by the connector (Data Explorer) and the workflow
+  // executor so both resolve a source to the same names. See the note on
+  // sanitizeSchemaName.
+  sanitizeSchemaName,
+  registerAddressableViews,
+  dropViews,
 };
