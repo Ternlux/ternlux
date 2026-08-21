@@ -391,6 +391,7 @@ Instead, ask about WHAT the user wants to accomplish in plain language.
   "filter": ${sourceVectorDbType === 'pinecone' ? '"{ \\"field\\": \\"value\\" }" | "{}"' : '"SQL WHERE" | ""'},
   "transformFunction": "function transformRecord(record, state) { /* your code */ return { record, state }; }",
   "initialState": {},  // Optional: initial state values
+  "targetColumns": [{"name": "field", "type": "TYPE"}],   // every field a transformed record carries afterwards, or "*" when transformRecord adds no new field. Downstream nodes are configured from this
   "explanation": "Brief description of what this does"
 }
 
@@ -545,6 +546,7 @@ If ready to execute:
   "targetConnectionName": "connection_name",  // REQUIRED for cloud vector DBs, omit for LanceDB
   "indexName": "index_name",  // For databases that use indexes (Pinecone, etc.)
   "namespace": "optional_namespace",  // For databases that use namespaces
+  "targetColumns": [{"name": "field", "type": "TYPE"}],   // every field written alongside the vector (the source columns carried over, plus anything added). Downstream nodes are configured from this; "*" if the source's columns are written through unchanged
   "explanation": "Explanation of what will happen"
 }
 
