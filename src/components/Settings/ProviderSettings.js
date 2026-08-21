@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Form, Select, Card, Button, message, Divider, Typography, Space, Alert } from 'antd';
+import { Form, Select, AutoComplete, Card, Button, message, Divider, Typography, Space, Alert } from 'antd';
 import { RobotOutlined, CheckCircleOutlined, SaveOutlined, EditOutlined } from '@ant-design/icons';
 import ProviderKeyForm from '../ApiKeySetup/ProviderKeyForm';
 import OthersProviderForm from '../ApiKeySetup/OthersProviderForm';
@@ -61,7 +61,11 @@ const enrichModels = (provider, liveModels) => {
 const ProviderSettings = () => {
   const [form] = Form.useForm();
   const [selectedProvider, setSelectedProvider] = useState('claude');
-  const [loading, setLoading] = useState(false);
+  // The provider every AI feature actually uses. The model + Max Tokens shown
+  // in the "Default AI Provider" card belong to THIS provider, not to whichever
+  // one is open in the "Configure Provider" section below (that section only
+  // manages API keys).
+  const [defaultProvider, setDefaultProviderValue] = useState(null);
   const [savingDefault, setSavingDefault] = useState(false);
   const [hasApiKey, setHasApiKey] = useState(false);
   const [providerHasKey, setProviderHasKey] = useState(true); // Track if selected provider has key
@@ -116,12 +120,37 @@ const ProviderSettings = () => {
     checkProviderApiKey(selectedProvider);
   }, [selectedProvider]);
 
-  // (Re)load the model list whenever the provider — or whether it has a key —
-  // changes. With a key we fetch the live SDK list; without one we show the
-  // bundled list so the dropdown is never empty.
+  // (Re)load the model list whenever the DEFAULT provider changes — that's the
+  // provider the model belongs to. For OpenAI-compatible providers the current
+  // model lives in their encrypted entry, so seed the field from there first;
+  // loadModels then only supplies suggestions.
   useEffect(() => {
-    loadModels(selectedProvider, providerHasKey);
-  }, [selectedProvider, providerHasKey]);
+    let cancelled = false;
+    (async () => {
+      if (defaultProvider && COMPAT_IDS.includes(defaultProvider)) {
+        let stored;
+        try {
+          const res = await window.electronAPI?.ai?.getCompatProvider?.(defaultProvider);
+          stored = res?.meta?.model || undefined;
+        } catch (e) {
+          console.warn('[ProviderSettings] could not read compat provider config:', e);
+        }
+        if (cancelled) return;
+        // Always assign: an empty stored model must clear whatever the previous
+        // provider left in the field.
+        form.setFieldValue('model', stored);
+      }
+      if (!cancelled) loadModels(defaultProvider);
+    })();
+    return () => { cancelled = true; };
+  }, [defaultProvider]);
+
+  // Keep the form field and its state copy in lockstep: the model list and the
+  // Max Tokens cap are derived from the default provider.
+  const applyDefaultProvider = (id) => {
+    form.setFieldValue('defaultProvider', id || undefined);
+    setDefaultProviderValue(id || null);
+  };
 
   const loadSettings = () => {
     try {
@@ -136,16 +165,16 @@ const ProviderSettings = () => {
         const initialProvider = settings.provider || settings.defaultProvider || 'claude';
         setSelectedProvider(initialProvider);
         form.setFieldsValue({
-          defaultProvider: settings.defaultProvider || settings.provider || undefined,
           provider: initialProvider,
-          model: settings.model || 'claude-3-5-sonnet-20241022',
+          model: settings.model || undefined,
           maxTokens: settings.maxTokens || DEFAULT_MAX_TOKENS
         });
+        applyDefaultProvider(settings.defaultProvider || settings.provider || null);
       } else {
-        // Set default values
+        // Set default values. The model is left empty on purpose — loadModels
+        // fills it from the default provider's live list.
         form.setFieldsValue({
           provider: 'claude',
-          model: 'claude-3-5-sonnet-20241022',
           maxTokens: DEFAULT_MAX_TOKENS
         });
       }
@@ -173,7 +202,7 @@ const ProviderSettings = () => {
       setConfiguredProviders(configured);
       // If no default has been chosen yet, preselect the first configured provider
       if (configured.length > 0 && !form.getFieldValue('defaultProvider')) {
-        form.setFieldValue('defaultProvider', configured[0]);
+        applyDefaultProvider(configured[0]);
       }
     } catch (error) {
       console.error('Error checking configured providers:', error);
@@ -192,28 +221,37 @@ const ProviderSettings = () => {
     }
   };
 
-  // Populate the model dropdown for `provider`. Fetches the live list via the
-  // SDK when a key is configured; otherwise (no key, or running outside
-  // Electron) falls back to the bundled curated list. Reconciles the form's
-  // selected model so it stays valid for whatever list we end up with.
-  const loadModels = async (provider, hasKey) => {
-    // "Others" (OpenAI-compatible) providers manage their own model field.
-    if (provider === 'others') {
+  // Populate the model dropdown for the default `provider`. Fetches the live
+  // list via the SDK; falls back to the bundled curated list when that isn't
+  // possible (outside Electron, or the call fails). Reconciles the form's
+  // selected model so it stays valid for whatever list we end up with — this is
+  // what stops a Claude model id from surviving a switch to OpenAI.
+  const loadModels = async (provider) => {
+    // 'others' is the picker for the compat group, not a provider itself.
+    if (!provider || provider === 'others') {
       setModels([]);
       return;
     }
 
+    const isCompat = COMPAT_IDS.includes(provider);
     const bundled = enrichModels(provider, PROVIDER_MODELS[provider] || []);
 
     const apply = (list) => {
       setModels(list);
       const current = form.getFieldValue('model');
+      if (isCompat) {
+        // A compat endpoint may serve model ids it doesn't enumerate (and local
+        // servers list none at all), so a stored id is never overruled — the
+        // list is only a suggestion source, and only fills an empty field.
+        if (!current && list.length > 0) form.setFieldValue('model', list[0].value);
+        return;
+      }
       if (list.length > 0 && !list.some((m) => m.value === current)) {
         form.setFieldValue('model', list[0].value);
       }
     };
 
-    if (!hasKey || !window.electronAPI?.ai?.listModels) {
+    if (!window.electronAPI?.ai?.listModels) {
       apply(bundled);
       return;
     }
@@ -234,14 +272,11 @@ const ProviderSettings = () => {
     }
   };
 
+  // Switching the panel below only changes which provider's API key you're
+  // managing — it doesn't touch the model, which follows the default provider.
   const handleProviderChange = (provider) => {
     setSelectedProvider(provider);
     setChangingKey(false);
-    // "Others" (OpenAI-compatible) providers manage their own model field in
-    // OthersProviderForm — there's no predefined model list to seed here.
-    if (provider === 'others' || !PROVIDER_MODELS[provider]) return;
-    const defaultModel = PROVIDER_MODELS[provider][0].value;
-    form.setFieldValue('model', defaultModel);
   };
 
   const handleKeySetupComplete = async () => {
@@ -288,16 +323,20 @@ const ProviderSettings = () => {
   const reconcileDefaultProvider = async () => {
     try {
       let local = null;
+      let localModel;
       try {
-        local = JSON.parse(localStorage.getItem('ai-provider-settings') || '{}').defaultProvider || null;
+        const saved = JSON.parse(localStorage.getItem('ai-provider-settings') || '{}');
+        local = saved.defaultProvider || null;
+        // Only carry the model across when it was chosen for THIS provider.
+        if (local && saved.provider === local && saved.model) localModel = saved.model;
       } catch (e) { /* corrupt — ignore */ }
       const res = await window.electronAPI?.ai?.getDefaultProvider?.();
       const main = res?.provider || null;
       if (local && local !== main) {
-        await persistDefaultProvider(local);
+        await persistDefaultProvider(local, localModel);
       } else if (main && !local) {
         mergeSettings({ defaultProvider: main });
-        form.setFieldValue('defaultProvider', main);
+        applyDefaultProvider(main);
       }
     } catch (e) {
       console.warn('[ProviderSettings] default provider reconcile failed:', e);
@@ -310,7 +349,7 @@ const ProviderSettings = () => {
     await checkApiKey();
     await refreshConfiguredProviders();
     if (provider && !form.getFieldValue('defaultProvider')) {
-      form.setFieldValue('defaultProvider', provider);
+      applyDefaultProvider(provider);
       mergeSettings({ defaultProvider: provider });
       // Compat providers carry their model in the encrypted key entry, so we
       // don't pass a model here (main resolves it downstream).
@@ -323,73 +362,61 @@ const ProviderSettings = () => {
     message.success('Provider configured successfully!');
   };
 
-  // Save ONLY the default provider (its own section/button).
+  // Save the default provider together with the model and Max Tokens that
+  // belong to it — one section, one button. The provider/model pair is written
+  // as a unit everywhere it's stored so a model can never outlive the provider
+  // it was chosen for.
   const handleSaveDefault = async () => {
     try {
       setSavingDefault(true);
-      const defaultProvider = form.getFieldValue('defaultProvider');
-      if (!defaultProvider) {
+      const values = form.getFieldsValue();
+      const provider = values.defaultProvider;
+      if (!provider) {
         message.warning('Select a default provider first.');
         return;
       }
-      mergeSettings({ defaultProvider });
-      // Carry the saved model for this provider through to main so backend
-      // AI calls use it (not a hardcoded default). Only pass a model when the
-      // stored config actually belongs to the chosen default provider.
-      let model;
-      try {
-        const saved = JSON.parse(localStorage.getItem('ai-provider-settings') || '{}');
-        if (saved.provider === defaultProvider && saved.model) model = saved.model;
-      } catch (e) { /* ignore corrupt settings */ }
-      await persistDefaultProvider(defaultProvider, model);
+
+      const isCompat = COMPAT_IDS.includes(provider);
+      const model = (values.model || '').trim() || undefined;
+      if (!model) {
+        message.warning('Select a model for this provider.');
+        return;
+      }
+
+      // A compat provider's model lives in its encrypted entry — that's what
+      // the main process reads when a call doesn't name one. Writing only the
+      // model preserves the stored key and base URL.
+      if (isCompat) {
+        const res = await window.electronAPI?.ai?.saveCompatProvider?.(provider, { model });
+        if (res && res.success === false) {
+          throw new Error(res.error || 'Failed to save the model for this provider');
+        }
+      }
+
+      // `provider` mirrors `defaultProvider` so every reader that pairs the two
+      // with `model` (renderer callAI) stays consistent.
+      mergeSettings({
+        defaultProvider: provider,
+        provider,
+        model,
+        temperature: 0.7,
+      });
+      // Writes localStorage AND the main-process prefs, clamped to what the
+      // chosen model accepts, so backend calls honor the same number.
+      const cap = models.find((m) => m.value === model)?.maxOutputTokens || null;
+      await saveMaxTokens(values.maxTokens || DEFAULT_MAX_TOKENS, cap);
+      await persistDefaultProvider(provider, model);
       message.success('Default AI provider saved!');
     } catch (error) {
       console.error('Error saving default provider:', error);
-      message.error('Failed to save default provider');
+      message.error(error.message || 'Failed to save default provider');
     } finally {
       setSavingDefault(false);
     }
   };
 
-  // Save the per-provider configuration (provider + model + max tokens). The
-  // default provider is managed by its own section above.
-  const handleSave = async () => {
-    try {
-      setLoading(true);
-      const values = await form.validateFields();
-      mergeSettings({
-        provider: values.provider,
-        model: values.model,
-        temperature: 0.7,
-      });
-      // Writes localStorage AND the main-process prefs, clamped to what the
-      // chosen model accepts, so backend calls honor the same number.
-      const cap = models.find((m) => m.value === values.model)?.maxOutputTokens || null;
-      await saveMaxTokens(values.maxTokens || DEFAULT_MAX_TOKENS, cap);
-      // Keep the main-process default in sync so backend AI calls use this
-      // model. If no default provider is set yet, adopt this one so a single
-      // Save "just works"; if this provider IS the default, refresh its model.
-      const currentDefault = form.getFieldValue('defaultProvider');
-      if (!currentDefault || currentDefault === values.provider) {
-        try {
-          form.setFieldValue('defaultProvider', values.provider);
-          mergeSettings({ defaultProvider: values.provider });
-          await persistDefaultProvider(values.provider, values.model);
-        } catch (e) {
-          console.error('[ProviderSettings] Could not sync default to main:', e);
-          message.warning('Settings saved, but the app may not use this provider until you set it as default.');
-        }
-      }
-      message.success('Provider settings saved successfully!');
-    } catch (error) {
-      console.error('Error saving provider settings:', error);
-      message.error('Failed to save provider settings');
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const currentProviderInfo = PROVIDER_INFO[selectedProvider];
+  const isCompatDefault = !!defaultProvider && COMPAT_IDS.includes(defaultProvider);
 
 
   return (
@@ -414,9 +441,9 @@ const ProviderSettings = () => {
             form={form}
             layout="vertical"
           >
-            {/* Default provider — its own section + save button. This is the
-                provider every AI feature uses; it's independent of which
-                provider you're currently configuring below. */}
+            {/* Default provider — provider + its model + its Max Tokens, saved
+                together by one button. This is what every AI feature uses; the
+                "Configure Provider" section below only manages API keys. */}
             {configuredProviders.length > 0 && (
               <Card
                 size="small"
@@ -437,6 +464,7 @@ const ProviderSettings = () => {
                     size="large"
                     placeholder="Select default provider"
                     getPopupContainer={(trigger) => trigger.parentNode}
+                    onChange={applyDefaultProvider}
                   >
                     {configuredProviders.map((id) => (
                       <Option key={id} value={id}>
@@ -448,6 +476,119 @@ const ProviderSettings = () => {
                     ))}
                   </Select>
                 </Form.Item>
+
+                {/* Model for the default provider. The list is refetched from
+                    that provider whenever it changes, and a model that isn't in
+                    the new list is replaced — a Claude model can't survive a
+                    switch to OpenAI. OpenAI-compatible endpoints get a free-text
+                    field with their /models list as suggestions: they accept ids
+                    they don't always enumerate, and local servers list none. */}
+                {isCompatDefault ? (
+                  <Form.Item
+                    label="Model"
+                    name="model"
+                    rules={[{ required: true, message: 'Enter the model id to use' }]}
+                    help={`The exact model id ${getProviderInfo(defaultProvider).name} expects. Suggestions are its published models — you can type any id it accepts.`}
+                    style={{ marginBottom: 16 }}
+                  >
+                    <AutoComplete
+                      size="large"
+                      placeholder={OPENAI_COMPAT_PROVIDERS[defaultProvider]?.placeholderModel || 'model-id'}
+                      options={models.map((m) => ({ value: m.value }))}
+                      filterOption={(input, option) =>
+                        String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())
+                      }
+                      getPopupContainer={(trigger) => trigger.parentNode}
+                      notFoundContent={modelsLoading ? 'Loading models…' : null}
+                    />
+                  </Form.Item>
+                ) : defaultProvider ? (
+                  <Form.Item
+                    label="Model"
+                    name="model"
+                    rules={[{ required: true, message: 'Please select a model' }]}
+                    style={{ marginBottom: 16 }}
+                  >
+                    <Select
+                      size="large"
+                      placeholder="Select model"
+                      getPopupContainer={(trigger) => trigger.parentNode}
+                      optionLabelProp="label"
+                      loading={modelsLoading}
+                      notFoundContent={modelsLoading ? 'Loading models…' : 'No models found'}
+                    >
+                      {models.map((model) => (
+                        <Option
+                          key={model.value}
+                          value={model.value}
+                          label={
+                            <>
+                              {model.label}
+                              {model.description.includes('Recommended') && (
+                                <CheckCircleOutlined
+                                  style={{ marginLeft: 8, color: '#52c41a' }}
+                                />
+                              )}
+                            </>
+                          }
+                        >
+                          <div>
+                            <div style={{ fontWeight: 500 }}>
+                              {model.label}
+                              {model.description.includes('Recommended') && (
+                                <CheckCircleOutlined
+                                  style={{ marginLeft: 8, color: '#52c41a' }}
+                                />
+                              )}
+                            </div>
+                            <div style={{ fontSize: 12, color: '#8c8c8c' }}>
+                              {model.description}
+                            </div>
+                          </div>
+                        </Option>
+                      ))}
+                    </Select>
+                  </Form.Item>
+                ) : null}
+
+                <Divider style={{ marginTop: 8 }} />
+
+                {/* Advanced Settings */}
+                <Title level={5}>Advanced Settings</Title>
+                <Paragraph type="secondary" style={{ fontSize: 13 }}>
+                  Configure maximum response length for AI outputs.
+                </Paragraph>
+
+                {/* Bounded by the selected model's published output limit, read
+                    from the same provider models endpoint that fills the model
+                    dropdown. Providers that don't publish limits get the full
+                    ladder. */}
+                <Form.Item noStyle shouldUpdate={(prev, cur) => prev.model !== cur.model}>
+                  {({ getFieldValue }) => {
+                    const selected = models.find((m) => m.value === getFieldValue('model'));
+                    const cap = selected?.maxOutputTokens || null;
+                    const ctx = selected?.maxInputTokens || null;
+                    return (
+                      <Form.Item
+                        label="Max Tokens"
+                        name="maxTokens"
+                        help={
+                          cap
+                            ? `Maximum length of AI responses. ${selected.label} accepts up to ${cap.toLocaleString()} output tokens${ctx ? ` and a ${ctx.toLocaleString()}-token context window` : ''}. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.`
+                            : 'Maximum length of AI responses. This provider does not publish per-model limits, so an unsupported value is rejected at request time. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.'
+                        }
+                        style={{ marginBottom: 20 }}
+                      >
+                        <Select getPopupContainer={(trigger) => trigger.parentNode}>
+                          {buildTokenOptions(cap).map((o) => (
+                            <Option key={o.value} value={o.value}>{o.label}</Option>
+                          ))}
+                        </Select>
+                      </Form.Item>
+                    );
+                  }}
+                </Form.Item>
+
                 <Button
                   type="primary"
                   icon={<SaveOutlined />}
@@ -459,10 +600,12 @@ const ProviderSettings = () => {
               </Card>
             )}
 
-            {/* Provider Selection */}
+            {/* Provider Selection — API keys only. The model and Max Tokens
+                live with the default provider above. */}
             <Form.Item
               label="Configure Provider"
               name="provider"
+              help="Add or replace the API key for a provider. Which provider the app actually uses — and with which model — is set above."
               rules={[{ required: true, message: 'Please select a provider' }]}
             >
               <Select
@@ -499,7 +642,7 @@ const ProviderSettings = () => {
             </Form.Item>
 
             {// "Others" = OpenAI-compatible providers (own dropdown + URL/key/model form).
-             // Otherwise: no key → show the key form; key present → show model/settings.
+             // Otherwise: no key → show the key form; key present → offer to replace it.
             }
   {selectedProvider === 'others' ? (
     <div>
@@ -613,104 +756,14 @@ const ProviderSettings = () => {
               </Card>
             )}
 
-            {/* Model Selection */}
-            <Form.Item
-              label="Model"
-              name="model"
-              rules={[{ required: true, message: 'Please select a model' }]}
-            >
-              <Select
-                size="large"
-                placeholder="Select model"
-                getPopupContainer={(trigger) => trigger.parentNode}
-                optionLabelProp="label"
-                loading={modelsLoading}
-                notFoundContent={modelsLoading ? 'Loading models…' : 'No models found'}
-              >
-                {models.map((model) => (
-                  <Option
-                    key={model.value}
-                    value={model.value}
-                    label={
-                      <>
-                        {model.label}
-                        {model.description.includes('Recommended') && (
-                          <CheckCircleOutlined
-                            style={{ marginLeft: 8, color: '#52c41a' }}
-                          />
-                        )}
-                      </>
-                    }
-                  >
-                    <div>
-                      <div style={{ fontWeight: 500 }}>
-                        {model.label}
-                        {model.description.includes('Recommended') && (
-                          <CheckCircleOutlined
-                            style={{ marginLeft: 8, color: '#52c41a' }}
-                          />
-                        )}
-                      </div>
-                      <div style={{ fontSize: 12, color: '#8c8c8c' }}>
-                        {model.description}
-                      </div>
-                    </div>
-                  </Option>
-                ))}
-              </Select>
-            </Form.Item>
-
-            <Divider />
-
-            {/* Advanced Settings */}
-            <Title level={5}>Advanced Settings</Title>
-            <Paragraph type="secondary" style={{ fontSize: 13 }}>
-              Configure maximum response length for AI outputs.
-            </Paragraph>
-
-            {/* Bounded by the selected model's published output limit, read
-                from the same provider models endpoint that fills the model
-                dropdown. Providers that don't publish limits get the full
-                ladder. */}
-            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.model !== cur.model}>
-              {({ getFieldValue }) => {
-                const selected = models.find((m) => m.value === getFieldValue('model'));
-                const cap = selected?.maxOutputTokens || null;
-                const ctx = selected?.maxInputTokens || null;
-                return (
-                  <Form.Item
-                    label="Max Tokens"
-                    name="maxTokens"
-                    help={
-                      cap
-                        ? `Maximum length of AI responses. ${selected.label} accepts up to ${cap.toLocaleString()} output tokens${ctx ? ` and a ${ctx.toLocaleString()}-token context window` : ''}. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.`
-                        : 'Maximum length of AI responses. This provider does not publish per-model limits, so an unsupported value is rejected at request time. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.'
-                    }
-                  >
-                    <Select getPopupContainer={(trigger) => trigger.parentNode}>
-                      {buildTokenOptions(cap).map((o) => (
-                        <Option key={o.value} value={o.value}>{o.label}</Option>
-                      ))}
-                    </Select>
-                  </Form.Item>
-                );
-              }}
-            </Form.Item>
-
-            {/* Save Button */}
-            <Form.Item style={{ marginTop: 32, marginBottom: 0 }}>
-              <Button
-                type="primary"
-                size="large"
-                icon={<SaveOutlined />}
-                loading={loading}
-                onClick={handleSave}
-                block
-              >
-                Save Provider Settings
-              </Button>
-
-            </Form.Item>
+            {/* Nothing else to configure here: the model and Max Tokens for
+                the provider the app uses live in "Default AI Provider" above. */}
+            {defaultProvider !== selectedProvider && (
+              <Text type="secondary" style={{ fontSize: 13 }}>
+                To use {currentProviderInfo?.name || selectedProvider} for AI features,
+                select it as the default provider above and pick its model.
+              </Text>
+            )}
             </div>}
           </Form>
         </Card>
@@ -722,7 +775,7 @@ const ProviderSettings = () => {
           </Text>
           <br />
           <Text type="secondary" style={{ fontSize: 13 }}>
-            The selected provider and model will be used for all AI-powered features including:
+            The default provider and its model are used for all AI-powered features including:
             <ul style={{ marginTop: 8, marginBottom: 0 }}>
               <li>Workflow node configuration assistance</li>
               <li>SQL query generation from natural language</li>
