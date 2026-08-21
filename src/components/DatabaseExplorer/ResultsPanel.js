@@ -9,19 +9,11 @@
  * objects) render as JSON. Statements that return no rows get a message pane.
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { C, MONO, SANS, Icon } from './theme';
-
-// ── value formatting ───────────────────────────────────────────────────────
-
-const formatCell = (value, column) => {
-  if (value === null || value === undefined) return null;
-  if (typeof value === 'object') return JSON.stringify(value);
-  if (column && column.numeric && typeof value === 'number') {
-    return value.toLocaleString('en-US', { maximumFractionDigits: 6 });
-  }
-  return String(value);
-};
+// The grid, the JSON cards and the Table/JSON switch are shared with the
+// workflow Data Preview — see ResultsView.js for the shape they read.
+import { Grid, JsonView, RowDetail, ViewToggle, autoViewFor, formatCell } from './ResultsView';
 
 const toCsv = (columns, rows) => {
   const esc = (v) => {
@@ -44,529 +36,6 @@ const download = (filename, text, mime) => {
   a.click();
   // Give the click a tick to start before releasing the object URL.
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-};
-
-// ── grid ───────────────────────────────────────────────────────────────────
-//
-// The grid renders only the rows in view. Everything below exists to keep that
-// cheap, because the old version paid for the whole result on EVERY render:
-// selecting one cell re-rendered every cell in the table, and at a thousand
-// rows that is tens of thousands of DOM nodes, inline style objects and event
-// closures rebuilt per click.
-//
-// Four things keep it fast now:
-//   * windowing — only the visible slice is in the DOM;
-//   * `table-layout: fixed` with measured column widths, so the browser never
-//     re-measures cell content (and columns don't jitter as you scroll);
-//   * a memoised Row, so changing the selection re-renders the rows that
-//     changed rather than all of them;
-//   * static styles hoisted out of render.
-
-const ROW_H = 26;          // must match the td height exactly — windowing maths
-const HEAD_H = 28;
-const OVERSCAN = 8;        // rows rendered off-screen each way, to hide scroll
-const GUTTER_W = 46;
-const COL_MIN = 90;
-const COL_MAX = 420;
-const CHAR_W = 6.7;        // ~1ch at 11.5px in this monospace face
-const WIDTH_SAMPLE = 150;  // rows sampled to size columns
-
-const gridStyles = {
-  scroller: { flex: 1, overflow: 'auto', background: C.bg, minHeight: 0, position: 'relative' },
-  gutterHead: {
-    position: 'sticky', top: 0, left: 0, zIndex: 4, width: GUTTER_W, height: HEAD_H,
-    background: C.s3, borderBottom: `1px solid ${C.border2}`, borderRight: `1px solid ${C.border2}`,
-  },
-  fillerHead: {
-    position: 'sticky', top: 0, zIndex: 2,
-    background: C.s2, borderBottom: `1px solid ${C.border2}`,
-  },
-  headInner: { display: 'flex', alignItems: 'center', gap: 5 },
-  colType: { fontSize: 9, color: C.dim },
-  nullCell: { fontSize: 10.5, color: C.dim, fontStyle: 'italic' },
-  spacerCell: { padding: 0, border: 0 },
-};
-
-/** Column pixel widths, measured once per result from a sample of its rows. */
-function measureWidths(columns, rows) {
-  const sample = Math.min(rows.length, WIDTH_SAMPLE);
-  return columns.map((col) => {
-    // header text + type label + sort caret
-    let widest = String(col.name).length + String(col.type || '').length + 4;
-    for (let i = 0; i < sample; i++) {
-      const v = rows[i] ? rows[i][col.name] : null;
-      if (v === null || v === undefined) { if (widest < 4) widest = 4; continue; }
-      const len = typeof v === 'object' ? JSON.stringify(v).length : String(v).length;
-      if (len > widest) widest = len;
-    }
-    return Math.round(Math.min(COL_MAX, Math.max(COL_MIN, widest * CHAR_W + 20)));
-  });
-}
-
-const Row = React.memo(function Row({
-  row, rowIndex, displayIndex, columns, widths, isOpen, selected, selectedColumn,
-  onOpenRow, onCellDown, onRowEnter,
-}) {
-  const zebra = displayIndex % 2 ? C.surface : C.bg;
-  const background = selected ? C.aS : zebra;
-
-  return (
-    <tr onPointerEnter={() => onRowEnter(rowIndex)}>
-      <td
-        onClick={() => onOpenRow(isOpen ? null : rowIndex)}
-        title="Show row detail"
-        style={{
-          position: 'sticky', left: 0, zIndex: 1, width: GUTTER_W, height: ROW_H,
-          background: isOpen ? C.aD : selected ? C.aS : C.s2,
-          borderBottom: `1px solid ${C.border}`, borderRight: `2px solid ${C.border2}`,
-          padding: '0 6px', textAlign: 'right', cursor: 'pointer',
-          fontSize: 10, color: isOpen ? C.accent : selected ? C.accent : C.dim,
-        }}
-      >
-        {displayIndex + 1}
-      </td>
-
-      {columns.map((col, ci) => {
-        const value = row[col.name];
-        const isCell = selectedColumn === col.name;
-        return (
-          <td
-            key={col.name}
-            onPointerDown={(e) => onCellDown(e, rowIndex, col.name, value)}
-            style={{
-              height: ROW_H, padding: '0 9px', width: widths[ci],
-              borderBottom: `1px solid ${C.border}`, borderRight: `1px solid ${C.border}`,
-              textAlign: col.numeric ? 'right' : 'left',
-              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-              background,
-              boxShadow: isCell ? `inset 0 0 0 2px ${C.accent}` : 'none',
-              cursor: 'default',
-            }}
-          >
-            {value === null || value === undefined
-              ? <span style={gridStyles.nullCell}>NULL</span>
-              : <span style={{ color: typeof value === 'object' ? C.cyan : C.text }}>
-                  {formatCell(value, col)}
-                </span>}
-          </td>
-        );
-      })}
-
-      <td style={{ borderBottom: `1px solid ${C.border}`, background }} />
-    </tr>
-  );
-});
-
-const Grid = ({
-  result, onOpenRow, openRow, onSelectCell, selectedCell,
-  selectedRows, onSelectRows,
-}) => {
-  const [sort, setSort] = useState(null);
-  const [viewport, setViewport] = useState({ top: 0, height: 600 });
-  const scrollerRef = useRef(null);
-  // Live drag state. A ref, not state: it changes on every pointermove and
-  // nothing about it needs to trigger a render on its own.
-  const drag = useRef(null);
-
-  // Memoised so the sort and width computations below keep a stable identity —
-  // a bare `result.rows || []` mints a new array whenever rows are absent, and
-  // that alone would re-sort and re-measure on every render.
-  const allRows = useMemo(() => result.rows || [], [result.rows]);
-  const columns = useMemo(() => result.columns || [], [result.columns]);
-
-  // Sorting reorders INDICES. The rows themselves are never copied or spread,
-  // so sorting a large result costs one integer array, not a second copy of
-  // the data.
-  const order = useMemo(() => {
-    const idx = allRows.map((_, i) => i);
-    if (!sort) return idx;
-    const { column, direction } = sort;
-    const dir = direction === 'asc' ? 1 : -1;
-    return idx.sort((a, b) => {
-      const x = allRows[a][column];
-      const y = allRows[b][column];
-      if (x === null || x === undefined) return 1;
-      if (y === null || y === undefined) return -1;
-      const cmp = typeof x === 'number' && typeof y === 'number'
-        ? x - y
-        : String(x).localeCompare(String(y));
-      return cmp * dir;
-    });
-  }, [allRows, sort]);
-
-  // Reverse lookup: row index -> its position in the display order. Drag
-  // selection needs this on every pointer move, and scanning `order` each time
-  // would be O(rows) per mouse event.
-  const positions = useMemo(() => {
-    const m = new Int32Array(allRows.length);
-    for (let d = 0; d < order.length; d++) m[order[d]] = d;
-    return m;
-  }, [order, allRows.length]);
-
-  const widths = useMemo(() => measureWidths(columns, allRows), [columns, allRows]);
-  const totalWidth = useMemo(
-    () => widths.reduce((n, w) => n + w, GUTTER_W), [widths],
-  );
-
-  // Visible slice.
-  const first = Math.max(0, Math.floor(viewport.top / ROW_H) - OVERSCAN);
-  const visibleCount = Math.ceil(viewport.height / ROW_H) + OVERSCAN * 2;
-  const last = Math.min(order.length, first + visibleCount);
-  const padTop = first * ROW_H;
-  const padBottom = Math.max(0, (order.length - last) * ROW_H);
-
-  const onScroll = (e) => {
-    const el = e.currentTarget;
-    setViewport((prev) => (
-      // Only re-render when the slice could actually change.
-      Math.abs(prev.top - el.scrollTop) >= ROW_H || prev.height !== el.clientHeight
-        ? { top: el.scrollTop, height: el.clientHeight }
-        : prev
-    ));
-  };
-
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el) return undefined;
-    const sync = () => setViewport({ top: el.scrollTop, height: el.clientHeight });
-    sync();
-    const ro = new ResizeObserver(sync);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  const cycleSort = (name) => setSort((prev) => {
-    if (!prev || prev.column !== name) return { column: name, direction: 'asc' };
-    if (prev.direction === 'asc') return { column: name, direction: 'desc' };
-    return null;
-  });
-
-  // ── selection ────────────────────────────────────────────────────────────
-  //
-  // Press and drag across rows to select them. The grid sets `user-select:
-  // none`, so a drag extends the row selection instead of smearing a text
-  // highlight across the cells. A press that never leaves its row is treated
-  // as an ordinary cell click, so inspecting a single value still works.
-  const applyRange = useCallback((anchor, focus, base) => {
-    const lo = Math.min(anchor, focus);
-    const hi = Math.max(anchor, focus);
-    const next = new Set(base);
-    for (let d = lo; d <= hi; d++) next.add(order[d]);
-    onSelectRows(next);
-  }, [order, onSelectRows]);
-
-  const onCellDown = useCallback((e, rowIndex, column, value) => {
-    if (e.button !== 0) return;
-    const displayIndex = positions[rowIndex];
-    const additive = e.metaKey || e.ctrlKey;
-    // What the selection builds on top of: existing rows when the modifier is
-    // held, nothing otherwise.
-    const base = additive ? new Set(selectedRows) : [];
-
-    if (e.shiftKey && selectedRows.size) {
-      // Extend from the previous anchor rather than starting over.
-      const anchor = drag.current && drag.current.anchor != null
-        ? drag.current.anchor
-        : displayIndex;
-      drag.current = { anchor, base, additive, moved: true, column, value, rowIndex };
-      applyRange(anchor, displayIndex, base);
-      return;
-    }
-
-    drag.current = { anchor: displayIndex, base, additive, moved: false, column, value, rowIndex };
-
-    if (additive) {
-      const next = new Set(selectedRows);
-      if (next.has(rowIndex)) next.delete(rowIndex); else next.add(rowIndex);
-      onSelectRows(next);
-    }
-  }, [positions, selectedRows, onSelectRows, applyRange]);
-
-  const onRowEnter = useCallback((rowIndex) => {
-    const d = drag.current;
-    if (!d) return;
-    const displayIndex = positions[rowIndex];
-    if (displayIndex === d.anchor && !d.moved) return;
-    d.moved = true;
-    applyRange(d.anchor, displayIndex, d.base);
-  }, [positions, applyRange]);
-
-  useEffect(() => {
-    const onUp = () => {
-      const d = drag.current;
-      if (!d) return;
-      // A press that never crossed a row boundary is an ordinary cell click.
-      if (!d.moved) {
-        onSelectCell({ row: d.rowIndex, column: d.column, value: d.value });
-        if (!d.additive) onSelectRows(new Set([d.rowIndex]));
-      }
-      drag.current = null;
-    };
-    window.addEventListener('pointerup', onUp);
-    return () => window.removeEventListener('pointerup', onUp);
-  }, [onSelectCell, onSelectRows]);
-
-  return (
-    <div
-      ref={scrollerRef}
-      onScroll={onScroll}
-      style={{ ...gridStyles.scroller, userSelect: 'none', WebkitUserSelect: 'none' }}
-    >
-      <table style={{
-        borderCollapse: 'separate', borderSpacing: 0,
-        fontFamily: MONO, fontSize: 11.5,
-        // Fixed layout is what stops the browser measuring every cell — and
-        // what keeps column widths steady while rows scroll in and out.
-        tableLayout: 'fixed', width: Math.max(totalWidth, 0),
-        minWidth: '100%',
-      }}>
-        <colgroup>
-          <col style={{ width: GUTTER_W }} />
-          {columns.map((col, i) => <col key={col.name} style={{ width: widths[i] }} />)}
-          <col />
-        </colgroup>
-
-        <thead>
-          <tr>
-            <th style={gridStyles.gutterHead} />
-            {columns.map((col) => {
-              const active = sort && sort.column === col.name;
-              return (
-                <th
-                  key={col.name}
-                  onClick={() => cycleSort(col.name)}
-                  title={`${col.name} · ${col.type}`}
-                  style={{
-                    position: 'sticky', top: 0, zIndex: 2, height: HEAD_H,
-                    background: C.s2, borderBottom: `2px solid ${active ? C.accent : C.border2}`,
-                    borderRight: `1px solid ${C.border}`, padding: '0 8px',
-                    textAlign: 'left', cursor: 'pointer', whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                  }}
-                >
-                  <div style={gridStyles.headInner}>
-                    <span style={{
-                      fontSize: 10.5, fontWeight: 700, color: active ? C.accent : C.text,
-                      overflow: 'hidden', textOverflow: 'ellipsis',
-                    }}>
-                      {col.name}
-                    </span>
-                    <span style={gridStyles.colType}>{col.type}</span>
-                    {active && Icon(sort.direction === 'asc' ? 'up' : 'down', C.accent, 11)}
-                  </div>
-                </th>
-              );
-            })}
-            <th style={gridStyles.fillerHead} />
-          </tr>
-        </thead>
-
-        <tbody>
-          {/* Spacers stand in for the rows that aren't rendered, so the
-              scrollbar reflects the whole result. */}
-          {padTop > 0 && (
-            <tr aria-hidden="true" style={{ height: padTop }}>
-              <td colSpan={columns.length + 2} style={gridStyles.spacerCell} />
-            </tr>
-          )}
-
-          {order.slice(first, last).map((rowIndex, n) => (
-            <Row
-              key={rowIndex}
-              row={allRows[rowIndex]}
-              rowIndex={rowIndex}
-              displayIndex={first + n}
-              columns={columns}
-              widths={widths}
-              isOpen={openRow === rowIndex}
-              selected={selectedRows.has(rowIndex)}
-              selectedColumn={
-                selectedCell && selectedCell.row === rowIndex ? selectedCell.column : null
-              }
-              onOpenRow={onOpenRow}
-              onCellDown={onCellDown}
-              onRowEnter={onRowEnter}
-            />
-          ))}
-
-          {padBottom > 0 && (
-            <tr aria-hidden="true" style={{ height: padBottom }}>
-              <td colSpan={columns.length + 2} style={gridStyles.spacerCell} />
-            </tr>
-          )}
-        </tbody>
-      </table>
-    </div>
-  );
-};
-
-// ── JSON view ──────────────────────────────────────────────────────────────
-
-// Cards are expensive enough that toggling one used to re-render all of them.
-// Memoised, a toggle now costs exactly the card that changed.
-const DocCard = React.memo(function DocCard({ doc, index, isOpen, onToggle }) {
-  const id = doc._id || doc.id || `document ${index + 1}`;
-  return (
-    <div style={{
-      margin: '0 12px 7px', borderRadius: 6, overflow: 'hidden',
-      border: `1px solid ${isOpen ? C.aB : C.border}`,
-      background: isOpen ? C.bg : C.surface,
-    }}>
-      <div
-        onClick={() => onToggle(index)}
-        style={{
-          display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', cursor: 'pointer',
-          background: isOpen ? C.aD : 'transparent',
-          borderBottom: isOpen ? `1px solid ${C.border}` : 'none',
-        }}
-      >
-        <span style={{ display: 'flex', transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform .12s' }}>
-          {Icon('caret', isOpen ? C.accent : C.dim, 11)}
-        </span>
-        <span style={{ fontSize: 9.5, fontFamily: MONO, fontWeight: 700, color: C.dim }}>
-          {String(index + 1).padStart(2, '0')}
-        </span>
-        <span style={{
-          fontSize: 11, fontFamily: MONO, fontWeight: 600,
-          color: isOpen ? C.accent : C.text,
-          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-        }}>
-          {typeof id === 'object' ? JSON.stringify(id) : String(id)}
-        </span>
-        <span style={{
-          flex: 1, minWidth: 0, fontSize: 10, fontFamily: MONO, color: C.dim,
-          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-        }}>
-          {Object.keys(doc).filter((k) => k !== '_id').slice(0, 5).join(' · ')}
-        </span>
-        <button
-          type="button"
-          title="Copy document"
-          onClick={(e) => {
-            e.stopPropagation();
-            try { navigator.clipboard.writeText(JSON.stringify(doc, null, 2)); } catch (_) { /* clipboard denied */ }
-          }}
-          style={{ border: 'none', background: 'transparent', cursor: 'pointer', padding: 2, display: 'flex' }}
-        >
-          {Icon('copy', C.muted, 11)}
-        </button>
-      </div>
-      {isOpen && (
-        <pre style={{
-          margin: 0, padding: '9px 14px 12px', overflowX: 'auto',
-          fontFamily: MONO, fontSize: 11, lineHeight: 1.65, color: C.text,
-        }}>
-          {JSON.stringify(doc, null, 2)}
-        </pre>
-      )}
-    </div>
-  );
-});
-
-// Cards vary in height once expanded, so this pages rather than windows:
-// render a chunk, and let the user ask for the next one. Same effect on the
-// symptom — a thousand documents never hit the DOM at once.
-const JSON_CHUNK = 150;
-
-const JsonView = ({ result }) => {
-  const [open, setOpen] = useState(() => new Set([0]));
-  const [shown, setShown] = useState(JSON_CHUNK);
-  const rows = result.rows || [];
-
-  // A new result starts from the top again.
-  useEffect(() => { setShown(JSON_CHUNK); setOpen(new Set([0])); }, [result]);
-
-  const toggle = useCallback((i) => setOpen((prev) => {
-    const next = new Set(prev);
-    if (next.has(i)) next.delete(i); else next.add(i);
-    return next;
-  }), []);
-
-  const remaining = rows.length - shown;
-
-  return (
-    <div style={{ flex: 1, overflow: 'auto', background: C.bg, minHeight: 0, padding: '8px 0 14px' }}>
-      {rows.slice(0, shown).map((doc, i) => (
-        <DocCard key={i} doc={doc} index={i} isOpen={open.has(i)} onToggle={toggle} />
-      ))}
-
-      {remaining > 0 && (
-        <div style={{ display: 'flex', justifyContent: 'center', padding: '4px 12px 2px' }}>
-          <button
-            type="button"
-            onClick={() => setShown((n) => n + JSON_CHUNK)}
-            style={{
-              padding: '5px 14px', borderRadius: 5, cursor: 'pointer',
-              border: `1px solid ${C.border2}`, background: C.surface, color: C.text,
-              fontFamily: MONO, fontSize: 10.5,
-            }}
-          >
-            Show {Math.min(JSON_CHUNK, remaining)} more · {remaining} left
-          </button>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ── row detail ─────────────────────────────────────────────────────────────
-
-const RowDetail = ({ result, index, onClose }) => {
-  const row = (result.rows || [])[index];
-  if (!row) return null;
-  return (
-    <div style={{
-      width: 300, flexShrink: 0, minHeight: 0,
-      borderLeft: `1px solid ${C.border}`, background: C.bg,
-      display: 'flex', flexDirection: 'column',
-    }}>
-      <div style={{
-        padding: '8px 12px', borderBottom: `1px solid ${C.border}`, background: C.surface,
-        display: 'flex', alignItems: 'center', gap: 8,
-      }}>
-        <div style={{ minWidth: 0 }}>
-          <div style={{
-            fontSize: 9, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.1em',
-            color: C.muted, textTransform: 'uppercase',
-          }}>
-            Row detail
-          </div>
-          <div style={{ fontSize: 12.5, fontWeight: 700, color: C.text }}>
-            {index + 1} of {result.rows.length}
-          </div>
-        </div>
-        <div style={{ flex: 1 }} />
-        <button
-          type="button"
-          onClick={onClose}
-          style={{ border: 'none', background: 'transparent', cursor: 'pointer', padding: 4, display: 'flex' }}
-        >
-          {Icon('close', C.muted, 13)}
-        </button>
-      </div>
-      <div style={{ flex: 1, overflowY: 'auto' }}>
-        {result.columns.map((col) => {
-          const value = row[col.name];
-          return (
-            <div key={col.name} style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-                <span style={{ fontSize: 10, fontFamily: MONO, fontWeight: 700, color: C.muted }}>{col.name}</span>
-                <span style={{ fontSize: 9, fontFamily: MONO, color: C.dim }}>{col.type}</span>
-              </div>
-              <div style={{
-                fontSize: 12, fontFamily: MONO, color: C.text,
-                wordBreak: 'break-word', lineHeight: 1.5,
-              }}>
-                {value === null || value === undefined
-                  ? <em style={{ color: C.dim }}>NULL</em>
-                  : formatCell(value, col)}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
 };
 
 // ── history ────────────────────────────────────────────────────────────────
@@ -656,8 +125,10 @@ const ResultsPanel = ({
   onDock,
 }) => {
   const [openRow, setOpenRow] = useState(null);
-  const [selectedCell, setSelectedCell] = useState(null);
-  const [selectedRows, setSelectedRows] = useState(() => new Set());
+  // What the grid has selected: either a rectangle of cells or whole rows.
+  // { mode: 'cells' | 'rows', rows: Set<sourceIndex>, columns: string[] | null,
+  //   cell: { row, column, value } | null }  — `columns` null means every one.
+  const [selection, setSelection] = useState(null);
   const [viewOverride, setViewOverride] = useState(null);
   const panelRef = useRef(null);
 
@@ -686,8 +157,7 @@ const ResultsPanel = ({
     // outcome claims a tab, so nothing moves in between.
     if (result || error) {
       if (openRow !== null) setOpenRow(null);
-      if (selectedCell !== null) setSelectedCell(null);
-      if (selectedRows.size) setSelectedRows(new Set());
+      if (selection !== null) setSelection(null);
       if (viewOverride !== null) setViewOverride(null);
 
       // One or the other: rows the statement returned, or why it returned none.
@@ -746,12 +216,10 @@ const ResultsPanel = ({
   };
 
   // Nested values read far better as JSON than truncated in a cell.
-  const autoView = useMemo(() => {
-    if (!hasRows) return 'grid';
-    if (isDocumentStore) return 'json';
-    const sample = shown.rows[0];
-    return Object.values(sample).some((v) => v && typeof v === 'object') ? 'json' : 'grid';
-  }, [shown, hasRows, isDocumentStore]);
+  const autoView = useMemo(
+    () => (hasRows ? autoViewFor(shown, { isDocumentStore }) : 'grid'),
+    [shown, hasRows, isDocumentStore],
+  );
 
   const view = viewOverride || autoView;
 
@@ -764,32 +232,50 @@ const ResultsPanel = ({
     }
   };
 
-  // Copy the selected rows as TSV — the format that pastes into a spreadsheet
-  // as cells. Scoped to this panel so it never steals Cmd-C from the editor,
-  // and it replaces the browser's copy-the-text-selection that the grid gives
-  // up by disabling text selection.
+  // A selection belongs to the rows it was made in, so switching tabs — or a
+  // pinned tab taking new rows — drops it rather than carrying the highlight,
+  // and the row detail, onto a different result.
   useEffect(() => {
-    if (!selectedRows.size) return undefined;
+    setSelection(null);
+    setOpenRow(null);
+  }, [activeSheet.id, activeSheet.rev]);
+
+  // Copy the selection as TSV — the format that pastes into a spreadsheet as
+  // cells. A cell range copies exactly the cells that are lit, bare; whole
+  // rows copy every column with a header line, because that is a record rather
+  // than a patch of values. Scoped to this panel so it never steals Cmd-C from
+  // the editor, and it replaces the browser's copy-the-text-selection that the
+  // grid gives up by disabling text selection.
+  useEffect(() => {
+    if (!selection || !selection.rows.size || !shown) return undefined;
     const onCopy = (e) => {
       const host = panelRef.current;
       if (!host || !host.contains(document.activeElement || e.target)) return;
-      const cols = shown.columns || [];
-      const picked = (shown.rows || [])
-        .map((row, i) => (selectedRows.has(i) ? row : null))
-        .filter(Boolean);
-      if (!picked.length) return;
+      const all = shown.columns || [];
+      // Filtering `all` rather than mapping the names keeps the copy in grid
+      // order whichever way the range was dragged.
+      const cols = selection.columns
+        ? all.filter((c) => selection.columns.includes(c.name))
+        : all;
+      const picked = (shown.rows || []).filter((_, i) => selection.rows.has(i));
+      if (!picked.length || !cols.length) return;
       const cell = (v) => (v === null || v === undefined ? ''
         : typeof v === 'object' ? JSON.stringify(v) : String(v));
-      const tsv = [
-        cols.map((c) => c.name).join('\t'),
-        ...picked.map((r) => cols.map((c) => cell(r[c.name])).join('\t')),
-      ].join('\n');
-      e.clipboardData.setData('text/plain', tsv);
+      const lines = picked.map((r) => cols.map((c) => cell(r[c.name])).join('\t'));
+      if (selection.mode === 'rows') lines.unshift(cols.map((c) => c.name).join('\t'));
+      e.clipboardData.setData('text/plain', lines.join('\n'));
       e.preventDefault();
     };
     document.addEventListener('copy', onCopy);
     return () => document.removeEventListener('copy', onCopy);
-  }, [selectedRows, shown]);
+  }, [selection, shown]);
+
+  // The focused cell drives the inspector in the stats bar; the Copy button
+  // beside it only makes sense while that cell is the whole selection.
+  const focusCell = selection && selection.cell ? selection.cell : null;
+  const selectedCells = selection && selection.columns
+    ? selection.rows.size * selection.columns.length
+    : 0;
 
   return (
     <div ref={panelRef} tabIndex={-1} style={{
@@ -917,28 +403,7 @@ const ResultsPanel = ({
         </div>
 
         {hasRows && !minimized && (
-          <div style={{
-            display: 'flex', gap: 2, padding: 2, borderRadius: 5, flexShrink: 0,
-            background: C.s2, border: `1px solid ${C.border}`,
-          }}>
-            {[['grid', 'Table'], ['json', 'JSON']].map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setViewOverride(key)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 3,
-                  border: 'none', cursor: 'pointer',
-                  fontSize: 9.5, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase',
-                  background: view === key ? C.bg : 'transparent',
-                  color: view === key ? C.accent : C.muted,
-                }}
-              >
-                {Icon(key === 'grid' ? 'grid' : 'json', view === key ? C.accent : C.muted, 10)}
-                {label}
-              </button>
-            ))}
-          </div>
+          <ViewToggle view={view} onChange={setViewOverride} />
         )}
 
         {typeof onDock === 'function' && (
@@ -1029,10 +494,8 @@ const ResultsPanel = ({
                     result={shown}
                     openRow={openRow}
                     onOpenRow={setOpenRow}
-                    selectedCell={selectedCell}
-                    onSelectCell={setSelectedCell}
-                    selectedRows={selectedRows}
-                    onSelectRows={setSelectedRows}
+                    selection={selection}
+                    onSelect={setSelection}
                   />
                 )}
                 {!busy && !failed && hasRows && view === 'json' && <JsonView key={`${activeSheet.id}-${activeSheet.rev}`} result={shown} />}
@@ -1067,8 +530,12 @@ const ResultsPanel = ({
                     : error ? 'pinned — the last run failed'
                       : 'pinned — later runs open a new tab')
                   : null,
-                selectedRows.size
-                  ? `${selectedRows.size} selected — ⌘C to copy`
+                selection && selection.rows.size
+                  ? (selection.mode === 'rows'
+                    ? `${selection.rows.size} row${selection.rows.size === 1 ? '' : 's'} selected — ⌘C to copy`
+                    : selectedCells > 1
+                      ? `${selectedCells} cells selected — ⌘C to copy`
+                      : null)
                   : null,
               ].filter(Boolean).map((text, i) => (
                 <span key={i} style={{
@@ -1088,18 +555,18 @@ const ResultsPanel = ({
                 flex: 1, minWidth: 12, fontSize: 10.5, fontFamily: MONO, color: C.dim,
                 whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
               }}>
-                {selectedCell
-                  ? `${selectedCell.column} = ${formatCell(selectedCell.value, null) ?? 'NULL'}`
-                  : 'click a cell to inspect · click a row number for detail'}
+                {focusCell
+                  ? `${focusCell.column} = ${formatCell(focusCell.value, null) ?? 'NULL'}`
+                  : 'drag across cells to select them · click a row number for the whole row, double-click for detail'}
               </span>
 
-              {selectedCell && (
+              {focusCell && selectedCells === 1 && (
                 <button
                   type="button"
                   title="Copy cell"
                   onClick={() => {
                     try {
-                      navigator.clipboard.writeText(String(formatCell(selectedCell.value, null) ?? ''));
+                      navigator.clipboard.writeText(String(formatCell(focusCell.value, null) ?? ''));
                     } catch (_) { /* clipboard denied */ }
                   }}
                   style={{

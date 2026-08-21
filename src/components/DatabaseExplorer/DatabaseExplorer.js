@@ -48,7 +48,22 @@ const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) =
 // worksheet store: it is a view preference, not part of the user's work, and it
 // must be readable synchronously on first paint to avoid a visible jump.
 const LAYOUT_KEY = 'ternlux.explorer.resultsLayout';
-const DEFAULT_LAYOUT = { dock: 'bottom', size: 0.4 };
+const DEFAULT_PANEL_W = 274;   // the object panel's designed width
+const PANEL_MIN_W = 200;       // narrower than this and the tree stops being readable
+const PANEL_MAX_W = 560;
+const PANEL_MAX_PCT = 0.5;     // …and never more than half the explorer, whatever the window
+const DEFAULT_LAYOUT = { dock: 'bottom', size: 0.4, panelWidth: DEFAULT_PANEL_W };
+
+// The object panel's bounds follow the space actually available, so a width
+// dragged out on a wide window quietly narrows again on a small one. `hostW` of
+// 0 means "not measured yet" — fall back to the static ceiling.
+const clampPanelWidth = (px, hostW) => {
+  const ceiling = hostW > 0
+    ? Math.min(PANEL_MAX_W, Math.round(hostW * PANEL_MAX_PCT))
+    : PANEL_MAX_W;
+  const max = Math.max(PANEL_MIN_W, ceiling);
+  return Math.max(PANEL_MIN_W, Math.min(Math.round(px) || PANEL_MIN_W, max));
+};
 
 const readLayout = (connectionId) => {
   try {
@@ -58,6 +73,9 @@ const readLayout = (connectionId) => {
     return {
       dock: mine.dock === 'right' ? 'right' : 'bottom',
       size: Math.min(0.85, Math.max(0.15, Number(mine.size) || DEFAULT_LAYOUT.size)),
+      // Stored in pixels, unlike `size`: the panel is a fixed column whose
+      // readable width doesn't scale with the window.
+      panelWidth: clampPanelWidth(Number(mine.panelWidth) || DEFAULT_PANEL_W, 0),
     };
   } catch (_) {
     return { ...DEFAULT_LAYOUT };
@@ -88,9 +106,9 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
 
   // File connections (local files, node outputs) carry their location in
   // `fileInfo` rather than `dbConfig`. The table list rides along to keep each
-  // connection scoped to what it owns, and `tablePaths` maps those names to
-  // files — a workbook becomes one Parquet file per sheet, so a connection can
-  // own several paths at once.
+  // connection scoped to what it owns; `tablePaths` maps those names to files
+  // when a connection spans several, and `tableSheets` maps them to sheets when
+  // a workbook puts several tables inside ONE file.
   const config = useMemo(() => {
     if (connection.connectionType === 'file' && connection.fileInfo) {
       return {
@@ -98,6 +116,7 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
         dbPath: connection.fileInfo.filePath,
         tables: connection.fileInfo.tables || null,
         tablePaths: connection.fileInfo.tablePaths || null,
+        tableSheets: connection.fileInfo.tableSheets || null,
         format: connection.fileInfo.format || null,
       };
     }
@@ -142,18 +161,35 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
   // so it survives a window resize.
   const [resultsDock, setResultsDock] = useState(() => readLayout(connectionId).dock);
   const [resultsSize, setResultsSize] = useState(() => readLayout(connectionId).size);
+  // The object panel's width, persisted the same way and in the same record.
+  const [panelWidth, setPanelWidth] = useState(() => readLayout(connectionId).panelWidth);
+  const [panelResizing, setPanelResizing] = useState(false);
   const splitRef = useRef(null);
   const dragRef = useRef(null);
+  const bodyRef = useRef(null);
+  // Width of the row the panel and the editor share. Measured rather than taken
+  // from the window: the chat rail (and a collapsed panel) change it without the
+  // window changing at all.
+  const [bodyWidth, setBodyWidth] = useState(0);
+
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(([entry]) => setBodyWidth(entry.contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     const l = readLayout(connectionId);
     setResultsDock(l.dock);
     setResultsSize(l.size);
+    setPanelWidth(l.panelWidth);
   }, [connectionId]);
 
   useEffect(() => {
-    writeLayout(connectionId, { dock: resultsDock, size: resultsSize });
-  }, [connectionId, resultsDock, resultsSize]);
+    writeLayout(connectionId, { dock: resultsDock, size: resultsSize, panelWidth });
+  }, [connectionId, resultsDock, resultsSize, panelWidth]);
 
   // Drag the divider. Pointer capture keeps the gesture alive over the Monaco
   // iframe and past the window edge, and the listeners are torn down on the
@@ -186,6 +222,38 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
     document.body.style.cursor = resultsDock === 'right' ? 'col-resize' : 'row-resize';
     document.body.style.userSelect = 'none';
   }, [resultsDock]);
+
+  // Drag the object panel's inner edge. The width is the distance from the
+  // pointer to the left of the body row, clamped to the panel's bounds, so
+  // dragging right widens and dragging left narrows.
+  const startPanelResize = useCallback((e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const host = bodyRef.current;
+    const box = host ? host.getBoundingClientRect() : null;
+    setPanelResizing(true);
+
+    const onMove = (ev) => {
+      setPanelWidth(clampPanelWidth(
+        ev.clientX - (box ? box.left : 0),
+        box ? box.width : 0,
+      ));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      setPanelResizing(false);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
 
   // ── chrome ───────────────────────────────────────────────────────────────
   const [panelHidden, setPanelHidden] = useState(false);
@@ -687,9 +755,10 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
       )}
 
       {/* body */}
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+      <div ref={bodyRef} style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {!panelHidden && (
           <ObjectPanel
+            width={clampPanelWidth(panelWidth, bodyWidth)}
             dbType={dbType}
             containerLabel={dialect ? dialect.container : 'Schema'}
             schemas={schemas}
@@ -715,6 +784,24 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
               setResultTab(resultTab === 'history' ? 'results' : 'history');
               setResultsMinimized(false);
             }}
+          />
+        )}
+
+        {/* Object-panel divider. A real column rather than an overlay, like the
+            results divider — laid over the panel it would sit on top of the
+            tree's scrollbar. Nothing to drag when the panel is collapsed. */}
+        {!panelHidden && (
+          <div
+            onPointerDown={startPanelResize}
+            onDoubleClick={() => setPanelWidth(DEFAULT_PANEL_W)}
+            title="Drag to resize · double-click to reset"
+            style={{
+              flexShrink: 0, width: 5, cursor: 'col-resize', touchAction: 'none',
+              background: panelResizing ? C.accent : 'transparent',
+              transition: 'background 0.12s',
+            }}
+            onMouseOver={(e) => { if (!panelResizing) e.currentTarget.style.background = C.border2; }}
+            onMouseOut={(e) => { if (!panelResizing) e.currentTarget.style.background = 'transparent'; }}
           />
         )}
 
