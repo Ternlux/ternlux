@@ -79,6 +79,7 @@ const WorkflowsTab = ({
   pendingOpenWorkflow = null,           // { id, bump } — signal from ChatAssistant via Workflows.js
   onPendingOpenHandled = () => {},      // call after we've handled the signal so it doesn't re-fire
   onFilesDropped = () => {},            // hands a validated data-file drop to the Connections tab
+  liveBuild = null,                     // in-flight builder progress, collected in Workflows.js
 }) => {
   const [workflows, setWorkflows] = useState([]);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -104,6 +105,25 @@ const WorkflowsTab = ({
     fetchWorkflows();
   }, []);
 
+  // Refresh the list from the local store and open one workflow in the editor.
+  // Returns whether that workflow was found. `isCancelled` lets callers abandon
+  // the open if their effect was torn down while the read was in flight.
+  const refreshAndOpen = async (workflowId, isCancelled = () => false) => {
+    const localWorkflows = await workflowsDb.getAll();
+    if (isCancelled()) return false;
+    const enriched = localWorkflows.map((wf) => ({
+      ...wf,
+      createdAt: moment(wf.createdAt),
+      lastRun: wf.lastExecuted ? moment(wf.lastExecuted) : null,
+      updatedAt: moment(wf.updatedAt),
+    }));
+    setWorkflows(enriched);
+    const target = enriched.find((w) => (w.id || w._id) === workflowId);
+    if (!target) return false;
+    handleEditWorkflow(target);
+    return true;
+  };
+
   // When ChatAssistant (via Workflows.js) signals a freshly-built workflow,
   // refresh the list and open that workflow in the editor. Keyed on `bump`
   // so re-building the same id still re-triggers.
@@ -112,17 +132,7 @@ const WorkflowsTab = ({
     let cancelled = false;
     (async () => {
       try {
-        const localWorkflows = await workflowsDb.getAll();
-        if (cancelled) return;
-        const enriched = localWorkflows.map((wf) => ({
-          ...wf,
-          createdAt: moment(wf.createdAt),
-          lastRun: wf.lastExecuted ? moment(wf.lastExecuted) : null,
-          updatedAt: moment(wf.updatedAt),
-        }));
-        setWorkflows(enriched);
-        const target = enriched.find((w) => (w.id || w._id) === pendingOpenWorkflow.id);
-        if (target) handleEditWorkflow(target);
+        await refreshAndOpen(pendingOpenWorkflow.id, () => cancelled);
       } finally {
         if (!cancelled) onPendingOpenHandled();
       }
@@ -131,6 +141,66 @@ const WorkflowsTab = ({
     // handleEditWorkflow is stable enough for this use; we key purely on bump+id.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingOpenWorkflow?.id, pendingOpenWorkflow?.bump]);
+
+  // ── Live build ───────────────────────────────────────────────────────────
+  // A build has started: put its canvas on screen so the user watches the
+  // pipeline being written instead of a spinner in the chat. A brand-new
+  // workflow isn't in the database yet, so the editor opens on a placeholder
+  // carrying only `liveBuildId` — that is what it matches the progress stream
+  // against, and the empty nodes/edges keep it off the "create a start node"
+  // path. A modify build opens the saved workflow so its existing nodes are
+  // there to be glowed and rewired.
+  //
+  // An editor already open on some OTHER workflow is left alone: the user is
+  // looking at it, and the finished build opens itself when it lands.
+  const liveBuildId = liveBuild?.workflowId || null;
+  const liveBuildPhase = liveBuild?.phase || null;
+  // Whether the open editor (if any) is the one this build belongs to.
+  const editorOwnsBuild = isEditorOpen
+    && (editingWorkflow?.id || editingWorkflow?._id || editingWorkflow?.liveBuildId) === liveBuildId;
+  // A canvas opened for an earlier build that this one has moved on from. It
+  // shows nothing but stale placeholders, so it is ours to re-point.
+  const staleLiveCanvas = isEditorOpen
+    && !!editingWorkflow?.liveBuildId
+    && editingWorkflow.liveBuildId !== liveBuildId;
+  useEffect(() => {
+    // Nothing to do when the editor is already open on something real: it is
+    // either this build's own canvas (which `editorOwnsBuild` feeds the
+    // progress stream to) or a workflow the user opened, which we don't take
+    // away from them.
+    if (!liveBuildId || liveBuildPhase !== 'building') return undefined;
+    if (isEditorOpen && !staleLiveCanvas) return undefined;
+    let cancelled = false;
+    (async () => {
+      if (liveBuild.mode === 'modify' && await refreshAndOpen(liveBuildId, () => cancelled)) return;
+      if (cancelled) return;
+      setEditingWorkflow({
+        liveBuildId,
+        name: liveBuild.workflowName || 'New Workflow',
+        description: '',
+        nodes: [],
+        edges: [],
+        executionSteps: [],
+      });
+      setIsEditorOpen(true);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveBuildId, liveBuildPhase, isEditorOpen, staleLiveCanvas]);
+
+  // The build finished — swap the preview for the real thing. This does NOT
+  // wait for ChatAssistant's post-build review to hand the workflow over: the
+  // review can take a while, and a failed one never hands it over at all,
+  // which would leave the canvas showing placeholders for a workflow that is
+  // already saved and openable.
+  useEffect(() => {
+    if (!liveBuildId || liveBuildPhase !== 'done') return undefined;
+    if (isEditorOpen && !editorOwnsBuild) return undefined;
+    let cancelled = false;
+    refreshAndOpen(liveBuildId, () => cancelled).catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveBuildId, liveBuildPhase]);
 
   const fetchWorkflows = async () => {
     setLoading(true);
@@ -523,6 +593,7 @@ const WorkflowsTab = ({
       >
         <WorkflowEditor
           workflow={editingWorkflow}
+          liveBuild={editorOwnsBuild ? liveBuild : null}
           dataSource={uploadedDataSource}
           onSave={handleSaveWorkflow}
           onAutoSave={handleAutoSave}

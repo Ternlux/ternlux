@@ -8,6 +8,7 @@ import {
 } from '@ant-design/icons';
 
 // Import node-specific chat components
+import { nodeDisplayName } from './nodes/nodeCardShared';
 import StartNodeChat from './NodeChats/StartNodeChat';
 import DataSourceNodeChat from './NodeChats/DataSourceNodeChat';
 // Transformer and Join are configured through the chat assistant, not this
@@ -382,10 +383,19 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
 
     const finalChat = [...chat, summaryMsg];
 
-    onConfigUpdate(node.id, { ...config, chat: finalChat });
+    // A transformer/join/output that was just (re)configured describes an output
+    // it has not produced: its target table is a name in this config and nothing
+    // more until the node runs. `executed` is what readers — the Data Preview
+    // above all — check before querying that table; executeNode sets it true.
+    const saved = { ...config, chat: finalChat };
+    if (node.type === 'transformer' || node.type === 'join' || node.type === 'output') {
+      saved.executed = false;
+    }
+
+    onConfigUpdate(node.id, saved);
 
     // Also update the selectedNode so DataPreview can show the new data
-    onPreviewConfigUpdate(node.id, { ...config, chat: finalChat });
+    onPreviewConfigUpdate(node.id, saved);
 
     setFormDirty(false);
     antMessage.success('Configuration saved! Check the Data Preview below.');
@@ -831,7 +841,7 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
             fontSize: 13, fontWeight: 600, color: '#111827', marginTop: 1,
             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
           }}>
-            {node.data?.label || `Configure ${node.type}`}
+            {nodeDisplayName(node.type, node.data, `Configure ${node.type}`)}
           </div>
         </div>
         {formDirty && (

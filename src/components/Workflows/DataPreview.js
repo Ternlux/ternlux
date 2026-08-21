@@ -14,10 +14,39 @@ import {
 } from '@ant-design/icons';
 import axios from 'axios';
 import Editor from '@monaco-editor/react';
+import { nodeDisplayName } from './nodes/nodeCardShared';
 
 const { Title, Text } = Typography;
 const { TabPane } = Tabs;
 const { Panel } = Collapse;
+
+// Node types whose output is created by running them: until then their target
+// table/collection is a name in the config and nothing else. `config.executed`
+// records whether the run has happened — set false when the node is built or
+// reconfigured, true by the executor (NodeExecution/workflowExecutionHelpers
+// markNodeExecuted, which also writes it to the saved workflow).
+const EXECUTED_FLAG_NODE_TYPES = new Set(['transformer', 'join', 'output']);
+
+/**
+ * Would reading this node's output query something that isn't there yet?
+ *
+ * Only an explicit `false` counts. Nodes saved before the flag existed have no
+ * `executed` at all, and those may well have been run — refusing to preview
+ * them would break working workflows, so they fall through to the query (and,
+ * if the table really is missing, to the pending-execution state below).
+ */
+const awaitsExecution = (node) =>
+  !!node &&
+  EXECUTED_FLAG_NODE_TYPES.has(node.type) &&
+  node.data?.config?.executed === false;
+
+// The shape renderDataTable shows as "runs first, previews after".
+const pendingExecutionResult = () => ({
+  headers: [],
+  data: [],
+  metadata: { rowCount: 0, pendingExecution: true },
+  pendingExecution: true,
+});
 
 const DataPreview = ({
   selectedNode,
@@ -299,12 +328,7 @@ const DataPreview = ({
           const isMissingTable = /no such table|doesn'?t exist|does not exist|not found/i.test(String(result.message || ''));
           const isTargetPreview = query === config.targetPreviewSql;
           if (isMissingTable && isTargetPreview) {
-            return {
-              headers: [],
-              data: [],
-              metadata: { rowCount: 0, pendingExecution: true },
-              pendingExecution: true
-            };
+            return pendingExecutionResult();
           }
           message.error('Database query failed: ' + result.message);
           return null;
@@ -458,11 +482,7 @@ const DataPreview = ({
           // The Transformed tab will show the transformed data
           // console.log('connectedDataSources: ', connectedDataSources)
           if (connectedDataSources.length > 0) {
-            const sourceToFetch = connectedDataSources[0];
-            const sourceConfig = sourceToFetch.data?.config;
-            if (sourceConfig) {
-              fetchPreviewData(sourceConfig);
-            }
+            fetchSourceNodePreview(connectedDataSources[0]);
           }
         } 
 
@@ -523,7 +543,7 @@ const DataPreview = ({
           clearCache([sourceCacheKey]);
 
           if (forceRefresh || activeTab === 'preview') {
-            fetchPreviewData(sourceConfig);
+            fetchSourceNodePreview(sourceNode);
           }
         }
       }
@@ -547,10 +567,7 @@ const DataPreview = ({
         clearCache(keysToDelete);
 
         if (forceRefresh || activeTab === 'preview') {
-          const sourceConfig = connectedDataSources[0].data?.config;
-          if (sourceConfig) {
-            fetchPreviewData(sourceConfig);
-          }
+          fetchSourceNodePreview(connectedDataSources[0]);
         }
       }
     }
@@ -749,6 +766,46 @@ const DataPreview = ({
     // }
   };
 
+  // Cache key for one source's preview rows. Mirrors the key the join tabs read
+  // in renderDataSourceTabs — the two have to agree or the tab shows nothing.
+  const previewCacheKey = (config) => {
+    const connectionId = config?.targetConnectionId || config?.sourceConnectionId || config?.connectionId;
+    const identifier = config?.targetTableName || config?.sourceTableName ||
+                       config?.targetCollection || config?.sourceCollection ||
+                       config?.sourceDataset || config?.dataset || config?.table;
+    return connectionId ? connectionId + identifier : null;
+  };
+
+  /**
+   * Preview an UPSTREAM node's output.
+   *
+   * What a transformer/join/output shows in its Preview tab is its parent's
+   * output, so this reads the parent's config — and when that parent is itself a
+   * transformer or a join, the table it reads is the one the parent WRITES.
+   * That table exists only after the parent has run, which is what
+   * `config.executed` records. Without this check the preview queries it anyway
+   * and a freshly built workflow greets the user with "Table
+   * 'db.some_table' doesn't exist" when nothing is actually wrong — it just
+   * hasn't been executed yet.
+   */
+  const fetchSourceNodePreview = (sourceNode) => {
+    const sourceConfig = sourceNode?.data?.config;
+    if (!sourceConfig) return;
+
+    if (awaitsExecution(sourceNode)) {
+      const pending = pendingExecutionResult();
+      setPreviewData(pending);
+      setLoadingPreview(false);
+      // Cached under the same key a fetch would have used, so the join tabs
+      // (which render from the cache) show the state too.
+      const cacheKey = previewCacheKey(sourceConfig);
+      if (cacheKey) setPreviewDataBySource(prev => ({ ...prev, [cacheKey]: pending }));
+      return;
+    }
+
+    fetchPreviewData(sourceConfig);
+  };
+
   // Handle tab change in preview section
   const handlePreviewTabChange = (tabKey) => {
     console.log('handlePreviewTabChange: ', tabKey)
@@ -768,8 +825,9 @@ const DataPreview = ({
     const cacheKey = connectionId + connectionSourceIdentifier;
     // Check if data for this source is already loaded
     if (!previewDataBySource[cacheKey]) {
-      // Data not cached, fetch it
-      fetchPreviewData(config);
+      // Data not cached, fetch it — unless this source hasn't run yet, in which
+      // case there is no table behind the config to fetch from.
+      fetchSourceNodePreview(sourceToFetch);
     } else {
       // Data is cached, update previewData to show it
       setPreviewData(previewDataBySource[cacheKey]);
@@ -1070,6 +1128,16 @@ const DataPreview = ({
 
   const fetchTransformedData = async () => {
     if (!selectedNode) return;
+
+    // The transformed rows ARE this node's output table. Configured is not the
+    // same as created: until the node has run there is nothing to select from,
+    // so show the pre-execution state rather than querying a table that the
+    // engine will (correctly) say does not exist.
+    if (awaitsExecution(selectedNode)) {
+      setTransformedData(pendingExecutionResult());
+      setLoadingTransformed(false);
+      return;
+    }
 
     // Check if node is saved/processed
     const nodeConfig = selectedNode?.data?.config;
@@ -1405,7 +1473,7 @@ const DataPreview = ({
     }
     const type = selectedNode.type;
     const config = selectedNode.data?.config || {};
-    const label = selectedNode.data?.label || type;
+    const label = nodeDisplayName(type, selectedNode.data, type);
 
     const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== '';
     const TYPE_LABEL = { start: 'Start', dataSource: 'Data Source', transformer: 'Transformer', join: 'Join', output: 'Output', branch: 'Branch' };
@@ -2119,7 +2187,10 @@ const DataPreview = ({
               <span>
                 <SwapOutlined style={{ marginRight: 6 }} />
                 Transformed
-                {transformedData && <span style={{ marginLeft: 4, color: '#52c41a' }}>✓</span>}
+                {/* The tick means "there are rows here". A node still waiting to
+                    run has a placeholder, not an output. */}
+                {transformedData && !transformedData.pendingExecution &&
+                  <span style={{ marginLeft: 4, color: '#52c41a' }}>✓</span>}
               </span>
             }
             key="transformed"
