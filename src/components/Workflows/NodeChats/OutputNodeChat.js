@@ -48,6 +48,24 @@ const FORMAT_OPTIONS = [
   { label: 'Avro — export as Avro file', value: 'avro' },
 ];
 
+/**
+ * A sheet name Excel will accept: at most 31 characters, none of `\ / ? * [ ] :`,
+ * not wrapped in apostrophes. A table name is bound by none of that, so a name
+ * derived from one is brought inside the rules before it is offered as the
+ * default. Mirrors sanitizeSheetName in public/duckdb/xlsx.js, which applies the
+ * same rules again at write time — this copy exists because the renderer cannot
+ * reach into the main process's modules.
+ */
+const sanitizeSheetName = (name, fallback = 'Data') => {
+  const cleaned = String(name || '')
+    .replace(/[\\/?*[\]:]/g, '_')
+    .replace(/^'+|'+$/g, '')
+    .trim()
+    .slice(0, 31)
+    .trim();
+  return cleaned || fallback;
+};
+
 const GROUP_ORDER = ['Databases', 'Vector', 'Cloud Storage', 'APIs', 'Local Files', 'Other'];
 
 /**
@@ -145,6 +163,10 @@ const OutputNodeChat = ({
     savePath: saved?.savePath || null,
     connectionId: saved?.connectionId || null,
     tableName: saved?.tableName || null,
+    // Excel only. An output node has exactly one input, so it writes exactly
+    // one sheet — pointing several nodes at the same workbook with different
+    // sheet names is how a multi-sheet file gets built.
+    sheetName: saved?.sheetName || null,
   });
 
   const [dirty, setDirty] = useState(false);
@@ -156,6 +178,8 @@ const OutputNodeChat = ({
 
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
+  // The one funnel every control in this form writes through, and so the one
+  // place `dirty` is raised — which is what puts the footer action on screen.
   const patch = useCallback((next) => {
     setDirty(true);
     setExecutionError(null);
@@ -391,6 +415,10 @@ const OutputNodeChat = ({
     if (outputSettings.outputType === 'local') {
       if (!outputSettings.format) out.format = true;
       if (!outputSettings.savePath) out.savePath = true;
+      // A workbook needs a tab to write to, and the user can clear the field.
+      if (outputSettings.format === 'excel' && !String(outputSettings.sheetName || '').trim()) {
+        out.sheetName = true;
+      }
     } else {
       if (!outputSettings.connectionId) out.connectionId = true;
       else if (!outputSettings.tableName) out.tableName = true;
@@ -421,9 +449,28 @@ const OutputNodeChat = ({
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
+  // What an Excel sheet is called when the user hasn't said: the table this
+  // node is writing. Two output nodes on one workbook then land on different
+  // tabs by default instead of overwriting each other.
+  const defaultSheetName = useCallback(
+    () => sanitizeSheetName(sourceTableSchema?.tableName || sourceNode?.data?.label),
+    [sourceTableSchema, sourceNode],
+  );
+
+  // Fill the sheet name in once the source is known — for a node saved before
+  // this field existed, and for one whose format was set before the source
+  // finished loading.
+  useEffect(() => {
+    if (outputSettings.outputType !== 'local' || outputSettings.format !== 'excel') return;
+    if (outputSettings.sheetName) return;
+    if (!sourceTableSchema && !sourceNode) return;
+    setOutputSettings((prev) => (prev.sheetName ? prev : { ...prev, sheetName: defaultSheetName() }));
+  }, [outputSettings.outputType, outputSettings.format, outputSettings.sheetName,
+    sourceTableSchema, sourceNode, defaultSheetName]);
+
   const changeOutputType = (value) => {
     // Switching sides drops whatever the other side had picked.
-    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null });
+    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null, sheetName: null });
     setAttempted(false);
   };
 
@@ -509,6 +556,8 @@ const OutputNodeChat = ({
       if (!result.success) return;
 
       onSave(buildConfig(finalSettings), []);
+      // Ran and saved — nothing left to do until a setting changes, and
+      // clearing `dirty` is what takes the footer action back off screen.
       setDirty(false);
       setAttempted(false);
     } finally {
@@ -573,9 +622,28 @@ const OutputNodeChat = ({
                   placeholder="Select a format…"
                   options={FORMAT_OPTIONS}
                   // Changing the format invalidates a path with the old extension.
-                  onChange={(v) => patch({ format: v, savePath: null })}
+                  // A sheet name means nothing outside a workbook.
+                  onChange={(v) => patch({
+                    format: v,
+                    savePath: null,
+                    sheetName: v === 'excel' ? (outputSettings.sheetName || defaultSheetName()) : null,
+                  })}
                 />
               </Field>
+              {outputSettings.format === 'excel' && (
+                <Field
+                  label="Sheet name"
+                  required
+                  invalid={invalid('sheetName')}
+                  hint={<>The tab this output writes. An existing workbook keeps its other sheets, so a second output node pointed at the same file adds another sheet rather than replacing it.</>}
+                >
+                  <TextInput
+                    value={outputSettings.sheetName ?? ''}
+                    placeholder={defaultSheetName()}
+                    onChange={(v) => patch({ sheetName: v })}
+                  />
+                </Field>
+              )}
               <Field
                 label="Save to"
                 required
@@ -712,12 +780,18 @@ const OutputNodeChat = ({
         cancelDisabled={running}
         onSave={handleSave}
         saveLabel={running ? 'Running…' : 'Run & Save Configuration'}
-        saveDisabled={running || cloudBlocked}
+        // Nothing edited, nothing to run or save — so the button stays disabled
+        // until something changes. This covers BOTH the moment the form opens
+        // and the moment a run finishes (which clears `dirty`), so a successful
+        // run cannot be repeated by accident on a config that has not moved.
+        saveDisabled={running || cloudBlocked || !dirty}
         saveDisabledReason={running
           ? 'The output is running — wait for it to finish.'
           : cloudBlocked
             ? 'Pick an upload path in the storage browser first.'
-            : undefined}
+            : !dirty
+              ? 'Nothing has changed yet. Edit a setting to run and save again.'
+              : undefined}
       />
 
       {cloudStorageBrowserOpen && selectedDestination?.connection && pluginManager && (

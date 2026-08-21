@@ -582,8 +582,9 @@ const DataSourceNodeChat = ({
         }
       }
 
-      // A workbook became one Parquet file per sheet, so the selected table
-      // decides which file to read — fileInfo.filePath is only the first.
+      // A connection can span several files, so the selected table decides
+      // which one to read — fileInfo.filePath is only the first. A workbook's
+      // sheets all resolve to the same path and are told apart by table name.
       const localPath = conn.connectionType === 'file'
         ? (conn.fileInfo?.tablePaths?.[table.name] || conn.fileInfo?.filePath)
         : null;
@@ -809,6 +810,13 @@ const DataSourceNodeChat = ({
         filePath: fileInfo.localPath,
         tables: fileInfo.tables,
         schemas: fileInfo.schemas,
+        // A cloud file is saved to disk and read in place now, so it carries
+        // everything a file added from disk does — including the sheet map a
+        // workbook needs for its tables to mean different sheets.
+        format: fileInfo.format || null,
+        tablePaths: fileInfo.tablePaths || null,
+        tableSheets: fileInfo.tableSheets || null,
+        sourceFilePath: fileInfo.localPath,
       },
       cloudSource: fileInfo.cloudSource,
     };
@@ -1201,8 +1209,8 @@ const DataSourceNodeChat = ({
         config.sourceDbCategory = conn.dbCategory || (conn.dbType === 'lancedb' ? 'Vector' : null);
 
         // A DuckDB source is a file: the path is the address, and the table
-        // name is only the label the user sees. A multi-sheet workbook became
-        // one Parquet file per sheet, so the chosen sheet picks the path.
+        // name is the label the user sees — except for a workbook, whose sheets
+        // share one path and are addressed by that name.
         if (conn.dbType === 'duckdb') {
           const selected = tableName || conn.fileInfo?.tables?.[0] || null;
           const filePath = (selected && conn.fileInfo?.tablePaths?.[selected]) || conn.fileInfo?.filePath || null;
@@ -1601,10 +1609,13 @@ const DataSourceNodeChat = ({
         error={gateMessage}
         onCancel={onCancel}
         onSave={handleSave}
-        saveDisabled={!!missing.cloudFile || (hasSaved && !dirty)}
+        // Nothing edited, nothing to save — the button stays disabled until
+        // something changes, rather than sitting active the moment the node is
+        // opened. The first edit makes it live.
+        saveDisabled={!!missing.cloudFile || !dirty}
         saveDisabledReason={missing.cloudFile
           ? 'Open the storage browser and pick a file to import first.'
-          : 'Nothing has changed since the last save.'}
+          : 'Nothing has changed yet.'}
       />
 
       {/* Cloud Storage Browser */}
