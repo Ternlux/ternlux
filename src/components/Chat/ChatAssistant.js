@@ -1,13 +1,48 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { C, SANS, MONO, I, MoreMenu } from '../Workflows/_designShared';
 import DataVisualization from './DataVisualization';
 import { loadJoinDestinations, hasJoinDestination } from '../Workflows/joinDestinations';
 
 const MAX_STEPS_PER_QUESTION = 8;
+// Consecutive "Fix it" clicks on a review verdict before the button stops being
+// offered. Each click re-sends the reviewer's remediation to the builder as its
+// next brief, so a wrong verdict becomes the next round's specification; without
+// a cap one bad call can rewrite a working node until it no longer runs. Two
+// rounds is enough for a genuine miss and short enough to stop a loop. Only
+// button clicks count — a message the user typed resets it (see fixRoundsRef).
+const MAX_REVIEW_FIX_ROUNDS = 2;
 // Shown whenever a model breaks the JSON contract, wherever it happens (main
 // agent, workflow sub-agent, planner, node builder). The raw text always rides
 // along as `invalidJson` and renders in the collapsible panel under the message.
 const INVALID_RESPONSE_MESSAGE = 'The AI responded with an invalid response. Click retry to ask the AI again.';
+
+/**
+ * Ask the open workflow editor to commit its canvas before a build reads the
+ * workflow from disk.
+ *
+ * A build plans against the SAVED workflow, so unsaved canvas edits are both
+ * invisible to it and about to be overwritten by whatever it writes back. The
+ * editor answers this event with a promise: it resolves immediately when there
+ * is nothing uncommitted, and otherwise after the user has either saved
+ * (through the Execution Steps review) or cancelled.
+ *
+ * The editor lives in a different subtree, so this goes over a window event
+ * rather than props — the same bridge the Settings request uses. Nothing
+ * listening means no editor is open, and therefore nothing unsaved to lose.
+ */
+async function requestWorkflowSaveGate() {
+  let answer = null;
+  try {
+    window.dispatchEvent(new CustomEvent('ternlux:workflow-save-gate', {
+      detail: { respond: (p) => { answer = p; } },
+    }));
+    if (!answer) return { ok: true, reason: 'no-editor' };
+    return (await answer) || { ok: true, reason: 'no-answer' };
+  } catch (_err) {
+    // Never let the gate itself be the reason a build cannot run.
+    return { ok: true, reason: 'gate-error' };
+  }
+}
 
 // NeDB refuses any field whose key starts with `$` (it reserves them for
 // update operators). Tool results occasionally include such keys — Mongo
@@ -268,8 +303,11 @@ const Markdown = ({ text }) => {
 const STEP_BADGE = {
   start:       { label: 'START',      color: '#0f766e', bg: '#ccfbf1' },
   dataSource:  { label: 'DATA SRC',   color: '#1e40af', bg: '#dbeafe' },
-  transformer: { label: 'TRANSFORM',  color: '#7c2d12', bg: '#fed7aa' },
-  join:        { label: 'JOIN',       color: '#6b21a8', bg: '#e9d5ff' },
+  // Purple transformer, orange join — the same hues the canvas cards use
+  // (TransformerNode #7c3aed, JoinNode #d97706), so a step reads as the node
+  // it will become.
+  transformer: { label: 'TRANSFORM',  color: '#6b21a8', bg: '#e9d5ff' },
+  join:        { label: 'JOIN',       color: '#9a3412', bg: '#fed7aa' },
   output:      { label: 'OUTPUT',     color: '#166534', bg: '#bbf7d0' },
 };
 
@@ -279,8 +317,12 @@ const STEP_BADGE = {
 // (workflow:executeBuild), bypassing the AI; the Cancel button just locks
 // the card. Once the user has either accepted or cancelled, the buttons
 // are replaced with a status line so they cannot fire twice.
-const PlanCard = ({ plan, status, onAccept, onCancel }) => {
+const PlanCard = ({ plan, status, onAccept, onCancel, stale = false }) => {
+  // `settled` — acted on. `stale` — never acted on, but the conversation moved
+  // past it. Both replace the buttons; only the wording differs, because
+  // "you didn't answer this" is not the same as "you did".
   const settled = status && status.kind !== 'idle';
+  const shown = settled ? status : (stale ? { kind: 'stale', message: 'Not accepted — you asked for something else.' } : null);
   return (
     <div style={{
       marginTop: 10, padding: 12, borderRadius: 6,
@@ -352,15 +394,15 @@ const PlanCard = ({ plan, status, onAccept, onCancel }) => {
           Deletes: {plan.deletedNodes.join(', ')}
         </div>
       )}
-      {settled ? (
+      {shown ? (
         <div style={{
           marginTop: 10, padding: '6px 10px', borderRadius: 4,
           fontSize: 11, fontFamily: SANS, fontWeight: 600,
-          background: status.kind === 'error' ? C.rD : (status.kind === 'success' ? C.gD : C.s2),
-          color:      status.kind === 'error' ? C.red : (status.kind === 'success' ? C.green : C.muted),
-          border: `1px solid ${status.kind === 'error' ? '#fecaca' : status.kind === 'success' ? '#bbf7d0' : C.border}`,
+          background: shown.kind === 'error' ? C.rD : (shown.kind === 'success' ? C.gD : C.s2),
+          color:      shown.kind === 'error' ? C.red : (shown.kind === 'success' ? C.green : C.muted),
+          border: `1px solid ${shown.kind === 'error' ? '#fecaca' : shown.kind === 'success' ? '#bbf7d0' : C.border}`,
         }}>
-          {status.message}
+          {shown.message}
         </div>
       ) : (
         <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'flex-end' }}>
@@ -461,7 +503,8 @@ const JoinDestinationPicker = ({ node, destinations, loading, onPick }) => {
 // user sees one focus area, not two competing headers. Dismissing it drops the
 // node from the turn payload; re-opening the panel restores it as long as the
 // node is still selected on the canvas (see focusDismissed).
-const NODE_CHIP_COLOR = { transformer: '#d97706', join: '#8b5cf6', dataSource: '#0ea5e9' };
+// Matches the canvas cards: transformer purple, join orange, source cyan.
+const NODE_CHIP_COLOR = { transformer: '#7c3aed', join: '#d97706', dataSource: '#0891b2' };
 const FocusNodeChip = ({ node, typeLabel, onClear }) => {
   if (!node) return null;
   const color = NODE_CHIP_COLOR[node.type] || C.accent;
@@ -683,10 +726,74 @@ const nodeCodeSections = (config = {}) => {
   return out;
 };
 
-const NodeRunPanel = ({ run, onRun, onSkip }) => {
+/**
+ * The reviewer found a mismatch and can say what would fix it. The user decides
+ * whether it gets fixed — this is the decision, not a to-do list.
+ *
+ * "Fix it" does not repair anything here. It composes the edits into an
+ * ordinary user turn and sends it, so the fix goes through the same builder,
+ * review and approval path as any other request. Nothing is applied behind the
+ * user's back, and a fix that is itself wrong gets reviewed like anything else.
+ */
+const ReviewFixPanel = ({ fix, onFix, onLeave, busy = false, stale = false }) => {
+  const state = fix.state || 'pending';
+  // Offered, never answered, and the user has since said something else — the
+  // offer is spent. Applying it now would correct a workflow that may have been
+  // rebuilt in between.
+  if (state === 'pending' && stale) {
+    return (
+      <div style={{ marginTop: 7, fontSize: 11, color: C.dim, fontFamily: SANS }}>
+        Not applied — you asked for something else.
+      </div>
+    );
+  }
+  if (state === 'dismissed') {
+    return (
+      <div style={{ marginTop: 7, fontSize: 11, color: C.dim, fontFamily: SANS }}>
+        Left as it is.
+      </div>
+    );
+  }
+  // Past tense: this label outlives the turn it started, so "applying…" would
+  // still be on screen long after the fix finished.
+  if (state === 'sent') {
+    return (
+      <div style={{ marginTop: 7, fontSize: 11, color: C.muted, fontFamily: SANS }}>
+        Asked to apply those changes.
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center' }}>
+      <button type="button" onClick={onFix} disabled={busy}
+        style={{
+          padding: '4px 10px', borderRadius: 4, border: 'none',
+          background: busy ? C.dim : C.accent, color: '#fff',
+          cursor: busy ? 'default' : 'pointer',
+          fontSize: 11, fontWeight: 600, fontFamily: SANS,
+        }}>
+        Fix it
+      </button>
+      <button type="button" onClick={onLeave} disabled={busy}
+        style={{
+          padding: '4px 10px', borderRadius: 4,
+          border: `1px solid ${C.border}`, background: '#fff', color: C.muted,
+          cursor: busy ? 'default' : 'pointer',
+          fontSize: 11, fontWeight: 600, fontFamily: SANS,
+        }}>
+        Leave it
+      </button>
+    </div>
+  );
+};
+
+const NodeRunPanel = ({ run, onRun, onSkip, stale = false }) => {
   const [showCode, setShowCode] = useState(false);
   const sections = useMemo(() => nodeCodeSections(run.config), [run.config]);
-  const state = run.state || 'pending';
+  // A run offered but never answered, with the conversation moved on, reads as
+  // "not run" — the same as Skip. Keeping the button live would let a click
+  // execute code against a node the later turns may have rebuilt.
+  const state = (run.state || 'pending') === 'pending' && stale ? 'skipped' : (run.state || 'pending');
 
   const label = {
     pending: 'Approve before this runs',
@@ -806,11 +913,18 @@ const StepBubble = ({ m, activeApprovalMsgId, onApproveCode, onDeclineCode }) =>
     }}>
       {I('compass', C.muted, 12)}
     </div>
-    <div style={{ maxWidth: '90%', minWidth: 80 }}>
+    {/* minWidth 0 is what lets this flex item shrink at all — without it a
+        flex child refuses to go below its content's intrinsic width, so a long
+        tool argument widened the bubble past maxWidth instead of wrapping. */}
+    <div style={{ maxWidth: '90%', minWidth: 0, flex: '1 1 auto' }}>
       <div style={{
         padding: '8px 11px', borderRadius: 6, borderTopLeftRadius: 2,
         background: C.surface, border: `1px solid ${C.border}`,
         fontSize: 11, color: C.muted, lineHeight: 1.6,
+        // Tool args, ids and paths are long runs with no spaces to break on.
+        // `anywhere` (not `break-word`) also shrinks the box's min-content
+        // width, which is what stops the content spilling past the border.
+        overflowWrap: 'anywhere',
       }}>
         <div style={{
           fontSize: 9, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.08em',
@@ -818,6 +932,7 @@ const StepBubble = ({ m, activeApprovalMsgId, onApproveCode, onDeclineCode }) =>
         }}>
           Step {m.stepIndex}
         </div>
+        {m.thinking && <ThinkingBlock text={m.thinking} />}
         {m.thought && (
           <div style={{ color: C.text, fontSize: 12, marginBottom: m.actions?.length ? 6 : 0 }}>
             {m.thought}
@@ -846,6 +961,95 @@ const BUILD_STEP_LABEL = {
   start: 'Start', dataSource: 'Data source', transformer: 'Transformer',
   join: 'Join', output: 'Output', branch: 'Branch',
 };
+// The step lines themselves, shared by the pinned panel (build in flight) and
+// the history bubble (build finished) so both read identically.
+const BuildLogLines = ({ logs }) => {
+  if (!logs.length) {
+    return <div style={{ fontSize: 11, color: C.dim, fontFamily: SANS }}>Preparing…</div>;
+  }
+  return logs.map((l) => {
+    const isDone = l.status === 'done';
+    return (
+      <div key={l.stepIndex} style={{
+        display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0',
+        fontSize: 11, fontFamily: SANS, color: isDone ? C.text : C.muted,
+      }}>
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          width: 13, height: 13, borderRadius: 2, flexShrink: 0,
+          background: isDone ? C.gD : C.s2,
+          color: isDone ? C.green : C.dim, fontSize: 9, fontWeight: 700,
+        }}>{isDone ? '✓' : '·'}</span>
+        <span style={{ fontWeight: 600 }}>{BUILD_STEP_LABEL[l.stepType] || l.stepType}</span>
+        {l.label && l.label !== (BUILD_STEP_LABEL[l.stepType] || l.stepType) && (
+          <span style={{ color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            — {l.label}
+          </span>
+        )}
+        {!isDone && (
+          <span style={{ color: C.dim, fontSize: 10, fontStyle: 'italic' }}>working…</span>
+        )}
+      </div>
+    );
+  });
+};
+
+// ── Pinned build panel ────────────────────────────────────────────────────
+// A build in flight lives HERE, not in the thread. It survives every pause for
+// a clarification, so answering three questions leaves one panel that keeps
+// filling in — rather than three build-log bubbles stacked in the transcript.
+// It moves into the history (as a BuildLogBubble) only once the build reaches a
+// terminal state: finished, failed, or cancelled.
+const BuildPin = ({ run }) => {
+  const [open, setOpen] = useState(true);
+  if (!run) return null;
+  const logs = Array.isArray(run.logs) ? run.logs : [];
+  const doneCount = logs.filter((l) => l.status === 'done').length;
+  const waiting = run.status === 'waiting' || run.status === 'paused';
+  return (
+    <div style={{
+      flexShrink: 0, borderTop: `1px solid ${C.border}`,
+      background: waiting ? '#fffbeb' : C.bg,
+    }}>
+      <div onClick={() => setOpen((o) => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+          userSelect: 'none', padding: '8px 14px',
+        }}>
+        <span style={{
+          fontSize: 9, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.08em',
+          textTransform: 'uppercase', color: waiting ? '#92400e' : C.accent,
+        }}>
+          {waiting ? 'Build paused' : 'Building…'}
+        </span>
+        <span style={{ fontSize: 11, color: C.muted, fontFamily: SANS }}>
+          {doneCount}/{logs.length || '…'} steps
+        </span>
+        <span style={{ flex: 1 }} />
+        <span style={{
+          fontSize: 9, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.06em',
+          color: C.dim, textTransform: 'uppercase',
+        }}>
+          {open ? 'Hide' : 'Show'}
+        </span>
+      </div>
+      {open && (
+        <div style={{ padding: '0 14px 10px 14px', maxHeight: 200, overflowY: 'auto' }}>
+          <BuildLogLines logs={logs} />
+          {run.note && (
+            <div style={{
+              marginTop: 6, fontSize: 11, fontFamily: SANS,
+              color: waiting ? '#92400e' : C.muted,
+            }}>
+              {run.note}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const BuildLogBubble = ({ m }) => {
   const logs = Array.isArray(m.logs) ? m.logs : [];
   const done = !!m.done;
@@ -867,39 +1071,62 @@ const BuildLogBubble = ({ m }) => {
             fontSize: 9, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.08em',
             color: C.dim, textTransform: 'uppercase', marginBottom: 6,
           }}>
-            {done ? (m.summary ? 'Build log' : 'Build paused') : 'Building…'}
+            {done ? (m.summary ? 'Build log' : 'Build stopped') : 'Building…'}
           </div>
-          {logs.length === 0 && (
-            <div style={{ fontSize: 11, color: C.dim, fontFamily: SANS }}>Preparing…</div>
-          )}
-          {logs.map((l) => {
-            const isDone = l.status === 'done';
-            return (
-              <div key={l.stepIndex} style={{
-                display: 'flex', alignItems: 'center', gap: 7, padding: '2px 0',
-                fontSize: 11, fontFamily: SANS, color: isDone ? C.text : C.muted,
-              }}>
-                <span style={{
-                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                  width: 13, height: 13, borderRadius: 2, flexShrink: 0,
-                  background: isDone ? C.gD : C.s2,
-                  color: isDone ? C.green : C.dim, fontSize: 9, fontWeight: 700,
-                }}>{isDone ? '✓' : '·'}</span>
-                <span style={{ fontWeight: 600 }}>{BUILD_STEP_LABEL[l.stepType] || l.stepType}</span>
-                {l.label && l.label !== (BUILD_STEP_LABEL[l.stepType] || l.stepType) && (
-                  <span style={{ color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    — {l.label}
-                  </span>
-                )}
-                {!isDone && (
-                  <span style={{ color: C.dim, fontSize: 10, fontStyle: 'italic' }}>working…</span>
-                )}
-              </div>
-            );
-          })}
+          <BuildLogLines logs={logs} />
         </div>
         <div style={{ marginTop: 4, fontSize: 9, color: C.dim, fontFamily: MONO }}>{m.ts}</div>
       </div>
+    </div>
+  );
+};
+
+// ── Thinking — the model's reasoning for a step, collapsed by default ─────
+// Same disclosure idiom as ActionLine: one line you can scan, the whole thing
+// on click. Only providers that expose reasoning (Claude) ever fill this.
+const ThinkingBlock = ({ text }) => {
+  const [open, setOpen] = useState(false);
+  // Reasoning runs to many lines; the collapsed row shows the opening of it on
+  // a single line so the block is identifiable without expanding.
+  const preview = text.replace(/\s+/g, ' ').trim();
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <button type="button" onClick={() => setOpen((o) => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          background: 'none', border: 'none', cursor: 'pointer',
+          padding: 0, width: '100%', minWidth: 0, textAlign: 'left',
+        }}>
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          width: 12, height: 12, borderRadius: 2, flexShrink: 0,
+          background: C.s2, color: C.dim, fontSize: 8,
+          transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 120ms',
+        }}>▶</span>
+        <span style={{
+          fontFamily: MONO, fontSize: 9, fontWeight: 700, letterSpacing: '0.08em',
+          textTransform: 'uppercase', color: C.dim, flexShrink: 0,
+        }}>
+          Thinking
+        </span>
+        {!open && (
+          <span style={{
+            fontFamily: SANS, fontSize: 11, color: C.dim, fontStyle: 'italic',
+            minWidth: 0, flex: '1 1 auto',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {preview}
+          </span>
+        )}
+      </button>
+      {open && (
+        <pre style={{
+          margin: '4px 0 0 18px', padding: '6px 8px',
+          background: '#fff', border: `1px solid ${C.border}`, borderRadius: 4,
+          fontFamily: SANS, fontSize: 11, lineHeight: 1.6, color: C.muted,
+          maxHeight: 260, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        }}>{text}</pre>
+      )}
     </div>
   );
 };
@@ -917,19 +1144,27 @@ const ActionLine = ({ action }) => {
     <div style={{ marginTop: 4 }}>
       <button type="button" onClick={() => setOpen((o) => !o)}
         style={{
-          display: 'flex', alignItems: 'center', gap: 6,
+          // Wraps rather than running off the side: the args are a JSON blob
+          // with few break opportunities, and a nowrap flex row pushed it past
+          // the bubble's right edge. Aligned to the top so a wrapped second
+          // line sits under the tool name rather than beside the tick.
+          display: 'flex', alignItems: 'flex-start', gap: 6, flexWrap: 'wrap',
           background: 'none', border: 'none', cursor: 'pointer',
           padding: 0, color: ok ? C.accent : C.red,
           fontFamily: MONO, fontSize: 11, fontWeight: 600,
+          maxWidth: '100%', minWidth: 0, textAlign: 'left',
         }}>
         <span style={{
           display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-          width: 12, height: 12, borderRadius: 2,
+          width: 12, height: 12, borderRadius: 2, flexShrink: 0, marginTop: 2,
           background: ok ? C.gD : C.rD,
           color: ok ? C.green : C.red, fontSize: 9,
         }}>{ok ? '✓' : '✗'}</span>
-        <span style={{ color: C.text }}>{action.tool}</span>
-        <span style={{ color: C.dim, fontWeight: 400 }}>{argsStr}</span>
+        <span style={{ color: C.text, minWidth: 0, overflowWrap: 'anywhere' }}>{action.tool}</span>
+        <span style={{
+          color: C.dim, fontWeight: 400,
+          minWidth: 0, flex: '1 1 auto', overflowWrap: 'anywhere',
+        }}>{argsStr}</span>
       </button>
       {open && (() => {
         // Arguments and result live in separate, labeled sections so the call
@@ -1171,10 +1406,14 @@ const InvalidResponsePanel = ({ raw }) => {
 // origin of a reply — the assistant itself, the workflow planner, a node builder,
 // or a skill — is discoverable without adding clutter to the transcript.
 const AGENT_LABELS = {
-  main:     'Ternlux Assistant (main agent)',
-  workflow: 'Workflow builder agent',
-  planner:  'Workflow planner',
-  builder:  'Node builder',
+  main:        'Ternlux Assistant (main agent)',
+  workflow:    'Workflow builder agent',
+  planner:     'Workflow planner',
+  builder:     'Node builder',
+  reviewer:    'Change reviewer',
+  // The gate in front of build_transformer / build_join / build_dataSource: it
+  // answered instead of forwarding the message to the node builder.
+  'node-router': 'Node-build router',
 };
 const agentLabel = (source) => {
   if (!source) return null;
@@ -1183,7 +1422,7 @@ const agentLabel = (source) => {
   return AGENT_LABELS[s] || s;
 };
 
-const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDeclineCode, onRunNode, onSkipNode, activeApprovalMsgId = null, isEditing, onSaveEdit, onCancelEdit, busy = false }) => {
+const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDeclineCode, onRunNode, onSkipNode, activeApprovalMsgId = null, isEditing, onSaveEdit, onCancelEdit, busy = false, stale = false }) => {
   const isUser = m.role === 'user';
   const plan = !isUser && !m.error && m.workflowPlan && Array.isArray(m.workflowPlan.steps)
     ? m.workflowPlan
@@ -1228,6 +1467,7 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
         <div style={{ maxWidth: '90%', minWidth: 80 }}>
           <NodeRunPanel
             run={m.run || {}}
+            stale={stale}
             onRun={() => onRunNode && onRunNode(m)}
             onSkip={() => onSkipNode && onSkipNode(m)}
           />
@@ -1330,6 +1570,7 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
             <PlanCard
               plan={plan}
               status={m.planStatus || { kind: 'idle' }}
+              stale={stale}
               onAccept={() => onAction && onAction('accept-plan', plan, m.id)}
               onCancel={() => onAction && onAction('cancel-plan', plan, m.id)}
             />
@@ -1339,6 +1580,15 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
           )}
           {!isUser && m.invalidJson && (
             <InvalidResponsePanel raw={m.invalidJson} />
+          )}
+          {!isUser && m.reviewFix && (
+            <ReviewFixPanel
+              fix={m.reviewFix}
+              busy={busy}
+              stale={stale}
+              onFix={() => onAction && onAction('apply-review-fix', m.reviewFix, m.id)}
+              onLeave={() => onAction && onAction('dismiss-review-fix', m.reviewFix, m.id)}
+            />
           )}
         </div>
         <div style={{
@@ -1416,8 +1666,36 @@ const SugGrid = ({ onPick }) => (
 );
 
 // ── Composer ───────────────────────────────────────────────────────────────
+// The textarea grows with what's typed, from its two-row resting height up to
+// twice that, then scrolls. Both bounds come from measuring the element rather
+// than arithmetic on the font size, so they follow the styling.
+const COMPOSER_MAX_GROWTH = 2;
+
 const Composer = ({ value, setValue, onSend, onCancel, busy }) => {
   const sendDisabled = busy || !value.trim();
+  const taRef = useRef(null);
+  const [restingH, setRestingH] = useState(0);
+
+  // The `rows={2}` height, taken once before any explicit height is set.
+  useLayoutEffect(() => {
+    if (restingH || !taRef.current) return;
+    setRestingH(taRef.current.clientHeight);
+  }, [restingH]);
+
+  useLayoutEffect(() => {
+    const el = taRef.current;
+    if (!el || !restingH) return;
+    const max = restingH * COMPOSER_MAX_GROWTH;
+    // 'auto' first: scrollHeight only reports the content's height when the box
+    // isn't already holding it open from the previous keystroke.
+    el.style.height = 'auto';
+    const content = el.scrollHeight;
+    el.style.height = `${Math.min(Math.max(content, restingH), max)}px`;
+    // Past the ceiling the textarea scrolls; below it there is nothing to
+    // scroll and a visible scrollbar would just flicker.
+    el.style.overflowY = content > max ? 'auto' : 'hidden';
+  }, [value, restingH]);
+
   return (
     <div style={{ padding: '12px 14px', borderTop: `1px solid ${C.border}`, background: C.bg, flexShrink: 0 }}>
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
@@ -1426,6 +1704,7 @@ const Composer = ({ value, setValue, onSend, onCancel, busy }) => {
           border: `1px solid ${C.border}`, borderRadius: 6,
         }}>
           <textarea
+            ref={taRef}
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
@@ -1439,6 +1718,9 @@ const Composer = ({ value, setValue, onSend, onCancel, busy }) => {
               fontSize: 12, fontFamily: SANS, color: C.text,
               resize: 'none', outline: 'none', lineHeight: 1.6,
               background: 'transparent', display: 'block',
+              // Height is driven by the auto-grow effect above; hidden until it
+              // measures, so the first paint isn't a scrollbar flash.
+              overflowY: 'hidden',
             }}
           />
         </div>
@@ -1584,7 +1866,10 @@ const useChatWindow = () => {
     w: typeof window === 'undefined' ? 1280 : window.innerWidth,
     h: typeof window === 'undefined' ? 800 : window.innerHeight,
   }));
-  const [docked, setDocked] = useState(false);
+  // Pinned to the right rail by default — the assistant is part of the app's
+  // layout, not a window the user has to place. Unpinning drops it back to a
+  // floating panel for the rest of the session.
+  const [docked, setDocked] = useState(true);
   const [pos, setPos] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [dockHint, setDockHint] = useState(null); // null | 'hold' | 'ready'
@@ -1806,7 +2091,12 @@ const DockPreview = ({ state, width }) => {
 
 // ── Main component ─────────────────────────────────────────────────────────
 const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt = null }) => {
-  const [open, setOpen] = useState(false);
+  // Open on the right from the start. App.js only mounts the assistant once the
+  // terms + analytics choice is recorded and an AI provider is configured, so
+  // being mounted at all means the app is ready to answer — there is nothing to
+  // gain from making the user click the launcher first. Closing it hides it for
+  // the rest of the session.
+  const [open, setOpen] = useState(true);
   const [expanded, setExpanded] = useState(false);
   // Where the popup sits: free-floating (draggable) or pinned to the right rail.
   const {
@@ -1863,6 +2153,22 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   );
   const isRestarted = restartedConvoIds.has(activeId);
   const messages = (isRestarted ? [] : activeConvo?.messages) || [];
+
+  // Index of the last USER message. Anything offering a choice above it — Accept
+  // plan, Fix it, Run this node — is an offer the user has already answered by
+  // moving on, so its buttons go. Leaving them live means a click acts on
+  // something several turns stale: accepting a plan the conversation has since
+  // replaced, or applying a fix to a workflow that was rebuilt afterwards.
+  //
+  // Derived at render rather than patched onto messages when a turn is sent, so
+  // it stays right for a conversation reloaded from storage and cannot drift
+  // out of step with the transcript.
+  const lastUserIdx = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === 'user') return i;
+    }
+    return -1;
+  }, [messages]);
   // Whether the NEXT message goes to the workflow sub-agent rather than the
   // main assistant — the same condition `send` reads off the convo when it
   // stamps a new user message. A restarted chat always starts on main, so its
@@ -1874,10 +2180,23 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // cancellation just means "do not issue the next chat:step call". The
   // currently in-flight call still completes, but its result is discarded.
   const cancelledRef = useRef(false);
-  // Id of the in-flight build's "build log" message, so progress events
-  // streamed from the main process know which message to append to. Null when
-  // no build is running.
-  const buildLogRef = useRef(null);
+  // The build currently in flight, pinned above the composer rather than
+  // appended to the thread: { logs, status: 'running'|'waiting'|'paused', note }.
+  // It spans EVERY pass of one build — each clarification the builder raises
+  // pauses and resumes into this same panel — and is committed to the history
+  // as a single build-log message once the build finishes, fails, or is
+  // cancelled. Null when no build is running.
+  //
+  // The ref is authoritative and the state is its render mirror: progress
+  // events arrive from the main process, outside React's batching, so reading
+  // the ref keeps every update against the newest logs — and it lets the commit
+  // below read the final logs without doing work inside a state updater.
+  const buildRunRef = useRef(null);
+  const [buildRun, setBuildRun] = useState(null);
+  const setPin = useCallback((next) => {
+    buildRunRef.current = typeof next === 'function' ? next(buildRunRef.current) : next;
+    setBuildRun(buildRunRef.current);
+  }, []);
 
   // Generated code waiting on the user's Approve/Decline.
   //
@@ -1897,6 +2216,30 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // serve here: it's state, so a send() closure that settles an approval and
   // waits for the old turn to unwind would still read the stale value.
   const agentLoopRef = useRef(false);
+
+  // `send` is defined far below these handlers, so Edit and Retry cannot list
+  // it as a dependency — naming it in a dep array would read the binding during
+  // render, before its `const` is initialized, and throw. Reaching it through a
+  // ref instead is what keeps them on the CURRENT send: memoized on
+  // [activeConvo, …], they otherwise keep whichever send existed when they were
+  // last rebuilt, and `send` closes over `loading`. A turn ends by appending its
+  // final message (rebuilding the handlers while loading is still true) and only
+  // then clearing the flag, so the captured send stays one that returns early on
+  // `if (loading) return` — and Save & submit silently does nothing.
+  const sendRef = useRef(null);
+
+  // How many times IN A ROW the user has clicked "Fix it" on a review verdict.
+  //
+  // The reviewer's remediation is re-sent to the builder as its next brief, so a
+  // wrong verdict becomes the next round's specification and each round drifts
+  // further from what the user actually asked for. The reviewer is told the
+  // count so it can stop proposing variations of its own earlier correction.
+  //
+  // Only the button increments it (`fromReviewFix` on the message). A message
+  // the user TYPED — even one that repeats the suggested fix in their own words
+  // — resets it to 0: that is a fresh instruction from a human, not the loop
+  // feeding itself.
+  const fixRoundsRef = useRef(0);
 
   const settleApproval = useCallback((decision) => {
     const pending = approvalRef.current;
@@ -2296,44 +2639,79 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     patchMessage(m.id, { run: { ...run, state: 'skipped' } });
   }, [patchMessage]);
 
-  // Fold one build-progress event into the build-log message's `logs` array.
-  // Searches every conversation by id (the build runs on the active one, but a
-  // late event mustn't get lost if the user switched away). A 'running' event
-  // appends a new line; the matching 'done' event flips that line's status.
-  const applyBuildProgress = useCallback((msgId, evt) => {
-    if (!msgId || !evt || evt.phase !== 'step') return;
-    setConversations((prev) => prev.map((c) => {
-      if (!c.messages.some((m) => m.id === msgId)) return c;
-      return {
-        ...c,
-        messages: c.messages.map((m) => {
-          if (m.id !== msgId) return m;
-          const logs = Array.isArray(m.logs) ? m.logs.slice() : [];
-          const idx = logs.findIndex((l) => l.stepIndex === evt.stepIndex);
-          const line = {
-            stepIndex: evt.stepIndex,
-            stepType: evt.stepType,
-            label: evt.label,
-            action: evt.action,
-            status: evt.status,
-          };
-          if (idx >= 0) logs[idx] = { ...logs[idx], ...line };
-          else logs.push(line);
-          return { ...m, logs };
-        }),
-        updatedAt: Date.now(),
-      };
-    }));
+  // Fold one build-progress event into the pinned build's `logs`. A 'running'
+  // Right-click anywhere in the panel → the native Copy/Paste menu. Electron
+  // draws no context menu of its own, so without this a right-click does
+  // nothing at all. The menu itself is built in the main process (roles need
+  // the WebContents); all the renderer contributes is what sits under the
+  // pointer — a selection to copy, and whether the target can be pasted into.
+  const showTextMenu = useCallback((e) => {
+    if (!window.electronAPI?.ui?.showTextContextMenu) return;
+    e.preventDefault();
+    const el = e.target;
+    const editable = !!el && (
+      el.tagName === 'TEXTAREA'
+      || (el.tagName === 'INPUT' && !el.readOnly && !el.disabled)
+      || el.isContentEditable
+    );
+    // An input's own selection doesn't show up in window.getSelection(), so ask
+    // the field directly when the pointer is over one.
+    const fieldSelection = editable && typeof el.selectionStart === 'number'
+      && el.selectionEnd > el.selectionStart;
+    const hasSelection = fieldSelection
+      || String(window.getSelection?.() || '').length > 0;
+    window.electronAPI.ui.showTextContextMenu({ hasSelection, isEditable: editable });
   }, []);
 
-  // Subscribe once to the main process's build-progress stream. Events are
-  // routed to whichever build-log message is currently in flight (buildLogRef).
+  // event appends a new line; the matching 'done' event flips that line's
+  // status. Events arriving with no build pinned are dropped — there is nothing
+  // in flight for them to belong to.
+  const applyBuildProgress = useCallback((evt) => {
+    if (!evt || evt.phase !== 'step') return;
+    setPin((prev) => {
+      if (!prev) return prev;
+      const logs = prev.logs.slice();
+      const idx = logs.findIndex((l) => l.stepIndex === evt.stepIndex);
+      const line = {
+        stepIndex: evt.stepIndex,
+        stepType: evt.stepType,
+        label: evt.label,
+        action: evt.action,
+        status: evt.status,
+      };
+      if (idx >= 0) logs[idx] = { ...logs[idx], ...line };
+      else logs.push(line);
+      return { ...prev, logs };
+    });
+  }, [setPin]);
+
+  // Move the pinned build into the transcript as ONE build-log message and drop
+  // the pin. Called on every terminal outcome — finished, failed, cancelled —
+  // so the history keeps a record while only a live build stays pinned.
+  const commitBuildPin = useCallback((summary = null) => {
+    const run = buildRunRef.current;
+    setPin(null);
+    if (!run || !run.logs.length) return;
+    // Append to the conversation the build BELONGS to, not whichever one is
+    // active — the user may have switched chats while it was parked.
+    const stamped = {
+      id: newMsgId(),
+      role: 'assistant', kind: 'buildLog', ts: nowTs(),
+      logs: run.logs, done: true,
+      ...(summary ? { summary } : {}),
+    };
+    setConversations((prev) => prev.map((c) => (
+      c.id === run.convoId
+        ? { ...c, messages: [...c.messages, stamped], updatedAt: Date.now() }
+        : c
+    )));
+  }, [setPin]);
+
+  // Subscribe once to the main process's build-progress stream.
   useEffect(() => {
     const api = window.electronAPI?.workflow;
     if (!api?.onBuildProgress) return undefined;
-    const unsub = api.onBuildProgress((evt) => {
-      applyBuildProgress(buildLogRef.current, evt);
-    });
+    const unsub = api.onBuildProgress((evt) => applyBuildProgress(evt));
     return () => { try { unsub && unsub(); } catch (_) { /* ignore */ } };
   }, [applyBuildProgress]);
 
@@ -2360,6 +2738,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         // against. Each caller passes the record its builder actually used.
         chatHistory,
         pendingNode,
+        // Consecutive "Fix it" clicks that led here. Lets the reviewer see that
+        // it is grading its own previous instruction rather than a fresh build.
+        fixRounds: fixRoundsRef.current,
       });
     } catch (err) {
       return { ...passthrough, reason: err.message || String(err) };
@@ -2385,16 +2766,47 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       return res;
     }
 
+    // The reviewer proposes the EDITS; the user decides whether they get made.
+    // Anything it could actually repair is offered as a "Fix it" button rather
+    // than printed as a to-do list — the assistant is what can make the change,
+    // so handing the user instructions for repairing the builder's own mistake
+    // was backwards. An empty `remediation` means it had no fix to offer, and
+    // then the message falls back to saying so.
+    // Past the cap, stop offering the button. Each click re-sends the verdict's
+    // remediation as the builder's next brief, so an unbounded chain lets one
+    // wrong verdict rewrite the node further and further from the user's
+    // request — with no human judgement between rounds. The verdict is still
+    // shown; the user is asked to say what they want instead.
+    const exhausted = fixRoundsRef.current >= MAX_REVIEW_FIX_ROUNDS;
+    const hasEdits = res.remediation.length > 0;
+    const canFix = hasEdits && !exhausted;
     const lines = [
       `**This doesn't match what you asked for.** ${res.reason || ''}`.trim(),
       res.issues.length ? `\n**What's wrong:**\n${res.issues.map((i) => `- ${i}`).join('\n')}` : '',
-      res.remediation.length ? `\n**How to fix it:**\n${res.remediation.map((r) => `- ${r}`).join('\n')}` : '',
+      // Still worth printing when the button is gone: the user can act on it
+      // themselves, or see that the reviewer is circling the same point.
+      hasEdits ? `\n**What I'd change:**\n${res.remediation.map((r) => `- ${r}`).join('\n')}` : '',
       drift ? `\n**Output validation may no longer fit:** ${drift.reason}` : '',
-      '\nThe workflow was saved — tell me what to change and I\'ll rebuild it, or open it on the canvas to edit by hand.',
+      canFix
+        ? '\nThe workflow was saved as-is. Want me to make those changes?'
+        : exhausted
+          ? `\nThe workflow was saved as-is. I've already applied ${fixRoundsRef.current} round(s) of my own corrections and it still isn't right, so I'd rather not keep changing it — each round moves further from what you asked for. Tell me what it should do and I'll rebuild it, or open it on the canvas to edit by hand.`
+          : '\nThe workflow was saved as-is. Tell me what it should do instead and I\'ll rebuild it, or open it on the canvas to edit by hand.',
     ].filter(Boolean);
     appendMessage({
       role: 'assistant', kind: 'final', ts: nowTs(), agentSource: 'reviewer',
       text: lines.join('\n'),
+      // Drives the Fix it / Leave it buttons. Carries what the fix turn needs
+      // to be written without re-deriving it from the rendered markdown.
+      ...(canFix ? {
+        reviewFix: {
+          state: 'pending',
+          scope: change.kind === 'node' ? 'node' : 'workflow',
+          nodeIds: Array.isArray(change.nodeIds) ? change.nodeIds : [],
+          issues: res.issues,
+          remediation: res.remediation,
+        },
+      } : {}),
     });
     return res;
   }, [appendMessage]);
@@ -2409,19 +2821,46 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       patchMessage(msgId, { planStatus: { kind: 'error', message: 'Build IPC unavailable — restart the app to pick up the latest preload.' } });
       return;
     }
+
+    // The build reads the workflow from the DATABASE. If the editor is open
+    // with unsaved canvas edits, it would plan against the older saved version
+    // and then write its result over those edits. Ask first — the editor puts
+    // the user through the Execution Steps review and saves, or the user
+    // cancels and the workflow is left exactly as it is.
+    const gate = await requestWorkflowSaveGate();
+    if (!gate.ok) {
+      patchMessage(msgId, {
+        planStatus: {
+          kind: 'idle',
+          message: gate.reason === 'save-failed'
+            ? 'The workflow could not be saved, so nothing was built. Fix the reported problem and accept the plan again.'
+            : 'Cancelled — your unsaved changes are untouched. Save the workflow, then accept the plan again.',
+        },
+      });
+      return;
+    }
+
     patchMessage(msgId, { planStatus: { kind: 'running', message: 'Building workflow…' } });
-    // Fresh build-log message for this run; progress events stream into it.
-    // A re-run after a clarification gets its own log so partial prior logs
-    // stay visible as history.
-    const logMsgId = appendMessage({ role: 'assistant', kind: 'buildLog', ts: nowTs(), logs: [] });
-    buildLogRef.current = logMsgId;
+    // Pin this run. A resume after a clarification keeps the panel it already
+    // has (the resumed pass re-reports every prior step as `cached`, so the
+    // lines refresh in place) instead of opening a second one.
+    setPin((prev) => ({
+      convoId: activeId,
+      logs: prev?.logs || [],
+      status: 'running',
+      note: null,
+    }));
     try {
       const resp = await window.electronAPI.workflow.executeBuild({ plan });
       // Carry already-built nodes forward so the resumed build (after the user
-      // answers) skips them instead of rebuilding the whole plan from step 0.
-      const planForResume = resp?.builtSteps
-        ? { ...plan, builtSteps: { ...(plan.builtSteps || {}), ...resp.builtSteps } }
-        : plan;
+      // answers) skips them instead of rebuilding the whole plan from step 0 —
+      // along with the workflow id that attempt built under, so every attempt
+      // at this plan writes under one id instead of minting a fresh one and
+      // orphaning what the earlier attempts already wrote.
+      const carried = {};
+      if (resp?.builtSteps) carried.builtSteps = { ...(plan.builtSteps || {}), ...resp.builtSteps };
+      if (resp?.buildWorkflowId) carried.buildWorkflowId = resp.buildWorkflowId;
+      const planForResume = Object.keys(carried).length ? { ...plan, ...carried } : plan;
       if (resp?.needsClarification) {
         // Park the build, ask the user, keep the plan card in "running"
         // state with a clarifying-message status. A question raised by a SKILL
@@ -2433,6 +2872,15 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           ? { ...planForResume, pendingSkills: { ...(planForResume.pendingSkills || {}), [stepIndex]: resp.pendingSkill } }
           : planForResume;
         updateConvo(activeId, { pendingBuild: { msgId, plan: nextPlan } });
+        // The build isn't over — it's parked on the user. Keep it pinned so the
+        // panel is still there (and still filling in) when the answer resumes
+        // it, instead of stacking another build log into the thread.
+        setPin((prev) => ({
+          ...prev,
+          logs: prev?.logs || [],
+          status: 'waiting',
+          note: 'Waiting for your answer — the build resumes from here.',
+        }));
         patchMessage(msgId, {
           planStatus: {
             kind: 'running',
@@ -2460,6 +2908,14 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       if (resp?.code === 'MAX_TOKENS' && resp.resume) {
         const stepIndex = Number.isInteger(resp.stepIndex) ? resp.stepIndex : null;
         patchMessage(msgId, { planStatus: { kind: 'running', message: 'Paused — the AI ran out of room on this step.' } });
+        // Same as a clarification: parked, not finished — Continue resumes into
+        // this pin.
+        setPin((prev) => ({
+          ...prev,
+          logs: prev?.logs || [],
+          status: 'paused',
+          note: 'Paused — the AI ran out of room on this step. Continue to resume.',
+        }));
         appendMessage({
           role: 'assistant', error: true, ts: nowTs(),
           text: resp.message || 'The AI ran out of room while building this step.',
@@ -2470,6 +2926,8 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       }
       if (!resp?.success) {
         patchMessage(msgId, { planStatus: { kind: 'error', message: resp?.message || 'Build failed.' } });
+        // Terminal — the log becomes history so the user can see how far it got.
+        commitBuildPin();
         // When the failure was an AI reply that wasn't valid JSON, surface it
         // like the interactive nodes: a short message + an expandable "raw
         // response" node the user can open to inspect what came back.
@@ -2485,8 +2943,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         return;
       }
       const summary = `Built "${resp.workflowName}" — ${resp.nodeCount} node${resp.nodeCount === 1 ? '' : 's'}, ${resp.edgeCount} edge${resp.edgeCount === 1 ? '' : 's'}.`;
-      // Cap the build log so it renders as a finished list, not mid-build.
-      if (logMsgId) patchMessage(logMsgId, { done: true, summary });
+      // Terminal — the whole run (every pass, every resume) lands in the
+      // transcript as one finished log, and the pin clears.
+      commitBuildPin(summary);
 
       // Check the pipeline against the conversation before calling it done. A
       // failed review stops here: the plan card reports the mismatch and the
@@ -2538,14 +2997,15 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       }
     } catch (err) {
       patchMessage(msgId, { planStatus: { kind: 'error', message: `Build failed: ${err.message || String(err)}` } });
+      // Terminal — same as an unsuccessful response.
+      commitBuildPin();
       updateConvo(activeId, { pendingBuild: null });
-    } finally {
-      // Stop streaming into this log and freeze its last line (no perpetual
-      // spinner if the build paused for a clarification or errored).
-      if (logMsgId) patchMessage(logMsgId, { done: true });
-      buildLogRef.current = null;
     }
-  }, [appendMessage, patchMessage, updateConvo, activeId, onWorkflowBuilt, reviewChange]);
+    // No `finally` clearing the pin: the clarification and MAX_TOKENS branches
+    // return with the build still parked, and the panel has to survive that —
+    // it is what the resumed pass fills back in. Every path that ENDS the build
+    // calls commitBuildPin itself.
+  }, [appendMessage, patchMessage, updateConvo, activeId, onWorkflowBuilt, reviewChange, setPin, commitBuildPin]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // DISABLED — the skill subagent no longer exists as a separate channel. A
@@ -2582,6 +3042,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     if (!msgId) return;
     if (action === 'cancel-plan') {
       patchMessage(msgId, { planStatus: { kind: 'cancelled', message: 'Plan discarded.' } });
+      // Cancelling ends a parked build, so whatever it managed to build moves
+      // into the transcript as a record rather than vanishing with the pin.
+      commitBuildPin();
       updateConvo(activeId, { pendingBuild: null });
       return;
     }
@@ -2591,7 +3054,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       return;
     }
     await runBuild(plan, msgId);
-  }, [patchMessage, updateConvo, activeId, runBuild]);
+  }, [patchMessage, updateConvo, activeId, runBuild, commitBuildPin]);
 
   // Hand the conversation back to the main assistant, the same way a finished
   // build does (see runBuild's tail) minus the build. The session is what makes
@@ -2605,8 +3068,11 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // doesn't strand a plan the user still wants.
   const exitWorkflowAgent = useCallback(() => {
     if (!activeId) return;
+    // Leaving the builder abandons any parked build — commit its log so the
+    // pin doesn't outlive the session it belonged to.
+    commitBuildPin();
     updateConvo(activeId, { agentMode: 'main', workflowSession: null, pendingBuild: null });
-  }, [activeId, updateConvo]);
+  }, [activeId, updateConvo, commitBuildPin]);
 
   // Build a fresh user message with the workflow tag stamped in. `mode`
   // controls routing on the next chat:step turn (Edit/Retry pass it from
@@ -2628,6 +3094,46 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       ...(m === 'workflow' ? { workflowBuilder: true } : {}),
     };
   }, [activeConvo]);
+
+  /**
+   * The user's answer to "want me to make those changes?".
+   *
+   * Lives here rather than in handlePlanAction because it needs `makeUserMsg`,
+   * which is declared just above — a dependency array up there would read it
+   * before initialisation.
+   *
+   * "Fix it" does NOT apply anything directly. It writes the reviewer's edits
+   * into an ordinary user turn and sends it, so the correction goes through the
+   * same builder, review and approval path as any other request. The fix is
+   * then visible in the transcript as something the user asked for, and a fix
+   * that is itself wrong gets reviewed like anything else.
+   */
+  const handleReviewFix = useCallback((action, fix, msgId) => {
+    if (!msgId || !fix) return;
+    if (action === 'dismiss-review-fix') {
+      patchMessage(msgId, { reviewFix: { ...fix, state: 'dismissed' } });
+      return;
+    }
+    if (action !== 'apply-review-fix') return;
+    if (loading) return;
+    const edits = (fix.remediation || []).map((r) => `- ${r}`).join('\n');
+    if (!edits) return;
+    patchMessage(msgId, { reviewFix: { ...fix, state: 'sent' } });
+    const scope = fix.scope === 'node'
+      ? `the node currently in focus${fix.nodeIds?.length ? ` (${fix.nodeIds.join(', ')})` : ''}`
+      : 'this workflow';
+    // sendRef, not send: send is declared below this point. That is what the
+    // ref exists for — see its declaration.
+    //
+    // `fromReviewFix` is what makes the round counter honest. Only a click on
+    // this button sets it, so a user who reads the same verdict and types their
+    // own instruction instead is not counted as another remediation round —
+    // their message is a fresh brief, and `send` resets the counter on it.
+    sendRef.current?.([
+      ...messages,
+      { ...makeUserMsg(`Apply these corrections to ${scope}:\n${edits}`), fromReviewFix: true },
+    ]);
+  }, [patchMessage, loading, messages, makeUserMsg]);
 
   // Routing for a re-run (Edit / Retry).
   //
@@ -2683,8 +3189,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       pendingBuild: null,
     });
     setEditingMsgId(null);
-    send([...trimmed, userMsg]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    sendRef.current?.([...trimmed, userMsg]);
   }, [activeConvo, makeUserMsg, updateConvo, resumeRouting]);
 
   // Continue handler — the answer stopped at the model's output limit, so ask
@@ -2787,8 +3292,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       workflowSession: targetSession,
       pendingBuild: null,
     });
-    send([...trimmed, userMsg]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    sendRef.current?.([...trimmed, userMsg]);
   }, [activeConvo, makeUserMsg, updateConvo, resumeRouting]);
 
   // send() takes the full conversation as an array; the last element is the
@@ -2819,6 +3323,11 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     let userMsg = historyArray[historyArray.length - 1];
     const text = (userMsg?.text || '').trim();
     if (!text || userMsg?.role !== 'user') return;
+    // Every way a turn can start funnels through here — typed, suggestion,
+    // retry, edit-and-resubmit, and the review "Fix it" button — so this is the
+    // one place the remediation-round counter can be kept honest. Only the
+    // button flags its message; anything the user wrote themselves resets it.
+    fixRoundsRef.current = userMsg.fromReviewFix ? fixRoundsRef.current + 1 : 0;
     if (!window.electronAPI?.chat?.step) {
       appendMessage({
         role: 'assistant', error: true, ts: nowTs(),
@@ -2859,29 +3368,17 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
 
     const isFirstMessage = effHistory.length === 1;
     // Seed an immediate placeholder title from the user's text so the chat
-    // sidebar shows something useful right away; the AI-generated title
-    // replaces it below once the call returns.
+    // sidebar shows something useful right away. The real name arrives with the
+    // turn's answer as `chatTitle` — the main agent is asked for it in the same
+    // prompt (see chatTitleSection in public/chat/prompts.js), so there is no
+    // second call to make here. If the turn never reaches an answer, this
+    // placeholder is what the conversation keeps.
     const titleUpdate = isFirstMessage ? { title: titleFromMessage(text) } : {};
     const restartUpdate = wasRestarted
       ? { agentMode: 'main', workflowSession: null, pendingBuild: null }
       : {};
     updateConvo(activeId, { messages: effHistory, ...titleUpdate, ...restartUpdate });
     setInput('');
-
-    // First user message → ask the AI for a 3-5 word topic title and patch
-    // the conversation when it returns. Fire-and-forget; failures fall back
-    // to the synchronous placeholder set above.
-    if (isFirstMessage && window.electronAPI?.chat?.generateTitle) {
-      const convoToTitle = activeId;
-      (async () => {
-        try {
-          const resp = await window.electronAPI.chat.generateTitle({ message: text });
-          if (resp?.success && resp.title) {
-            updateConvo(convoToTitle, { title: resp.title });
-          }
-        } catch (_) { /* keep the placeholder title */ }
-      })();
-    }
 
     // If we're waiting on an answer from the user for an in-flight workflow
     // build (a builder threw ClarificationNeeded), the user's reply isn't
@@ -2938,15 +3435,24 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // derive the workflow-builder's Q/A trail (paired with the next user
     // message).
     const history = effHistory.slice(0, -1)
-      // don't replay tool/log turns — the model's own view of the run (including
-      // any code it had approved) lives in the scratchpad, not these bubbles.
-      // nodeRun is a control, not a turn: it has no text to replay.
-      .filter((m) => m.kind !== 'step' && m.kind !== 'buildLog' && m.kind !== 'nodeRun')
-      .map((m) => ({
-        role: m.role,
-        text: m.text,
-        ...(m.clarification ? { clarification: true } : {}),
-      }));
+      // buildLog and nodeRun are controls, not turns — no text, nothing to replay.
+      .filter((m) => m.kind !== 'buildLog' && m.kind !== 'nodeRun')
+      .map((m) => (
+        // `step` bubbles ARE replayed now. They carry the tool calls that
+        // produced the answer below them, and without them a follow-up question
+        // arrives with the conclusion but no record of how it was reached — the
+        // model then re-runs lookups it already did, or contradicts itself.
+        // The backend decides how much of each result survives (see
+        // historyStepTurns); the raw results are sent so that decision is made
+        // in one place, against real token counts.
+        m.kind === 'step'
+          ? { role: 'assistant', kind: 'step', stepIndex: m.stepIndex, thought: m.thought, actions: m.actions }
+          : {
+              role: m.role,
+              text: m.text,
+              ...(m.clarification ? { clarification: true } : {}),
+            }
+      ));
     const ctx = effectiveContext;
     const scratchpad = [];
     // Seed the agent mode + session from the user message's own stamps —
@@ -2990,6 +3496,30 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           break;
         }
 
+        // The planner reads the SAVED workflow, exactly as the build does, so a
+        // step that can plan is gated the same way — otherwise the agent
+        // proposes against a version the user has already moved past, and the
+        // plan is wrong before Accept is even offered.
+        //
+        // `agentMode === 'workflow'` is the sub-agent that does the planning
+        // (carried over from the PREVIOUS response, so it is known before this
+        // dispatch goes out), and `triggerPlanWorkflowBuild` is the batched
+        // plan_workflow_build the backend defers back to us. A workflow with
+        // nothing uncommitted answers immediately and opens nothing, so an
+        // ordinary follow-up in workflow mode is unaffected.
+        if (agentMode === 'workflow' || triggerPlanWorkflowBuild) {
+          const gate = await requestWorkflowSaveGate();
+          if (!gate.ok) {
+            appendMessage({
+              role: 'assistant', kind: 'final', ts: nowTs(),
+              text: gate.reason === 'invalid-workflow'
+                ? 'I left the workflow alone — it has unsaved changes that can\'t be saved yet (check the workflow name). Fix that, save, and ask me again.'
+                : 'Left the workflow untouched — your unsaved changes are still on the canvas. Save it and ask me again, and I\'ll plan against what you see now.',
+            });
+            break;
+          }
+        }
+
         let resp;
         try {
           resp = await window.electronAPI.chat.step({
@@ -3005,6 +3535,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             // dataSource). Follow-ups are handled through the node's chat
             // history, not a side clarifications structure.
             targetNode: withAppliedConfig(focusNodeRef.current, appliedNodeConfig),
+            // Asks the main prompt to name this conversation with its answer.
+            // Stays true for every step of this turn — the model only produces
+            // the title when it finally answers, which may be several steps in.
+            isNewChat: isFirstMessage,
           });
         } catch (err) {
           appendMessage({
@@ -3034,6 +3568,11 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           });
           break;
         }
+
+        // The main agent names a new conversation as part of its answer, so the
+        // title lands on whichever step finally answers. Replaces the
+        // placeholder seeded from the user's text when the send started.
+        if (resp.chatTitle) updateConvo(activeId, { title: resp.chatTitle });
 
         // A build_* tool built/refined the focused node OR committed follow-up
         // chat (partial) — hand it to WorkflowEditor to write onto the node.
@@ -3151,12 +3690,18 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         } : null;
 
         const hasActions = Array.isArray(resp.actions) && resp.actions.length > 0;
+        // The model's reasoning for this turn, when the provider exposes it
+        // (Claude today). It earns a step bubble on its own: the turn that ends
+        // with the answer calls no tools, and its thinking is the only record of
+        // how the answer was reached.
+        const thinking = typeof resp.thinking === 'string' ? resp.thinking.trim() : '';
         let stepMsgId = null;
-        if (hasActions || approval) {
+        if (hasActions || approval || thinking) {
           stepMsgId = appendMessage({
             role: 'assistant', kind: 'step', ts: nowTs(),
             stepIndex: resp.step?.index ?? scratchpad.length,
             thought: resp.thought,
+            ...(thinking ? { thinking } : {}),
             actions: resp.actions,
             ...(approval ? { approval } : {}),
           });
@@ -3297,6 +3842,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       cancelledRef.current = false;
     }
   }, [input, loading, messages, effectiveContext, activeId, activeConvo, restartedConvoIds, updateConvo, appendMessage, patchMessage, runBuild, reviewChange, settleApproval]);
+
+  // Edit / Retry reach send through this — see sendRef's declaration.
+  sendRef.current = send;
 
   // ── Floating launcher button ─────────────────────────────────────────────
   if (!open) {
@@ -3439,7 +3987,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
 
   // ── Body ─────────────────────────────────────────────────────────────────
   const Body = (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, overflow: 'hidden' }}>
+    <div
+      onContextMenu={showTextMenu}
+      style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, overflow: 'hidden' }}
+    >
       {Header}
       {/* One focus strip for everything the turn is scoped to: the workflow (or
           connection/execution) the user has open, and the node they clicked.
@@ -3500,7 +4051,13 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             <Bubble
               key={m.id || i}
               m={m}
-              onAction={handlePlanAction}
+              // The user has spoken since this offer was made — see lastUserIdx.
+              stale={i < lastUserIdx}
+              onAction={(action, payload, id) => (
+                action === 'apply-review-fix' || action === 'dismiss-review-fix'
+                  ? handleReviewFix(action, payload, id)
+                  : handlePlanAction(action, payload, id)
+              )}
               onEdit={handleEditMessage}
               onRetry={handleRetryMessage}
               onContinue={handleContinueMessage}
@@ -3544,6 +4101,11 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       // </div>
       // )}
       */}
+      {/* A build in flight sits here, between the thread and the composer —
+          right where the user is typing the answer it is waiting for. It stays
+          across every clarification pause and only enters the transcript when
+          the build ends. */}
+      <BuildPin run={buildRun?.convoId === activeId ? buildRun : null} />
       {/* While code awaits approval the turn is parked, not working — keep the
           composer live so "just type your next message" actually works. */}
       <Composer value={input} setValue={setInput}
