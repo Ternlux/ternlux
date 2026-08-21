@@ -130,6 +130,7 @@ Return your response in JSON format:
 {
   "action": "unrelateSkill" | "answer_directly" | "ask_questions" | "execute",
   "pythonCode": "Complete Python code (ONLY if action is 'execute')",
+  "targetColumns": [{"name": "col", "type": "TYPE"}],   // ONLY if action is 'execute': every column the code RETURNS, in order. Downstream nodes are configured from this, so it must match what transform() actually emits — "*" only if the shape is unchanged from the source
   "explanation": "Explanation of what you're doing or asking",
   "followUpQuestion": "Question for user (ONLY if action is 'ask_questions')",
   "directAnswer": "Answer to user's question (ONLY if action is 'answer_directly')",
@@ -180,6 +181,9 @@ Return your response in JSON format:
       return {
         action: 'execute',
         pythonCode: analysis.pythonCode,
+        // Declared output shape — the builder records it as the node's
+        // targetTableSchema when it cannot describe the result for real.
+        targetColumns: analysis.targetColumns ?? null,
         explanation: analysis.explanation,
         operationType
       };
@@ -371,7 +375,9 @@ Otherwise use standard SQL/NoSQL transformation.
       pluginManager,
       getFullConfig,
       appSqliteDbPath,
-      sqlitePool
+      sqlitePool,
+      helpers,
+      targetLocalPath = null
     } = params;
     const startTime = Date.now();
 
@@ -384,7 +390,26 @@ Otherwise use standard SQL/NoSQL transformation.
 
       if (isLocalFile) {
         // Local file - load directly
-        if (sourceConnection.dbType === 'nedb') {
+        if (sourceConnection.dbType === 'duckdb') {
+          // Every local file is a DuckDB source now — csv, json, parquet, avro,
+          // a workbook, or an upstream node's table in the workflow database.
+          // Without this branch a local source fell through to no branch at all
+          // and the Python ran against ZERO rows, reporting success.
+          const localPath = sourceConnection.localPath;
+          const recorded = sourceTableSchema.originalTableName || sourceTableSchema.tableName;
+          // A workflow database addresses its table by name; a workbook by its
+          // sheet — public/lib/duckdb.js registers one view per sheet. Any
+          // other file is registered under its own basename.
+          const addressedByName = /\.(duckdb|xlsx|xlsm)$/i.test(localPath);
+          const tableName = addressedByName
+            ? recorded
+            : path.basename(localPath, path.extname(localPath));
+          if (!tableName) throw new Error('No table recorded for the local source');
+          sourceData = await helpers.runQuery(
+            'duckdb', { query: `SELECT * FROM "${tableName}"` }, localPath,
+          );
+          console.log(`[Python Executor] Loaded ${sourceData.length} rows from ${tableName}`);
+        } else if (sourceConnection.dbType === 'nedb') {
           const Datastore = require('@seald-io/nedb');
           // NeDB doesn't use table names in queries, just the file path
           const db = new Datastore({ filename: sourceConnection.localPath, autoload: false });
@@ -593,107 +618,33 @@ if __name__ == '__main__':
 
       // Step 3: Save transformed data to local file
       const { data: transformedData, recordCount, executionTime } = result;
-      const isNoSQL = operationType === 'nosql';
-      const targetDbType = isNoSQL ? 'nedb' : 'sqlite';
+      // A node's output is a table in its workflow's own DuckDB database,
+      // whatever shape the transform had. It used to land in a NeDB file under
+      // the process's working directory, or in the app-wide SQLite — neither of
+      // which any current reader looks in, and the first of which is not even
+      // writable in a packaged app.
+      const targetDbType = 'duckdb';
 
       // Generate target table/collection name from node ID or use default
       const nodeId = params.nodeId || `transform_${Date.now()}`;
       const targetTableName = nodeId.replace(/-/g, '_').toLowerCase();
 
-      let localPath;
-      let targetPreviewSql;
+      // The workflow builder records targetLocalPath as the workflow's own
+      // database (workflow-data/<workflowId>.duckdb), so the result becomes a
+      // table there like every other node's output. An ad-hoc run with no path
+      // falls back to a standalone file beside it.
+      const localPath = targetLocalPath
+        || path.join(require('electron').app.getPath('userData'), 'workflow-data', `${targetTableName}.parquet`);
 
-      if (isNoSQL) {
-        // Save to NeDB - create specific directory for NeDB files
-        const outputDir = path.join(process.cwd(), 'data', 'skills', 'python-executor');
-        await fs.mkdir(outputDir, { recursive: true });
-        localPath = path.join(outputDir, `${targetTableName}.db`);
-        const Datastore = require('@seald-io/nedb');
-        const db = new Datastore({ filename: localPath });
+      const docs = Array.isArray(transformedData) ? transformedData : [transformedData];
+      await helpers.runQuery(
+        'duckdb',
+        { operation: 'insert', mode: 'replace', tableName: targetTableName, docs },
+        localPath,
+      );
+      console.log(`[Python Executor] Saved ${docs.length} row(s) to ${targetTableName} in ${localPath}`);
 
-        await new Promise((resolve, reject) => {
-          db.loadDatabase((err) => err ? reject(err) : resolve());
-        });
-
-        // Insert transformed data
-        const docsToInsert = Array.isArray(transformedData) ? transformedData : [transformedData];
-        await new Promise((resolve, reject) => {
-          db.insert(docsToInsert, (err, newDocs) => {
-            if (err) reject(err);
-            else resolve(newDocs);
-          });
-        });
-
-        console.log(`[Python Executor] Saved ${docsToInsert.length} documents to NeDB: ${localPath}`);
-
-        targetPreviewSql = JSON.stringify({
-          collection: targetTableName,
-          filter: {},
-          limit: 100
-        });
-      } else {
-        // Save to SQLite - use app-wide SQLite database
-        if (!appSqliteDbPath) {
-          throw new Error('App SQLite database path not provided');
-        }
-
-        if (!sqlitePool) {
-          throw new Error('SQLite connection pool not provided');
-        }
-
-        localPath = appSqliteDbPath;
-
-        // Use connection pool to write data
-        await sqlitePool.executeWrite(async (db) => {
-          // Infer schema from first record
-          const firstRecord = Array.isArray(transformedData) && transformedData.length > 0
-            ? transformedData[0]
-            : transformedData;
-
-          if (!firstRecord || typeof firstRecord !== 'object') {
-            throw new Error('Cannot create table: transformed data is not an object or array of objects');
-          }
-
-          // Drop table if exists
-          await new Promise((resolve, reject) => {
-            db.run(`DROP TABLE IF EXISTS ${targetTableName}`, (err) => {
-              if (err) reject(err);
-              else resolve();
-            });
-          });
-
-          // Create table
-          const columns = Object.keys(firstRecord).map(key => {
-            const value = firstRecord[key];
-            const type = typeof value === 'number'
-              ? (Number.isInteger(value) ? 'INTEGER' : 'REAL')
-              : 'TEXT';
-            return `${key} ${type}`;
-          }).join(', ');
-
-          const createTableSQL = `CREATE TABLE ${targetTableName} (${columns})`;
-          await new Promise((resolve, reject) => {
-            db.run(createTableSQL, (err) => err ? reject(err) : resolve());
-          });
-
-          // Insert data
-          const rowsToInsert = Array.isArray(transformedData) ? transformedData : [transformedData];
-          const columnNames = Object.keys(firstRecord);
-          const placeholders = columnNames.map(() => '?').join(', ');
-          const insertSQL = `INSERT INTO ${targetTableName} (${columnNames.join(', ')}) VALUES (${placeholders})`;
-
-          for (const row of rowsToInsert) {
-            const values = columnNames.map(col => row[col]);
-            await new Promise((resolve, reject) => {
-              db.run(insertSQL, values, (err) => err ? reject(err) : resolve());
-            });
-          }
-
-          console.log(`[Python Executor] Saved ${rowsToInsert.length} rows to SQLite: ${localPath}`);
-        });
-
-        targetPreviewSql = `SELECT * FROM ${targetTableName} LIMIT 100`;
-      }
+      const targetPreviewSql = `SELECT * FROM ${targetTableName} LIMIT 100`;
 
       // Build config object for TransformerNodeChat to save
       const sourceConfig = params.sourceNodeConfig || {};
@@ -718,13 +669,15 @@ if __name__ == '__main__':
         storagelocation: 'local',
         // Target configuration (local storage)
         targetConnectionId: `local-${targetDbType}`,
-        targetConnectionName: targetDbType === 'nedb' ? 'Local NeDB' : 'Local SQLite',
+        targetConnectionName: 'Local DuckDB',
         targetConnectionType: 'file',
         targetDbType: targetDbType,
         targetDbConfig: {},
         targetLocalPath: localPath,
-        targetTableName: isNoSQL ? undefined : targetTableName,
-        targetCollection: isNoSQL ? targetTableName : undefined,
+        // The result is a table whichever shape the transform had — a document
+        // store's collection is no longer a separate destination here.
+        targetTableName: targetTableName,
+        targetCollection: undefined,
         targetSchema: null,
         targetPreviewSql: targetPreviewSql,
 
