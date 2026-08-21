@@ -30,6 +30,7 @@ import {
 import DataPreview from './DataPreview';
 import WorkflowStepsEditor from './WorkflowStepsEditor';
 import { generateStepsFromNodes } from '../../utils/workflowUtils';
+import { persistedNameFor, withPersistedNodeNames } from './nodes/nodeCardShared';
 import { connectionsDb, executionsDb } from '../../utils/localDb';
 import axios from 'axios';
 
@@ -64,11 +65,70 @@ const initialEdges = [];
 // point by this much so they don't land on top of each other.
 const DROP_STACK_OFFSET = 48;
 
-const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest }) => {
+// Which CSS class a node carries while the AI builder is working on it. The
+// glow is applied to ReactFlow's node wrapper (not the card itself) so every
+// node type gets it without each one having to know about builds.
+const buildClassFor = (step) => {
+  if (!step) return '';
+  switch (step.status) {
+    case 'running': return 'wf-node-building';
+    // The build stopped on this node — it is waiting on an answer from the
+    // user, or it failed. A steady ring, not a pulse: nothing is happening.
+    case 'paused':  return 'wf-node-paused';
+    case 'failed':  return 'wf-node-failed';
+    default:        return 'wf-node-built';
+  }
+};
+
+// What the canvas banner says about the build in flight. A paused build is the
+// one worth spelling out: the canvas is showing a half-written workflow and
+// nothing is moving, and the reason is a question sitting in the chat.
+const buildBannerText = (live, runningLabel) => {
+  const total = live.totalSteps || live.nodes.length;
+  const built = Math.min(live.nodes.length, total);
+  switch (live.phase) {
+    case 'done':
+      return `Built ${live.nodes.length} node${live.nodes.length === 1 ? '' : 's'}`;
+    case 'paused':
+      return 'Paused — answer the assistant to continue building';
+    case 'failed':
+      return 'Build stopped — see the chat for what went wrong';
+    default:
+      return `Building${runningLabel ? ` ${runningLabel}` : ''} — ${built} of ${total}`;
+  }
+};
+
+// Size declared on live-build placeholder cards.
+//
+// ReactFlow measures a node on first render and reports the result back
+// through onNodesChange, expecting it to be written onto the node in state.
+// A placeholder is deliberately NOT in that state (see the live build overlay
+// below), so its measurement is dropped and it arrives "unmeasured" on every
+// render — and ReactFlow renders an unmeasured node with visibility:hidden
+// until it knows its size. That is a strobe, and a feedback loop with it: hide
+// → measure → report → new nodes array → hide again. Declaring the size up
+// front settles it. Every node card is a fixed 264px wide; the height is only
+// used for fitView bounds (edges are routed from measured handle positions),
+// so an approximation costs nothing.
+const PLACEHOLDER_NODE_WIDTH = 264;
+const PLACEHOLDER_NODE_HEIGHT = 96;
+const NO_GHOSTS = new Set();
+
+// Node types whose output only exists once the node has run, and which
+// therefore carry `config.executed` (see NodeExecution/workflowExecutionHelpers
+// markNodeExecuted). A data source reads something that already exists, so it
+// has nothing to flag.
+const EXECUTED_FLAG_NODE_TYPES = new Set(['transformer', 'join', 'output']);
+
+const WorkflowEditor = ({ workflow, liveBuild = null, onSave, onAutoSave, onCancel, onCloseRequest }) => {
   const reactFlowWrapper = useRef(null);
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const [reactFlowInstance, setReactFlowInstance] = useState(null);
+  // The AI builder is writing this workflow right now, or has paused mid-build
+  // waiting for the user to answer something. Either way the canvas is showing
+  // a workflow that isn't finished and isn't the user's to save or run yet.
+  const buildInFlight = !!liveBuild && (liveBuild.phase === 'building' || liveBuild.phase === 'paused');
   const [selectedNode, setSelectedNode] = useState(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [workflowName, setWorkflowName] = useState('');
@@ -121,6 +181,8 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   // After an explicit save completes (via the steps editor), perform this
   // deferred action: 'close' | 'execute' | null.
   const [pendingAction, setPendingAction] = useState(null);
+  // Resolver for an in-flight assistant save gate — see requestSaveGate.
+  const saveGateResolveRef = useRef(null);
 
   // Latest signals the on-disk code watcher reads to decide whether a
   // 'workflow:codeChanged' event should reload the canvas. `suppressUntil`
@@ -423,6 +485,7 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     }
   }, [onCloseRequest, handleCancel]);
 
+
   // A node can only be a parent (the source of a connection) once it has been
   // configured AND run — otherwise it has no output for the child node to
   // consume, and the failure only surfaces later as an opaque downstream error.
@@ -686,7 +749,21 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     }
   };
 
+  // Ids of live-build placeholder cards, readable from the click handlers.
+  // They're computed further down (with the overlay they belong to) and go
+  // through a ref because these callbacks are created above that point.
+  const ghostIdsRef = useRef(NO_GHOSTS);
+
   const onNodeClick = useCallback((event, node) => {
+    // A card the AI builder is still writing. It has no config and no edges
+    // yet — opening it would show an empty node panel and a preview
+    // complaining about missing inputs, describing the placeholder rather
+    // than the node being built. Say what it actually is instead.
+    if (ghostIdsRef.current.has(node.id)) {
+      message.info('This node is still being built — it will open once the build finishes.');
+      return;
+    }
+
     // Everything the clicked node is carrying — the raw node (position, data)
     // and its full config, chat transcript and schemas included, plus how it
     // is wired. Logged as live objects so the console can expand them.
@@ -719,6 +796,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   // Handle node context menu (right-click)
   const onNodeContextMenu = useCallback((event, node) => {
     event.preventDefault();
+    // Nothing on the menu (edit, rename, delete) applies to a card that is
+    // still being built.
+    if (ghostIdsRef.current.has(node.id)) return;
 
     setContextMenuNode(node);
     setContextMenu({
@@ -781,30 +861,38 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     setIsSidebarOpen(false);
   }, []);
   // console.log('nodes: ', selectedNode)
+  /**
+   * Merge a config onto a node and bring its derived name along.
+   *
+   * The name is re-derived here rather than only on save because it is read
+   * straight away — by the card, the panel header, the steps editor — and a name
+   * we derived earlier describes the config it was derived FROM. Point a data
+   * source at a different connection and the old name is simply wrong.
+   *
+   * Shared by both ways a config arrives: the chat builder's apply-node-config
+   * and the form panels' onConfigUpdate. They used to differ, which is why a
+   * chat-rebuilt transformer renamed itself and a form-configured data source
+   * did not.
+   */
+  const mergeConfigWithName = useCallback((node, config) => {
+    const next = { ...node, data: { ...node.data, config: { ...(node.data?.config || {}), ...config } } };
+    const name = persistedNameFor(next.type, next.data);
+    return name
+      ? { ...next, data: { ...next.data, config: { ...next.data.config, node_name: name, node_nameAuto: true } } }
+      : next;
+  }, []);
+
   // Handle node configuration updates
   const onNodeConfigUpdate = useCallback((nodeId, config) => {
     console.log('config: ', config)
-    setNodes((nds) =>
-      nds.map((node) => {
-        if (node.id === nodeId) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              config: {
-                ...node.data.config,
-                ...config
-              }
-            }
-          };
-        }
-        return node;
-      })
-    );
+    setNodes((nds) => nds.map((node) => (node.id === nodeId ? mergeConfigWithName(node, config) : node)));
+    // The open panel and the preview read `selectedNode`, not the nodes array,
+    // so without this the form that just saved keeps showing the old title.
+    setSelectedNode((prev) => (prev && prev.id === nodeId ? mergeConfigWithName(prev, config) : prev));
 
     // Trigger auto-save flag for sidebar changes
     setTriggerSidebarSave(true);
-  }, [setNodes]);
+  }, [setNodes, mergeConfigWithName]);
 
   // ── Chat-assistant node targeting ────────────────────────────────────────
   // Build the payload the ChatAssistant sends to chat:step as `targetNode`, so
@@ -843,6 +931,114 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   useEffect(() => { nodesRef.current = nodes; }, [nodes]);
   useEffect(() => { edgesRef.current = edges; }, [edges]);
 
+  // ── Live build overlay ────────────────────────────────────────────────────
+  //
+  // While the AI builder applies a plan it streams one event per node (see
+  // public/chat/workflowBuilder.js). Workflows.js accumulates them and hands
+  // the running graph down as `liveBuild`, which we draw ON TOP of the canvas:
+  // a card appears the moment a node's build starts, glows while the builder
+  // works on it, and settles when that step finishes.
+  //
+  // The overlay never touches `nodes` / `edges` state. That matters — those
+  // drive saving, execution, the steps editor and the unsaved-changes check,
+  // and a half-built placeholder must not reach any of them. It exists only in
+  // what we hand ReactFlow to render, and only for ids the real graph doesn't
+  // have yet: a node that already exists (a modify build, or the finished
+  // workflow after it reloads) keeps its real card and merely picks up the
+  // glow class. When there is no build in flight these are the state arrays
+  // themselves, identity included, so nothing about the editor changes.
+  const liveSteps = liveBuild?.nodes;
+
+  // Ids drawn only from the progress stream — nodes the real graph doesn't
+  // have yet. ReactFlow reports changes for them (it can't know they're not
+  // ours to keep); those are filtered out below rather than run through
+  // applyNodeChanges, which would rebuild the state array for nothing.
+  const ghostIds = useMemo(() => {
+    if (!liveSteps || liveSteps.length === 0) return NO_GHOSTS;
+    const real = new Set(nodes.map((n) => n.id));
+    const ids = liveSteps.filter((s) => s.id && s.type && !real.has(s.id)).map((s) => s.id);
+    return ids.length ? new Set(ids) : NO_GHOSTS;
+  }, [nodes, liveSteps]);
+  ghostIdsRef.current = ghostIds;
+
+  const displayNodes = useMemo(() => {
+    if (!liveSteps || liveSteps.length === 0) return nodes;
+    const stepById = new Map(liveSteps.map((s) => [s.id, s]));
+    const withGlow = nodes.map((n) => {
+      const cls = buildClassFor(stepById.get(n.id));
+      return cls ? { ...n, className: [n.className, cls].filter(Boolean).join(' ') } : n;
+    });
+    const placeholders = liveSteps
+      .filter((s) => ghostIds.has(s.id))
+      .map((s) => ({
+        id: s.id,
+        type: s.type,
+        position: s.position || { x: 0, y: 0 },
+        // An empty config is what an unconfigured node has, so every card
+        // renders its "not configured yet" state — which is exactly true.
+        data: { label: s.label || 'Node', config: {} },
+        className: buildClassFor(s),
+        // Declared rather than measured — see PLACEHOLDER_NODE_WIDTH.
+        width: PLACEHOLDER_NODE_WIDTH,
+        height: PLACEHOLDER_NODE_HEIGHT,
+        // Inert: it isn't a real node yet, so it can't be moved, wired,
+        // opened or deleted.
+        draggable: false,
+        selectable: false,
+        connectable: false,
+        deletable: false,
+      }));
+    return placeholders.length ? withGlow.concat(placeholders) : withGlow;
+  }, [nodes, liveSteps, ghostIds]);
+
+  // Drop ReactFlow's changes for placeholder nodes: they aren't in `nodes`, so
+  // applyNodeChanges can only discard them anyway — but it returns a fresh
+  // array every time it is called, and that new identity re-renders the canvas
+  // and re-triggers the measurement it just answered.
+  const handleNodesChange = useCallback((changes) => {
+    if (ghostIds.size === 0) { onNodesChange(changes); return; }
+    const own = changes.filter((c) => !ghostIds.has(c.id));
+    if (own.length) onNodesChange(own);
+  }, [onNodesChange, ghostIds]);
+
+  const liveEdges = liveBuild?.edges;
+  const displayEdges = useMemo(() => {
+    if (!liveSteps || liveSteps.length === 0 || !liveEdges?.length) return edges;
+    const have = new Set(edges.map((e) => `${e.source}->${e.target}`));
+    const extra = liveEdges
+      .filter((e) => e && e.source && e.target && !have.has(`${e.source}->${e.target}`))
+      .map((e) => ({
+        id: e.id || `live-${e.source}-${e.target}`,
+        source: e.source,
+        target: e.target,
+        animated: true,
+        selectable: false,
+        deletable: false,
+        focusable: false,
+        style: { stroke: '#3b82f6', strokeWidth: 2, strokeDasharray: '6 4' },
+      }));
+    return extra.length ? edges.concat(extra) : edges;
+  }, [edges, liveEdges, liveSteps]);
+
+  // The node the builder is on right now, for the canvas banner.
+  const buildingLabel = useMemo(() => {
+    const running = (liveSteps || []).find((s) => s.status === 'running');
+    return running ? (running.label || running.type || '') : '';
+  }, [liveSteps]);
+
+  // Keep the growing pipeline in frame. Each new node lands to the right of
+  // the last one, so without this the build quickly walks off screen — but
+  // only re-fit when the node COUNT changes, so the view doesn't fight the
+  // user panning around mid-build.
+  const liveNodeCount = liveSteps?.length || 0;
+  useEffect(() => {
+    if (!reactFlowInstance || liveNodeCount === 0) return;
+    const t = setTimeout(() => {
+      try { reactFlowInstance.fitView({ padding: 0.2, duration: 400 }); } catch (_) { /* view is optional */ }
+    }, 60);
+    return () => clearTimeout(t);
+  }, [liveNodeCount, reactFlowInstance]);
+
   // Broadcast the focused node to the ChatAssistant. It re-fires when the
   // node's config changes (e.g. right after a build) so the chat always has
   // the current SQL/JS for refinement. Clears focus when nothing is selected.
@@ -869,12 +1065,12 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     const handler = (e) => {
       const nb = e.detail;
       if (!nb || !nb.nodeId || !nb.config) return;
-      setNodes((prev) => prev.map((n) => n.id === nb.nodeId
-        ? { ...n, data: { ...n.data, config: { ...(n.data?.config || {}), ...nb.config } } }
-        : n));
-      setSelectedNode((prev) => (prev && prev.id === nb.nodeId
-        ? { ...prev, data: { ...prev.data, config: { ...(prev.data?.config || {}), ...nb.config } } }
-        : prev));
+      // Merge the built config, then re-derive the node's name from it: a
+      // rebuild that retargets a transformer should rename it, and the name
+      // has to be on the node before a run or save reads it.
+      const withName = (n) => mergeConfigWithName(n, nb.config);
+      setNodes((prev) => prev.map((n) => (n.id === nb.nodeId ? withName(n) : n)));
+      setSelectedNode((prev) => (prev && prev.id === nb.nodeId ? withName(prev) : prev));
       setHasUnsavedChanges(true);
       // `partial` = a follow-up chat commit (question/answer only), not a build.
       if (!nb.partial) {
@@ -884,7 +1080,7 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     };
     window.addEventListener('ternlux:apply-node-config', handler);
     return () => window.removeEventListener('ternlux:apply-node-config', handler);
-  }, [setNodes]);
+  }, [setNodes, mergeConfigWithName]);
 
   // Run one node on the chat assistant's behalf. The assistant holds the
   // approval UI but not the graph, so it asks here and we answer through the
@@ -910,7 +1106,12 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
             nodes: toCloneable(nodesRef.current, 'nodes'),
             edges: toCloneable(edgesRef.current, 'edges'),
           });
-          if (result?.success && handleDataPreviewRefresh) handleDataPreviewRefresh();
+          if (result?.success) {
+            // Before the refresh: the preview decides what it may query from
+            // this flag, so it must be on the node when the refresh arrives.
+            markNodesExecuted((n) => n.id === nodeId);
+            if (handleDataPreviewRefresh) handleDataPreviewRefresh();
+          }
           done(result || { success: false, message: 'No result returned.' });
         } catch (err) {
           done({ success: false, message: err.message || String(err) });
@@ -943,6 +1144,35 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   const handleDataPreviewRefresh = useCallback(() => {
     setDataPreviewRefreshTrigger(prev => prev + 1);
   }, []);
+
+  /**
+   * Mirror the executor's `config.executed` flag onto the canvas nodes.
+   *
+   * A transformer/join/output names its output table the moment it is built, so
+   * nothing in its config separates "this table exists" from "this table is
+   * planned" — which is how the Data Preview came to query a table no run had
+   * created yet. executeNode writes the flag to the saved workflow; the canvas
+   * keeps its own node objects, and the preview reads THOSE, so a run has to
+   * update them too or the preview stays blocked until the workflow reloads.
+   *
+   * `matches(node)` picks the nodes the run covered: all of them after a full
+   * run, one after a single-node run. Nothing is cleared here — a node whose
+   * output has gone stale is a save-time concern (see mergeConfigWithName), not
+   * a run-time one. This does NOT set hasUnsavedChanges: the run already wrote
+   * the same flag to disk, so the canvas is agreeing with the file.
+   */
+  const markNodesExecuted = useCallback((matches) => {
+    const stamp = (node) => {
+      if (!EXECUTED_FLAG_NODE_TYPES.has(node.type)) return node;
+      if (!matches(node)) return node;
+      const config = node.data?.config || {};
+      if (config.executed === true) return node;
+      return { ...node, data: { ...node.data, config: { ...config, executed: true } } };
+    };
+    setNodes((prev) => prev.map(stamp));
+    // The preview reads selectedNode, not the array, so it needs the flag too.
+    setSelectedNode((prev) => (prev ? stamp(prev) : prev));
+  }, [setNodes]);
 
   // A REST API data source has no form fields beyond the connection — once it
   // is saved the request itself is described in the chat. Close the form (the
@@ -1175,6 +1405,85 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     return true;
   };
 
+  /**
+   * The assistant's save gate.
+   *
+   * A build reads the workflow from the DATABASE, so canvas edits that were
+   * never saved are invisible to it — the agent would plan against a workflow
+   * the user is no longer looking at, and then overwrite their edits with the
+   * result. Rather than guess, the build asks here first.
+   *
+   * Resolves { ok: true } when there is nothing uncommitted (the common case,
+   * and no prompt is shown). Otherwise the user is asked to save through the
+   * Execution Steps editor — the same route Execute takes — and the answer
+   * decides: a committed save resolves { ok: true }, cancelling resolves
+   * { ok: false } and the caller abandons the build.
+   */
+  const requestSaveGate = useCallback(() => new Promise((resolve) => {
+    // This canvas is a build in progress — very likely one opened by that
+    // build itself. There are no user edits here to protect, and a build that
+    // paused to ask a question asks the gate again on the way back in: stopping
+    // it behind a save prompt would strand a half-built workflow that the user
+    // has no way to finish. Let it through.
+    if (buildInFlight) {
+      resolve({ ok: true, reason: 'live-build' });
+      return;
+    }
+    if (!hasUnsavedChanges && !tempStateSave) {
+      resolve({ ok: true, reason: 'clean' });
+      return;
+    }
+    // Only one gate can be open at a time; a second request while the editor
+    // is already up is answered by the same decision.
+    if (saveGateResolveRef.current) {
+      resolve({ ok: false, reason: 'already-prompting' });
+      return;
+    }
+    if (!validateWorkflow()) {
+      // e.g. missing name — the steps editor cannot commit, so don't open it.
+      resolve({ ok: false, reason: 'invalid-workflow' });
+      return;
+    }
+    saveGateResolveRef.current = resolve;
+    // Straight into the Execution Steps editor — the user sees the steps the
+    // assistant is about to plan against, and saving from there is what
+    // releases the build. No intermediate confirm: the only useful answers are
+    // "save" and "cancel", and both live in this editor.
+    message.info('Save your workflow first — the assistant plans against the saved version.');
+    setPendingAction('aiBuild');
+    setSaveAfterStepsEditor(true);
+    setIsStepsEditorOpen(true);
+  }), [buildInFlight, hasUnsavedChanges, tempStateSave, validateWorkflow]);
+
+  // The assistant lives outside this tree entirely (App renders it beside
+  // Workflows), so the gate is offered through a window event rather than
+  // threaded down four components — the same bridge the Settings request uses.
+  // When no editor is mounted nothing answers, and the caller proceeds: there
+  // is no open canvas, so there is nothing unsaved to lose.
+  // Read through a ref so the listener is registered ONCE. `requestSaveGate`
+  // changes on every render that touches the canvas (it closes over the
+  // unsaved flags), and re-binding a window listener on every node drag is
+  // needless churn.
+  const requestSaveGateRef = useRef(requestSaveGate);
+  requestSaveGateRef.current = requestSaveGate;
+
+  useEffect(() => {
+    const handler = (e) => { e.detail?.respond?.(requestSaveGateRef.current()); };
+    window.addEventListener('ternlux:workflow-save-gate', handler);
+    return () => window.removeEventListener('ternlux:workflow-save-gate', handler);
+  }, []);
+
+  // Settle whatever the gate is waiting on. Called from every path that ends
+  // the prompt so a caller is never left awaiting a promise that never
+  // resolves — including an editor unmount mid-decision.
+  const settleSaveGate = useCallback((ok, reason) => {
+    const resolve = saveGateResolveRef.current;
+    saveGateResolveRef.current = null;
+    if (resolve) resolve({ ok, reason });
+  }, []);
+
+  useEffect(() => () => settleSaveGate(false, 'editor-closed'), [settleSaveGate]);
+
   const handleSave = async (providedExecutionSteps = null) => {
     if (!validateWorkflow()) {
       return;
@@ -1206,11 +1515,18 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         }
       }
 
+      // Write each node's display name into its config before anything is
+      // serialized. The canvas derives a name on the fly; the execution log
+      // cannot — it is written in the main process from the SAVED workflow, so
+      // a name that lives only in the renderer shows up there as "Transformer".
+      const namedNodes = withPersistedNodeNames(nodes);
+      if (namedNodes !== nodes) setNodes(namedNodes);
+
       // Use provided execution steps, stored execution steps, or auto-generate if none exist
       let finalExecutionSteps = providedExecutionSteps || executionSteps;
-      if (!finalExecutionSteps.length && nodes.length > 0) {
+      if (!finalExecutionSteps.length && namedNodes.length > 0) {
         // Auto-generate execution steps using shared utility function
-        finalExecutionSteps = generateStepsFromNodes(nodes, edges);
+        finalExecutionSteps = generateStepsFromNodes(namedNodes, edges);
       }
 
       const workflowData = {
@@ -1219,9 +1535,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         id: currentWorkflowId || workflowScopeIdRef.current,
         name: workflowName,
         description: workflowDescription,
-        nodes: toCloneable(nodes, 'nodes'),
+        nodes: toCloneable(namedNodes, 'nodes'),
         edges: toCloneable(edges, 'edges'),
-        nodeCount: nodes.length,
+        nodeCount: namedNodes.length,
         type: 'Custom',
         final_dataset: toCloneable(finalDatasetS3Key, 'final_dataset'),
         executionSteps: finalExecutionSteps || []
@@ -1234,7 +1550,7 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       setInitialWorkflowState({
         name: workflowName,
         description: workflowDescription,
-        nodes,
+        nodes: namedNodes,
         edges
       });
       setHasUnsavedChanges(false);
@@ -1326,9 +1642,14 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         }
       }
 
+      // Names are persisted on every save, background ones included — see
+      // handleSave. An auto-save is what most runs read from.
+      const namedNodes = withPersistedNodeNames(nodes);
+      if (namedNodes !== nodes) setNodes(namedNodes);
+
       let finalExecutionSteps = executionStepsOverride || executionSteps;
-      if (!finalExecutionSteps.length && nodes.length > 0) {
-        finalExecutionSteps = generateStepsFromNodes(nodes, edges);
+      if (!finalExecutionSteps.length && namedNodes.length > 0) {
+        finalExecutionSteps = generateStepsFromNodes(namedNodes, edges);
       }
 
       const workflowData = {
@@ -1337,9 +1658,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         id: currentWorkflowId || workflowScopeIdRef.current,
         name: workflowName,
         description: workflowDescription,
-        nodes: toCloneable(nodes, 'nodes'),
+        nodes: toCloneable(namedNodes, 'nodes'),
         edges: toCloneable(edges, 'edges'),
-        nodeCount: nodes.length,
+        nodeCount: namedNodes.length,
         type: 'Custom',
         final_dataset: toCloneable(finalDatasetS3Key, 'final_dataset'),
         executionSteps: finalExecutionSteps || [],
@@ -1363,7 +1684,7 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       }
 
       if (executionStepsOverride) setExecutionSteps(finalExecutionSteps);
-      setInitialWorkflowState({ name: workflowName, description: workflowDescription, nodes, edges });
+      setInitialWorkflowState({ name: workflowName, description: workflowDescription, nodes: namedNodes, edges });
       setHasUnsavedChanges(false);
       setTempStateSave(!explicit);
       if (explicit) message.success('Workflow saved');
@@ -1551,6 +1872,13 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
   };
 
   const handleSaveWorkflow = () => {
+    // The builder saves the workflow itself when it finishes. Saving now would
+    // commit whatever half of it has reached the canvas — for a workflow being
+    // built from scratch, an empty one.
+    if (buildInFlight) {
+      message.warning('The assistant is still building this workflow — it saves itself when it finishes.');
+      return;
+    }
     // The Save button is always clickable (never silently disabled). Give clear
     // feedback instead of a dead "not-allowed" cursor.
     if (saving) {
@@ -1598,7 +1926,11 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
     setIsStepsEditorOpen(false);
     setSaveAfterStepsEditor(false);
     // Cancelling the steps editor abandons any deferred close/execute action.
+    const action = pendingAction;
     setPendingAction(null);
+    // Closing without saving is the assistant gate's "cancel": the build is
+    // abandoned and the canvas is left exactly as the user had it.
+    if (action === 'aiBuild') settleSaveGate(false, 'cancelled');
   };
 
   // Lightweight goal-drift check after an explicit save. Only fires when the
@@ -1654,7 +1986,13 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       const ok = await autoSave({ explicit: true, executionStepsOverride: savedExecutionSteps, outputValidation });
       const action = pendingAction;
       setPendingAction(null);
-      if (!ok) return; // save failed/validation — stay in the editor
+      if (!ok) {
+        // Save failed or failed validation — stay in the editor, and release a
+        // waiting build rather than leaving it hanging on a save that never
+        // landed.
+        if (action === 'aiBuild') settleSaveGate(false, 'save-failed');
+        return;
+      }
       // Goal-drift check: if we just saved a PRE-EXISTING validation function the
       // user did not regenerate, verify it still fits the (possibly edited)
       // workflow and offer to regenerate. Non-blocking; the deferred action still
@@ -1665,6 +2003,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         onCancel();
       } else if (action === 'execute') {
         doExecuteWorkflow();
+      } else if (action === 'aiBuild') {
+        // The workflow on disk now matches the canvas, so the build can read it.
+        settleSaveGate(true, 'saved');
       }
     } else {
       // Steps edited without an immediate save request — mark as unsaved so the
@@ -1679,6 +2020,10 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
    * Execution Steps) before running, so a run never executes unverified state.
    */
   const handleExecuteWorkflow = async () => {
+    if (buildInFlight) {
+      message.warning('The assistant is still building this workflow — wait for it to finish before running it.');
+      return;
+    }
     if (!nodes || nodes.length === 0) {
       message.warning('No nodes to execute');
       return;
@@ -1738,13 +2083,20 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
       const result = await window.electronAPI.workflow.executeWorkflow({
         workflowId: currentWorkflowId,
         workflowName: workflowName || 'Untitled Workflow',
-        nodes: toCloneable(nodes, 'nodes'),
+        // Named here as well: a run can start from edits that were never
+        // saved, and the log is written from exactly what we send.
+        nodes: toCloneable(withPersistedNodeNames(nodes), 'nodes'),
         edges: toCloneable(edges, 'edges'),
         executionSteps: toCloneable(finalExecutionSteps, 'executionSteps')
       });
 
       if (result.success) {
         message.success(`Workflow executed successfully! Execution ID: ${result.executionId}`);
+
+        // The run went through every step, so every node that writes an output
+        // now has one. Mirror the flag the executor wrote to the saved workflow
+        // onto the canvas, which is what the Data Preview reads.
+        markNodesExecuted(() => true);
 
         // Send success notification
         if (window.Notification && Notification.permission === 'granted') {
@@ -1978,9 +2330,9 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
         <ReactFlowProvider>
           <div className="react-flow-wrapper" ref={reactFlowWrapper} style={{ height: '100%' }}>
             <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={onNodesChange}
+              nodes={displayNodes}
+              edges={displayEdges}
+              onNodesChange={handleNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
               onInit={setReactFlowInstance}
@@ -2024,8 +2376,14 @@ const WorkflowEditor = ({ workflow, onSave, onAutoSave, onCancel, onCloseRequest
               {/* Workflow Info */}
               <Panel position="top-left">
                 <div className="workflow-toolbar">
-                  {nodes.length} nodes · {edges.length} connections
+                  {displayNodes.length} nodes · {displayEdges.length} connections
                 </div>
+                {liveBuild && (
+                  <div className={`wf-build-banner wf-build-banner--${liveBuild.phase}`}>
+                    <span className="wf-build-dot" />
+                    {buildBannerText(liveBuild, buildingLabel)}
+                  </div>
+                )}
               </Panel>
             </ReactFlow>
           </div>

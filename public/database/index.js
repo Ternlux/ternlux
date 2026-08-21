@@ -59,12 +59,68 @@ function kindFor(rawType) {
 }
 
 /**
- * Infer a display type per column from the first non-null value in each.
- * Connectors return column *names* from runQuery; the grid wants something to
- * show under the header and to decide right-alignment for numbers.
+ * Engine type name → the short label the grid puts under a column header, and
+ * whether the column right-aligns.
+ *
+ * Ordered, and matched against the START of the declared type, so
+ * `DECIMAL(18,4)` and `TIMESTAMP WITH TIME ZONE` land on their family without
+ * every dialect's spelling being enumerated.
  */
-function describeColumns(names, rows) {
+const DISPLAY_TYPES = [
+  [/^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT|INT|SERIAL|LONG)/i, 'integer', true],
+  [/^(FLOAT|DOUBLE|DECIMAL|REAL|NUMERIC|MONEY)/i, 'number', true],
+  [/^BOOL/i, 'boolean', false],
+  [/^(DATE|TIMESTAMP|TIME|INTERVAL)/i, 'date', false],
+  [/^(BLOB|BYTEA|BINARY|VARBINARY)/i, 'blob', false],
+  [/^MAP\(/i, 'map', false],
+  [/^STRUCT\(/i, 'struct', false],
+  [/^UNION\(/i, 'union', false],
+  [/^JSON/i, 'json', false],
+  [/^(VARCHAR|CHAR|TEXT|STRING|UUID|ENUM)/i, 'string', false],
+];
+
+/**
+ * The label for a DECLARED type, or null when there isn't one to read.
+ *
+ * Nothing here inspects a value: the whole point is that the engine already
+ * said what the column is. A MAP whose entries arrive as `[{key, value}]` is
+ * the case that made this necessary — by its value it looks like an array, and
+ * calling it one sends a reader looking for list functions that will not bind.
+ */
+function displayType(declared) {
+  const type = String(declared || '').trim();
+  if (!type) return null;
+  // A list is spelled as its ELEMENT type followed by `[]`, so it has to be
+  // recognised before the element type matches a family of its own.
+  if (/\[\]$/.test(type) || /^LIST\(/i.test(type)) return { type: 'list', numeric: false };
+  for (const [pattern, label, numeric] of DISPLAY_TYPES) {
+    if (pattern.test(type)) return { type: label, numeric };
+  }
+  // Something unmapped — show the engine's own word for it rather than
+  // "unknown", minus any parameters.
+  return { type: type.toLowerCase().split('(')[0].trim(), numeric: false };
+}
+
+/**
+ * A display type per column: the engine's declared type where the connector
+ * reports one, and otherwise inferred from the first non-null value.
+ *
+ * `runQuery` returns column NAMES, so sniffing was the only option and remains
+ * the fallback for connectors that report nothing more. It is a guess, and it
+ * guesses wrong in ways that matter: an all-null column reads as "unknown" and
+ * loses its right-alignment, and a DuckDB MAP reads as "array" because that is
+ * how its entries encode. A connector that also sends `columnTypes` gets the
+ * real answer instead.
+ */
+function describeColumns(names, rows, declaredTypes = null) {
+  const declared = new Map(
+    (Array.isArray(declaredTypes) ? declaredTypes : []).map((c) => [c.name, c.type]),
+  );
+
   return names.map((name) => {
+    const fromDeclared = displayType(declared.get(name));
+    if (fromDeclared) return { name, ...fromDeclared };
+
     let type = 'unknown';
     for (const row of rows) {
       const v = row ? row[name] : undefined;
@@ -139,6 +195,7 @@ function registerDatabaseIpc({ ipcMain, pluginManager, getFullConfig, getUserDat
         dbPath: conn.fileInfo.filePath,
         tables: conn.fileInfo.tables || null,
         tablePaths: conn.fileInfo.tablePaths || null,
+        tableSheets: conn.fileInfo.tableSheets || null,
         format: conn.fileInfo.format || null,
       };
     }
@@ -428,7 +485,9 @@ function registerDatabaseIpc({ ipcMain, pluginManager, getFullConfig, getUserDat
         success: true,
         ms,
         rows,
-        columns: describeColumns(names, rows),
+        // `columnTypes` is optional — a connector that reports the engine's own
+        // types gets them used; one that doesn't falls back to sniffing.
+        columns: describeColumns(names, rows, res.columnTypes),
         // rowCount is what the engine reported; rows.length is what we kept.
         rowCount: typeof res.rowCount === 'number' ? res.rowCount : allRows.length,
         // On a capped read the engine stopped early, so `truncated` is the

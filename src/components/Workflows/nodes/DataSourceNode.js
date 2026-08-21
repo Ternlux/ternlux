@@ -3,7 +3,7 @@ import { Handle, Position } from 'reactflow';
 import {
   DatabaseOutlined, ApiOutlined, FileOutlined, FileTextOutlined, FileExcelOutlined,
 } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, truncate } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate } from './nodeCardShared';
 import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
 import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
 import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
@@ -86,12 +86,10 @@ const DataSourceNode = ({ data, selected }) => {
 
   const SourceIconComponent = getSourceIcon(config);
 
-  const getDisplayName = () => {
-    if (config.sourceConnectionName) {
-      return config.sourceConnectionName;
-    }
-    return isConfigured ? 'Configured Data Source' : 'Data Source';
-  };
+  // Named by nodeDisplayName — the table/collection it reads beats the bare
+  // connection name, so two sources on one connection are told apart.
+  const getDisplayName = () =>
+    nodeDisplayName('dataSource', data, isConfigured ? 'Configured Data Source' : 'Data Source');
 
   const getSummary = () => {
     if (!isConfigured) return 'Click to configure data source';

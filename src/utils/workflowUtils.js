@@ -2,6 +2,8 @@
  * Utility functions for workflow processing
  */
 
+import { nodeDisplayName } from '../components/Workflows/nodes/nodeCardShared';
+
 /**
  * Generate execution order using DFS logic, including disconnected nodes
  * @param {Array} workflowNodes - Array of workflow nodes
@@ -85,8 +87,10 @@ export const generateStepsFromNodes = (workflowNodes, workflowEdges) => {
     const node = workflowNodes.find(n => n.id === nodeId);
     if (!node) return null;
 
-    // Get the appropriate label (node_name first, then connectionName, then fallback)
-    const nodeLabel = node.data?.config?.node_name || node.data?.config?.connectionName || node.data?.label || 'Unnamed';
+    // One naming rule for every surface — see nodeDisplayName. A node built
+    // through chat never gets its creation-time label rewritten, so the config
+    // is what names it.
+    const nodeLabel = nodeDisplayName(node.type, node.data, 'Unnamed');
     
     // Get the appropriate description based on node type
     let description = '';
@@ -110,20 +114,15 @@ export const generateStepsFromNodes = (workflowNodes, workflowEdges) => {
     };
   }).filter(Boolean); // Remove any null entries
 
-  // Ensure start node is first and output node is last
+  // Ensure start node is first. Output nodes stay where the graph order put
+  // them: a workflow can have several, and an output may legitimately sit
+  // mid-pipeline, so nothing is forced to the end.
   const startIndex = steps.findIndex(step => step.nodeType === 'start');
-  const outputIndex = steps.findIndex(step => step.nodeType === 'output');
 
   if (startIndex > 0) {
     // Move start to beginning
     const startStep = steps.splice(startIndex, 1)[0];
     steps.unshift(startStep);
-  }
-
-  if (outputIndex !== -1 && outputIndex < steps.length - 1) {
-    // Move output to end
-    const outputStep = steps.splice(outputIndex, 1)[0];
-    steps.push(outputStep);
   }
 
   // Update order property after reordering

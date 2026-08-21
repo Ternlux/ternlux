@@ -876,6 +876,7 @@ module.exports = {
       "explanation": "Brief explanation of the transformation approach",
       "operationType": "aggregation" | "filter" | "javascript",
       "nosqlOperation": "MongoDB aggregation pipeline array or filter object as JSON string",
+      "targetColumns": [{"name": "field", "type": "TYPE"}],   // EVERY top-level field the output documents have — downstream nodes are configured from this, so it must match what the operation actually emits ("*" if the fields are unchanged from the source)
       "transformFunction": "JavaScript function code as string (ONLY if operationType is 'javascript', otherwise null). Also still provide nosqlOperation for the query filter"
     }
 
@@ -886,6 +887,7 @@ module.exports = {
       "explanation": "Filter orders over $100 and project customer info",
       "operationType": "aggregation",
       "nosqlOperation": "[{ \\"$match\\": { \\"total\\": { \\"$gt\\": 100 } } }, { \\"$project\\": { \\"customerId\\": 1, \\"total\\": 1, \\"date\\": 1 } }]",
+      "targetColumns": [{"name": "_id", "type": "ObjectId"}, {"name": "customerId", "type": "string"}, {"name": "total", "type": "number"}, {"name": "date", "type": "date"}],
       "transformFunction": null
     }
 
@@ -894,6 +896,7 @@ module.exports = {
       "explanation": "Filter documents matching criteria",
       "operationType": "filter",
       "nosqlOperation": "{ \\"status\\": \\"active\\", \\"total\\": { \\"$gt\\": 100 } }",
+      "targetColumns": "*",
       "transformFunction": null
     }
 
@@ -962,6 +965,7 @@ module.exports = {
       "explanation": "Brief explanation of what will be deleted or updated and why",
       "operationType": "delete" | "update" | "javascript",
       "nosqlOperation": "For delete: filter object. For update: { \\"filter\\": {...}, \\"update\\": {...} }. For javascript: filter object as JSON string",
+      "targetColumns": [{"name": "field", "type": "TYPE"}],   // the collection's top-level fields AFTER the change, or "*" when the change adds no new field (plain delete / value update)
       "transformFunction": "JavaScript function code as string (ONLY if operationType is 'javascript', otherwise null)"
     }
 
@@ -972,6 +976,7 @@ module.exports = {
       "explanation": "Delete all cancelled orders from the collection",
       "operationType": "delete",
       "nosqlOperation": "{ \\"status\\": \\"cancelled\\" }",
+      "targetColumns": "*",
       "transformFunction": null
     }
 
@@ -980,6 +985,7 @@ module.exports = {
       "explanation": "Mark all old orders as archived",
       "operationType": "update",
       "nosqlOperation": "{ \\"filter\\": { \\"createdAt\\": { \\"$lt\\": \\"2024-01-01\\" } }, \\"update\\": { \\"$set\\": { \\"archived\\": true, \\"archivedDate\\": \\"{{current_date}}\\" } } }",
+      "targetColumns": [{"name": "_id", "type": "ObjectId"}, {"name": "createdAt", "type": "date"}, {"name": "archived", "type": "boolean"}, {"name": "archivedDate", "type": "date"}],
       "transformFunction": null
     }
 

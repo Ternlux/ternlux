@@ -4,3 +4,5 @@ dist-min
 build
 dev-logs
 .env
+# DuckDB extension binaries — fetched at build time by scripts/fetch-duckdb-extensions.js
+resources/duckdb-extensions/

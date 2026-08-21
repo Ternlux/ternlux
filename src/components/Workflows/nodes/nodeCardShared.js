@@ -141,6 +141,143 @@ export const describeNode = (type, config = {}) => {
   return '';
 };
 
+// ── Node display name ───────────────────────────────────────────────────────
+//
+// Every surface that names a node — the canvas card, the execution-steps
+// editor, the run log — used to roll its own precedence, and all of them
+// bottomed out on `data.label`. That label is written once at creation
+// (`getNodeLabel(type)` → "Transformer") and nothing updates it afterwards:
+// building a node through chat merges `config` only, so a canvas full of
+// configured nodes still reads "Transformer", "Transformer", "Data Source".
+//
+// So the config becomes the name when nothing better was chosen. It already
+// says what the node does, it updates itself every time the node is rebuilt,
+// and it needs no migration — existing saved workflows read correctly too.
+const GENERIC_LABELS = new Set(['start', 'data source', 'datasource', 'transformer', 'join', 'output', 'node', 'unnamed', '']);
+
+const isGenericLabel = (label) => GENERIC_LABELS.has(String(label || '').trim().toLowerCase());
+
+/** The dataset a node is named after, when neither a name nor a real label exists. */
+const derivedNameOf = (type, config = {}) => {
+  if (type === 'dataSource') {
+    // A source is identified by WHERE it reads from, not what it reads: the
+    // connection, the engine behind it, and the database on that engine. The
+    // table/collection is already on the card's summary line ("Reads orders"),
+    // and putting it here instead left two sources on different databases
+    // sharing one name. Segments that repeat each other (a connection named
+    // after its database, say) collapse to one.
+    const parts = [
+      config.sourceConnectionName || config.connectionName,
+      config.sourceDbType || config.sourceType || config.sourceConnectionType,
+      config.sourceDbConfig?.database || config.sourceDatabase,
+    ].filter(nonEmpty).map((p) => String(p).trim());
+    const seen = new Set();
+    const unique = parts.filter((p) => {
+      const key = p.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return unique.join(' · ') || sourceDatasetOf(config);
+  }
+  if (type === 'transformer') {
+    // In-place work writes nothing new — it IS its source table, so that is
+    // the only dataset that names it.
+    if (config.transformationSettings?.operationMode === 'in_place') {
+      return sourceDatasetOf(config) || targetDatasetOf(config);
+    }
+    return targetDatasetOf(config) || sourceDatasetOf(config);
+  }
+  if (type === 'join') return targetDatasetOf(config);
+  if (type === 'output') {
+    const os = config.outputSettings || config;
+    if (nonEmpty(os.tableName)) return os.tableName;
+    // A file output is named by its file, not the whole path.
+    if (nonEmpty(os.savePath)) return String(os.savePath).split(/[\\/]/).pop();
+  }
+  return '';
+};
+
+/**
+ * What to call a node, in one place so every surface agrees.
+ *
+ * Precedence: a name the USER chose wins, then a label that isn't just the node
+ * type, then whatever the config identifies, then a name we derived earlier,
+ * then the type itself.
+ *
+ * A name WE derived (`node_nameAuto`) deliberately ranks below a fresh
+ * derivation — it is a cache written for the main process, which cannot derive
+ * anything, not an authority. Ranked above one it went stale the moment the
+ * config moved on: repoint a data source at another connection and the card
+ * kept the old connection's name until the next save re-stamped it. Read as a
+ * cache it corrects itself immediately, and every workflow already saved with a
+ * stale one reads correctly with no migration. It still answers when nothing is
+ * derivable right now, so a node whose config is mid-edit keeps its name rather
+ * than flicking back to "Data Source".
+ *
+ * @param {string} type     Node type ('transformer' | 'join' | 'dataSource' | …).
+ * @param {Object} data     The node's `data` ({ label, config }).
+ * @param {string} fallback Shown when the node has nothing to name it yet.
+ */
+export const nodeDisplayName = (type, data = {}, fallback = 'Node') => {
+  const config = data.config || {};
+  const label = String(data.label || '').trim();
+  const stamped = nonEmpty(config.node_name) ? String(config.node_name).trim() : '';
+  if (stamped && !config.node_nameAuto) return stamped;
+  if (label && !isGenericLabel(label)) return label;
+  const derived = derivedNameOf(type, config);
+  if (derived) return derived;
+  return stamped || label || fallback;
+};
+
+// ── Persisting the name ─────────────────────────────────────────────────────
+//
+// Deriving at display time covers everything the renderer draws, but the
+// execution log is written by the main process from the SAVED workflow — it
+// has no access to this module and no chance to derive anything. So the name
+// is also written into the config, where the executor (and anything else
+// reading a saved workflow) can just read it.
+//
+// `node_nameAuto` records that WE wrote it. A name typed into the node's own
+// form carries no such flag and is never touched, while a name we derived
+// stays in step with the config it came from — rebuild a transformer onto a
+// different target table and the name follows.
+
+/**
+ * The name to persist onto a node, or null when there is nothing to write
+ * (nothing derivable yet, already correct, or a name the user owns).
+ */
+export const persistedNameFor = (type, data = {}) => {
+  const config = data.config || {};
+  if (nonEmpty(config.node_name) && !config.node_nameAuto) return null;
+  const label = String(data.label || '').trim();
+  const name = (label && !isGenericLabel(label)) ? label : derivedNameOf(type, config);
+  if (!name || name === config.node_name) return null;
+  return name;
+};
+
+/**
+ * Stamp derived names onto a node list. Returns the SAME array when nothing
+ * changed, so callers can use it as a cheap "did anything move" check and skip
+ * a redundant setNodes.
+ */
+export const withPersistedNodeNames = (nodes = []) => {
+  let changed = false;
+  const out = nodes.map((node) => {
+    const name = persistedNameFor(node?.type, node?.data);
+    if (!name) return node;
+    changed = true;
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        config: { ...(node.data?.config || {}), node_name: name, node_nameAuto: true },
+      },
+    };
+  });
+  return changed ? out : nodes;
+};
+
 /** Card summaries are one clamped paragraph — keep prose from running away. */
 export const truncate = (text, max = 100) => {
   const str = String(text || '').trim();

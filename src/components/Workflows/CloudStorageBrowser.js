@@ -62,9 +62,6 @@ const CloudStorageBrowser = ({
   const [selectedFile, setSelectedFile] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [downloadingFile, setDownloadingFile] = useState(false);
-  const [filePreview, setFilePreview] = useState(null);
-  const [availableSheets, setAvailableSheets] = useState([]);
-  const [selectedSheet, setSelectedSheet] = useState(null);
   const [processingFile, setProcessingFile] = useState(false);
   const [outputFileName, setOutputFileName] = useState('');
   const [continuationToken, setContinuationToken] = useState(null);
@@ -264,7 +261,6 @@ const CloudStorageBrowser = ({
       setCurrentPath([]);
       setObjects([]);
       setSelectedFile(null);
-      setFilePreview(null);
       setSearchTerm('');
       setContinuationToken(null);
       setHasMore(false);
@@ -272,7 +268,6 @@ const CloudStorageBrowser = ({
       // Back to container root
       setCurrentPath([]);
       setSelectedFile(null);
-      setFilePreview(null);
       loadObjects(getContainerIdentifier(currentContainer), '', true);
     } else if (index < currentPath.length) {
       // Navigate to specific folder
@@ -280,7 +275,6 @@ const CloudStorageBrowser = ({
       setCurrentPath(newPath);
       const folderPrefix = getFolderPrefix(newPath);
       setSelectedFile(null);
-      setFilePreview(null);
       loadObjects(getContainerIdentifier(currentContainer), folderPrefix, true);
     }
   };
@@ -364,7 +358,9 @@ const CloudStorageBrowser = ({
         return;
       }
 
-      // Determine file type and import to local storage
+      // A workbook no longer needs a sheet chosen here: the file is kept as a
+      // file, and every sheet in it is registered as a table the user picks
+      // between later — exactly as a workbook added from disk behaves.
       const fileName = selectedFile.name;
       const fileType = getLocalFileType(fileName);
 
@@ -373,24 +369,7 @@ const CloudStorageBrowser = ({
         return;
       }
 
-      // Check if it's Excel with multiple sheets
-      if (fileName.toLowerCase().endsWith('.xlsx') || fileName.toLowerCase().endsWith('.xls')) {
-        // Need to check sheets first
-        const sheets = await analyzeExcelFile(downloadResult.data);
-        if (sheets.length > 1) {
-          setAvailableSheets(sheets);
-          setFilePreview({ type: 'excel-multisheet', data: downloadResult.data });
-          setProcessingFile(false);
-          message.info('This Excel file has multiple sheets. Please select one.');
-          return;
-        } else if (sheets.length === 1) {
-          // Single sheet - proceed with import
-          await importFileToLocal(downloadResult.data, fileName, fileType, sheets[0]);
-        }
-      } else {
-        // Not Excel - import directly
-        await importFileToLocal(downloadResult.data, fileName, fileType, null);
-      }
+      await saveFileLocally(downloadResult.data, fileName);
     } catch (error) {
       console.error('Error downloading file:', error);
       message.error('Failed to download and import file');
@@ -400,87 +379,76 @@ const CloudStorageBrowser = ({
     }
   };
 
-  const analyzeExcelFile = async (fileData) => {
-    // This would use XLSX library to read sheet names
-    if (!window.electronAPI?.fileReaderEnhanced?.analyzeExcel) {
-      return ['Sheet1']; // Fallback
-    }
-
+  /**
+   * Keep the downloaded file, somewhere the user chooses, and register it as a
+   * local data source.
+   *
+   * It is no longer imported into the app's shared SQLite database — the file
+   * itself is the data source now, so DuckDB reads it in place, a workbook
+   * keeps all of its sheets, and the user has a real file they can open.
+   */
+  const saveFileLocally = async (fileData, fileName) => {
     try {
-      const result = await window.electronAPI.fileReaderEnhanced.analyzeExcel(fileData);
-      return result.sheets || ['Sheet1'];
-    } catch (error) {
-      console.error('Error analyzing Excel:', error);
-      return ['Sheet1'];
-    }
-  };
-
-  const importFileToLocal = async (fileData, fileName, fileType, sheetName) => {
-    try {
-      // Call electron API to import file to local SQLite/NeDB
-      if (!window.electronAPI?.cloudStorage?.importFile) {
-        message.error('Cloud storage import not available');
+      if (!window.electronAPI?.saveFileDialog || !window.electronAPI?.cloudStorage?.saveAndRegister) {
+        message.error('Saving cloud files is not available');
         return;
       }
 
-      // Convert sheetName to sheets array
-      // If sheetName is provided, only import that sheet; otherwise import all sheets
-      const sheets = sheetName ? [sheetName] : [];
+      const extension = fileName.includes('.') ? fileName.split('.').pop().toLowerCase() : '';
+      const chosen = await window.electronAPI.saveFileDialog(fileName, extension);
+      if (chosen.canceled || !chosen.filePath) return;
 
-      const result = await window.electronAPI.cloudStorage.importFile({
+      setProcessingFile(true);
+      const result = await window.electronAPI.cloudStorage.saveAndRegister({
         data: fileData,
-        fileName: fileName,
-        fileType: fileType,
-        sheets: sheets,
-        containerName: getContainerIdentifier(currentContainer),
-        connectionName: connection.name
+        targetPath: chosen.filePath,
       });
 
-      if (result.success) {
-        message.success('File imported successfully!');
-
-        // Include sheet name in file name if provided
-        const displayFileName = sheetName
-          ? `${fileName} (${sheetName})`
-          : fileName;
-
-        // Return the imported file info to parent component
-        onFileSelect({
-          fileName: displayFileName,
-          localPath: result.localPath,
-          dbType: result.dbType, // 'sqlite' or 'nedb'
-          tables: result.tables,
-          sheetName: sheetName, // Pass sheet name for reference
-          schemas: result.schemas || result.schema, // Pass schema(s) from import
-          cloudSource: {
-            connectionId: connection.id,
-            connectionName: connection.name,
-            dbType: connection.dbType,
-            containerName: getContainerIdentifier(currentContainer),
-            objectName: selectedFile.name,
-            objectKey: selectedFile.objectKey || selectedFile.name, // Use objectKey if available
-            objectPath: [...currentPath, selectedFile].map(p => p.name).join('/'),
-            sheetName: sheetName // Store sheet name for re-import
-          }
-        });
-
-        onClose();
-      } else {
-        message.error('Failed to import file: ' + result.message);
+      if (!result.success) {
+        message.error('Failed to save file: ' + result.message);
+        return;
       }
+
+      const tableNames = result.tables.map((t) => t.name);
+      const sheeted = result.tables.filter((t) => t.sheet);
+      message.success(
+        result.tables.length > 1
+          ? `Saved ${fileName} — ${result.tables.length} tables, read in place`
+          : `Saved ${fileName} — read in place, no import needed`,
+      );
+
+      onFileSelect({
+        fileName,
+        localPath: result.filePath,
+        // Every local file is read by DuckDB, whatever format it arrived in.
+        dbType: 'duckdb',
+        format: result.format,
+        tables: tableNames,
+        tablePaths: Object.fromEntries(result.tables.map((t) => [t.name, t.path])),
+        tableSheets: sheeted.length
+          ? Object.fromEntries(sheeted.map((t) => [t.name, t.sheet]))
+          : null,
+        schemas: result.tables.map((t) => t.schema).filter(Boolean),
+        cloudSource: {
+          connectionId: connection.id,
+          connectionName: connection.name,
+          dbType: connection.dbType,
+          containerName: getContainerIdentifier(currentContainer),
+          objectName: selectedFile.name,
+          objectKey: selectedFile.objectKey || selectedFile.name, // Use objectKey if available
+          objectPath: [...currentPath, selectedFile].map(p => p.name).join('/'),
+          // Where the file was saved, so a workflow run refreshes THIS file
+          // rather than importing a fresh copy somewhere the user cannot see.
+          localPath: result.filePath,
+        }
+      });
+
+      onClose();
     } catch (error) {
-      console.error('Error importing file:', error);
-      message.error('Failed to import file');
+      console.error('Error saving file:', error);
+      message.error('Failed to save file');
     } finally {
       setProcessingFile(false);
-    }
-  };
-
-  const handleSheetSelection = async (sheetName) => {
-    setSelectedSheet(sheetName);
-    if (filePreview && filePreview.type === 'excel-multisheet') {
-      setProcessingFile(true);
-      await importFileToLocal(filePreview.data, selectedFile.name, 'spreadsheet', sheetName);
     }
   };
 
@@ -849,25 +817,10 @@ const CloudStorageBrowser = ({
                 </Space>
               </Card>
 
-              {/* Sheet Selection for Excel */}
-              {availableSheets.length > 1 && (
-                <Card style={{ marginBottom: 16 }}>
-                  <Title level={5} style={{ fontSize: 14, marginBottom: 12 }}>Select Sheet</Title>
-                  <Select
-                    placeholder="Choose a sheet"
-                    style={{ width: '100%' }}
-                    value={selectedSheet}
-                    onChange={handleSheetSelection}
-                    disabled={processingFile}
-                  >
-                    {availableSheets.map(sheet => (
-                      <Option key={sheet} value={sheet}>{sheet}</Option>
-                    ))}
-                  </Select>
-                </Card>
-              )}
+              {/* A workbook needs no sheet chosen here any more: the file is
+                  saved whole and every sheet becomes a table. */}
 
-              {/* Import Button */}
+              {/* Save Button */}
               <Button
                 type="primary"
                 size="large"
@@ -875,12 +828,9 @@ const CloudStorageBrowser = ({
                 icon={<CloudDownloadOutlined />}
                 onClick={handleDownloadAndImport}
                 loading={downloadingFile || processingFile}
-                disabled={
-                  (availableSheets.length > 1 && !selectedSheet) ||
-                  !isSupportedFileType(selectedFile.name)
-                }
+                disabled={!isSupportedFileType(selectedFile.name)}
               >
-                {processingFile ? 'Importing...' : downloadingFile ? 'Downloading...' : 'Import File'}
+                {processingFile ? 'Saving...' : downloadingFile ? 'Downloading...' : 'Download File'}
               </Button>
 
               {!isSupportedFileType(selectedFile.name) ? (
@@ -889,7 +839,7 @@ const CloudStorageBrowser = ({
                 </Text>
               ) : (
                 <Text type="secondary" style={{ display: 'block', textAlign: 'center', marginTop: 12, fontSize: 12 }}>
-                  File will be imported to local storage
+                  You'll choose where to save it, then it's read in place
                 </Text>
               )}
             </div>

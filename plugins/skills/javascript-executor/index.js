@@ -378,6 +378,11 @@ function validateResult(parsed) {
       readyToExecute: true,
       transformFunction: parsed.transformFunction,
       outputType,
+      // The output shape the model declared. The builder records it as the
+      // node's targetTableSchema when it cannot describe the result for real,
+      // so downstream nodes see what this function produces rather than what
+      // it consumed.
+      targetColumns: parsed.targetColumns ?? null,
       explanation: parsed.explanation || ''
     };
   }
@@ -638,8 +643,15 @@ Ready to execute:
   "action": "execute",
   "transformFunction": "async function transform(records, ctx) { /* ... */ return outputRecords; }",
   "outputType": "${outputType}",
+  "targetColumns": [{"name": "col", "type": "TYPE"}],
   "explanation": "Short description"
 }
+
+\`targetColumns\` is every key present on the records your function RETURNS — the
+output shape, not the input's. Nodes downstream of this one are configured from
+it, so a key listed here that the function never sets becomes a reference to a
+column that does not exist. Use "*" only when the records pass through with their
+keys unchanged.
 
 If still unclear (rare at this stage):
 {
@@ -663,10 +675,14 @@ async function loadSourceRecords({ sourceConnection, sourceTableSchema, helpers 
   if (isLocal && sourceConnection.dbType === 'duckdb') {
     // A workflow database holds the upstream node's result as a named table.
     // A plain data file is addressable by its own basename — the name
-    // public/lib/duckdb.js registers it under.
+    // public/lib/duckdb.js registers it under. A WORKBOOK is the exception:
+    // it registers a view per sheet, so the recorded table name is what picks
+    // the sheet, and the file's basename would name only the first.
     const localPath = sourceConnection.localPath;
-    const tableName = /\.duckdb$/i.test(localPath)
-      ? (sourceTableSchema.originalTableName || sourceTableSchema.tableName)
+    const recorded = sourceTableSchema.originalTableName || sourceTableSchema.tableName;
+    const isWorkbook = /\.(xlsx|xlsm)$/i.test(localPath);
+    const tableName = (/\.duckdb$/i.test(localPath) || isWorkbook)
+      ? recorded
       : path.basename(localPath, path.extname(localPath));
     if (!tableName) throw new Error('No table recorded for the local source');
     return helpers.runQuery('duckdb', { query: `SELECT * FROM "${tableName}"` }, localPath);

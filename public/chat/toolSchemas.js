@@ -1,8 +1,9 @@
 /**
  * Provider-neutral JSON Schema tool definitions for the chat assistant.
  *
- * These mirror the tool contract written in prose inside buildMainSystemPrompt /
- * buildWorkflowSystemPrompt. The prose stays the long-form source of truth —
+ * These mirror the tool contract written in prose inside the `main` and
+ * `workflow` prompts (see chat/prompts.js). The prose stays the long-form
+ * source of truth —
  * it is still sent as the system prompt on both paths, and the JSON-in-text
  * fallback (local models, unknown OpenAI-compatible endpoints) has nothing else
  * to go on. What lives here is the machine-checkable part: names, argument
@@ -344,12 +345,13 @@ const VISUAL_SCHEMA = {
     y: { type: 'string', description: 'Column name for the y axis. Required with `source`.' },
     dataset: {
       type: 'array',
-      description: 'Inline data instead of `source`. Never provide both.',
-      items: {
-        type: 'object',
-        properties: { x: {}, y: { type: 'number' } },
-        required: ['x', 'y'],
-      },
+      // Chart types are validated at resolve time (rows without x/y degrade to
+      // a table), so the schema only has to be loose enough for both uses: a
+      // chart's { x, y } points, and a table's arbitrary row objects.
+      description: 'Inline data instead of `source`. Never provide both. Chart types take '
+        + '{ "x": <label>, "y": <number> } per item; a "table" takes any row objects, with '
+        + 'the keys you want as columns.',
+      items: { type: 'object' },
     },
   },
   required: ['type', 'title'],
@@ -364,6 +366,15 @@ const FINAL_ANSWER_TOOL = {
     properties: {
       answer: { type: 'string', description: 'The reply, in markdown.' },
       visuals: { type: 'array', maxItems: 3, items: VISUAL_SCHEMA },
+      // Present only on the first turn of a new chat, and only then does the
+      // system prompt ask for it (see chatTitleSection in prompts.js). Naming
+      // the conversation this way costs nothing; the standalone chatTitle
+      // prompt is the fallback for turns that never reach a final answer.
+      title: {
+        type: 'string',
+        description: 'Only when the system prompt asked you to name this conversation: a 3-5 word, '
+          + 'title-case topic name. Omit otherwise.',
+      },
     },
     required: ['answer'],
     additionalProperties: false,

@@ -37,6 +37,7 @@ import axios from 'axios';
 import Editor from '@monaco-editor/react';
 import CodeEditorPopup from '../Chat/CodeEditorPopup';
 import { getNodeExecutionOrder, generateStepsFromNodes } from '../../utils/workflowUtils';
+import { nodeDisplayName } from './nodes/nodeCardShared';
 
 const { Title, Text } = Typography;
 const { Option } = Select;
@@ -79,22 +80,16 @@ const DraggableStepItem = ({ step, index }) => {
     return NODE_TYPE_ICONS[step.nodeType] || <SettingOutlined />;
   };
 
-  const getStepTitle = () => {
-    // Priority: customName > config.node_name > nodeLabel > default
-    // console.log('step.config: ', step.config)
-    // Check if there's a node_name in the step's config
-    if (step.config?.node_name) {
-      return step.config.node_name;
-    }
-    
-    // Use nodeLabel if available
-    if (step.nodeLabel) {
-      return step.nodeLabel;
-    }
-    
-    // Fallback to node type
-    return `${NODE_TYPE_NAMES[step.nodeType] || 'Unknown'} - Unnamed`;
-  };
+  // Same naming rule as the canvas card (nodeDisplayName): an explicit name,
+  // else a label that isn't just the node type, else what the config says the
+  // node reads/writes. `nodeLabel` is the snapshot taken when the step was
+  // created, so it goes in as the label and loses to the config when it is
+  // nothing but the type name — which is why steps used to read "Transformer".
+  const getStepTitle = () => nodeDisplayName(
+    step.nodeType,
+    { label: step.nodeLabel, config: step.config },
+    `${NODE_TYPE_NAMES[step.nodeType] || 'Unknown'} - Unnamed`,
+  );
 
   return (
     <div
@@ -218,7 +213,7 @@ const WorkflowStepsEditor = ({
         // Create new step for missing node
         const node = workflowNodes.find(n => n.id === nodeId);
         if (node) {
-          const nodeLabel = node.data?.config?.node_name || node.data?.config?.connectionName || node.data?.label || 'Unnamed';
+          const nodeLabel = nodeDisplayName(node.type, node.data, 'Unnamed');
           
           let description = '';
           if (node.type === 'transformer') {
@@ -244,18 +239,14 @@ const WorkflowStepsEditor = ({
     });
     // console.log('mergedSteps: ', mergedSteps)
 
-    // Ensure start node is first and output node is last
+    // Ensure the start node is first. Output nodes keep whatever position the
+    // graph order gave them — there can be more than one, and none of them is
+    // required to be last.
     const startIndex = mergedSteps.findIndex(step => step.nodeType === 'start');
-    const outputIndex = mergedSteps.findIndex(step => step.nodeType === 'output');
 
     if (startIndex > 0) {
       const startStep = mergedSteps.splice(startIndex, 1)[0];
       mergedSteps.unshift(startStep);
-    }
-
-    if (outputIndex !== -1 && outputIndex < mergedSteps.length - 1) {
-      const outputStep = mergedSteps.splice(outputIndex, 1)[0];
-      mergedSteps.push(outputStep);
     }
 
     // Update order property after reordering
@@ -338,48 +329,46 @@ const WorkflowStepsEditor = ({
     if (over && active.id !== over.id) {
       setSteps((prevSteps) => {
         const draggedStep = prevSteps.find(step => step.id === active.id);
-        const targetStep = prevSteps.find(step => step.id === over.id);
 
-        // Prevent moving start or output nodes
-        if (draggedStep?.nodeType === 'start' || draggedStep?.nodeType === 'output') {
-          message.warning('Start and Output nodes cannot be reordered. Start must be first, Output must be last.');
+        // Start is the only pinned step — it has to run first. Output nodes are
+        // ordinary steps: a workflow can have several, and the user decides
+        // where each one runs (mid-pipeline exports are legitimate).
+        if (draggedStep?.nodeType === 'start') {
+          message.warning('The Start node must stay first.');
           return prevSteps;
         }
 
         const oldIndex = prevSteps.findIndex(step => step.id === active.id);
         const newIndex = prevSteps.findIndex(step => step.id === over.id);
+        const startIndex = prevSteps.findIndex(step => step.nodeType === 'start');
 
-        // Prevent dropping on start or output positions
-        if (newIndex === 0 || (targetStep?.nodeType === 'output')) {
-          message.warning('Cannot place nodes before Start or after Output.');
+        if (startIndex !== -1 && newIndex <= startIndex) {
+          message.warning('Nodes cannot be placed before the Start node.');
           return prevSteps;
         }
 
-        const reorderedSteps = arrayMove(prevSteps, oldIndex, newIndex);
-        
-        // Ensure start is still first and output is still last
-        const startIndex = reorderedSteps.findIndex(step => step.nodeType === 'start');
-        const outputIndex = reorderedSteps.findIndex(step => step.nodeType === 'output');
-
-        if (startIndex !== 0 && startIndex !== -1) {
-          const startStep = reorderedSteps.splice(startIndex, 1)[0];
-          reorderedSteps.unshift(startStep);
-        }
-
-        if (outputIndex !== -1 && outputIndex !== reorderedSteps.length - 1) {
-          const outputStep = reorderedSteps.splice(outputIndex, 1)[0];
-          reorderedSteps.push(outputStep);
-        }
-
         // Update order property
-        const finalSteps = reorderedSteps.map((step, index) => ({
+        const finalSteps = arrayMove(prevSteps, oldIndex, newIndex).map((step, index) => ({
           ...step,
           order: index
         }));
 
+        // The order is honored literally at run time, so a step that now sits
+        // ahead of a node it reads from will find no input. Say so — but keep
+        // the order the user chose.
+        const position = new Map(finalSteps.map((step, index) => [step.nodeId, index]));
+        const runsTooEarly = (edges || []).some(edge =>
+          position.has(edge.source) &&
+          position.has(edge.target) &&
+          position.get(edge.source) > position.get(edge.target)
+        );
+        if (runsTooEarly) {
+          message.warning('This order runs a step before a node it reads from — execution may fail.');
+        }
+
         // Mark as modified since user manually reordered
         setHasModifiedOrder(true);
-        
+
         return finalSteps;
       });
     }

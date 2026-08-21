@@ -116,10 +116,12 @@ const StartNodeChat = ({ node, initialConfig, currentWorkflowId, onSave, onCance
   const missingCount = Object.keys(missing).length;
   const invalid = (key) => attempted && !!missing[key];
 
-  // A configured node only re-saves once something changed; a fresh node can
-  // save straight away (Manual needs no input at all). Missing fields do NOT
-  // disable Save — clicking it is what reveals them.
-  const saveDisabled = saving || (!!saved && !dirty);
+  // Nothing edited, nothing to save — so the button stays disabled until
+  // something changes. It used to come up active the moment a fresh node was
+  // opened, inviting a save of a config the user had not touched. Missing
+  // fields do NOT disable Save once it IS live — clicking it is what reveals
+  // them.
+  const saveDisabled = saving || !dirty;
 
   // ── Path picker ──────────────────────────────────────────────────────────
 
@@ -373,7 +375,7 @@ const StartNodeChat = ({ node, initialConfig, currentWorkflowId, onSave, onCance
         saveDisabled={saveDisabled}
         saveDisabledReason={saving
           ? 'Registering the trigger — wait for it to finish.'
-          : 'Nothing has changed since the last save.'}
+          : 'Nothing has changed yet.'}
       />
     </FormScope>
   );

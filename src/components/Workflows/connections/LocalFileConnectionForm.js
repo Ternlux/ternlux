@@ -23,8 +23,13 @@ const IMPORT_BAND_START = 25;
 const IMPORT_BAND_SIZE = 65;
 const ROWS_HALFWAY = 250000; // rows at which a total-less import reads ~half done
 
-const importPercent = ({ phase, bytesRead, totalBytes, rows = 0 }) => {
+const importPercent = ({ phase, bytesRead, totalBytes, rows = 0, total = 0 }) => {
   if (phase === 'reading') return IMPORT_BAND_START;
+  // Registering a file describes its tables rather than reading its rows, so
+  // progress is how many of them are done — one step per sheet of a workbook.
+  if (phase === 'describing') {
+    return Math.round(IMPORT_BAND_START + IMPORT_BAND_SIZE * (total > 0 ? rows / total : 0));
+  }
   const ratio = (totalBytes > 0 && bytesRead >= 0)
     ? Math.min(1, bytesRead / totalBytes)
     : 1 - Math.exp(-rows / ROWS_HALFWAY);
@@ -90,10 +95,13 @@ const LocalFileConnectionForm = ({
       duckdb: [{ name: 'DuckDB Database', extensions: ['duckdb'] }],
       lancedb: [{ name: 'LanceDB Directory', extensions: ['lance'] }],
       json: [{ name: 'JSON Files', extensions: ['json'] }],
+      // No .xls or .xlsb: DuckDB reads a workbook as an OOXML zip, which the
+      // legacy binary formats are not. Offering them in the picker would only
+      // let a user get as far as the error.
       spreadsheet: [
-        { name: 'Spreadsheet Files', extensions: ['csv', 'xlsx', 'xls'] },
+        { name: 'Spreadsheet Files', extensions: ['csv', 'xlsx', 'xlsm'] },
         { name: 'CSV Files', extensions: ['csv'] },
-        { name: 'Excel Files', extensions: ['xlsx', 'xls'] }
+        { name: 'Excel Files', extensions: ['xlsx', 'xlsm'] }
       ],
       parquet: [{ name: 'Parquet Files', extensions: ['parquet'] }],
       avro: [{ name: 'Avro Files', extensions: ['avro'] }]
@@ -139,13 +147,20 @@ const LocalFileConnectionForm = ({
     }
   };
 
+  // Excel formats DuckDB cannot open, named so the rejection can say why and
+  // what to do about it rather than just listing what was expected.
+  const LEGACY_SPREADSHEETS = {
+    '.xls': 'Excel 97–2003 (.xls)',
+    '.xlsb': 'Binary Excel (.xlsb)',
+  };
+
   const isValidFileType = (filename) => {
     const validExtensions = {
       sqlite: ['.db', '.sqlite', '.sqlite3'],
       duckdb: ['.duckdb'],
       lancedb: ['.lance'],
       json: ['.json'],
-      spreadsheet: ['.csv', '.xlsx', '.xls'],
+      spreadsheet: ['.csv', '.xlsx', '.xlsm'],
       parquet: ['.parquet'],
       avro: ['.avro']
     };
@@ -154,7 +169,13 @@ const LocalFileConnectionForm = ({
     const valid = validExtensions[fileType].includes(ext);
 
     if (!valid) {
-      message.error(`Invalid file type. Expected: ${validExtensions[fileType].join(', ')}`);
+      if (LEGACY_SPREADSHEETS[ext]) {
+        message.error(
+          `${LEGACY_SPREADSHEETS[ext]} files aren't supported. Open the file in Excel and save it as .xlsx.`,
+        );
+      } else {
+        message.error(`Invalid file type. Expected: ${validExtensions[fileType].join(', ')}`);
+      }
     }
 
     return valid;
@@ -277,20 +298,22 @@ const LocalFileConnectionForm = ({
       let importedTables = null;
       let schemas = null; // Schema(s) reported by DuckDB
       let tablePaths = null; // table name -> the file DuckDB reads for it
-      let fileFormat = null; // what DuckDB reads it as: csv | json | parquet
+      let tableSheets = null; // table name -> sheet, for a workbook's tables
+      let fileFormat = null; // how DuckDB reads it: csv | json | parquet | xlsx | avro
 
       setUploading(true);
       setUploadProgress(10);
 
-      // Data files are no longer imported into a local database. They are
-      // registered by path and queried in place by DuckDB — so adding a file
-      // is instant regardless of its size. Excel and Avro are the exception:
-      // DuckDB can't read them, so they are converted to Parquet once here.
+      // Data files are no longer imported into a local database, and no longer
+      // converted either. Every supported format — including Excel and Avro,
+      // which DuckDB reads through extensions that ship with the app — is
+      // registered by path and queried in place, so adding a file is instant
+      // regardless of its size, and an edit goes back into the file itself.
       if (['spreadsheet', 'parquet', 'avro', 'json'].includes(fileType)) {
         setUploadProgress(IMPORT_BAND_START);
 
-        // Conversions stream in the main process and report progress back, so
-        // the bar tracks real rows rather than a timer.
+        // Registration reports each table it describes back from the main
+        // process, so a workbook's bar tracks real sheets rather than a timer.
         const importId = `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const unsubscribe = window.electronAPI?.onImportProgress
           ? window.electronAPI.onImportProgress((evt) => {
@@ -320,11 +343,16 @@ const LocalFileConnectionForm = ({
         targetFilePath = result.tables[0].path;
         importedTables = result.tables.map((t) => t.name);
         tablePaths = Object.fromEntries(result.tables.map((t) => [t.name, t.path]));
+        // Only a workbook has sheets; for everything else this stays null so
+        // the connector's config keeps the shape it had.
+        const sheeted = result.tables.filter((t) => t.sheet);
+        tableSheets = sheeted.length ? Object.fromEntries(sheeted.map((t) => [t.name, t.sheet])) : null;
         schemas = result.tables.map((t) => t.schema).filter(Boolean);
 
-        if (result.converted) {
-          const rows = result.tables.reduce((sum, t) => sum + (t.rowCount || 0), 0);
-          message.success(`Converted ${formatCount(rows)} rows to Parquet (${result.tables.length} table(s))`);
+        if (result.tables.length > 1) {
+          message.success(
+            `Added ${result.tables.length} sheets from ${fileName} — read in place, no import needed`,
+          );
         } else {
           message.success(`Added ${result.tables[0].name} — queried in place, no import needed`);
         }
@@ -376,11 +404,12 @@ const LocalFileConnectionForm = ({
           // the converted Parquet for Excel/Avro.
           filePath: targetFilePath,
           sourceFilePath: originalFilePath, // Always the file the user picked
-          format: fileFormat, // csv | json | parquet — how DuckDB reads it
+          format: fileFormat, // csv | json | parquet | xlsx | avro
           fileSize: null,
           uploadedAt: new Date().toISOString(),
           tables: importedTables, // Table (sheet) names belonging to this connection
-          tablePaths, // table name -> path, for multi-sheet workbooks
+          tablePaths, // table name -> path, when a connection spans several files
+          tableSheets, // table name -> sheet, for a multi-sheet workbook
           schemas: schemas, // Schema(s) reported by DuckDB
         },
         status: 'ready',
@@ -462,7 +491,7 @@ const LocalFileConnectionForm = ({
       duckdb: '.duckdb',
       lancedb: '.lance',
       json: '.json',
-      spreadsheet: '.csv,.xlsx,.xls',
+      spreadsheet: '.csv,.xlsx,.xlsm',
       parquet: '.parquet',
       avro: '.avro'
     };
@@ -617,7 +646,11 @@ const LocalFileConnectionForm = ({
               {importStatus
                 ? (importStatus.phase === 'reading'
                   ? 'Reading workbook...'
-                  : `Imported ${formatCount(importStatus.rows)} ${fileType === 'json' ? 'documents' : 'rows'}${importStatus.sheet ? ` from "${importStatus.sheet}"` : ''}...`)
+                  : importStatus.phase === 'describing'
+                    ? (importStatus.sheet
+                      ? `Reading sheet "${importStatus.sheet}"...`
+                      : 'Reading file...')
+                    : `Imported ${formatCount(importStatus.rows)} ${fileType === 'json' ? 'documents' : 'rows'}${importStatus.sheet ? ` from "${importStatus.sheet}"` : ''}...`)
                 : uploadProgress < IMPORT_BAND_START ? 'Reading file...' :
                   uploadProgress < 90 ? 'Importing data...' :
                   uploadProgress < 100 ? 'Finalizing...' :

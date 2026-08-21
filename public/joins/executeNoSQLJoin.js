@@ -156,18 +156,27 @@ async function executeNoSQLJoin({
     let insertResult;
 
     if (isLocalStorage) {
-      // Save to local NeDB
-      insertResult = await saveToLocalNeDB(
-        targetCollection,
-        joinedResults,
-        operationMode,
-        joinedResults.length,
-        targetLocalPath,
-        { workflowId, nodeId }
-      );
+      // A join's local result is a table in the workflow's own DuckDB database,
+      // the same as every other node output. It used to be written to a NeDB
+      // file, which nothing downstream reads any more.
+      const duck = require('../duckdb');
+      const table = targetCollection || `join_${String(nodeId || Date.now()).replace(/[^A-Za-z0-9_]/g, '_')}`;
+      const mode = operationMode === 'new_table' ? 'replace' : 'append';
 
-      if (!insertResult.success) {
-        throw new Error(insertResult.message);
+      if (joinedResults.length === 0) {
+        insertResult = { success: true, message: 'Join produced no documents', recordCount: 0 };
+      } else {
+        const { rowCount } = targetLocalPath && !workflowId
+          ? await duck.ingestRowsToTableAt(joinedResults, targetLocalPath, table, { mode })
+          : await duck.ingestRowsToTable(joinedResults, workflowId, table, { mode });
+        insertResult = {
+          success: true,
+          message: `Saved ${rowCount} document(s) to ${table}`,
+          recordCount: rowCount,
+          documentsInserted: rowCount,
+          localPath: workflowId ? duck.workflowDbPath(workflowId) : targetLocalPath,
+          targetTableName: table,
+        };
       }
     } else {
       // Insert into remote NoSQL database

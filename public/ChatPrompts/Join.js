@@ -73,15 +73,15 @@ Analyze the user's request and conversation history to determine the next steps.
   "skillExplanation": "Brief explanation of why this skill is being used (only if usesSkill is true)",
   "vectorRequired": false | true,   // true ONLY when this join needs runtime embedding / similarity search (Scenario B). Defaults to false. Read the user's intent — a vector source on its own does NOT imply vectorRequired.
   "inferredSettings": {
-    "destinationSelection": "connection_id or local-duckdb or local-lancedb" (optional; use local-lancedb when the user wants the result stored as a LOCAL vector table — embeddings / a lancedb table / similarity-searchable — and named no saved vector connection. Do NOT downgrade a requested local vector table to local-duckdb),
-    "operationMode": "new_table" | "merge_existing" (optional),
-    "targetTableName": "table_name" ${operationMode === 'new_table' ? '(REQUIRED for new_table mode)' : '(optional)'},
-    "joinType": "INNER" | "LEFT" | "FULL" (optional),
-    "joinColumns": [{"source1": "col", "source2": "col"}] (optional),
-    "selectedColumns": {"sourceLabel1": ["col1", "col2"], "sourceLabel2": ["col3"]} (optional)
+    "destinationSelection": "connection_id or local-duckdb or local-lancedb",   // optional; use local-lancedb when the user wants the result stored as a LOCAL vector table — embeddings / a lancedb table / similarity-searchable — and named no saved vector connection. Do NOT downgrade a requested local vector table to local-duckdb
+    "operationMode": "new_table" | "merge_existing",   // optional
+    "targetTableName": "table_name",   // ${operationMode === 'new_table' ? 'REQUIRED for new_table mode' : 'optional'}
+    "joinType": "INNER" | "LEFT" | "FULL",   // optional
+    "joinColumns": [{"source1": "col", "source2": "col"}],   // optional
+    "selectedColumns": {"sourceLabel1": ["col1", "col2"], "sourceLabel2": ["col3"]}   // optional; "*" as the only entry for a source means ALL of that source's columns — see below
   },
-  "followUpQuestion": "Single clear question to ask the user" (only if action is "ask_questions"),
-  "directAnswer": "answer if action is answer_directly" (optional),
+  "followUpQuestion": "Single clear question to ask the user",   // only if action is "ask_questions"
+  "directAnswer": "answer if action is answer_directly",   // only if action is "answer_directly"
   "reasoning": "explanation of decision"
 }
 
@@ -108,6 +108,9 @@ CRITICAL RULES FOR JOINS:
    c) Column Selection: Which columns to include in the final output
       - Ask: "Which columns do you want in the final table? Please specify from each source."
       - Example: "From customers: customer_id, name; From orders: order_id, total"
+      - \`["*"]\` means all of that source's columns (expanded from the list above).
+        Use it alone, never mixed with names, when the user wants everything from
+        a source. Otherwise name only columns the source actually has.
 
    d) Table Names and Context: Understanding what each source represents
       - If table names are unclear, ask: "Can you describe what data each source contains?"
@@ -169,6 +172,10 @@ User: "What columns are available in the first source?"
 → action: "answer_directly", directAnswer: "The first source contains these columns: ..."
 
 CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something or answer a question, put that text inside the "directAnswer" field and set "action" to "answer_directly" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
+
+The structure above is ANNOTATED, not literal: the "|" unions list the allowed values (pick ONE) and the "//" notes describe each field. Neither is part of the output. Your reply must be strict JSON — no comments, no "|", a comma between every pair of fields.
+
+Watch the nesting: "inferredSettings" contains ONLY destinationSelection, operationMode, targetTableName, joinType, joinColumns and selectedColumns. "reasoning", "followUpQuestion" and "directAnswer" are SIBLINGS of "inferredSettings" at the top level, never inside it. Before you send, check that the last character is the "}" that closes the outermost object, not the one that closes "inferredSettings".
   `,
 
   /**
@@ -196,6 +203,13 @@ Source ${idx + 1}: ${src.sourceNodeLabel || src.sourceNodeId}
 - In Destination DB: ${src.isInDestinationDb ? 'Yes (no temp table needed)' : 'No (needs temp table)'}
 - Required Fields: ${src.requiredFields.length > 0 ? src.requiredFields.join(', ') : 'None (reference existing table directly in joinSql)'}
 `).join('')}
+
+Column selection: in the TOP-LEVEL "selectedColumns" map, \`["*"]\` means all of
+that source's columns as listed above — use it when you carry a whole side
+through (a \`t1.*\` in joinSql must be \`["*"]\` here), alone, never mixed with
+column names. Otherwise list only columns the source actually has, or your own
+SQL aliases. The per-source "selectedColumns" array in "sourcesConfig" is a
+different field: explicit names only, "*" is never valid there.
 
 ${sources.some((s) => s.isSourceVector) ? `
 ## Vector source(s) detected — Scenario A (treat as a regular DB)
@@ -364,9 +378,8 @@ All sources are loaded into memory and joined using JavaScript.
     // For each source, include sourceNodeId and ONLY its required fields
     {
       "sourceNodeId": "...",
-      "nosqlOperation": "..." // If source is NoSQL: JSON string like {\\"collection\\": \\"users\\", \\"filter\\": {}}
-      // OR
-      "sql": "..." // If source is SQL: SELECT statement to fetch data. MUST end with {LIMIT_OFFSET_HERE} placeholder
+      "nosqlOperation": "...",   // EITHER, if the source is NoSQL: JSON string like {\\"collection\\": \\"users\\", \\"filter\\": {}}
+      "sql": "..."               // OR, if the source is SQL: SELECT statement to fetch data. MUST end with {LIMIT_OFFSET_HERE}. Emit "sql" or "nosqlOperation" for a source, never both
     }
   ],
   "javascriptFunction": "function joinData(source1Data, source2Data, ...) { /* join logic */ return results; }",
@@ -420,8 +433,11 @@ are no temp tables, no CREATE TABLE, and no INSERT. Write ONE SELECT.
 }
 
 The dialect is DuckDB (PostgreSQL-flavoured). Useful extras: SELECT * EXCLUDE
-(col), SELECT * REPLACE (expr AS col), QUALIFY, GROUP BY ALL. Nested values
-read as STRUCT/LIST — reach into them with dot notation (addr.city) or [1].
+(col), SELECT * REPLACE (expr AS col), QUALIFY, GROUP BY ALL. Nested values read
+as STRUCT (dot notation, addr.city), LIST (1-based index, items[1], or unnest()
+to expand to rows) or MAP (bracket by key, attrs['color']). A key/value object
+is a STRUCT when its keys are few and stable and a MAP once there are 200+
+distinct keys — the schema above says which, so read it rather than assume.
 
 Example 1 (two local files):
 {
@@ -463,14 +479,14 @@ External sources are loaded into temp tables. Sources already in destination are
     // For each source, include sourceNodeId and ONLY its required fields
     {
       "sourceNodeId": "...",
-      "tempTableName": "temp_node_xxx" // Only if needs temp table. For databases with schemas (Snowflake, PostgreSQL, etc.), use fully-qualified name matching DDL
-      "ddl": "CREATE TABLE temp_node_xxx (col1 TYPE, col2 TYPE, col3 TYPE)" // Columns in DDL MUST be in the SAME ORDER as selectedColumns. Table name MUST match tempTableName exactly
-      "sql": "SELECT col1, col2, col3 FROM ... {LIMIT_OFFSET_HERE}" // CRITICAL: Must end with {LIMIT_OFFSET_HERE} placeholder. Columns in SELECT MUST be in the SAME ORDER as selectedColumns
-      "nosqlOperation": "..." // If NoSQL source needing temp table: JSON string query
-      "selectedColumns": ["col1", "col2", "col3"] // Array defining column order - DDL, SQL, and this array MUST all match
+      "tempTableName": "temp_node_xxx",   // Only if needs temp table. For databases with schemas (Snowflake, PostgreSQL, etc.), use fully-qualified name matching DDL
+      "ddl": "CREATE TABLE temp_node_xxx (col1 TYPE, col2 TYPE, col3 TYPE)",   // Columns in DDL MUST be in the SAME ORDER as selectedColumns. Table name MUST match tempTableName exactly
+      "sql": "SELECT col1, col2, col3 FROM ... {LIMIT_OFFSET_HERE}",   // EITHER, for a SQL source: must end with {LIMIT_OFFSET_HERE}. Columns in SELECT MUST be in the SAME ORDER as selectedColumns
+      "nosqlOperation": "...",   // OR, for a NoSQL source needing a temp table: JSON string query. Emit "sql" or "nosqlOperation", never both
+      "selectedColumns": ["col1", "col2", "col3"]   // Array defining column order - DDL, SQL, and this array MUST all match
     }
   ],
-  "targetDdl": "CREATE TABLE ..." // Only if operationMode is "new_table", else null. MUST be a SINGLE CREATE TABLE statement ONLY — the execution engine already DROPs the target table before running this DDL, so do NOT prepend "DROP TABLE ...;" or include any other statement (a multi-statement string only has its FIRST statement executed, which would run the DROP and skip the CREATE),
+  "targetDdl": "CREATE TABLE ...",   // Only if operationMode is "new_table", else null. MUST be a SINGLE CREATE TABLE statement ONLY — the execution engine already DROPs the target table before running this DDL, so do NOT prepend a DROP statement or include any other statement (a multi-statement string only has its FIRST statement executed, which would run the DROP and skip the CREATE)
   "joinSql": "INSERT INTO target_table SELECT ... FROM temp_xxx t1 JOIN existing_table t2 ...",
   "previewSql": "SELECT * FROM ${destinationConfig.tableName} LIMIT 100",
   "joinColumns": [{"table1": "col", "table2": "col"}],
@@ -556,6 +572,8 @@ Based on the user's request and conversation history, determine:
 Note: Each table pair can have different join types (e.g., Table A INNER JOIN Table B, result LEFT JOIN Table C).
 
 CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. Only return the keys provided in this prompt, and put any explanation inside the JSON's "explanation" field. Any character outside the JSON object will break parsing and cause the request to fail.
+
+The output structures above are ANNOTATED, not literal: the "//" notes describe each field and are NOT part of the output. Your reply must be strict JSON — no comments, a comma between every pair of fields, and every "{" and "[" closed. Before you send, check that the LAST character is the "}" that closes the outermost object.
   `,
 
 };

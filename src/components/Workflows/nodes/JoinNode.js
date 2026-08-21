@@ -1,7 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { MergeOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, truncate } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate } from './nodeCardShared';
 
 const COLOR = '#d97706';
 const MONO = "'JetBrains Mono', monospace";
@@ -24,14 +24,9 @@ const JoinNode = ({ data, selected }) => {
     config.javascriptFunction
   );
 
-  // The node's own label names it — the destination table/collection it writes
-  // is the summary's job. A hand-dropped node starts on the generic type name,
-  // so that one case still defers to whatever the config was named.
-  const getDisplayName = () => {
-    const label = String(data.label || '').trim();
-    if (label && label.toLowerCase() !== 'join') return label;
-    return config.node_name || label || 'Join';
-  };
+  // Named by nodeDisplayName — see TransformerNode for why the config, not
+  // the creation-time label, is what names a node.
+  const getDisplayName = () => nodeDisplayName('join', data, 'Join');
 
   const getSummary = () => {
     if (!isConfigured) return 'Click to configure join operation';

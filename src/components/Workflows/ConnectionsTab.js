@@ -3,7 +3,6 @@ import { Modal, message } from 'antd';
 import axios from 'axios';
 
 import DataPreviewModal from './DataPreviewModal';
-import DataSourceUpload from './DataSourceUpload';
 import ConnectionTypeSelector from './ConnectionTypeSelector';
 
 import DynamicConnectionForm from './connections/DynamicConnectionForm';
@@ -12,7 +11,7 @@ import LocalFileConnectionForm from './connections/LocalFileConnectionForm';
 import DatabaseExplorer from '../DatabaseExplorer/DatabaseExplorer';
 
 import { connectionsDb } from '../../utils/localDb';
-import { C, MONO, SANS, I, Btn, Tag, MoreMenu, PageHeader, fullscreenModalProps } from './_designShared';
+import { C, MONO, SANS, I, Btn, Tag, MoreMenu, PageHeader } from './_designShared';
 import {
   detectFileType, collectDroppableFiles, fileDragHandlers, FileDropOverlay,
   LOCAL_FILE_FORM_TYPES, LOCAL_FILE_MODAL_TITLES,
@@ -321,10 +320,8 @@ const ConnectionsTab = ({
 }) => {
   const [connections, setConnections] = useState([]);
   const [isConnectionTypeSelectorOpen, setTypeSelectorOpen] = useState(false);
-  const [isUploadModalOpen, setUploadModalOpen] = useState(false);
   const [activeDbType, setActiveDbType] = useState(null);
   const [editingConnection, setEditingConnection] = useState(null);
-  const [editingSchema, setEditingSchema] = useState(null);
   const [previewData, setPreviewData] = useState(null);
   const [isPreviewOpen, setPreviewOpen] = useState(false);
   const [explorerConnection, setExplorerConnection] = useState(null);
@@ -445,7 +442,7 @@ const ConnectionsTab = ({
 
   // Anything modal that is already open owns the drop — see fileDragHandlers.
   const dropDisabled = Boolean(activeDbType) || Boolean(explorerConnection)
-    || isPreviewOpen || isUploadModalOpen || isConnectionTypeSelectorOpen;
+    || isPreviewOpen || isConnectionTypeSelectorOpen;
   const { onDragOver, onDragLeave } = useMemo(
     () => fileDragHandlers(setIsDragOver, dropDisabled), [dropDisabled]);
 
@@ -653,15 +650,11 @@ const ConnectionsTab = ({
       const fileType = connection.dbType === 'duckdb'
         ? (connection.fileType || 'spreadsheet')
         : (connection.dbType || connection.fileType);
-      if (LOCAL_FILE_FORM_TYPES.includes(fileType)) {
-        setActiveDbType(fileType);
-      } else {
-        setActiveDbType('spreadsheet');
-        setUploadModalOpen(true);
-      }
+      // A type with no form of its own opens in the spreadsheet form, which is
+      // where re-picking the file puts it right.
+      setActiveDbType(LOCAL_FILE_FORM_TYPES.includes(fileType) ? fileType : 'spreadsheet');
     } else {
       setActiveDbType('spreadsheet');
-      setUploadModalOpen(true);
     }
   };
 
@@ -697,13 +690,6 @@ const ConnectionsTab = ({
         }
       },
     });
-  };
-
-  const handleUploadComplete = () => {
-    fetchConnections();
-    setUploadModalOpen(false);
-    setEditingConnection(null);
-    message.success(editingConnection ? 'Data source updated.' : 'Data source created.');
   };
 
   const handlePreviewData = async (connection) => {
@@ -955,23 +941,6 @@ const ConnectionsTab = ({
         onClose={() => setTypeSelectorOpen(false)}
         onSelectType={handleConnectionTypeSelect}
       />
-
-      {/* Spreadsheet upload */}
-      <Modal
-        title={editingSchema ? 'Edit Data Schema' : editingConnection ? 'Edit Data Source' : 'Upload Spreadsheet'}
-        open={isUploadModalOpen}
-        onCancel={() => { setUploadModalOpen(false); setEditingConnection(null); setEditingSchema(null); }}
-        footer={null}
-        {...fullscreenModalProps()}
-        destroyOnClose
-      >
-        <DataSourceUpload
-          onUploadComplete={handleUploadComplete}
-          onCancel={() => { setUploadModalOpen(false); setEditingConnection(null); setEditingSchema(null); }}
-          editingConnection={editingConnection}
-          editingSchema={editingSchema}
-        />
-      </Modal>
 
       {/* Database connection form */}
       {ActiveForm && (

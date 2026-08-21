@@ -183,6 +183,10 @@ async function handleTransformSQL({
           // name the model's `FROM …` refers to.
           sourceTableName: config?.sourceTableName || config?.sourceTableSchema?.tableName || null,
           sourceFormat,
+          // The source is ALSO registered under this connection's own schema,
+          // so `FROM <connection>.<table>` — the form the Data Explorer's tree
+          // displays — resolves at run time as well as the bare name.
+          connectionName: config?.sourceConnectionName || null,
           workflowId,
           nodeId,
         };
@@ -421,16 +425,38 @@ async function handleTransformNoSQL({
           operationMode
         });
   
-        // If plugin indicates local storage is needed, save to local NeDB
+        // The plugin aggregated remotely and handed back documents to land
+        // locally. They go where every other node output goes: a table in this
+        // workflow's own DuckDB database. They used to become a NeDB file,
+        // which nothing downstream reads any more — the preview, joins and
+        // output nodes all address a node's result as a DuckDB table.
         if (result.needsLocalStorage && result.transformedDocs) {
-          return await saveToLocalNeDB(
-            targetCollection,
-            result.transformedDocs,
-            operationMode,
-            result.totalProcessed,
-            targetLocalPath,
-            { workflowId, nodeId }
-          );
+          const docs = Array.isArray(result.transformedDocs)
+            ? result.transformedDocs
+            : [result.transformedDocs];
+          if (docs.length === 0) {
+            return { success: true, message: 'Transformation produced no documents', recordCount: 0 };
+          }
+
+          const duck = require('../duckdb');
+          const table = targetCollection || `transform_${String(nodeId || Date.now()).replace(/[^A-Za-z0-9_]/g, '_')}`;
+          // `mode` mirrors what the NeDB path meant by operationMode: a new
+          // table replaces, anything else adds to what is already there.
+          const mode = operationMode === 'new_table' ? 'replace' : 'append';
+
+          const { rowCount } = targetLocalPath && !workflowId
+            ? await duck.ingestRowsToTableAt(docs, targetLocalPath, table, { mode })
+            : await duck.ingestRowsToTable(docs, workflowId, table, { mode });
+
+          return {
+            success: true,
+            message: `Saved ${rowCount} document(s) to ${table}`,
+            recordCount: rowCount,
+            documentsInserted: rowCount,
+            totalProcessed: result.totalProcessed || rowCount,
+            localPath: workflowId ? duck.workflowDbPath(workflowId) : targetLocalPath,
+            targetTableName: table,
+          };
         }
   
         return result;
@@ -747,7 +773,10 @@ async function handleExecuteJoin({
                   rows,
                   rows.length // Don't re-chunk, already chunked by loadSQLSourceInChunks
                 );
-              }
+              },
+              // Lets a local DuckDB source be resolved by path instead of
+              // through the connector, which cannot open one.
+              sourceConfig
             );
 
             console.log(`[SQL Join] Loaded ${totalInserted} rows from SQL source`);

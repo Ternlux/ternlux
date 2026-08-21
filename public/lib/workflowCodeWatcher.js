@@ -22,6 +22,45 @@ const fs = require('fs');
 // Key format: `${webContentsId}:${workflowId}` → chokidar watcher
 const activeCodeWatchers = new Map();
 
+// workflowId → timestamp until which this workflow's file events are OUR OWN.
+const selfWriteUntil = new Map();
+
+// How long after an app write its file events keep arriving. chokidar holds an
+// event back until the file has been quiet for `stabilityThreshold` (500ms
+// below), and a build persists a whole workflow's code in one go, so the window
+// has to outlast the slowest of those settles rather than the write itself.
+const SELF_WRITE_WINDOW_MS = 3000;
+
+/**
+ * Declare that the app is about to rewrite this workflow's code files.
+ *
+ * The watcher exists to catch EXTERNAL edits — an IDE, an AI tool, anything
+ * outside the app — and reload the canvas from them. A write the app made is
+ * never external: the editor already has that state, or is about to be handed
+ * it. Every such write funnels through the workflows-collection wrapper in
+ * electron.js, which externalizes node code on insert and update, so calling
+ * this there covers all of them: the AI builder persisting a node, an execution
+ * flagging one, and the editor's own save.
+ *
+ * Without it, a build that adds a node rewrites the code folder, chokidar
+ * reports it, and the editor reloads the workflow mid-build — repeatedly, once
+ * per write, while the build is still going.
+ */
+function suppressWorkflowCodeEvents(workflowId, ms = SELF_WRITE_WINDOW_MS) {
+  if (!workflowId) return;
+  const until = Date.now() + ms;
+  const current = selfWriteUntil.get(workflowId) || 0;
+  if (until > current) selfWriteUntil.set(workflowId, until);
+}
+
+function isSelfWrite(workflowId) {
+  const until = selfWriteUntil.get(workflowId);
+  if (!until) return false;
+  if (Date.now() < until) return true;
+  selfWriteUntil.delete(workflowId);
+  return false;
+}
+
 function watcherKey(webContentsId, workflowId) {
   return `${webContentsId}:${workflowId}`;
 }
@@ -67,6 +106,8 @@ function watchWorkflowCode(params, notify) {
     });
 
     const onChange = (event) => (filePath) => {
+      // Our own write coming back at us — the editor is already in step with it.
+      if (isSelfWrite(workflowId)) return;
       console.log(`[CodeWatch] ${event} detected for ${workflowId}: ${filePath}`);
       try {
         notify({ workflowId, event, path: filePath });
@@ -138,4 +179,5 @@ module.exports = {
   unwatchWorkflowCode,
   unwatchAllForWebContents,
   stopAllCodeWatchers,
+  suppressWorkflowCodeEvents,
 };

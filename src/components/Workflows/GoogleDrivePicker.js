@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { message, Modal, Select } from 'antd';
-
-const { Option } = Select;
+import { message } from 'antd';
 
 /**
  * Google Drive Picker Component
@@ -12,10 +10,7 @@ const GoogleDrivePicker = ({ connection, onFileSelect, onClose }) => {
   const [loadingPicker, setLoadingPicker] = useState(false);
   const [downloadingFile, setDownloadingFile] = useState(false);
   const [processingFile, setProcessingFile] = useState(false);
-  const [availableSheets, setAvailableSheets] = useState([]);
-  const [selectedSheet, setSelectedSheet] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
-  const [filePreview, setFilePreview] = useState(null);
 
   // Load Google Picker API
   useEffect(() => {
@@ -193,103 +188,83 @@ const GoogleDrivePicker = ({ connection, onFileSelect, onClose }) => {
     // Create a temporary file object for metadata
     const fileObject = { name: fileName, data, contentType };
 
-    // For Excel files, analyze sheets
-    if (['xlsx', 'xls'].includes(fileExtension)) {
-      try {
-        const sheetResult = await window.electronAPI.cloudStorage.analyzeExcelFile(data);
-        if (sheetResult.success && sheetResult.sheets.length > 0) {
-          if (sheetResult.sheets.length > 1) {
-            // Multiple sheets - let user select
-            setAvailableSheets(sheetResult.sheets);
-            setSelectedFile(fileObject);
-            setFilePreview({ type: 'excel-multisheet', data, fileName });
-            setProcessingFile(false);
-            message.info('This Excel file has multiple sheets. Please select one.');
-            return;
-          } else {
-            // Single sheet - import directly
-            setSelectedFile(fileObject);
-            setProcessingFile(true);
-            await importFileToLocal(data, fileName, localFileType, sheetResult.sheets[0]);
-            return;
-          }
-        }
-      } catch (error) {
-        console.error('Excel analysis error:', error);
-      }
-    }
-
-    // Import the file directly for non-Excel files
+    // A workbook is no longer analysed for its sheets here. It is saved whole
+    // and registered, and every sheet in it becomes a table — so there is
+    // nothing to choose between at download time.
     setSelectedFile(fileObject);
-    setProcessingFile(true);
-    await importFileToLocal(data, fileName, localFileType, null);
+    await saveFileLocally(data, fileName);
   };
 
-  const importFileToLocal = async (fileData, fileName, fileType, sheetName) => {
+  /**
+   * Keep the downloaded file where the user asks, then register it as a local
+   * data source — the same treatment a file picked off disk gets.
+   *
+   * Nothing is imported into the app's SQLite database any more. A Google Sheet
+   * exported as .xlsx lands as a real workbook the user owns, and every one of
+   * its sheets becomes a table DuckDB reads in place.
+   */
+  const saveFileLocally = async (fileData, fileName) => {
     try {
-      // Call electron API to import file to local SQLite/NeDB
-      if (!window.electronAPI?.cloudStorage?.importFile) {
-        message.error('Cloud storage import not available');
+      if (!window.electronAPI?.saveFileDialog || !window.electronAPI?.cloudStorage?.saveAndRegister) {
+        message.error('Saving Drive files is not available');
         return;
       }
 
-      const result = await window.electronAPI.cloudStorage.importFile({
+      const extension = fileName.includes('.') ? fileName.split('.').pop().toLowerCase() : '';
+      const chosen = await window.electronAPI.saveFileDialog(fileName, extension);
+      if (chosen.canceled || !chosen.filePath) return;
+
+      setProcessingFile(true);
+      const result = await window.electronAPI.cloudStorage.saveAndRegister({
         data: fileData,
-        fileName: fileName,
-        fileType: fileType,
-        sheetName: sheetName,
-        containerName: 'root',
-        connectionName: connection.name
+        targetPath: chosen.filePath,
       });
 
-      if (result.success) {
-        message.success('File imported successfully!');
-
-        // Include sheet name in file name if provided
-        const displayFileName = sheetName
-          ? `${fileName} (${sheetName})`
-          : fileName;
-
-        // Return the imported file info to parent component
-        onFileSelect({
-          fileName: displayFileName,
-          localPath: result.localPath,
-          dbType: result.dbType, // 'sqlite' or 'nedb'
-          tables: result.tables,
-          sheetName: sheetName, // Pass sheet name for reference
-          schemas: result.schemas || result.schema, // Pass schema(s) from import
-          cloudSource: {
-            connectionId: connection.id,
-            connectionName: connection.name,
-            containerName: 'root',
-            objectName: fileName,
-            objectPath: fileName
-          }
-        });
-
-        onClose();
-      } else {
-        message.error('Failed to import file: ' + result.message);
+      if (!result.success) {
+        message.error('Failed to save file: ' + result.message);
+        return;
       }
+
+      const sheeted = result.tables.filter((t) => t.sheet);
+      message.success(
+        result.tables.length > 1
+          ? `Saved ${fileName} — ${result.tables.length} tables, read in place`
+          : `Saved ${fileName} — read in place, no import needed`,
+      );
+
+      onFileSelect({
+        fileName,
+        localPath: result.filePath,
+        dbType: 'duckdb',
+        format: result.format,
+        tables: result.tables.map((t) => t.name),
+        tablePaths: Object.fromEntries(result.tables.map((t) => [t.name, t.path])),
+        tableSheets: sheeted.length
+          ? Object.fromEntries(sheeted.map((t) => [t.name, t.sheet]))
+          : null,
+        schemas: result.tables.map((t) => t.schema).filter(Boolean),
+        cloudSource: {
+          connectionId: connection.id,
+          connectionName: connection.name,
+          containerName: 'root',
+          objectName: fileName,
+          objectPath: fileName,
+          localPath: result.filePath,
+        }
+      });
+
+      onClose();
     } catch (error) {
-      console.error('Error importing file:', error);
-      message.error('Failed to import file');
+      console.error('Error saving file:', error);
+      message.error('Failed to save file');
     } finally {
       setProcessingFile(false);
     }
   };
 
-  const handleSheetSelection = async (sheetName) => {
-    setSelectedSheet(sheetName);
-    if (filePreview && filePreview.type === 'excel-multisheet') {
-      setProcessingFile(true);
-      await importFileToLocal(filePreview.data, filePreview.fileName, 'spreadsheet', sheetName);
-    }
-  };
-
   const isSupportedFileType = (fileName) => {
     const name = fileName.toLowerCase();
-    const supportedTypes = ['.csv', '.xlsx', '.xls', '.json', '.sqlite', '.db', '.parquet', '.avro', '.nedb'];
+    const supportedTypes = ['.csv', '.xlsx', '.xls', '.json', '.sqlite', '.db', '.parquet', '.avro', '.duckdb'];
     return supportedTypes.some(ext => name.endsWith(ext));
   };
 
@@ -308,45 +283,15 @@ const GoogleDrivePicker = ({ connection, onFileSelect, onClose }) => {
     if (name.endsWith('.csv') || name.endsWith('.xlsx') || name.endsWith('.xls')) return 'spreadsheet';
     if (name.endsWith('.json')) return 'json';
     if (name.endsWith('.sqlite') || name.endsWith('.db')) return 'sqlite';
-    if (name.endsWith('.nedb')) return 'nedb';
+    if (name.endsWith('.duckdb')) return 'duckdb';
     if (name.endsWith('.parquet')) return 'parquet';
     if (name.endsWith('.avro')) return 'avro';
     return null;
   };
 
-  // Show sheet selection modal if needed
-  const showSheetSelectionModal = () => {
-    Modal.confirm({
-      title: 'Select Excel Sheet',
-      content: (
-        <Select
-          placeholder="Choose a sheet"
-          style={{ width: '100%', marginTop: 16 }}
-          onChange={(value) => {
-            setSelectedSheet(value);
-            Modal.destroyAll();
-            handleSheetSelection(value);
-          }}
-        >
-          {availableSheets.map(sheet => (
-            <Option key={sheet} value={sheet}>{sheet}</Option>
-          ))}
-        </Select>
-      ),
-      okButtonProps: { style: { display: 'none' } },
-      cancelText: 'Cancel',
-      onCancel: () => {
-        onClose();
-      }
-    });
-  };
-
-  // Show sheet selection modal when available
-  useEffect(() => {
-    if (availableSheets.length > 1) {
-      showSheetSelectionModal();
-    }
-  }, [availableSheets]);
+  // There is no sheet to choose any more: a workbook is saved whole and each
+  // of its sheets is registered as a table, so the picker's job ends at the
+  // download.
 
   return null;
 };

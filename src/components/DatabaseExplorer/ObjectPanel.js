@@ -85,6 +85,9 @@ const iconButton = (title, onClick, glyph) => (
 );
 
 const ObjectPanel = ({
+  // Owned by DatabaseExplorer — it holds the drag handle beside this panel and
+  // persists the width per connection, alongside the results-divider layout.
+  width = 274,
   dbType,
   containerLabel = 'Schema',
   schemas = [],
@@ -208,7 +211,7 @@ const ObjectPanel = ({
 
   return (
     <div style={{
-      width: 274, flexShrink: 0, minHeight: 0,
+      width, flexShrink: 0, minHeight: 0,
       borderRight: `1px solid ${C.border}`, background: C.surface,
       display: 'flex', flexDirection: 'column',
     }}>

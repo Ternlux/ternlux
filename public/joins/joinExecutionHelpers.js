@@ -3,6 +3,7 @@
  * Shared utilities for executing join operations
  */
 
+const path = require('path');
 const Datastore = require('@seald-io/nedb');
 const localSqlite = require('../lib/sqlite');
 
@@ -18,6 +19,161 @@ function isLocalSqliteSource(conn, pluginManager) {
 
 function localSqlitePath(conn) {
   return conn.fileInfo?.filePath || conn.localPath || conn.dbConfig?.dbPath || null;
+}
+
+/**
+ * The file a local DuckDB source is read from.
+ *
+ * A connection that spans several files keeps a name -> path map, so the table
+ * being read is what decides which file that is; everything else has one path
+ * and the table name is only a label.
+ */
+function duckSourcePath(connection, tableName) {
+  const paths = connection?.dbConfig?.tablePaths;
+  if (tableName && paths && typeof paths === 'object' && paths[tableName]) return paths[tableName];
+  return localFilePathOf(connection);
+}
+
+/**
+ * The connection name a local source's schema is derived from.
+ *
+ * The saved `sourcesConfig[].connection` shape does not carry the connection's
+ * NAME — it was assembled for reading a file, not for naming one. So fall back
+ * to the file's own basename, which is what registerLocalFile names an imported
+ * connection after; for the ordinary case ("customers.csv" imported as
+ * "customers") the two agree, and the schema comes out the same as the Data
+ * Explorer's. An explicit name is preferred whenever a caller has one.
+ */
+function connectionNameOf(connection, dbPath) {
+  const explicit = connection?.connectionName || connection?.name || null;
+  if (explicit) return explicit;
+  const original = connection?.fileInfo?.originalName;
+  if (original) return path.basename(original, path.extname(original));
+  return dbPath ? path.basename(dbPath, path.extname(dbPath)) : null;
+}
+
+/**
+ * Read a local DuckDB source — a data file, or a table in a workflow database.
+ *
+ * These never go through the duckdb CONNECTOR. The connector is built for a
+ * saved connection and resolves its file from `config.dbPath`, but the shape
+ * this loader is handed comes from enrichJoinSourcesConfig, which puts the path
+ * on `connection.localPath` and leaves dbConfig empty for anything without a
+ * saved connection — every upstream node's output, since those carry the
+ * synthetic id "local-duckdb". Routed through the connector that source
+ * resolved to nothing: `runQuery` returned `{ success: false, message: 'DuckDB
+ * requires a file path', rows: [] }`, the caller's `result.rows || []` turned
+ * that into an empty array, and the join ran to completion against no rows —
+ * writing a silently empty result into the destination.
+ *
+ * So the path is resolved here the same way the local-destination join resolves
+ * it (executeLocalDuckDBJoin), which also gets two things the connector route
+ * did not: a workflow database is attached and its table addressed through the
+ * alias, and a workbook's sheet is picked out by the source's table name rather
+ * than every sheet reading as the first one.
+ *
+ * The AI writes `SELECT … FROM <table>`, so the source is exposed under that
+ * name for the duration of the read — and under the file's own basename too,
+ * since the two do not always agree (mirrors DuckDB.registerSource).
+ */
+async function withDuckDBSource(sourceConnection, sourceConfig, fn) {
+  const duck = require('../duckdb');
+
+  const table = sourceConfig.tableName
+    || sourceConfig.sourceTableSchema?.tableName
+    || sourceConfig.tempTableName
+    || null;
+  const dbPath = duckSourcePath(sourceConnection, table);
+  if (!dbPath) {
+    throw new Error(
+      `Local source "${table || sourceConfig.sourceNodeId || 'unknown'}" has no file path`
+      + ' — expected one on connection.localPath, fileInfo.filePath or dbConfig.dbPath.',
+    );
+  }
+
+  let body;
+  if (/\.duckdb$/i.test(dbPath)) {
+    // An upstream node's output: a real table inside a workflow database.
+    if (!table) throw new Error(`Reading a table out of ${path.basename(dbPath)} requires the source's table name.`);
+    const alias = await duck.attachDb(dbPath);
+    body = `SELECT * FROM ${duck.quoteIdentifier(alias)}.${duck.quoteIdentifier(duck.sanitizeIdentifier(table))}`;
+  } else {
+    // A data file, read where it lies. For a workbook the table name is the
+    // sheet; for every other format that resolves to null.
+    const ref = await duck.tableRef(
+      dbPath,
+      sourceConnection.fileInfo?.format || sourceConnection.dbConfig?.format || null,
+      { sheet: duck.sheetFor(dbPath, table) },
+    );
+    body = `SELECT * FROM ${ref}`;
+  }
+
+  // Bare AND `<connection>.<table>` — see duck.registerAddressableViews. It
+  // matters more here than for a transformer: a join has SEVERAL local sources,
+  // so `customers.customers` and `products.products` are exactly how the Data
+  // Explorer tells the user (and any model reading their SQL) to tell two files
+  // apart.
+  const { created } = await duck.registerAddressableViews({
+    body,
+    names: [table, path.basename(dbPath, path.extname(dbPath))],
+    connectionName: connectionNameOf(sourceConnection, dbPath),
+  });
+  try {
+    return await fn({ duck, table, dbPath });
+  } finally {
+    // Leaving one behind would shadow whatever else answers to that name.
+    await duck.dropViews(created);
+  }
+}
+
+/** Read a local DuckDB source whole. */
+async function loadDuckDBSourceData(sourceConnection, sourceConfig) {
+  return withDuckDBSource(sourceConnection, sourceConfig, async ({ duck, table }) => {
+    const sql = String(sourceConfig.sql || '').replace('{LIMIT_OFFSET_HERE}', '').trim();
+    if (!sql) {
+      throw new Error(`Local source "${table || sourceConfig.sourceNodeId || 'unknown'}" has no SQL to read it with.`);
+    }
+    const result = await duck.query(sql);
+    return result.rows || [];
+  });
+}
+
+/**
+ * Page a local DuckDB source, for a join whose DESTINATION is a real database.
+ *
+ * That route stages every source into a temp table on the destination, so rows
+ * arrive in chunks rather than all at once. Until this existed, a local DuckDB
+ * source taking it fell through to the duckdb CONNECTOR, which resolves its
+ * file from `config.dbPath` — and an upstream node's output carries the
+ * synthetic id "local-duckdb" with an empty dbConfig, so there was nothing to
+ * open and the read failed with "DuckDB requires a file path". The path was on
+ * `connection.localPath` the whole time; only loadDuckDBSourceData looked there,
+ * and that is the read-it-all route, not this one.
+ *
+ * Views are registered ONCE and every page runs against them, so a source is
+ * not re-resolved per chunk.
+ */
+async function loadDuckDBSourceInChunks(sourceConnection, sourceConfig, sql, chunkSize, onChunk) {
+  return withDuckDBSource(sourceConnection, sourceConfig, async ({ duck, table }) => {
+    const base = String(sql || '').trim();
+    if (!base) {
+      throw new Error(`Local source "${table || sourceConfig?.sourceNodeId || 'unknown'}" has no SQL to read it with.`);
+    }
+    let offset = 0;
+    let totalProcessed = 0;
+    while (true) {
+      const pagination = `LIMIT ${chunkSize} OFFSET ${offset}`;
+      const chunkQuery = base.includes('{LIMIT_OFFSET_HERE}')
+        ? base.replace('{LIMIT_OFFSET_HERE}', pagination)
+        : `${base} ${pagination}`;
+      const { rows } = await duck.query(chunkQuery);
+      if (!rows || rows.length === 0) break;
+      totalProcessed += rows.length;
+      await onChunk(rows, offset, totalProcessed);
+      offset += chunkSize;
+    }
+    return totalProcessed;
+  });
 }
 
 /**
@@ -37,6 +193,12 @@ async function loadSourceData(sourceConnection, sourceConfig, pluginManager, get
     if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
     const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '');
     return await localSqlite.runQuery({ dbPath, query: sql });
+  }
+
+  // Local DuckDB source — a file, or a table in a workflow database. Read by
+  // path rather than through the connector; see loadDuckDBSourceData.
+  if (sourceDbType === 'duckdb') {
+    return await loadDuckDBSourceData(sourceConnection, sourceConfig);
   }
 
   // Check if connector is available
@@ -73,15 +235,41 @@ async function loadSourceData(sourceConnection, sourceConfig, pluginManager, get
       const plugin = pluginManager.getConnector(sourceDbType);
       const operationObj = JSON.parse(operation);
       const result = await plugin.runQuery(fullConfig, sourceConnection.id, operationObj);
-      return result.rows || [];
+      return rowsOrThrow(result, sourceConnection, sourceLabel(sourceConfig, sourceConnection));
     }
   } else {
     // Load from SQL source via plugin
     const plugin = pluginManager.getConnector(sourceDbType);
     const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '')
     const result = await plugin.runQuery(fullConfig, sourceConnection.id, { query: sql});
-    return result.rows || [];
+    return rowsOrThrow(result, sourceConnection, sourceLabel(sourceConfig, sourceConnection));
   }
+}
+
+/**
+ * A connector's rows, or the reason there are none.
+ *
+ * Connectors report failure as `{ success: false, message, rows: [] }` rather
+ * than by throwing, so `result.rows || []` reads a failed read as an empty
+ * source — and a join over an empty source succeeds, writing a silently wrong
+ * result to the destination. Same rule the skill-helper layer applies in
+ * electron.js: success false is an error.
+ */
+function rowsOrThrow(result, sourceConnection, label) {
+  if (result && result.success === false) {
+    const name = label || sourceConnection?.id || 'source';
+    throw new Error(`Could not read join source "${name}" (${sourceConnection?.dbType}): ${result.message || 'query failed'}`);
+  }
+  return (result && result.rows) || [];
+}
+
+/** How a source is named in a read failure — the table it meant, else its node. */
+function sourceLabel(sourceConfig, sourceConnection) {
+  return sourceConfig?.tableName
+    || sourceConfig?.sourceTableSchema?.tableName
+    || sourceConfig?.sourceNodeId
+    || sourceConnection?.id
+    || 'source';
 }
 
 /**
@@ -100,9 +288,20 @@ async function loadSQLSourceInChunks(
   chunkSize,
   pluginManager,
   getFullConfig,
-  onChunk
+  onChunk,
+  // The source's own config. Needed to resolve WHERE a local source lives (and
+  // which sheet of a workbook it means) — the connection alone does not say.
+  sourceConfig = null
 ) {
   const sourceDbType = sourceConnection.dbType;
+
+  // Local DuckDB source — a data file, or an upstream node's table in a
+  // workflow database. Read by PATH rather than through the connector, which
+  // resolves its file from `config.dbPath` and so cannot open either of those.
+  // Mirrors the branch loadSourceData already has; see loadDuckDBSourceInChunks.
+  if (sourceDbType === 'duckdb' && sourceConfig) {
+    return await loadDuckDBSourceInChunks(sourceConnection, sourceConfig, sql, chunkSize, onChunk);
+  }
 
   // Local imported-file SQLite source — page through it with the local lib
   // (LIMIT/OFFSET) since there is no plugin connector for sqlite.
@@ -158,10 +357,11 @@ async function loadSQLSourceInChunks(
     }
 
     const result = await plugin.runQuery(fullConfig, sourceConnection.id, { query: chunkQuery });
-    if(!result.success){
-      console.log('chunkQuery: ', chunkQuery, result)
-    }
-    const rows = result.rows || [];
+    // A failed chunk is not the end of the data. Left to `rows || []` it reads
+    // as one — the loop breaks, the caller is told how many rows it got, and a
+    // temp table that should hold a million rows holds none, with the join over
+    // it succeeding anyway. Fail the read instead.
+    const rows = rowsOrThrow(result, sourceConnection, sourceConnection?.id);
 
     if (rows.length === 0) break;
 
@@ -495,9 +695,13 @@ async function executeLocalDuckDBJoin({
   try {
     if (!joinSql || !String(joinSql).trim()) throw new Error('Join SQL is empty');
 
+    // Counts SOURCES, not views. It used to piggyback on `views.length`, which
+    // was one-per-source until a source started registering several names.
+    let sourceIndex = 0;
     for (const sourceConfig of sourcesConfig) {
       const name = sourceConfig.tempTableName || sourceConfig.tableName;
       if (!name) continue;
+      const stagingIndex = sourceIndex++;
 
       const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection || {};
       const filePath = localFilePathOf(sourceConnection);
@@ -508,8 +712,14 @@ async function executeLocalDuckDBJoin({
         const ref = await duck.workflowTableRef(workflowId, sourceConfig.tableName || name);
         body = `SELECT * FROM ${ref}`;
       } else if (filePath) {
-        // The point of the whole change: read the file where it is.
-        body = `SELECT * FROM ${await duck.tableRef(filePath, sourceConnection.fileInfo?.format || null)}`;
+        // The point of the whole change: read the file where it is. A workbook
+        // holds a table per sheet, and this source's table name is which sheet
+        // it means — without that, every sheet of a workbook would join as the
+        // first one, quietly and with no error.
+        const ref = await duck.tableRef(filePath, sourceConnection.fileInfo?.format || null, {
+          sheet: duck.sheetFor(filePath, sourceConfig.tableName),
+        });
+        body = `SELECT * FROM ${ref}`;
       } else {
         // A source DuckDB can't read where it lies — a remote database, or a
         // vector store. Its rows are pulled through the plugin and staged as a
@@ -522,15 +732,29 @@ async function executeLocalDuckDBJoin({
         if (!rows || rows.length === 0) {
           body = emptyViewSelect(sourceConfig.selectedColumns);
         } else {
-          const staged = `join_src_${views.length}_${name}`;
+          const staged = `join_src_${stagingIndex}_${name}`;
           await duck.ingestRowsToStaging(rows, outPath, staged);
           stagedTables.push(staged);
           body = `SELECT * FROM ${await duck.stagingRef(outPath, staged)}`;
         }
       }
 
-      await duck.exec(`CREATE OR REPLACE VIEW ${duck.quoteIdentifier(name)} AS ${body}`);
-      views.push(name);
+      // `name` is the temp-table alias the generated joinSql addresses. The
+      // source's REAL table name and its `<connection>.<table>` form are
+      // registered alongside it, so a join written against what the Data
+      // Explorer shows resolves too — with several local files in one join,
+      // that qualified form is the only way to tell same-named tables apart.
+      const realTable = sourceConfig.tableName || sourceConfig.sourceTableSchema?.tableName || null;
+      const { created } = await duck.registerAddressableViews({
+        body,
+        names: [name, realTable],
+        // A node output has no connection; it is already reachable as
+        // `<workflowAlias>.<table>` through the attach.
+        connectionName: DuckDB.isWorkflowDb(filePath)
+          ? null
+          : connectionNameOf(sourceConnection, filePath),
+      });
+      views.push(...created);
     }
 
     // The join result is this node's output: a table in the workflow database.
@@ -554,9 +778,9 @@ async function executeLocalDuckDBJoin({
       error: error.stack,
     };
   } finally {
-    for (const name of views) {
-      try { await duck.exec(`DROP VIEW IF EXISTS ${duck.quoteIdentifier(name)}`); } catch { /* best effort */ }
-    }
+    // `views` holds quoted refs from registerAddressableViews, bare and
+    // schema-qualified alike.
+    await duck.dropViews(views);
     await duck.dropStaging(outPath, stagedTables);
   }
 }

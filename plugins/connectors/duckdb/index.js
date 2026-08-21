@@ -7,12 +7,17 @@
  *
  * A path is one of two things, and the difference decides everything:
  *
- *   a DATA FILE (csv / json / parquet) — registered as a view in a schema of
- *     this connection's own, which is what lets a worksheet say
+ *   a DATA FILE (csv / json / parquet / xlsx / avro) — registered as a view in
+ *     a schema of this connection's own, which is what lets a worksheet say
  *     `SELECT * FROM Orders` about a file. Views are recreated per call, so a
  *     file edited on disk is picked up without reconnecting. A view cannot be
  *     written to, so DDL and DML take the copy-and-write-back path in
  *     runInPlace.
+ *
+ *     A workbook is the one file holding several tables: each sheet is its own
+ *     view, all over the same path, and `sheet` is what tells them apart. They
+ *     share one schema, so the tree shows the workbook once with a table per
+ *     sheet, and `SELECT * FROM Items JOIN Orders …` needs no qualification.
  *
  *   a DATABASE (.duckdb / .sqlite / .db) — attached under its own catalog
  *     alias. Its tables are real tables, so UPDATE, INSERT, DELETE and ALTER
@@ -21,11 +26,13 @@
  *     SQLite goes through DuckDB's sqlite extension and is written through it
  *     too, so the same statements work on either kind.
  *
- * Config: { dbPath, tables?, tablePaths?, format? }
- *   dbPath      the file DuckDB reads (csv / json / parquet / duckdb / sqlite)
+ * Config: { dbPath, tables?, tablePaths?, tableSheets?, format? }
+ *   dbPath      the file DuckDB reads (csv / json / parquet / xlsx / avro /
+ *               duckdb / sqlite)
  *   tables      names this connection owns; defaults to the file's own name,
  *               or for a database, to every table in it
- *   tablePaths  name -> path, for a workbook that became several Parquet files
+ *   tablePaths  name -> path, when a connection spans more than one file
+ *   tableSheets name -> sheet, for a workbook's tables — they share one path
  */
 
 const path = require('path');
@@ -57,16 +64,12 @@ function idToken(connectionId, config) {
  * keeps the choice stable across sessions — the same connection always resolves
  * to the same schema.
  */
-function sanitizeSchemaName(name) {
-  const cleaned = String(name || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 48);
-  if (!cleaned) return null;
-  return /^[0-9]/.test(cleaned) ? `f_${cleaned}` : cleaned;
-}
+// Lives in the core duckdb module, not here: the workflow executor registers
+// its sources under the same schema name, and a name that differed between the
+// two would mean the Explorer displaying `sales_csv.orders` while a run
+// rejected it. Collision handling (below) stays connector-side — only the
+// Explorer knows the sibling set.
+const sanitizeSchemaName = duck.sanitizeSchemaName;
 
 function schemaFor(connectionId, config) {
   const base = sanitizeSchemaName(config && config.connectionName);
@@ -97,17 +100,29 @@ function schemaFor(connectionId, config) {
  */
 const isDatabase = (filePath) => /\.(duckdb|sqlite|sqlite3|db)$/i.test(String(filePath || ''));
 
-/** The data files this connection exposes, as `{ name, path }`. */
+/**
+ * The data files this connection exposes, as `{ name, path, sheet }`.
+ *
+ * `sheet` is what makes a workbook work. Its sheets all share ONE path — the
+ * .xlsx itself — so unlike the Parquet-per-sheet arrangement this replaced, the
+ * path no longer identifies the table and the sheet name is what picks it out.
+ * Null for every other format, which has only one table per file.
+ */
 function tablesOf(config) {
+  const sheets = config.tableSheets && typeof config.tableSheets === 'object' ? config.tableSheets : {};
   const paths = config.tablePaths && typeof config.tablePaths === 'object' ? config.tablePaths : null;
   if (paths && Object.keys(paths).length) {
-    return Object.entries(paths).map(([name, file]) => ({ name, path: file }));
+    return Object.entries(paths).map(([name, file]) => ({ name, path: file, sheet: sheets[name] || null }));
   }
   const names = Array.isArray(config.tables) && config.tables.length ? config.tables : null;
   const fallback = path.basename(config.dbPath || '', path.extname(config.dbPath || '')) || 'data';
   // Several names but only one path means an older record; they all describe
   // the same file, so point them at it rather than inventing paths.
-  return (names || [fallback]).map((name) => ({ name, path: config.dbPath }));
+  return (names || [fallback]).map((name) => ({
+    name,
+    path: config.dbPath,
+    sheet: sheets[name] || null,
+  }));
 }
 
 /**
@@ -168,10 +183,12 @@ async function registerSchema(config, connectionId) {
   const tables = [];
   for (const table of tablesOf(config)) {
     const format = config.format || duck.detectFormat(table.path);
-    const from = await duck.tableRef(table.path, format);
+    const from = await duck.tableRef(table.path, format, { sheet: table.sheet });
     const ref = `${duck.quoteIdentifier(schema)}.${duck.quoteIdentifier(table.name)}`;
     await duck.exec(`CREATE OR REPLACE VIEW ${ref} AS SELECT * FROM ${from}`);
-    tables.push({ schema, name: table.name, kind: 'file', ref, path: table.path, format, from });
+    tables.push({
+      schema, name: table.name, kind: 'file', ref, path: table.path, format, from, sheet: table.sheet,
+    });
   }
   return { schema, tables };
 }
@@ -486,7 +503,7 @@ async function runInPlace(config, connectionId, sql, candidates) {
       if (unwritable.length) {
         throw new Error(
           `Cannot write ${unwritable.map((t) => path.basename(t.path)).join(', ')} back — `
-          + 'only csv, json and parquet files can be modified in place',
+          + 'only csv, json, parquet, xlsx and avro files can be modified in place',
         );
       }
 
@@ -520,8 +537,10 @@ async function runInPlace(config, connectionId, sql, candidates) {
         }
         if (after !== before.get(table.ref)) changed.push(table);
       }
+      // Sequential, and it matters for a workbook: two sheets of one file can
+      // both be targets, and each write reads back the file the last one left.
       for (const table of changed) {
-        await duck.copyToFile(`SELECT * FROM ${table.ref}`, table.path, table.format);
+        await duck.copyToFile(`SELECT * FROM ${table.ref}`, table.path, table.format, { sheet: table.sheet });
       }
 
       // DML reports what it touched in a single `Count` row; DDL reports
@@ -529,7 +548,10 @@ async function runInPlace(config, connectionId, sql, candidates) {
       const affected = result.rows.length === 1 && result.rows[0].Count !== undefined
         ? Number(result.rows[0].Count)
         : null;
-      const rewritten = changed.map((t) => path.basename(t.path)).join(', ');
+      // Naming the sheet as well as the file, since several sheets share one.
+      const rewritten = changed
+        .map((t) => (t.sheet ? `${path.basename(t.path)} (${t.sheet})` : path.basename(t.path)))
+        .join(', ');
 
       return {
         result: {
@@ -682,6 +704,11 @@ module.exports = {
         success: true,
         rows: result.rows,
         columns: result.columns.map((c) => c.name),
+        // The engine's own types, alongside the names the contract asks for.
+        // Without them the explorer has to guess a column's type from its first
+        // value, which reads a MAP as an array — its entries cross into JS as
+        // `[{key, value}]` — and an all-null column as nothing at all.
+        columnTypes: result.columns.map((c) => ({ name: c.name, type: c.type })),
         rowCount: result.rowCount,
         // Set only on the streaming path; undefined means "we read everything".
         truncated: result.truncated,

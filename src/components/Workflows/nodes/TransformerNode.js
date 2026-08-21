@@ -1,7 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { SettingOutlined, EditOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, truncate } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate } from './nodeCardShared';
 
 const COLOR = '#7c3aed';
 const MONO = "'JetBrains Mono', monospace";
@@ -25,14 +25,9 @@ const TransformerNode = ({ data, selected }) => {
     config.transformationRequest
   );
 
-  // The node's own label names it — what it writes (target table / engine) is
-  // the summary's job. A hand-dropped node starts on the generic type name, so
-  // that one case still defers to whatever the config was named.
-  const getDisplayName = () => {
-    const label = String(data.label || '').trim();
-    if (label && label.toLowerCase() !== 'transformer') return label;
-    return config.node_name || label || 'Transformer';
-  };
+  // Named by nodeDisplayName so the card, the steps editor and the run log
+  // agree — and so a node built through chat stops reading "Transformer".
+  const getDisplayName = () => nodeDisplayName('transformer', data, 'Transformer');
 
   const getSummary = () => {
     if (!isConfigured) return 'Click to configure transformation';

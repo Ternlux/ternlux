@@ -481,3 +481,114 @@
 .react-flow__panel a{
   display: none;
 }
+/* ── Live AI build ──────────────────────────────────────────────────────────
+   While the builder writes a workflow, WorkflowEditor draws each node on the
+   canvas as it is built. The classes below are applied to ReactFlow's node
+   wrapper, so a node of any type picks the treatment up without its card
+   component knowing anything about builds. The 6px radius matches the cards. */
+
+/* The node the builder is working on right now. */
+.react-flow__node.wf-node-building {
+  border-radius: 6px;
+  animation: wf-node-glow 1.6s ease-in-out infinite;
+  z-index: 5;
+}
+
+@keyframes wf-node-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.55), 0 0 14px 3px rgba(59, 130, 246, 0.28);
+  }
+  50% {
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.95), 0 0 30px 9px rgba(59, 130, 246, 0.5);
+  }
+}
+
+/* A node that has just finished: the glow settles into a quiet ring rather
+   than snapping off, so the eye can follow the build down the pipeline. */
+.react-flow__node.wf-node-built {
+  border-radius: 6px;
+  animation: wf-node-settle 1.1s ease-out 1;
+}
+
+@keyframes wf-node-settle {
+  0% {
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.9), 0 0 26px 8px rgba(59, 130, 246, 0.45);
+  }
+  60% {
+    box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.55), 0 0 16px 4px rgba(5, 150, 105, 0.3);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(5, 150, 105, 0);
+  }
+}
+
+/* The build stopped on this node: it is waiting on an answer from the user, or
+   it failed. A steady ring rather than a pulse — nothing is happening. */
+.react-flow__node.wf-node-paused {
+  border-radius: 6px;
+  box-shadow: 0 0 0 2px rgba(217, 119, 6, 0.85), 0 0 16px 4px rgba(217, 119, 6, 0.28);
+}
+
+.react-flow__node.wf-node-failed {
+  border-radius: 6px;
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.85), 0 0 16px 4px rgba(220, 38, 38, 0.25);
+}
+
+/* Placeholder cards (nodes that exist only in the progress stream so far) read
+   as provisional until the real node replaces them. */
+.react-flow__node.wf-node-building,
+.react-flow__node.wf-node-built {
+  transition: transform 240ms ease, opacity 240ms ease;
+}
+
+/* Canvas banner: what the builder is on, and how far along it is. */
+.wf-build-banner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding: 5px 10px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #bfdbfe;
+  border-radius: 5px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.07);
+  font-family: 'Inter', -apple-system, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  color: #1d4ed8;
+  white-space: nowrap;
+}
+
+.wf-build-banner--done {
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.wf-build-banner--paused {
+  border-color: #fcd34d;
+  color: #b45309;
+}
+
+.wf-build-banner--failed {
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
+.wf-build-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: wf-build-pulse 1.4s ease-in-out infinite;
+}
+
+.wf-build-banner--done .wf-build-dot,
+.wf-build-banner--paused .wf-build-dot,
+.wf-build-banner--failed .wf-build-dot {
+  animation: none;
+}
+
+@keyframes wf-build-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.72); }
+}
