@@ -4,8 +4,10 @@
  */
 
 const path = require('path');
-const Datastore = require('@seald-io/nedb');
 const localSqlite = require('../lib/sqlite');
+const { batchChunkSizeFor } = require('../lib/batchChunkSize');
+const { throwIfCancelled, isCancelledError } = require('../NodeExecution/executionCancel');
+const { setBatchWindow } = require('../NodeExecution/executionLog');
 
 // Imported-file SQLite connections have NO plugin connector (sqlite is a local
 // builtin, read via public/lib/sqlite.js). Detect that case so we read the
@@ -92,8 +94,14 @@ async function withDuckDBSource(sourceConnection, sourceConfig, fn) {
   }
 
   let body;
-  if (/\.duckdb$/i.test(dbPath)) {
-    // An upstream node's output: a real table inside a workflow database.
+  // A DATABASE — .duckdb, or a .sqlite/.db read through DuckDB's sqlite
+  // extension — holds real tables and is attached. Anything else is a data file
+  // read in place. `.duckdb` alone was too narrow: a local SQLite source fell
+  // into the file branch below, where tableRef has no format for a .db and the
+  // read failed on a source the Data Explorer browses fine. Same predicate as
+  // the DuckDB connector's, so the two cannot disagree.
+  if (duck.isDatabaseFile(dbPath)) {
+    // An upstream node's output, or an imported SQLite file: a real table.
     if (!table) throw new Error(`Reading a table out of ${path.basename(dbPath)} requires the source's table name.`);
     const alias = await duck.attachDb(dbPath);
     body = `SELECT * FROM ${duck.quoteIdentifier(alias)}.${duck.quoteIdentifier(duck.sanitizeIdentifier(table))}`;
@@ -150,8 +158,18 @@ async function loadDuckDBSourceData(sourceConnection, sourceConfig) {
  * `connection.localPath` the whole time; only loadDuckDBSourceData looked there,
  * and that is the read-it-all route, not this one.
  *
- * Views are registered ONCE and every page runs against them, so a source is
- * not re-resolved per chunk.
+ * Views are registered ONCE and the whole read runs against them, so a source
+ * is not re-resolved per chunk.
+ *
+ * STREAMED, not paged with LIMIT/OFFSET.
+ *
+ * It used to run one `LIMIT n OFFSET m` per chunk, which asks DuckDB to
+ * re-scan and discard the first m rows every time: quadratic in the size of the
+ * source, so a ten-million-row local table cost on the order of 10^10 rows of
+ * scanning to read 10^7. `duck.streamRows` pulls one result once and hands back
+ * ~2048-row chunks, which is both linear and bounded in memory. The statement
+ * is passed through untouched — no injected LIMIT, so SQL that a rewrite would
+ * have broken still runs.
  */
 async function loadDuckDBSourceInChunks(sourceConnection, sourceConfig, sql, chunkSize, onChunk) {
   return withDuckDBSource(sourceConnection, sourceConfig, async ({ duck, table }) => {
@@ -159,19 +177,36 @@ async function loadDuckDBSourceInChunks(sourceConnection, sourceConfig, sql, chu
     if (!base) {
       throw new Error(`Local source "${table || sourceConfig?.sourceNodeId || 'unknown'}" has no SQL to read it with.`);
     }
-    let offset = 0;
+    // The placeholder exists for engines that need pagination spliced in.
+    // Streaming needs none, so it is removed rather than filled.
+    const readQuery = base.includes('{LIMIT_OFFSET_HERE}')
+      ? base.replace('{LIMIT_OFFSET_HERE}', '')
+      : base;
+
     let totalProcessed = 0;
-    while (true) {
-      const pagination = `LIMIT ${chunkSize} OFFSET ${offset}`;
-      const chunkQuery = base.includes('{LIMIT_OFFSET_HERE}')
-        ? base.replace('{LIMIT_OFFSET_HERE}', pagination)
-        : `${base} ${pagination}`;
-      const { rows } = await duck.query(chunkQuery);
-      if (!rows || rows.length === 0) break;
-      totalProcessed += rows.length;
-      await onChunk(rows, offset, totalProcessed);
-      offset += chunkSize;
+    let buffer = [];
+
+    // DuckDB's chunks are ~2048 rows; the caller asked for `chunkSize`, which is
+    // the DESTINATION's batch size. Re-cut rather than passing chunks straight
+    // through, or a connector that rations calls (BigQuery's load-job quota)
+    // would get whatever DuckDB happened to produce.
+    const deliver = async () => {
+      if (buffer.length === 0) return;
+      const chunk = buffer;
+      buffer = [];
+      throwIfCancelled('reading a local source', `${totalProcessed} rows read so far`);
+      totalProcessed += chunk.length;
+      await onChunk(chunk, totalProcessed - chunk.length, totalProcessed);
+    };
+
+    for await (const page of duck.streamRows(readQuery)) {
+      for (const row of page) {
+        buffer.push(row);
+        if (buffer.length >= chunkSize) await deliver();
+      }
     }
+    await deliver();
+
     return totalProcessed;
   });
 }
@@ -202,41 +237,28 @@ async function loadSourceData(sourceConnection, sourceConfig, pluginManager, get
   }
 
   // Check if connector is available
-  if (!pluginManager.hasConnector(sourceDbType) && sourceDbType !== 'nedb') {
+  if (!pluginManager.hasConnector(sourceDbType)) {
     throw new Error(`Database type ${sourceDbType} is not supported`);
   }
 
   const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
-  const isNoSQLSource = ['mongodb', 'nedb'].includes(sourceDbType);
+  // Only a remote document store is still NoSQL. Every local file — JSON
+  // included — is read as SQL by DuckDB and took the branch above.
+  const isNoSQLSource = sourceDbType === 'mongodb';
 
   if (isNoSQLSource) {
-    // Load from NoSQL source
+    // Load from the document store via its plugin
     const operation = sourceConfig.nosqlOperation || '{}';
-
-    if (sourceDbType === 'nedb') {
-      // NeDB is handled locally, not via plugin
-      const localPath = sourceConnection.fileInfo?.filePath || sourceConnection.localPath;
-      const db = new Datastore({ filename: localPath, autoload: false });
-
-      await new Promise((resolve, reject) => {
-        db.loadDatabase((err) => err ? reject(err) : resolve());
-      });
-      const operationJson = JSON.parse(operation);
-      const filter = operationJson.filter || {};
-      const limit = operationJson.limit || 1000000;
-
-      return await new Promise((resolve, reject) => {
-        const query = db.find(filter);
-        if (limit > 0) query.limit(limit);
-        query.exec((err, docs) => err ? reject(err) : resolve(docs));
-      });
-    } else {
-      // MongoDB or other NoSQL via plugin
-      const plugin = pluginManager.getConnector(sourceDbType);
-      const operationObj = JSON.parse(operation);
-      const result = await plugin.runQuery(fullConfig, sourceConnection.id, operationObj);
-      return rowsOrThrow(result, sourceConnection, sourceLabel(sourceConfig, sourceConnection));
-    }
+    const plugin = pluginManager.getConnector(sourceDbType);
+    const operationObj = JSON.parse(operation);
+    // 0 = no cap. A join source is read WHOLE — the join function needs every
+    // document to be correct, and a truncated read is not a smaller answer but
+    // a wrong one. The connector's default is 100 (a preview default), which
+    // meant an anti-join against an existing collection only ever saw its first
+    // 100 documents: every record past that looked new on each run and was
+    // re-emitted forever. An explicit `limit` inside the operation still wins.
+    const result = await plugin.runQuery(fullConfig, sourceConnection.id, operationObj, 0);
+    return rowsOrThrow(result, sourceConnection, sourceLabel(sourceConfig, sourceConnection));
   } else {
     // Load from SQL source via plugin
     const plugin = pluginManager.getConnector(sourceDbType);
@@ -311,6 +333,7 @@ async function loadSQLSourceInChunks(
     let offset = 0;
     let totalProcessed = 0;
     while (true) {
+      throwIfCancelled('reading a local SQLite source', `${totalProcessed} rows read so far`);
       const paginationClause = `LIMIT ${chunkSize} OFFSET ${offset}`;
       const chunkQuery = sql.includes('{LIMIT_OFFSET_HERE}')
         ? sql.replace('{LIMIT_OFFSET_HERE}', paginationClause)
@@ -335,6 +358,11 @@ async function loadSQLSourceInChunks(
   let totalProcessed = 0;
   console.log('sql: ', sql)
   while (true) {
+    // Paging a large remote table is one node and many round-trips, so the
+    // runner's between-steps check never comes round. Stopping here is clean:
+    // the read has written nothing, only the temp-table load below has.
+    throwIfCancelled('reading a source', `${totalProcessed} rows read so far`);
+
     // Replace {LIMIT_OFFSET_HERE} placeholder with database-specific pagination syntax
     let chunkQuery;
     let paginationClause;
@@ -382,7 +410,9 @@ async function loadSQLSourceInChunks(
  * @param {string} tempTableName - Temp table name
  * @param {Array} selectedColumns - Array of column names in order
  * @param {Array} data - Array of data to insert
- * @param {number} chunkSize - Batch size for inserts
+ * @param {number} chunkSize - Batch size for inserts. A connector that
+ *   declares `batchInsertChunkSize` overrides this — see
+ *   public/lib/batchChunkSize.js for why BigQuery does.
  * @returns {Promise<number>} Total rows inserted
  */
 async function insertDataToTempTable(
@@ -400,18 +430,35 @@ async function insertDataToTempTable(
   }
 
   let totalInserted = 0;
+  const effectiveChunkSize = batchChunkSizeFor(destPlugin, chunkSize);
 
   // Insert in chunks to avoid query size limits
-  for (let chunkStart = 0; chunkStart < data.length; chunkStart += chunkSize) {
-    const chunk = data.slice(chunkStart, chunkStart + chunkSize);
+  for (let chunkStart = 0; chunkStart < data.length; chunkStart += effectiveChunkSize) {
+    // Same reason as the output node's loop: staging a big source into the
+    // destination is minutes of work inside a single step. The temp table is
+    // dropped by the join's cleanup, so a partial load here is not left behind.
+    throwIfCancelled(
+      'staging a join source',
+      `${totalInserted} of ${data.length} rows loaded into ${tempTableName}`,
+    );
+
+    const chunk = data.slice(chunkStart, chunkStart + effectiveChunkSize);
 
     // Use plugin's batchInsert function if available, otherwise fallback to individual inserts
     if (destPlugin.batchInsert) {
-      const result = await destPlugin.batchInsert(destFullConfig, destConnectionId, tempTableName, selectedColumns, chunk);
-      if (!result.success) {
-        throw new Error(result.message || 'Batch insert failed');
+      // Which records this call carries, for the tracer's line — see
+      // executionLog.setBatchWindow. Staging a big source is a run of otherwise
+      // identical batch lines.
+      setBatchWindow({ table: tempTableName, written: totalInserted });
+      try {
+        const result = await destPlugin.batchInsert(destFullConfig, destConnectionId, tempTableName, selectedColumns, chunk);
+        if (!result.success) {
+          throw new Error(result.message || 'Batch insert failed');
+        }
+        totalInserted += result.rowsInserted;
+      } finally {
+        setBatchWindow(null);
       }
-      totalInserted += result.rowsInserted;
     } else {
       // Fallback: individual INSERT statements
       const insertStatements = chunk.map(row => {
@@ -448,201 +495,6 @@ async function insertDataToTempTable(
   return totalInserted;
 }
 
-/**
- * Execute join operation on local SQLite database
- * @param {string} appSqliteDbPath - Path to local SQLite database
- * @param {Array} sourcesConfig - Array of source configurations
- * @param {string} targetDdl - CREATE TABLE statement for target
- * @param {string} joinSql - JOIN SQL query
- * @param {string} targetTableName - Target table name
- * @param {string} operationMode - 'new_table' or 'merge_existing'
- * @param {Object} pluginManager - Plugin manager instance
- * @param {Function} getFullConfig - Function to get full config with credentials
- * @returns {Promise<Object>} Result with success, message, localPath, targetTableName
- */
-async function executeLocalSQLiteJoin(
-  appSqliteDbPath,
-  sourcesConfig,
-  targetDdl,
-  joinSql,
-  targetTableName,
-  operationMode,
-  pluginManager,
-  getFullConfig,
-  sqlitePool
-) {
-  if (!sqlitePool) {
-    throw new Error('[executeLocalSQLiteJoin] sqlitePool is required');
-  }
-
-  const tempTablesToCleanup = [];
-
-  return sqlitePool.executeWrite(async (db) => {
-    try {
-    // Step 1: Create and populate temp tables for sources
-    for (let i = 0; i < sourcesConfig.length; i++) {
-      const sourceConfig = sourcesConfig[i];
-
-      if (!sourceConfig.ddl || !sourceConfig.tempTableName) {
-        console.log(`[Local SQLite Join] Source_exists: ${i + 1}`);
-        continue;
-      }
-
-      const tempTableName = sourceConfig.tempTableName;
-      tempTablesToCleanup.push(tempTableName);
-
-      console.log(`[Local SQLite Join] ${tempTableName}...`);
-
-      // Drop temp table
-      await new Promise((res, rej) => {
-        db.run(`DROP TABLE IF EXISTS ${tempTableName}`, (err) => err ? rej(err) : res());
-      });
-
-      // Create temp table
-      await new Promise((res, rej) => {
-        db.run(sourceConfig.ddl, (err) => {
-          if (err) rej(new Error(`Failed to create temp table: ${err.message}`));
-          else res();
-        });
-      });
-
-      // Load data from source
-      const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
-      const isNoSQLSource = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
-      let sourceData = [];
-
-      if (Array.isArray(sourceConfig._preloadedRows)) {
-        // Caller (e.g. vector source pre-resolved by skill) supplied rows.
-        sourceData = sourceConfig._preloadedRows;
-      } else if (isNoSQLSource) {
-        sourceData = await loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig);
-      } else if (isLocalSqliteSource(sourceConnection, pluginManager)) {
-        // Imported-file SQLite source — no plugin connector exists; read
-        // directly from its .db file via the local lib.
-        const dbPath = localSqlitePath(sourceConnection);
-        if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
-        const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '');
-        sourceData = await localSqlite.runQuery({ dbPath, query: sql });
-      } else {
-        const sourcePlugin = pluginManager.getConnector(sourceConnection.dbType);
-        const sourceFullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
-        const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '')
-        const result = await sourcePlugin.runQuery(sourceFullConfig, sourceConnection.id, {query: sql});
-        sourceData = result.rows || [];
-      }
-
-      if (sourceData.length === 0) {
-        console.log(`[Local SQLite Join] No_data: ${tempTableName}`);
-        continue;
-      }
-
-      const selectedColumns = sourceConfig.selectedColumns;
-      if (!selectedColumns || selectedColumns.length === 0) {
-        throw new Error(`No selectedColumns found for ${tempTableName}`);
-      }
-
-      // THE FIX: Use serialize locally for the fast transaction block
-      await new Promise((res, rej) => {
-        db.serialize(() => {
-          db.run("BEGIN TRANSACTION");
-
-          const columnsList = selectedColumns.join(', ');
-          const placeholders = selectedColumns.map(() => '?').join(', ');
-          const stmt = db.prepare(`INSERT INTO ${tempTableName} (${columnsList}) VALUES (${placeholders})`);
-
-          // Insert each row
-          for (const row of sourceData) {
-            const values = selectedColumns.map(col => {
-              const val = row[col];
-              if (val === null || val === undefined) return null;
-              if (val instanceof Date) return val.toISOString();
-              if (typeof val === 'object') return JSON.stringify(val);
-              return val;
-            });
-            stmt.run(values);
-          }
-
-          stmt.finalize();
-
-          db.run("COMMIT", (err) => {
-            if (err) rej(new Error(`Failed to commit transaction: ${err.message}`));
-            else res();
-          });
-        });
-      });
-
-      console.log(`[Local SQLite Join] ${tempTableName}: ${sourceData.length}`);
-
-      // // Validate data
-      // const validateRecords = await new Promise((res, rej) => {
-      //   db.all(`SELECT * FROM ${tempTableName} LIMIT 3`, (err, rows) => err ? rej(err) : res(rows));
-      // });
-      // console.log(`[Local SQLite Join] Sample data from ${tempTableName}:`, JSON.stringify(validateRecords, null, 2));
-    }
-
-    // Step 2: Create target table if needed
-    if (operationMode === 'new_table' && targetDdl) {
-      console.log(`[Local SQLite Join] TABLE_CREATE: ${targetTableName}...`);
-      await new Promise((res, rej) => {
-        db.run(`DROP TABLE IF EXISTS ${targetTableName}`, (err) => err ? rej(err) : res());
-      });
-      await new Promise((res, rej) => {
-        db.run(targetDdl, (err) => {
-          if (err) rej(new Error(`Failed to create target table: ${err.message}`));
-          else res();
-        });
-      });
-    }
-
-    // Step 3: Execute join SQL
-    // console.log(`[Local SQLite Join] Executing join query...`);
-    const rowsAffected = await new Promise((res, rej) => {
-      db.run(joinSql, function(err) {
-        if (err) rej(new Error(`Join query failed: ${err.message}`));
-        else res(this.changes);
-      });
-    });
-    console.log(`[Local SQLite Join] JOIN_QUERY: ${rowsAffected}`);
-
-    // Target Table Validations
-    // const targetRecords = await new Promise((res, rej) => {
-    //   db.all(`SELECT * FROM ${targetTableName} LIMIT 3`, (err, rows) => err ? rej(err) : res(rows));
-    // });
-    // console.log(`[Local SQLite Join] Sample data from target table:`, JSON.stringify(targetRecords, null, 2));
-
-    // const targetCount = await new Promise((res, rej) => {
-    //   db.get(`SELECT COUNT(*) as count FROM ${targetTableName}`, (err, row) => err ? rej(err) : res(row.count));
-    // });
-    // console.log(`[Local SQLite Join] Total rows in target table: ${targetCount}`);
-
-    return {
-      success: true,
-      message: `Join completed successfully. Results saved to local SQLite at ${appSqliteDbPath}`,
-      localPath: appSqliteDbPath,
-      targetTableName
-    };
-
-    } catch (error) {
-      console.error('[Local SQLite Join] Error:', error);
-      return {
-        success: false,
-        message: `Local SQLite join failed: ${error.message}`,
-        error: error.stack
-      };
-    } finally {
-      // Step 4: Clean up temp tables (Placed in finally to ensure cleanup even if an error occurs)
-      for (const tempTable of tempTablesToCleanup) {
-        await new Promise((res) => {
-          db.run(`DROP TABLE IF EXISTS ${tempTable}`, (err) => {
-            if (err) console.error(`Failed to cleanup ${tempTable}: ${err.message}`);
-            res();
-          });
-        });
-      }
-      // Connection pool handles db connection, no need to close
-    }
-  });
-}
 
 /** The file a local source is read from, or null when it isn't a local file. */
 function localFilePathOf(connection) {
@@ -765,12 +617,25 @@ async function executeLocalDuckDBJoin({
 
     return {
       success: true,
-      message: `Join completed — ${rowCount} row(s) written to ${targetTableName}`,
+      // A join that matched nothing is a legitimate result, and the count is
+      // read back off the table it wrote, so a zero here is real. It is worth
+      // saying out loud: an empty source (which stages as an empty view above)
+      // and join keys that simply never match look identical from the outside.
+      warning: rowCount === 0,
+      message: rowCount === 0
+        ? `Join completed — 0 rows written to ${targetTableName}. Either a source was empty or no rows matched the join keys.`
+        : `Join completed — ${rowCount} row(s) written to ${targetTableName}`,
       localPath: outPath,
       targetTableName,
       rowCount,
     };
   } catch (error) {
+    // A stop must stay an exception all the way to the runner — see the note in
+    // outputExecutionHelpers' executeOutput catch. The `finally` below still
+    // runs, so the views and staging this join created are cleaned up either
+    // way.
+    if (isCancelledError(error)) throw error;
+
     console.error('[DuckDB Join] Error:', error);
     return {
       success: false,
@@ -789,6 +654,5 @@ module.exports = {
   loadSourceData,
   loadSQLSourceInChunks,
   insertDataToTempTable,
-  executeLocalSQLiteJoin,
   executeLocalDuckDBJoin
 };
