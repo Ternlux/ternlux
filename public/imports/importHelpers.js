@@ -2,7 +2,7 @@
  * File → local store importers.
  *
  * All of these stream: rows are pulled from the source in chunks, written to
- * SQLite/NeDB in transactional batches, and the event loop is released between
+ * SQLite in transactional batches, and the event loop is released between
  * batches. Nothing builds an array of every row in the file, so import cost is
  * bounded by the batch size rather than the file size — a 5 GB CSV imports in
  * the same memory as a 5 MB one, and the window stays responsive throughout.
@@ -504,100 +504,11 @@ function firstMeaningfulChar(filePath) {
   }
 }
 
-/**
- * Import a JSON file into a NeDB datastore.
- *
- * A top-level array is parsed incrementally with stream-json and inserted in
- * batches, so the documents are never all held as one parsed array on top of
- * the raw file text. Anything else (a single object) is small by nature and
- * read whole.
- *
- * @param {object} db - an already-loaded NeDB Datastore
- * @returns {Promise<{ success: boolean, docCount?: number, message: string }>}
- */
-async function importJsonToNeDB(filePath, db, options = {}) {
-  const { onProgress = null, batchSize = 1000 } = options;
-
-  try {
-    const totalBytes = fileSizeOf(filePath);
-    const leading = firstMeaningfulChar(filePath);
-
-    if (leading !== '[') {
-      // Single document (or a non-array literal) — no streaming to be had.
-      let parsed;
-      try {
-        parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      } catch (parseErr) {
-        return { success: false, message: `Invalid JSON format: ${parseErr.message}` };
-      }
-      const documents = Array.isArray(parsed) ? parsed : [parsed];
-      if (documents.length === 0) {
-        return { success: false, message: 'No documents found in JSON file' };
-      }
-      const inserted = await db.insertAsync(documents);
-      const docCount = Array.isArray(inserted) ? inserted.length : 1;
-      return { success: true, docCount, message: `Imported ${docCount} documents to NeDB` };
-    }
-
-    const { parser } = require('stream-json');
-    const { streamArray } = require('stream-json/streamers/StreamArray');
-    const { pipeline } = require('stream');
-
-    const readStream = fs.createReadStream(filePath);
-    const documents = streamArray();
-    // pipeline (rather than .pipe chaining) so a syntax error part-way through
-    // the file lands on the stream we are iterating instead of being thrown as
-    // an unhandled 'error' event by the parser.
-    pipeline(readStream, parser(), documents, () => {});
-
-    const report = progressReporter(onProgress, { phase: 'writing', file: path.basename(filePath), totalBytes });
-    let lastReportAt = 0;
-
-    let batch = [];
-    let docCount = 0;
-
-    const flush = async () => {
-      if (batch.length === 0) return;
-      const pending = batch;
-      batch = [];
-      await db.insertAsync(pending);
-      docCount += pending.length;
-      await yieldToEventLoop();
-      if (report && Date.now() - lastReportAt >= 250) {
-        lastReportAt = Date.now();
-        report({ rows: docCount, bytesRead: readStream.bytesRead });
-      }
-    };
-
-    try {
-      for await (const item of documents) {
-        batch.push(item.value);
-        if (batch.length >= batchSize) await flush();
-      }
-      await flush();
-    } catch (streamErr) {
-      readStream.destroy();
-      return { success: false, message: `Invalid JSON format: ${streamErr.message}` };
-    }
-
-    if (docCount === 0) {
-      return { success: false, message: 'No documents found in JSON file' };
-    }
-    if (report) report({ rows: docCount, bytesRead: totalBytes });
-
-    return { success: true, docCount, message: `Imported ${docCount} documents to NeDB` };
-  } catch (error) {
-    console.error('JSON import error:', error);
-    return { success: false, message: `Failed to import JSON: ${error.message}` };
-  }
-}
-
 module.exports = {
   importParquetToSqlite,
   importAvroToSqlite,
   importSpreadsheetToSqlite,
   importCsvToSqlite,
-  importJsonToNeDB,
   buildSchemaFromInferredTypes,
   readDelimitedHead,
   DELIMITED_EXTENSIONS,

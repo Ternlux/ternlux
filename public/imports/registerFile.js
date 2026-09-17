@@ -96,4 +96,35 @@ async function registerLocalFile(filePath, _userDataDir, { onProgress = null } =
   }
 }
 
-module.exports = { registerLocalFile };
+/**
+ * The table names a data file exposes RIGHT NOW, read from the file itself.
+ *
+ * A connection records its tables once, when it is created. That snapshot goes
+ * stale the moment the file changes underneath it: a sheet added to a workbook
+ * is invisible, and a sheet deleted is still offered. Callers that want the
+ * current answer ask the file, and fall back to the snapshot only when this
+ * cannot answer.
+ *
+ * Deliberately mirrors registerLocalFile's candidate naming above — a workbook
+ * is its sheets, anything else is one table named after the file — so a live
+ * listing and a recorded one use the same names for the same tables. It stops
+ * at names: no `describeTable`, so no DuckDB read per sheet. Callers wanting
+ * columns already have getColumns for that.
+ *
+ * Returns [] rather than throwing for anything it cannot read (a missing file,
+ * a database file like .duckdb/.sqlite, a legacy .xls), leaving the caller free
+ * to fall back.
+ */
+function listFileTables(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return [];
+  if (duck.isLegacyWorkbook(filePath) || !duck.isReadable(filePath)) return [];
+  try {
+    if (duck.detectFormat(filePath) === 'xlsx') return duck.listSheets(filePath);
+    return [path.basename(filePath, path.extname(filePath))];
+  } catch (error) {
+    console.warn(`[listFileTables] ${filePath}: ${error.message}`);
+    return [];
+  }
+}
+
+module.exports = { registerLocalFile, listFileTables };
