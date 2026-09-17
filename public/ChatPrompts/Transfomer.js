@@ -49,6 +49,13 @@ transfomer: {
         transformed result. The rows it returns become the target table — you do
         not write CREATE TABLE, and you do not write an INSERT.
 
+        The target is TRUNCATED AND LOADED on every run: it is replaced
+        wholesale by what your SELECT returns, so nothing from a previous run
+        survives. Do not try to merge, upsert, or de-duplicate against what was
+        there last time, and do not filter rows out on the grounds that an
+        earlier run already handled them — the SELECT describes the WHOLE table,
+        every time.
+
         **Important Notes**:
         - Refer to the source by the name above, as if it were a table
         - Column types come from the file; DuckDB infers them, so you do not declare them
@@ -235,7 +242,7 @@ transfomer: {
 
         Provide working DuckDB SQL.`,
 
-        transformationRequest: (userRequest, sourceTablesInfo, dbyType, isSourceLocal = false, availableSkills = []) => `You are an intelligent data transformation assistant. Analyze the user's request and determine the best course of action.
+        transformationRequest: (userRequest, sourceTablesInfo, dbyType, isSourceLocal = false, availableSkills = [], defaultSchema = null) => `You are an intelligent data transformation assistant. Analyze the user's request and determine the best course of action.
 
         User's request: "${userRequest}"
 
@@ -243,7 +250,8 @@ transfomer: {
         ${sourceTablesInfo}
 
         Database type: ${dbyType}
-        ${isSourceLocal ? 'Source data location: Local file (data is already stored locally)' : 'Source data location: Database (remote connection)'}
+        ${isSourceLocal ? 'Source data location: Local file (data is already stored locally)' : 'Source data location: Database (remote connection)'}${defaultSchema ? `
+        Default destination schema: ${defaultSchema}` : ''}
 
         ${availableSkills.length > 0 ? `**Available Skills**:
 You have access to these special transformation skills that can be used instead of standard SQL/NoSQL transformations:
@@ -272,10 +280,18 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
 
         Your task is to analyze this request and determine:
 
-        1. **Action Type**: What should happen next?
-           - "answer_directly": The user is asking a question that doesn't require transformation (e.g., "what columns are available?", "explain the transformation")
-           - "ask_questions": Need to ask clarifying questions to determine transformation settings (use questionsNeeded to specify clarifications)
+        1. **Action Type**: What should happen next? There are exactly TWO, and every
+           request ends in one of them — you either build, or you ask.
            - "generate_transformation": If the instructions are clear and there are no follow up questions (questionsNeeded in JSON response) required to ask the user and transformation can be written
+           - "ask_questions": ANYTHING else. Need to ask clarifying questions to determine transformation settings (use questionsNeeded to specify clarifications)
+           You are a builder, not a chat partner: you do not answer questions as an
+           end in itself. When the user asks one ("what columns are available?"), or
+           when you cannot do what was asked (the named table is not in the source
+           data above, the request contradicts the schema), that is "ask_questions" —
+           put what you know, and what you need, in questionsNeeded. NEVER report a
+           request as impossible in a way that looks like a finished node: silently
+           leaving the node as it was is how a transformation written for a previous
+           source survives onto a new one and fails at run time.
 
         2. **Inferred Settings**: Based on the request, what transformation settings can you determine based on users input? Do not infer settings unless specified by the users input.
            - operationMode: "new_table" (creating new dataset) or "in_place" (updating/deleting existing records) or null if unclear${isSourceLocal ? '' : `
@@ -298,12 +314,26 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
             - If a transformation needs to create a new table, where should the data be stored: in the database or locally
             - **IMPORTANT**: If storageLocation is "local", then operationMode MUST always be "new_table" (database-to-local transformations cannot be in-place)`}
 
-        4. tableName: custom output table/collection name if user specifies one (e.g., "save to customer_data", "create orders_2024 table"), or null to use default
+        4. tableName: the output table/collection name, and nothing else — never
+           schema-qualified. Where a request names the table with a schema in
+           front of it, return only the table part${defaultSchema ? '; the schema is its own field (see 5)' : ''}.
+           - If the user named one ("save to customer_data", "create orders_2024 table"), use it verbatim.
+           - Otherwise, for operationMode "new_table", COIN a short snake_case name
+             describing what the result CONTAINS — "denied_stores", "orders_2024",
+             "customers_with_totals". This name becomes the node's label on the
+             canvas, so it has to read as English, not as an identifier: no node
+             ids, no timestamps, no "transformer_" prefix, 2-3 words at most.
+           - Only for operationMode "in_place" is null right: an in-place update
+             writes back to the source, which already has a name.${defaultSchema ? `
+
+        5. schema: which schema the output table lives in. The default is
+           ${defaultSchema} — return that unless the user asked for another one.` : ''}
 
 
         Examples:
-        - Request: "What columns are in the orders table?" → answer_directly
-        - Request: "I want to transform the data" → answer_directly (ask the user to provide the logic they want)${isSourceLocal ? `
+        - Request: "What columns are in the orders table?" → ask_questions (name the columns in the question text, then ask what they want done with them)
+        - Request: "I want to transform the data" → ask_questions (ask the user to provide the logic they want)
+        - Request names a table that is not in the source data above → ask_questions (say which table you were given, and ask which one to use)${isSourceLocal ? `
         - Request: "Can you update column A in the table directly?" → generate_transformation (operationMode: in_place)
         - Request: "Create a new table with filtered customers" → ask_questions (clear: operationMode is new_table)` : `
         - Request: "Can you update column A in the table directly?" → generate_transformation (operationMode: in_place, storageLocation: database)
@@ -316,13 +346,13 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
         - current application execution plan injects $out into statement and takes care of deleting collection if it needs to be replaced for new_table
         - Do not include any additional keys in the response
 
-        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, explanation, or corrected SQL before or after the object. If you need to explain something to the user, answer a question, or correct/diagnose SQL, put that text inside the "directAnswer" field and set "action" to "answer_directly" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
+        CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, explanation, or corrected SQL before or after the object. If you need to explain something to the user, answer a question, correct/diagnose SQL, or say why you cannot proceed, put that text inside a "questionsNeeded" entry and set "action" to "ask_questions" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
 
         Return your response as JSON:
         {
-          "action": "answer_directly" | "generate_transformation" | "ask_questions",
-          "directAnswer": "Your direct answer (only if action is answer_directly)",
-          "tableName": "inferred custom_table_name if in users input",
+          "action": "generate_transformation" | "ask_questions",
+          "tableName": "the table name ONLY, never schema-qualified — the user's name, or a short snake_case name you coin for a new table (null only for in_place)",${defaultSchema ? `
+          "schema": "the schema the output table lives in (default ${defaultSchema})",` : ''}
           "usesSkill": false | true,
           "skillId": "skill-id-here (only if usesSkill is true)",
           "skillExplanation": "Brief explanation of why this skill is being used (only if usesSkill is true)",

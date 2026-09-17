@@ -233,15 +233,14 @@ ${vocabulary.map(p => `- ${p}`).join('\n')}
 
 ${guidance}
 
-CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something or answer a question, put that text inside the "directAnswer"/"explanation" fields — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
+CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something, answer a question, or say why you cannot proceed, put that text inside the "followUpQuestion" field and set "action" to "ask_questions" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
 
 Return JSON with EXACTLY this shape (no extra keys):
 
 \`\`\`json
 {
-  "action": "answer_directly" | "ask_questions" | "create_plan",
+  "action": "ask_questions" | "create_plan",
   "followUpQuestion": "single clear question (only if action is ask_questions)",
-  "directAnswer": "answer (only if action is answer_directly)",
   "code": "async function fetchData({ axios }) { /* ... */ return rows; }",
   "explanation": "One sentence describing what the function does, including any looping behavior."
 }
@@ -249,12 +248,14 @@ Return JSON with EXACTLY this shape (no extra keys):
 
 RULES:
 
-1. **answer_directly** — user is asking a question and does not yet want to
-   configure a request. Fill \`directAnswer\`. Leave \`code\` and
-   \`explanation\` as nulls.
+1. There are exactly TWO actions, and every request ends in one of them — you
+   either write the function, or you ask. You are a builder, not a chat partner:
+   you do not answer questions as an end in itself.
 
 2. **ask_questions** — you need one more detail before you can write the
-   function. Fill \`followUpQuestion\`. Leave code/explanation as nulls.
+   function, the user asked something informational, or you cannot do what was
+   asked. Fill \`followUpQuestion\` — answer what they asked inside it if they
+   asked something, then say what you still need. Leave code/explanation as nulls.
 
 3. **create_plan** — you have enough to describe the exact call. Populate
    \`code\` and \`explanation\`.
