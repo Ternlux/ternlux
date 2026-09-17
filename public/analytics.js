@@ -49,10 +49,7 @@ const TRACK_CHANNELS = new Set([
   'skills:buildPrompt',
   'oauth:exchange-code',
   'oauth:start-callback-server',
-  'cloud-storage:import-file',
-  'import-to-sqlite',
-  'import-to-nedb',
-  'google-sheets:import-to-sqlite',
+  'google-sheets:import-to-duckdb',
 ]);
 
 // Hard-coded set of safe error labels we ever emit. Anything that isn't on
@@ -121,8 +118,6 @@ const PROP_EXTRACTORS = {
   'skills:buildPrompt': (args) => ({ pluginId: args?.[0]?.skillId || null }),
   'dbconn:test': (args) => ({ dbType: args?.[0]?.dbType || null }),
   'oauth:exchange-code': (args) => ({ dbType: args?.[0]?.dbType || null }),
-  'cloud-storage:import-file': (args) => ({ fileType: args?.[0]?.fileType || null }),
-  'import-to-sqlite': (args) => ({ fileType: args?.[0]?.fileType || null }),
 };
 
 function statePath() {

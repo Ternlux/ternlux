@@ -39,27 +39,23 @@ analytics.patchIpcMain(ipcMain);
 // to require across plugin directories.
 const vectorEmbeddings = require('./lib/embeddings');
 const vectorLanceDB    = require('./lib/lancedb');
-const localNeDB        = require('./lib/nedb');
 const localSQLite      = require('./lib/sqlite');
 const localDuckDB      = require('./lib/duckdb');
 const { executeOutput } = require('./NodeExecution/outputExecutionHelpers');
 const { addExecutionLog, executeNode } = require('./NodeExecution/workflowExecutionHelpers');
+const { createExecutionSink, runWithExecutionLog } = require('./NodeExecution/executionLog');
+const {
+  runWithCancellation, isCancelledError, ExecutionCancelledError,
+  throwIfCancelled, isCancellationRequested,
+} = require('./NodeExecution/executionCancel');
 const nodeExecution = require('./NodeExecution/NodeExecution');
 const apiFetch = require('./NodeExecution/ApiFetch');
 const { runOutputValidation } = require('./NodeExecution/outputValidation');
-const {
-  importParquetToSqlite,
-  importAvroToSqlite,
-  importSpreadsheetToSqlite,
-  importCsvToSqlite,
-  importJsonToNeDB,
-  readDelimitedHead,
-  DELIMITED_EXTENSIONS,
-} = require('./imports/importHelpers');
-const SqliteConnectionPool = require('./SqliteConnectionPool');
 const { registerCronJob, unregisterCronJob, getActiveCronJobs, stopAllCronJobs } = require('./triggers/cronTriggers');
 const { registerFileWatcher, unregisterFileWatcher, getActiveFileWatchers, stopAllFileWatchers } = require('./triggers/fileWatchTriggers');
 const { registerAllWorkflowTriggers } = require('./triggers/registerAllTriggers');
+const { registerLocalFile, listFileTables } = require('./imports/registerFile');
+
 const chatAssistant = require('./chat/chatAssistant');
 const workflowBuilder = require('./chat/workflowBuilder');
 
@@ -72,10 +68,15 @@ const { registerDatabaseIpc } = require('./database');
 // imported directly into the renderer. They're loaded here and exposed via
 // the chatPrompts:build IPC channel so NodeChat components don't reach into
 // the public/ tree themselves.
+// sanitizePromptModule wraps each builder so embedding vectors are stripped
+// from its arguments before a prompt is assembled — a vector source's sample
+// rows are otherwise serialised in full, and one 1536-dim embedding is ~8k
+// tokens of digits the model has no use for. See public/lib/promptSanitize.js.
+const { stripVectors, sanitizePromptModule } = require('./lib/promptSanitize');
 const CHAT_PROMPT_MODULES = {
-  join: require('./ChatPrompts/Join').join,
-  transfomer: require('./ChatPrompts/Transfomer').transfomer,
-  restApi: require('./ChatPrompts/RestApi'),
+  join: sanitizePromptModule(require('./ChatPrompts/Join').join),
+  transfomer: sanitizePromptModule(require('./ChatPrompts/Transfomer').transfomer),
+  restApi: sanitizePromptModule(require('./ChatPrompts/RestApi')),
 };
 
 ipcMain.handle('chatPrompts:build', async (_event, key, args = []) => {
@@ -95,90 +96,17 @@ ipcMain.handle('chatPrompts:build', async (_event, key, args = []) => {
 // so a key saved during development persists when the packaged app is launched.
 app.setName('Ternlux');
 
-// Single SQLite database path for all local transformations
+// Where file imports made before the DuckDB switch put their tables. NOTHING
+// WRITES HERE ANY MORE — local results are DuckDB, and the transform, join and
+// import paths that used this database have all been retired. The path is kept
+// so a connection recorded against it can still be READ: the readers open the
+// file by path (lib/sqlite, or DuckDB's sqlite attach), which is why there is no
+// longer a pool holding it open.
 let appSqliteDbPath = null;
-let sqlitePool = null;
 
-// Per-path NeDB Datastore cache. NeDB's loadDatabase rewrites `<file>.db~`
-// and renames it to `<file>.db`; running two Datastore instances concurrently
-// on the same path races that rename and one fails with ENOENT. Sharing a
-// single instance per path serializes operations through NeDB's executor.
-const nedbInstanceCache = new Map();
-
-/**
- * Adopt an already-loaded Datastore into the shared cache.
- *
- * A JSON import finishes with the entire collection already parsed in memory.
- * Without this, that instance is dropped on the floor and the next reader
- * (preview, explorer, a workflow node) goes through getOrLoadNedb, which
- * builds a *second* Datastore and re-reads and re-parses the whole file —
- * roughly 17 seconds of blocked main process for a 300 MB collection, after
- * the import has already reported itself complete. Handing the loaded instance
- * over means the data is usable the moment the progress bar finishes.
- */
-function adoptNedbInstance(filePath, db) {
-  let mtimeMs = null;
-  try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch (_) {
-    // No file yet is fine; the next getOrLoadNedb will just reload.
-  }
-  nedbInstanceCache.set(filePath, { db, loaded: Promise.resolve(db), mtimeMs });
-}
-
-async function getOrLoadNedb(filePath) {
-  // Bust the cache when the file changed on disk since we loaded it. A cached
-  // instance holds an in-memory snapshot from its first load and never sees
-  // writes made through a *different* Datastore instance — e.g. saveToLocalNeDB
-  // (which in new_table mode deletes+recreates the file) or transformNeDB. Left
-  // stale, reads (preview, downstream nodes) keep returning the old/empty
-  // contents even though targetLocalPath on disk now has the transformed rows.
-  let diskMtimeMs = null;
-  try {
-    diskMtimeMs = fs.statSync(filePath).mtimeMs;
-  } catch (_) {
-    // File may not exist yet; nothing to invalidate against.
-  }
-
-  let entry = nedbInstanceCache.get(filePath);
-  if (entry && diskMtimeMs !== null && entry.mtimeMs !== diskMtimeMs) {
-    nedbInstanceCache.delete(filePath);
-    entry = undefined;
-  }
-
-  if (!entry) {
-    const db = new Datastore({ filename: filePath, autoload: false });
-    const loaded = new Promise((resolve, reject) => {
-      db.loadDatabase((err) => (err ? reject(err) : resolve(db)));
-    });
-    entry = { db, loaded, mtimeMs: diskMtimeMs };
-    nedbInstanceCache.set(filePath, entry);
-    try {
-      await loaded;
-      // loadDatabase compacts (rewrites) the file, bumping its mtime. Capture
-      // the post-load value so our own load isn't mistaken for an external
-      // write on the next call.
-      try { entry.mtimeMs = fs.statSync(filePath).mtimeMs; } catch (_) {}
-    } catch (err) {
-      nedbInstanceCache.delete(filePath);
-      throw err;
-    }
-  } else {
-    await entry.loaded;
-  }
-  return entry.db;
-}
-
-/**
- * Initialize the SQLite connection pool
- * All local SQL transformations will use this persistent connection
- */
+/** Resolve the legacy app database path. Opens nothing. */
 async function initializeAppDatabase() {
   appSqliteDbPath = path.join(app.getPath('userData'), 'app-data.db');
-
-  // Create and initialize the connection pool
-  sqlitePool = new SqliteConnectionPool(appSqliteDbPath);
-  await sqlitePool.initialize();
-
-  console.log('App SQLite connection pool initialized at:', appSqliteDbPath);
   return appSqliteDbPath;
 }
 
@@ -547,19 +475,22 @@ ipcMain.handle('db-credentials:delete', (_event, { connectionId }) => {
 });
 
 // ---------------------------------------------------------------------------
-// Local NeDB datastores — lazily initialized after app is ready so that
-// app.getPath('userData') is available.
+// The app's own metadata store — workflows, connections, executions and chat
+// sessions, kept in NeDB files under userData. This is internal bookkeeping and
+// is unrelated to the stores a user's DATA lives in (those are DuckDB).
+// Lazily initialized after app is ready so app.getPath('userData') is available.
 // ---------------------------------------------------------------------------
 
 const _dbs = {};
-const VALID_COLLECTIONS = ['workflows', 'connections', 'executions', 'chatSessions'];
+const VALID_COLLECTIONS = ['workflows', 'connections', 'executions', 'chatSessions', 'workflowHistory'];
 
 // NeDB forbids object KEYS that contain a "." (it reserves the dot for
 // dot-notation queries) and throws "Field names cannot contain a .". Workflow
-// configs legitimately use dotted keys (e.g. join selectedColumns keyed by
-// "dbo.transactions"), so we transparently encode "." → "||" in keys on write
-// and decode "||" → "." on read for the workflows collection only. Values are
-// never touched — only object keys.
+// configs legitimately use dotted keys — a join's `joinColumns` is keyed by the
+// qualified table it joins on, "[dbo].[transactions]" — so we transparently
+// encode "." → "||" in keys on write and decode "||" → "." on read, for every
+// collection (see getDb). Values are never touched, only object keys, so what a
+// caller stores is what it reads back.
 const DOT_TOKEN = '||';
 const _dbWrappers = {};
 
@@ -660,7 +591,7 @@ function wrapKeySafeDb(raw) {
     updateAsync: async (query, update, options = {}) => {
       let externalized = update;
       const set = update && update.$set;
-      if (set && (Array.isArray(set.nodes) || Array.isArray(set.executionSteps))) {
+      if (set && Array.isArray(set.nodes)) {
         // Directory naming needs the workflow name; modify updates may omit it,
         // so fall back to the stored doc's name.
         let wfName = set.name;
@@ -693,6 +624,32 @@ function wrapKeySafeDb(raw) {
   });
 }
 
+// Dotted-key encoding WITHOUT code externalization, for the workflow history
+// collection. Its documents are snapshots of workflow nodes, so they carry the
+// same dotted config keys the workflows collection has to encode — but a
+// version snapshot has to stay self-contained: externalizing its code would
+// point every version at the same file on disk, and reverting would then
+// restore the CURRENT code under an old graph.
+function wrapDotSafeDb(raw) {
+  const overrides = {
+    insertAsync: (doc) => raw.insertAsync(encodeDotKeys(doc)).then(decodeDotKeys),
+    findOneAsync: (...args) => raw.findOneAsync(...args).then(decodeDotKeys),
+    findAsync: (...args) => wrapDecodingCursor(raw.findAsync(...args), null),
+    updateAsync: async (query, update, options = {}) => {
+      const res = await raw.updateAsync(query, encodeUpdate(update), options);
+      if (res && res.affectedDocuments) res.affectedDocuments = decodeDotKeys(res.affectedDocuments);
+      return res;
+    },
+  };
+  return new Proxy(raw, {
+    get(target, prop, receiver) {
+      if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop];
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
 function getDb(collection) {
   if (!VALID_COLLECTIONS.includes(collection)) {
     throw new Error(`Unknown collection: ${collection}`);
@@ -702,13 +659,42 @@ function getDb(collection) {
       filename: path.join(app.getPath('userData'), `ternlux-${collection}.db`),
       autoload: true,
     });
+    if (collection === 'executions') {
+      // The execution monitor polls "what is running" every second or so, and
+      // each open canvas asks for its workflow's newest run. Without these the
+      // collection is scanned end to end each time, and it only ever grows.
+      _dbs[collection].ensureIndex({ fieldName: 'status' }, () => {});
+      _dbs[collection].ensureIndex({ fieldName: 'workflowId' }, () => {});
+    }
+    if (collection === 'workflowHistory') {
+      // One document per workflow, always fetched by workflowId — which is the
+      // collection's primary key, so the index is unique.
+      _dbs[collection].ensureIndex({ fieldName: 'workflowId', unique: true }, () => {});
+    }
   }
-  // Only workflows need dotted-key encoding; other collections are returned raw.
-  if (collection === 'workflows') {
-    if (!_dbWrappers[collection]) _dbWrappers[collection] = wrapKeySafeDb(_dbs[collection]);
-    return _dbWrappers[collection];
+  // EVERY collection gets the dotted-key encoding. A dotted key is not a
+  // workflow-shaped problem — it is a NeDB one, and workflow-shaped data ends
+  // up in most of these stores:
+  //
+  //   chatSessions — a message records the config of a node the assistant
+  //                  built (`nodeRun`) and the results of tools like
+  //                  get_workflow, so a join keyed by "[dbo].[transactions]"
+  //                  (joinColumns) reaches this collection intact
+  //   connections  — a file connection's `fileInfo.tables` is keyed by table
+  //                  name, and a sheet or CSV can have a dot in its name
+  //   executions   — an output-validation function returns whatever it likes
+  //
+  // Each of those used to throw "Field names cannot contain a ." out of the
+  // db:update handler, and the renderer only warns, so the write was lost
+  // silently — a chat that discussed a schema-qualified join simply stopped
+  // persisting. Only `workflows` needs the extra code-externalization pass on
+  // top (wrapKeySafeDb encodes as well).
+  if (!_dbWrappers[collection]) {
+    _dbWrappers[collection] = collection === 'workflows'
+      ? wrapKeySafeDb(_dbs[collection])
+      : wrapDotSafeDb(_dbs[collection]);
   }
-  return _dbs[collection];
+  return _dbWrappers[collection];
 }
 
 // db:insert — insert a document into a collection
@@ -739,6 +725,52 @@ ipcMain.handle('db:update', async (_event, { collection, query = {}, update = {}
   return db.updateAsync(query, update, options);
 });
 
+/** A connection that reads a file on disk rather than a remote server. */
+const isLocalFileConnection = (conn) =>
+  !!conn && conn.connectionType === 'file' && !!conn.fileInfo?.filePath;
+
+/**
+ * Let go of whatever a deleted file connection registered on the shared DuckDB
+ * instance — its schema of views, or its ATTACH for a database file.
+ *
+ * The config is built the same way the Data Explorer builds it (see
+ * public/database/index.js configForConnection + withSiblings), because the
+ * connector resolves its schema name from exactly those fields; handing it a
+ * different shape would compute a different name and drop nothing.
+ *
+ * Best-effort: a connection the user asked to delete gets deleted either way.
+ */
+async function releaseFileConnection(conn, remainingConnections = []) {
+  try {
+    const connector = pluginManager.hasConnector(conn.dbType)
+      ? pluginManager.getConnector(conn.dbType)
+      : null;
+    if (!connector || typeof connector.releaseConnection !== 'function') return;
+
+    const configFor = (c) => ({
+      ...(c.dbConfig || {}),
+      dbPath: c.fileInfo?.filePath,
+      tables: c.fileInfo?.tables || null,
+      tablePaths: c.fileInfo?.tablePaths || null,
+      tableSheets: c.fileInfo?.tableSheets || null,
+      format: c.fileInfo?.format || null,
+    });
+
+    const siblings = remainingConnections
+      .filter((c) => c.dbType === conn.dbType && isLocalFileConnection(c))
+      .map((c) => ({ connectionId: c.id || c._id, name: c.name, config: configFor(c) }))
+      .filter((s) => s.config.dbPath);
+
+    const config = { ...configFor(conn), connectionName: conn.name, ...(siblings.length ? { siblings } : {}) };
+    const result = await connector.releaseConnection(config, conn.id || conn._id);
+    if (result && result.success === false) {
+      console.warn(`[db:remove] could not release connection ${conn.name}:`, result.message);
+    }
+  } catch (err) {
+    console.warn('[db:remove] could not release connection:', err.message);
+  }
+}
+
 // db:remove — remove matching documents; options: { multi }
 ipcMain.handle('db:remove', async (_event, { collection, query = {}, options = {} }) => {
   const db = getDb(collection);
@@ -757,8 +789,42 @@ ipcMain.handle('db:remove', async (_event, { collection, query = {}, options = {
       } catch (err) {
         console.warn('[db:remove] could not drop workflow database:', err.message);
       }
+      // So does its version history — there is nothing left to revert into,
+      // and versions left behind would be handed to whatever workflow next
+      // reused the id. Matched on both ids because the history is keyed by
+      // whichever one the renderer recorded under.
+      try {
+        await getDb('workflowHistory').removeAsync(
+          { $or: [{ workflowId: m.id }, { workflowId: m._id }] },
+          { multi: true },
+        );
+      } catch (err) {
+        console.warn('[db:remove] could not drop workflow history:', err.message);
+      }
     }
   }
+
+  // A local file connection leaves a schema of views on the shared DuckDB
+  // instance the first time it is browsed (see the duckdb connector's
+  // registerSchema). Those views outlive the connection record, so without
+  // this a deleted CSV keeps answering to `sales_csv.orders` in a worksheet
+  // and keeps appearing among other connections' siblings until restart.
+  if (collection === 'connections') {
+    const matches = await db.findAsync(query);
+    const doomed = (Array.isArray(matches) ? matches : []).filter(isLocalFileConnection);
+    if (doomed.length) {
+      // The siblings a name collision is resolved against are the connections
+      // that REMAIN — which is what the explorer will pass next time it
+      // registers, and therefore the name this one was registered under.
+      const removedIds = new Set(doomed.map((c) => String(c.id || c._id)));
+      const remaining = (await getDb('connections').findAsync({}))
+        .filter((c) => !removedIds.has(String(c.id || c._id)));
+      for (const conn of doomed) {
+        await releaseFileConnection(conn, remaining);
+      }
+    }
+  }
+
   return db.removeAsync(query, options);
 });
 
@@ -768,8 +834,8 @@ ipcMain.handle('db:count', async (_event, { collection, query = {} }) => {
   return db.countAsync(query);
 });
 
-// db:read-local-collection — read from a local NeDB or SQLite file
-ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 100, storageType = 'nedb', sqlPreview = null, tableName = null }) => {
+// db:read-local-collection — read from a local DuckDB or SQLite file
+ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 100, storageType = 'duckdb', sqlPreview = null, tableName = null }) => {
   try {
     if (!filePath || !fs.existsSync(filePath)) {
       return {
@@ -830,7 +896,7 @@ ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 10
           tables: [name],
           currentTable: name,
           // DuckDB knows the real column types, so callers don't have to infer
-          // them from the first row the way the NeDB path has to.
+          // them from the first row.
           columns: result.columns,
         };
       } catch (error) {
@@ -937,36 +1003,16 @@ ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 10
           });
         }
       });
-    } else {
-      // Read NeDB file via shared per-path Datastore (avoids rename race).
-      let localDb;
-      try {
-        localDb = await getOrLoadNedb(filePath);
-      } catch (loadErr) {
-        return {
-          success: false,
-          message: `Failed to load local collection: ${loadErr.message}`
-        };
-      }
-
-      return new Promise((resolve) => {
-        localDb.find({}).limit(limit).exec((err, docs) => {
-          if (err) {
-            resolve({
-              success: false,
-              message: `Failed to read documents: ${err.message}`
-            });
-          } else {
-            resolve({
-              success: true,
-              rows: docs,
-              rowCount: docs.length,
-              json: true // NeDB/MongoDB data is JSON
-            });
-          }
-        });
-      });
     }
+
+    // Every local store is read by DuckDB or SQLite above. A storageType that
+    // reaches here is one this app no longer has a reader for — a stale config
+    // naming the removed local document store — and saying so is better than
+    // the empty result an unhandled branch used to return.
+    return {
+      success: false,
+      message: `Unsupported local storage type "${storageType}". Local files are read as DuckDB or SQLite.`,
+    };
   } catch (error) {
     return {
       success: false,
@@ -1133,7 +1179,6 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
  */
 ipcMain.handle('file:register-local', async (_event, { filePath, importId = null }) => {
   try {
-    const { registerLocalFile } = require('./imports/registerFile');
     return await registerLocalFile(filePath, app.getPath('userData'), {
       onProgress: makeImportProgressReporter(_event, importId),
     });
@@ -1151,117 +1196,8 @@ function makeImportProgressReporter(event, importId) {
   };
 }
 
-/**
- * import-to-sqlite — Import CSV/Excel/Parquet/Avro file to internal SQLite database
- * Returns { success, dbPath, tableName, rowCount, message }
- */
-ipcMain.handle('import-to-sqlite', async (_event, { filePath, tableName, fileType, sheets = [], importId = null }) => {
-  try {
-    const path = require('path');
-    const onProgress = makeImportProgressReporter(_event, importId);
-
-    // Use the app-wide SQLite database
-    if (!appSqliteDbPath) {
-      return {
-        success: false,
-        message: 'App database not initialized'
-      };
-    }
-
-    if (!sqlitePool) {
-      return {
-        success: false,
-        message: 'SQLite connection pool not initialized'
-      };
-    }
-
-    // Sanitize the base table name
-    let sanitizedTableName = String(tableName)
-      .replace(/[^a-zA-Z0-9_]/g, '_')
-      .replace(/^[0-9]/, '_$&') // Prefix with underscore if starts with number
-      .substring(0, 64); // Limit length
-
-    // Ensure table name is not empty
-    if (!sanitizedTableName || sanitizedTableName === '') {
-      sanitizedTableName = 'imported_table';
-    }
-
-    const dbPath = appSqliteDbPath;
-
-    // Determine file type from extension if not provided
-    const ext = path.extname(filePath).toLowerCase();
-    const detectedFileType = fileType || (
-      ext === '.parquet' ? 'parquet' :
-      ext === '.avro' ? 'avro' :
-      'spreadsheet'
-    );
-
-    // Use connection pool for import
-    return await sqlitePool.executeWrite(async (db) => {
-      // Route to appropriate parser based on file type
-      if (detectedFileType === 'parquet') {
-        return await importParquetToSqlite(filePath, sanitizedTableName, db, dbPath, { onProgress });
-      } else if (detectedFileType === 'avro') {
-        return await importAvroToSqlite(filePath, sanitizedTableName, db, dbPath, { onProgress });
-      } else {
-        // Default: CSV/Excel import
-        // sheets parameter: empty array = import all sheets, specific sheets = import only those
-        return await importSpreadsheetToSqlite(filePath, sanitizedTableName, db, dbPath, sheets, { onProgress });
-      }
-    });
-  } catch (error) {
-    console.error('Import error:', error);
-    return {
-      success: false,
-      message: error.message || 'Failed to import file'
-    };
-  }
-});
 
 
-/**
- * import-to-nedb — Import JSON file to internal NeDB database
- * Returns { success, dbPath, collectionName, docCount, message }
- */
-ipcMain.handle('import-to-nedb', async (_event, { filePath, collectionName, importId = null }) => {
-  try {
-    // Create internal databases directory
-    const userDataPath = app.getPath('userData');
-    const dbDir = path.join(userDataPath, 'internal_databases');
-    if (!fs.existsSync(dbDir)) {
-      fs.mkdirSync(dbDir, { recursive: true });
-    }
-
-    // Create database file
-    const dbPath = path.join(dbDir, `${collectionName}.nedb`);
-
-    const db = new Datastore({ filename: dbPath });
-    await db.loadDatabaseAsync();
-
-    // Streams a top-level JSON array in and inserts it in batches, so a large
-    // file never lands in memory as raw text plus parsed documents at once.
-    const result = await importJsonToNeDB(filePath, db, {
-      onProgress: makeImportProgressReporter(_event, importId),
-    });
-
-    if (!result.success) return result;
-
-    // The collection is already loaded here — hand it to the shared cache so
-    // the first preview doesn't re-parse the file from scratch.
-    adoptNedbInstance(dbPath, db);
-
-    return {
-      success: true,
-      dbPath,
-      collectionName,
-      docCount: result.docCount,
-      message: result.message,
-    };
-  } catch (err) {
-    console.error('Import to NeDB error:', err);
-    return { success: false, message: err.message };
-  }
-});
 
 /**
  * list-lancedb-tables — List all tables in a LanceDB database directory
@@ -1320,28 +1256,36 @@ async function getFullConfig(connectionId, baseConfig = {}) {
     return baseConfig;
   }
 
-  // A local file connection keeps its location in fileInfo, not dbConfig, and
-  // most callers hand us dbConfig (which is empty for a file). Fill in the path
-  // here so any connector call for a file connection is addressable, rather
-  // than making every call site remember to reshape the config.
-  if (!baseConfig?.dbPath) {
-    try {
-      const conn = (await loadConnectionsFromDb()).find(
-        (c) => (c.id || c._id) === connectionId,
-      );
-      if (conn?.connectionType === 'file' && conn.fileInfo?.filePath) {
-        baseConfig = {
-          ...baseConfig,
-          dbPath: conn.fileInfo.filePath,
-          tables: conn.fileInfo.tables || null,
-          tablePaths: conn.fileInfo.tablePaths || null,
-          tableSheets: conn.fileInfo.tableSheets || null,
-          format: conn.fileInfo.format || null,
-        };
-      }
-    } catch (err) {
-      console.warn('[getFullConfig] Could not resolve file connection path:', err.message);
+  try {
+    const conn = (await loadConnectionsFromDb()).find(
+      (c) => (c.id || c._id) === connectionId,
+    );
+
+    // Only the fields a plugin marks `sensitive` go to the keychain; everything
+    // else (a GCS bucket, an S3 region/endpoint, a SharePoint siteId, the OAuth
+    // redirectUri and token expiry) stays in the connection's dbConfig. Callers
+    // that pass `{}` used to lose all of it, so lay the stored dbConfig down as
+    // the base layer — anything the caller supplied still wins over it.
+    if (conn?.dbConfig) {
+      baseConfig = { ...conn.dbConfig, ...baseConfig };
     }
+
+    // A local file connection keeps its location in fileInfo, not dbConfig, and
+    // most callers hand us dbConfig (which is empty for a file). Fill in the
+    // path here so any connector call for a file connection is addressable,
+    // rather than making every call site remember to reshape the config.
+    if (!baseConfig?.dbPath && conn?.connectionType === 'file' && conn.fileInfo?.filePath) {
+      baseConfig = {
+        ...baseConfig,
+        dbPath: conn.fileInfo.filePath,
+        tables: conn.fileInfo.tables || null,
+        tablePaths: conn.fileInfo.tablePaths || null,
+        tableSheets: conn.fileInfo.tableSheets || null,
+        format: conn.fileInfo.format || null,
+      };
+    }
+  } catch (err) {
+    console.warn('[getFullConfig] Could not load stored connection config:', err.message);
   }
 
   try {
@@ -1487,10 +1431,22 @@ ipcMain.handle('dbconn:get-preview-query', async (_event, { dbType, tableName, l
 });
 
 /**
- * google-sheets:import-to-sqlite — Import a Google Sheet to local SQLite database.
+ * google-sheets:import-to-duckdb — Import a Google Sheet to a local DuckDB file.
+ *
+ * One file holds every imported sheet, a table each: DuckDB replaces only the
+ * table being written, so re-importing a sheet refreshes it and leaves the
+ * others alone. That is the same "one file, many tables" arrangement the shared
+ * app SQLite database used to provide, minus the second storage engine.
+ *
+ * Column names are sanitized (and de-duplicated) so downstream SQL can address
+ * them unquoted, and a column whose values are all numeric is CONVERTED to
+ * numbers before the write rather than declared numeric and filled with
+ * strings — Sheets hands back everything as text, and DuckDB, unlike SQLite,
+ * does not silently coerce on insert.
+ *
  * Returns { success, localPath, tableName, rowCount, message }
  */
-ipcMain.handle('google-sheets:import-to-sqlite', async (_event, { config, connectionId, spreadsheetId, sheetName }) => {
+ipcMain.handle('google-sheets:import-to-duckdb', async (_event, { config, connectionId, spreadsheetId, sheetName }) => {
   try {
     const fullConfig = await getFullConfig(connectionId, config);
 
@@ -1558,97 +1514,44 @@ ipcMain.handle('google-sheets:import-to-sqlite', async (_event, { config, connec
       return 'TEXT';
     };
 
-    // Step 5: Build DDL with sanitized column names
-    const columnDefs = columns.map((column, index) => {
-      const sanitizedName = columnIndexMap.get(index);
-      const columnValues = rows.map(row => row[column]);
-      const columnType = inferType(columnValues);
-      return `"${sanitizedName}" ${columnType}`;
-    }).join(', ');
+    const columnTypes = columns.map((column, index) => ({
+      original: column,
+      name: columnIndexMap.get(index),
+      type: inferType(rows.map(row => row[column])),
+    }));
 
-    const ddl = `CREATE TABLE "${sanitizedTableName}" (${columnDefs})`;
-
-    // Step 6: Build INSERT statement with sanitized column names
-    const quotedColumns = columns.map((col, index) => {
-      const sanitizedName = columnIndexMap.get(index);
-      return `"${sanitizedName}"`;
-    }).join(', ');
-    const placeholders = columns.map(() => '?').join(', ');
-    const insertSql = `INSERT INTO "${sanitizedTableName}" (${quotedColumns}) VALUES (${placeholders})`;
-
-    // Step 7: Use connection pool to insert data into app-data.db
-    if (!sqlitePool) {
-      return {
-        success: false,
-        message: 'SQLite connection pool not initialized'
-      };
-    }
-
-    return await sqlitePool.executeWrite(async (db) => {
-      // Drop table if exists
-      await new Promise((resolve, reject) => {
-        db.run(`DROP TABLE IF EXISTS "${sanitizedTableName}"`, (dropErr) => {
-          if (dropErr) reject(new Error(`Failed to drop existing table: ${dropErr.message}`));
-          else resolve();
-        });
-      });
-
-      // Create table
-      await new Promise((resolve, reject) => {
-        db.run(ddl, (createErr) => {
-          if (createErr) reject(new Error(`Failed to create table: ${createErr.message}`));
-          else resolve();
-        });
-      });
-
-      // Insert data in chunks
-      const CHUNK_SIZE = 1000;
-      let processedRows = 0;
-
-      const processChunk = async (startIndex) => {
-        const endIndex = Math.min(startIndex + CHUNK_SIZE, rows.length);
-        const chunk = rows.slice(startIndex, endIndex);
-
-        await new Promise((resolve, reject) => {
-          const stmt = db.prepare(insertSql);
-
-          for (const row of chunk) {
-            const values = columns.map(col => row[col]);
-            stmt.run(values, (runErr) => {
-              if (runErr) {
-                console.error('[Google Sheets Import] Insert error:', runErr);
-              }
-            });
-          }
-
-          stmt.finalize((finalizeErr) => {
-            if (finalizeErr) {
-              console.error('[Google Sheets Import] Finalize error:', finalizeErr);
-              reject(finalizeErr);
-            } else {
-              processedRows += chunk.length;
-              resolve();
-            }
-          });
-        });
-
-        if (endIndex < rows.length) {
-          // Process next chunk
-          await processChunk(endIndex);
+    // Step 5: Re-key each row under the sanitized names, converting the columns
+    // that are wholly numeric. An empty cell stays null rather than becoming 0.
+    const shaped = rows.map((row) => {
+      const out = {};
+      for (const { original, name, type } of columnTypes) {
+        const value = row[original];
+        if (value === null || value === undefined || value === '') {
+          out[name] = null;
+        } else if (type === 'INTEGER' || type === 'REAL') {
+          const asNumber = Number(value);
+          out[name] = Number.isNaN(asNumber) ? value : asNumber;
+        } else {
+          out[name] = value;
         }
-      };
-
-      // Start processing chunks
-      await processChunk(0);
-
-      return {
-        success: true,
-        localPath: appSqliteDbPath,
-        tableName: sanitizedTableName,
-        rowCount: processedRows,
-        message: `Imported ${processedRows} rows from Google Sheet`
-      };
+      }
+      return out;
     });
+
+    // Step 6: Write the table into the shared Google Sheets database
+    const duck = require('./duckdb');
+    const localPath = path.join(app.getPath('userData'), 'google-sheets.duckdb');
+    const { rowCount, tableName } = await duck.ingestRowsToTableAt(
+      shaped, localPath, sanitizedTableName, { mode: 'replace' },
+    );
+
+    return {
+      success: true,
+      localPath,
+      tableName,
+      rowCount,
+      message: `Imported ${rowCount} rows from Google Sheet`
+    };
   } catch (err) {
     console.error('[Google Sheets Import] Error:', err);
     return { success: false, message: err.message };
@@ -1746,11 +1649,17 @@ ipcMain.handle('dbconn:generate-transform-prompt', async (_event, {
 
           // Execute prompt function in main process with provided parameters
           // For in-place mode, use source table/schema; for new-table mode, use target table/schema
+          //
+          // Every argument that can carry sample rows goes through the vector
+          // stripper first. Doing it here rather than inside each connector
+          // covers all of them at once — every connector's getTransformPrompts
+          // serialises the schema it is handed, and a transformer reading a
+          // vector table would otherwise put whole embeddings in the prompt.
           const prompt = promptFn(
             settings,
-            sourceTableInfo,
+            stripVectors(sourceTableInfo),
             settingsContext,
-            sourceConnection || sourceTableSchema,
+            stripVectors(sourceConnection || sourceTableSchema),
             sourceSchemaClean,
             operationMode === 'in_place' ? (sourceFullTableName || sourceTableSchema?.tableName) : (fullTableName || targetTableName),
             serverVersion
@@ -2970,7 +2879,7 @@ ipcMain.handle('workflow:generateValidation', async (event, { workflowId } = {})
  * a stale document.
  */
 ipcMain.handle('workflow:validateChange', async (_event, {
-  workflowId, change = {}, chatHistory = [], pendingNode = null, fixRounds = 0,
+  workflowId, change = {}, chatHistory = [], priorActions = [], pendingNode = null, fixRounds = 0,
 } = {}) => {
   try {
     if (!workflowId) return { success: false, message: 'workflowId is required' };
@@ -2988,7 +2897,14 @@ ipcMain.handle('workflow:validateChange', async (_event, {
         nodes: found
           ? nodes.map((n) => (
             n.id === pendingNode.nodeId
-              ? { ...n, data: { ...(n.data || {}), config: { ...(n.data?.config || {}), ...pendingNode.config } } }
+              // REPLACES the saved config, never merges onto it. The renderer
+              // only sends pendingNode for a FINISHED build (a partial chat
+              // commit is not reviewed), so this is a whole config — and
+              // reviewing it spread over the previous run's fields means
+              // judging a node that exists nowhere: the reviewer passed a
+              // BigQuery transformer whose targetSql was still the local
+              // DuckDB SELECT it had inherited. Same rule the canvas applies.
+              ? { ...n, data: { ...(n.data || {}), config: { ...pendingNode.config } } }
               : n
           ))
           // A node added on the canvas and configured from chat has never been
@@ -3003,9 +2919,34 @@ ipcMain.handle('workflow:validateChange', async (_event, {
       };
     }
 
+    // A single-node rebuild writes one node and stops, so every node reading it
+    // still describes the OLD output shape. Refresh that here, before the
+    // review, so the reviewer judges the workflow as it now stands — and so a
+    // downstream node is never left claiming an input its parent no longer
+    // produces. A plan build needs none of this: executeBuild already resolves
+    // each step's upstream from the nodes it just built.
+    let impactedDownstream = [];
+    if (change.kind === 'node' && Array.isArray(change.nodeIds) && change.nodeIds.length === 1) {
+      const rebuiltId = change.nodeIds[0];
+      const rebuiltCfg = (reviewed.nodes || [])
+        .find((n) => n.id === rebuiltId)?.data?.config || null;
+      const { nodes, impacted } = workflowBuilder.propagateSourceSchema(reviewed, rebuiltId, rebuiltCfg);
+      impactedDownstream = impacted;
+      if (nodes !== reviewed.nodes) {
+        reviewed = { ...reviewed, nodes };
+        // Persist the refreshed inputs. Only the source-shape fields moved; the
+        // children's own logic is untouched.
+        await wfDb.updateAsync(
+          { $or: [{ id: workflow.id || workflowId }, { _id: workflow._id || workflowId }] },
+          { $set: { nodes, updatedAt: new Date().toISOString() } },
+          {},
+        );
+      }
+    }
+
     const helpers = await buildSkillHelpers();
     const review = await chatAssistant.validateWorkflowChange({
-      workflow: reviewed, helpers, change, chatHistory, fixRounds,
+      workflow: reviewed, helpers, change, chatHistory, priorActions, fixRounds, impactedDownstream,
     });
 
     // Only meaningful once a validation function exists; checkValidationDrift
@@ -3015,7 +2956,22 @@ ipcMain.handle('workflow:validateChange', async (_event, {
       drift = await chatAssistant.checkValidationDrift({ workflow: reviewed, helpers });
     }
 
-    return { success: true, ...review, drift };
+    // The workflow's identity travels with the verdict. A review that finds a
+    // problem is offered back to the user as a fix, and that fix has to name
+    // the workflow it applies to — both so the user can see which one they are
+    // agreeing to change, and so the agent is told the target outright instead
+    // of inferring it from whatever the chat happens to be discussing.
+    return {
+      success: true,
+      workflowId: workflow.id || workflow._id || workflowId,
+      workflowName: workflow.name || null,
+      // Which nodes downstream now read a different shape. The chat lists them
+      // so the user can see what the rebuild moved, and the reviewer's
+      // remediation covers them.
+      impactedDownstream,
+      ...review,
+      drift,
+    };
   } catch (err) {
     console.error('[workflow:validateChange]', err);
     // Never block the user's work on a failed review.
@@ -3113,7 +3069,7 @@ async function loadConnectionsFromDb() {
  */
 /**
  * @param {string|null} [defaultDbPath] - Optional fallback for local file
- *   connections (nedb / sqlite / lancedb). When a runQuery / getTables /
+ *   connections (duckdb / sqlite / lancedb). When a runQuery / getTables /
  *   getColumns call passes its own `dbPath`, that wins. When neither is
  *   provided, the call is treated as a saved-connection lookup.
  */
@@ -3121,10 +3077,9 @@ async function buildSkillHelpers(defaultDbPath = null) {
   const apiKeys = loadApiKeys() || {};
   const connections = await loadConnectionsFromDb();
 
-  const LOCAL_DB_TYPES = new Set(['duckdb', 'nedb', 'sqlite', 'lancedb']);
+  const LOCAL_DB_TYPES = new Set(['duckdb', 'sqlite', 'lancedb']);
   const localLib = (dbType) => {
     if (dbType === 'duckdb')  return localDuckDB;
-    if (dbType === 'nedb')    return localNeDB;
     if (dbType === 'sqlite')  return localSQLite;
     if (dbType === 'lancedb') return vectorLanceDB;
     return null;
@@ -3136,7 +3091,7 @@ async function buildSkillHelpers(defaultDbPath = null) {
    *
    * Routing rule: local iff a dbPath is available (per-call or default) AND
    * `connection` identifies one of the local dbTypes — either a string name
-   * matching nedb/sqlite/lancedb, or an object that carries a matching
+   * matching duckdb/sqlite/lancedb, or an object that carries a matching
    * `dbType`.
    */
   /**
@@ -3169,7 +3124,7 @@ async function buildSkillHelpers(defaultDbPath = null) {
 
   /**
    * Route a RESOLVED saved-connection record (looked up by name/id) to the
-   * local lib when its dbType is a local builtin (sqlite / nedb / lancedb).
+   * local lib when its dbType is a local builtin (duckdb / sqlite / lancedb).
    *
    * This is the path the chat assistant and headless workflow builder hit:
    * they pass a connection id/name (not a bare dbType + dbPath), so
@@ -3215,14 +3170,23 @@ async function buildSkillHelpers(defaultDbPath = null) {
 
   /**
    * runQuery(connection, query, dbPath = null)
-   *  - dbPath is non-null → local file (nedb / sqlite / lancedb), connection
-   *    is the dbType string ('nedb' | 'sqlite' | 'lancedb')
+   *  - dbPath is non-null → local file (duckdb / sqlite / lancedb), connection
+   *    is the dbType string ('duckdb' | 'sqlite' | 'lancedb')
    *  - dbPath is null     → saved connection looked up by name/id
    *
-   * Replaces the old separate sqliteQuery / nedbReadFile / nedbWriteFile /
+   * Replaces the old separate sqliteQuery / readFile / writeFile /
    * writeLanceDB helpers — every store is reachable through this one entry.
    */
   async function runQuery(connection, query, dbPath = null) {
+    // The prompts teach `operation: 'queryVectors'` for a vector search, and
+    // lib/lancedb.js accepts it as a synonym for 'query'. The connector-side
+    // stores (Pinecone) never got that synonym, so the same generated function
+    // worked against LanceDB and threw "Unknown operation" against Pinecone.
+    // Normalise here, the one entry point all three branches share, so already
+    // saved workflows keep working whichever store they point at.
+    if (query && typeof query === 'object' && query.operation === 'queryVectors') {
+      query = { ...query, operation: 'query' };
+    }
     const local = resolveLocal(connection, dbPath);
     if (local) {
       const queryObj = (query && typeof query === 'object') ? query : { query };
@@ -3237,30 +3201,94 @@ async function buildSkillHelpers(defaultDbPath = null) {
     const connector = requireConnector(conn);
     const id = conn.id || conn._id;
     const fullConfig = await getFullConfig(id, conn.dbConfig || {});
-    const queryObj = typeof query === 'string'
-      ? { query, limit: 1000000 }
-      : { limit: 1000000, ...query };
+    // No injected limit.
+    //
+    // A skill is handed its source as ONE array — that is the contract its
+    // function signature is written against, and it is not being changed — but
+    // "all of it" and "the first million rows of it" are different things. This
+    // used to stamp `limit: 1000000` onto every query a skill made, so a
+    // JavaScript or Python transform over a larger source silently operated on
+    // a truncated copy and reported a clean result. A caller that genuinely
+    // wants fewer rows still says so in its own query object.
+    const queryObj = typeof query === 'string' ? { query } : { ...query };
     const result = await connector.runQuery(fullConfig, id, queryObj);
     if (result && result.success === false) throw new Error(result.message || 'runQuery failed');
     return result.rows || result.data || [];
   }
 
+  /**
+   * The tables a local store holds right now, read from the store itself.
+   *
+   * Each local dbType needs a different question asked. duckdb is the awkward
+   * one: it has no catalog to list because a data-file connection is registered
+   * by PATH — the file IS the catalog — so its module exposes no getTables at
+   * all. A .duckdb/.sqlite database file reached through the same dbType does
+   * have a catalog, and `isReadable` (true for csv/json/parquet/xlsx/avro,
+   * false for database files) is what tells the two apart.
+   *
+   * Returns [] rather than throwing when a store cannot answer, so callers fall
+   * back to what the connection recorded instead of failing outright.
+   */
+  const liveLocalTables = async ({ dbType, dbPath, lib }) => {
+    if (!dbPath) return [];
+    if (dbType === 'duckdb') {
+      const duck = require('./duckdb');
+      if (duck.isReadable(dbPath)) return listFileTables(dbPath);
+      return await duck.tablesAt(dbPath);
+    }
+    if (typeof lib?.getTables !== 'function') return [];
+    return await lib.getTables({ dbPath });
+  };
+
   async function getTables(connection, dbPath = null) {
     const local = resolveLocal(connection, dbPath);
-    if (local) return local.lib.getTables({ dbPath: local.dbPath });
+    // Through liveLocalTables rather than lib.getTables directly: the duckdb
+    // module has no getTables, so this branch threw a TypeError for every
+    // by-path duckdb call ("local-duckdb", a workflow's own .duckdb).
+    if (local) return await liveLocalTables(local);
     const conn = requireConnection(connection);
     const localConn = resolveLocalConnection(conn);
     if (localConn) {
-      // Imported CSV/Excel files share one app-wide SQLite db; scope the
-      // result to the tables this connection owns so callers don't see
-      // unrelated imports. Direct files (no recorded tables) list all.
+      // `fileInfo.tables` is a SNAPSHOT taken when the connection was created.
+      // Read the store FIRST so a file that changed since then — a sheet added
+      // to a workbook, a table added to or dropped from a LanceDB directory —
+      // reports what it actually holds, and treat the snapshot as the fallback
+      // for stores that cannot answer.
+      //
+      // One store must NOT be read this way: imported CSV/Excel files and Google
+      // Sheets share the app-wide SQLite database, so its table list is every
+      // connection's tables, not this one's. There the recorded set is not a
+      // stale cache but the ownership SCOPE, and going live would hand callers
+      // (and the assistant) unrelated connections' data.
+      const sharesAppDb = localConn.dbPath === appSqliteDbPath;
+      if (!sharesAppDb) {
+        try {
+          const live = await liveLocalTables(localConn);
+          if (live && live.length) return live;
+        } catch (err) {
+          console.warn(`[getTables] live listing failed for "${conn.name}" (${localConn.dbPath}): ${err.message}`);
+        }
+      }
       if (localConn.ownTables) return localConn.ownTables;
-      return localConn.lib.getTables({ dbPath: localConn.dbPath });
+      // Nothing recorded, so there is no scope to honour: list whatever the
+      // store holds, exactly as before. This is the direct-file case (a .sqlite
+      // or .duckdb the user picked owns everything in it), and also the only
+      // sane answer for an unscoped connection on the app-wide db.
+      return await liveLocalTables(localConn);
     }
     const connector = requireConnector(conn);
     const id = conn.id || conn._id;
     const fullConfig = await getFullConfig(id, conn.dbConfig || {});
     const result = await connector.getTables(fullConfig, id);
+    // A connector reports failure by RETURNING { success: false } — it does not
+    // throw. Returning `result.tables || []` for that made a suspended
+    // warehouse, an expired token or a network blip indistinguishable from a
+    // database that genuinely holds no tables, and the caller acted on the
+    // second reading: a data source node was rewritten with no table at all and
+    // reported as saved. Same shape runQuery already uses.
+    if (result && result.success === false) {
+      throw new Error(`Could not list tables on "${conn.name}": ${result.message || 'unknown error'}`);
+    }
     return result.tables || [];
   }
 
@@ -3277,6 +3305,11 @@ async function buildSkillHelpers(defaultDbPath = null) {
     const id = conn.id || conn._id;
     const fullConfig = await getFullConfig(id, conn.dbConfig || {});
     const result = await connector.getColumns(fullConfig, id, schema, table);
+    // Same reasoning as getTables above: a failed lookup must not read as "this
+    // table has no columns".
+    if (result && result.success === false) {
+      throw new Error(`Could not read columns of "${table}" on "${conn.name}": ${result.message || 'unknown error'}`);
+    }
     return result.columns || [];
   }
 
@@ -3348,8 +3381,16 @@ async function buildSkillHelpers(defaultDbPath = null) {
     // to require across plugin directories.
     embeddings: vectorEmbeddings,
     lancedb: vectorLanceDB,
+    // Cooperative stop, for the loops a skill runs itself. Injected for the
+    // same reason the vector libs above are: a plugin has its own
+    // node_modules and must not require across directories into public/.
+    //
+    // It works because skills are plain in-process require()s (see
+    // pluginManager) — the AsyncLocalStorage context the runner opened around
+    // this node is live when the skill calls it. Outside a run it is inert, so
+    // a skill invoked from an ad-hoc IPC handler is unaffected.
+    cancel: { throwIfCancelled, isCancelledError, isCancellationRequested },
     appSqliteDbPath,
-    sqlitePool,
     pluginManager,
     getFullConfig,
     // Start-node trigger registration, bound to executeWorkflowFromTrigger so
@@ -3479,7 +3520,6 @@ ipcMain.handle('skills:execute', async (_event, { skillId, params }) => {
       pluginManager,
       getFullConfig,
       appSqliteDbPath,
-      sqlitePool
     };
 
     const result = await pluginManager.executeSkill(skillId, enhancedParams);
@@ -3678,7 +3718,6 @@ ipcMain.handle('cloud-storage:get-picker-credentials', async (_event, { connecti
   }
 });
 
-// Import file from cloud storage to local SQLite/NeDB
 /**
  * cloud-storage:save-and-register — keep a cloud file, then treat it as local.
  *
@@ -3698,7 +3737,6 @@ ipcMain.handle('cloud-storage:save-and-register', async (_event, { data, targetP
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     fs.writeFileSync(targetPath, Buffer.from(data));
 
-    const { registerLocalFile } = require('./imports/registerFile');
     const result = await registerLocalFile(targetPath, app.getPath('userData'));
 
     // A file that cannot be registered is not left lying around pretending to
@@ -3715,138 +3753,8 @@ ipcMain.handle('cloud-storage:save-and-register', async (_event, { data, targetP
   }
 });
 
-ipcMain.handle('cloud-storage:import-file', async (_event, { data, fileName, fileType, sheetName, sheets = [], containerName, connectionName }) => {
-  try {
-    const tmpDir = path.join(app.getPath('temp'), 'ternlux-cloud-imports');
-    if (!fs.existsSync(tmpDir)) {
-      fs.mkdirSync(tmpDir, { recursive: true });
-    }
 
-    // Extract just the filename (remove any path components)
-    const baseFileName = path.basename(fileName);
-
-    // Write data to temporary file
-    const tmpFilePath = path.join(tmpDir, baseFileName);
-    fs.writeFileSync(tmpFilePath, Buffer.from(data));
-
-    // Determine storage type (SQLite for structured data, NeDB for JSON)
-    const ext = path.extname(baseFileName).toLowerCase();
-    let result;
-
-    // Sanitize container name for use as table prefix
-    const sanitizedContainerName = (containerName || 'cloud')
-      .replace(/[^a-zA-Z0-9_]/g, '_')
-      .substring(0, 32); // Limit prefix length
-
-    // Support both old sheetName (string) and new sheets (array) parameters
-    // If sheetName is provided (backward compatibility), convert to sheets array
-    const sheetsToImport = sheets.length > 0 ? sheets : (sheetName ? [sheetName] : []);
-
-    console.log('[Cloud Import] File:', baseFileName, 'Container:', containerName, 'Prefix:', sanitizedContainerName, 'Sheets:', sheetsToImport)
-    if (ext === '.json') {
-      // Import to NeDB with container prefix
-      const baseCollectionName = path.basename(baseFileName, ext).replace(/[^a-zA-Z0-9_]/g, '_');
-      const collectionName = `${sanitizedContainerName}_${baseCollectionName}`;
-
-      console.log('[Cloud Import] Preparing NeDB import:', {
-        baseFileName,
-        containerName,
-        baseCollectionName,
-        collectionName
-      });
-
-      // Reuse the streaming import-to-nedb logic
-      const userDataPath = app.getPath('userData');
-      const dbDir = path.join(userDataPath, 'internal_databases');
-      if (!fs.existsSync(dbDir)) {
-        fs.mkdirSync(dbDir, { recursive: true });
-      }
-
-      const dbPath = path.join(dbDir, `${collectionName}.db`);
-
-      try {
-        const db = new Datastore({ filename: dbPath });
-        await db.loadDatabaseAsync();
-        const importResult = await importJsonToNeDB(tmpFilePath, db);
-        if (importResult.success) adoptNedbInstance(dbPath, db);
-        result = importResult.success
-          ? {
-            success: true,
-            localPath: dbPath,
-            dbType: 'nedb',
-            tables: [collectionName],
-            message: importResult.message,
-          }
-          : importResult;
-      } catch (err) {
-        result = { success: false, message: err.message };
-      }
-    } else {
-      // Import to SQLite (CSV, Excel, Parquet, Avro, etc.) with container prefix
-      const baseTableName = path.basename(baseFileName, ext).replace(/[^a-zA-Z0-9_]/g, '_');
-      const tableName = `${sanitizedContainerName}_${baseTableName}`;
-
-      console.log('[Cloud Import] Preparing SQLite import:', {
-        baseFileName,
-        ext,
-        containerName,
-        baseTableName,
-        tableName,
-        tmpFilePath,
-        dbPath: appSqliteDbPath
-      });
-
-      // Standard import using connection pool
-      if (!sqlitePool) {
-        result = { success: false, message: 'SQLite connection pool not initialized' };
-      } else {
-        console.log('[Cloud Import] extension:', ext, 'sheets:', sheetsToImport);
-
-        result = await sqlitePool.executeWrite(async (db) => {
-          try {
-            let importResult;
-            if (ext === '.csv') {
-              importResult = await importCsvToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
-            } else if (ext === '.parquet') {
-              importResult = await importParquetToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
-            } else if (ext === '.avro') {
-              importResult = await importAvroToSqlite(tmpFilePath, tableName, db, appSqliteDbPath);
-            } else {
-              // Pass sheets array to importSpreadsheetToSqlite
-              // Empty array = import all sheets, specific sheets = import only those
-              importResult = await importSpreadsheetToSqlite(tmpFilePath, tableName, db, appSqliteDbPath, sheetsToImport);
-            }
-
-            return {
-              ...importResult,
-              localPath: appSqliteDbPath,
-              dbType: 'sqlite',
-              sheets: sheetsToImport.length > 0 ? sheetsToImport : undefined // Include selected sheets info
-            };
-          } catch (err) {
-            return { success: false, message: err.message };
-          }
-        });
-      }
-    }
-
-    // Clean up temp file
-    if (fs.existsSync(tmpFilePath)) {
-      fs.unlinkSync(tmpFilePath);
-    }
-
-    return result;
-  } catch (error) {
-    console.error('Cloud import error:', error);
-    return {
-      success: false,
-      message: error.message
-    };
-  }
-});
-
-
-// Unified NoSQL transformation handler (routes to appropriate plugin or native NeDB)
+// Unified NoSQL transformation handler (routes to the source's document-store connector)
 ipcMain.handle('dbconn:transform-nosql', async (_event, params) => {
   return await nodeExecution.handleTransformNoSQL(params);
 });
@@ -3868,7 +3776,7 @@ ipcMain.handle('dbconn:execute-branch', async (_event, params) => {
 /**
  * IPC: 'rest-api:execute-fetch'
  * Runs a REST API fetch plan authored on a DataSource node and materialises the
- * response into NeDB. Decrypts credentials in the main process only; never
+ * response locally. Decrypts credentials in the main process only; never
  * returns resolved URL/headers/body to the renderer.
  */
 ipcMain.handle('rest-api:execute-fetch', async (_event, params) => {
@@ -3904,43 +3812,280 @@ ipcMain.handle('dbconn:execute-output', async (_event, sourceConnection, sourceT
  * workflow:executeNode — run ONE node, exactly the way a full workflow run
  * would run it (same executeNode dispatch, same helpers bundle).
  *
- * This is what the chat assistant's "Run this node" button calls after the user
- * approves a config it built. It is deliberately not recorded as an execution:
- * nothing was scheduled and no other node ran, so an executions row would
- * misreport the workflow's history. Upstream nodes are NOT run — the node reads
- * whatever its sources last produced, which is what makes the approval
- * meaningful (the user is agreeing to this one write, not a cascade).
+ * This is what the chat assistant's "Run this node" button and the output
+ * panel's Run button call. Upstream nodes are NOT run — the node reads whatever
+ * its sources last produced, which is what makes the approval meaningful (the
+ * user is agreeing to this one write, not a cascade).
+ *
+ * IT IS RECORDED AS AN EXECUTION, and that is a deliberate reversal.
+ *
+ * It used to run unrecorded, on the reasoning that nothing was scheduled and no
+ * other node ran, so an executions row would misreport the workflow's history.
+ * True as far as it went, and it cost the user the thing that matters more: an
+ * unrecorded run is INVISIBLE and UNSTOPPABLE. The execution monitor lists rows
+ * in the `executions` collection and `workflow:cancel` addresses a run by its
+ * executionId — both of them, and there is no second channel. So a node run
+ * from the chat or the output panel could not be seen while it worked and could
+ * not be called off, and an output node writing 400k rows is precisely the run
+ * a user most wants to stop.
+ *
+ * The history objection is answered by labelling rather than by hiding:
+ * `singleNode: true` and `trigger.type: 'node'` mark these rows for any reader
+ * that wants to tell one node's run apart from a whole workflow's.
  */
 ipcMain.handle('workflow:executeNode', async (_event, { workflowId, nodeId, nodes, edges } = {}) => {
-  try {
-    if (!nodeId || !Array.isArray(nodes)) {
-      return { success: false, message: 'nodeId and nodes are required.' };
+  if (!nodeId || !Array.isArray(nodes)) {
+    return { success: false, message: 'nodeId and nodes are required.' };
+  }
+
+  const nodeMap = new Map();
+  nodes.forEach((n) => nodeMap.set(n.id, n));
+  const node = nodeMap.get(nodeId);
+  if (!node) return { success: false, message: `Node ${nodeId} is not part of this workflow.` };
+
+  const executionsDb = getDb('executions');
+  const executionId = `exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const startTime = new Date().toISOString();
+  const started = Date.now();
+
+  // Same precedence the full runner uses: the name written on every save wins
+  // over the creation-time type label.
+  const nodeLabel = node.data?.config?.node_name || node.data?.label || node.id;
+
+  // The monitor titles a run with `workflowName` and subtitles it with the step
+  // in flight. For one node that reads best as "<workflow> · <node>", so the
+  // workflow's real name is looked up when there is one to look up.
+  let workflowName = null;
+  if (workflowId) {
+    try {
+      const wf = await getDb('workflows').findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+      workflowName = wf?.name || null;
+    } catch (_err) {
+      // A name is presentation only — a run must not fail for want of one.
     }
-    const nodeMap = new Map();
-    nodes.forEach((n) => nodeMap.set(n.id, n));
-    const node = nodeMap.get(nodeId);
-    if (!node) return { success: false, message: `Node ${nodeId} is not part of this workflow.` };
+  }
+
+  const executionRecord = {
+    executionId,
+    workflowId: workflowId || null,
+    workflowName: workflowName || nodeLabel,
+    status: 'running',
+    startTime,
+    endTime: null,
+    duration: null,
+    currentNodeId: nodeId,
+    currentNodeName: nodeLabel,
+    totalSteps: 1,
+    executionOrder: [nodeId],
+    nodeExecutions: [],
+    logs: [],
+    results: { totalRecordsProcessed: 0, summary: '' },
+    // What tells this row apart from a full run in any history view.
+    singleNode: true,
+    trigger: { type: 'node', user: 'local' },
+    username: 'local',
+    cancelRequested: false,
+  };
+
+  const logSink = createExecutionSink(executionsDb, executionId);
+
+  try {
+    await executionsDb.insertAsync(executionRecord);
+    await addExecutionLog(executionsDb, executionId, 'info', `Running node: ${nodeLabel} (${node.type})`, nodeId);
 
     const helpers = {
       pluginManager,
       getFullConfig,
       getDb,
       appSqliteDbPath,
-      sqlitePool,
       buildSkillHelpers,
       workflowId,
     };
 
-    const started = Date.now();
-    const result = await executeNode(node, nodeMap, edges || [], helpers);
+    let result = null;
+    let stopped = false;
+    let failure = null;
+
+    try {
+      // Both contexts, for the same reasons the full runner opens them: the log
+      // context files everything the node calls under this node, and the
+      // cancellation context is what lets a stop reach the chunk loops INSIDE
+      // it rather than waiting for a step boundary that never comes — there is
+      // only one step here, so without it a stop could not land at all.
+      result = await runWithExecutionLog(logSink, nodeId, () =>
+        runWithCancellation(() => isCancelRequested(executionId), () =>
+          executeNode(node, nodeMap, edges || [], helpers)));
+      await logSink.flush();
+
+      // Same safety net as the full runner: a layer that swallowed the
+      // cancellation and returned { success: false } would otherwise be
+      // recorded as a failure, which is the worst reading of a stop the user
+      // asked for.
+      if (!result?.success && isCancelRequested(executionId)) {
+        throw new ExecutionCancelledError(`"${nodeLabel}"`, result?.message || null);
+      }
+    } catch (err) {
+      await logSink.flush();
+      if (isCancelledError(err)) stopped = true;
+      failure = err;
+    }
+
+    const duration = Date.now() - started;
+    const succeeded = !stopped && !failure && !!result?.success;
+    const status = stopped ? 'cancelled' : succeeded ? 'completed' : 'failed';
+    const recordsProcessed = result?.recordsProcessed || 0;
+    const message = stopped
+      ? failure.message
+      : failure
+        ? (failure.message || 'Node execution failed.')
+        : (result?.message || (succeeded ? 'Node executed successfully.' : 'Node execution failed.'));
+
+    executionRecord.nodeExecutions = [{
+      nodeId,
+      nodeName: nodeLabel,
+      nodeType: node.type,
+      status,
+      startTime,
+      duration,
+      error: succeeded ? null : { message },
+      metrics: {
+        recordsProcessed: succeeded ? recordsProcessed : 0,
+        recordsSuccess: succeeded ? recordsProcessed : 0,
+        recordsFailed: 0,
+      },
+    }];
+
+    await addExecutionLog(
+      executionsDb, executionId,
+      stopped ? 'warn' : succeeded ? (result?.warning ? 'warn' : 'info') : 'error',
+      `Node ${nodeLabel} ${stopped ? 'stopped' : succeeded ? 'completed' : 'failed'}: ${message}`,
+      nodeId,
+    );
+
+    executionRecord.results = {
+      totalRecordsProcessed: succeeded ? recordsProcessed : 0,
+      summary: message,
+    };
+
+    await executionsDb.updateAsync(
+      { executionId },
+      {
+        $set: {
+          status,
+          endTime: new Date().toISOString(),
+          duration,
+          // Nothing is in flight any more — the canvas stops pulsing this node.
+          currentNodeId: null,
+          currentNodeName: null,
+          cancelRequested: false,
+          nodeExecutions: executionRecord.nodeExecutions,
+          results: executionRecord.results,
+        },
+      },
+      {},
+    );
+
     return {
-      success: !!result?.success,
-      message: result?.message || (result?.success ? 'Node executed successfully.' : 'Node execution failed.'),
-      recordsProcessed: result?.recordsProcessed || 0,
-      duration: Date.now() - started,
+      success: succeeded,
+      cancelled: stopped,
+      executionId,
+      message,
+      // Succeeded, but with something the caller needs to show differently — an
+      // empty source, so the node wrote nothing. Dropping it here would leave a
+      // run that wrote nothing looking exactly like one that wrote everything.
+      warning: !!result?.warning,
+      recordsProcessed: succeeded ? recordsProcessed : 0,
+      duration,
     };
   } catch (err) {
+    // The record itself could not be kept up to date — the run is over either
+    // way, so close the row out rather than leaving it 'running' forever and
+    // wedging the monitor open on a run nothing is doing.
     console.error('[workflow:executeNode]', err);
+    try {
+      await logSink.flush();
+      await executionsDb.updateAsync(
+        { executionId },
+        {
+          $set: {
+            status: 'failed',
+            endTime: new Date().toISOString(),
+            duration: Date.now() - started,
+            currentNodeId: null,
+            currentNodeName: null,
+            cancelRequested: false,
+            results: { totalRecordsProcessed: 0, summary: err.message || String(err) },
+          },
+        },
+        {},
+      );
+    } catch (_err) { /* the row may never have been inserted */ }
+    return { success: false, executionId, message: err.message || String(err) };
+  } finally {
+    clearCancelRequest(executionId);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Stopping a run in flight
+// ---------------------------------------------------------------------------
+
+/**
+ * Execution ids the user has asked to stop.
+ *
+ * Cancellation is COOPERATIVE and lands BETWEEN steps. A node in flight is a
+ * connector call — a load job, a multi-statement insert, a driver cursor — and
+ * there is no abort signal threaded through any of them; killing one mid-write
+ * would leave a half-written destination table with nothing recording how far
+ * it got. So the runner checks this set before each step: the node currently
+ * executing finishes and is recorded, and the run stops before the next one.
+ *
+ * That is also why the UI says "stopping after the current step" rather than
+ * pretending the button is immediate.
+ */
+const cancelRequests = new Set();
+
+const isCancelRequested = (executionId) => cancelRequests.has(executionId);
+const clearCancelRequest = (executionId) => cancelRequests.delete(executionId);
+
+/**
+ * workflow:cancel — ask a running execution to stop at its next step boundary.
+ *
+ * `cancelRequested` is written onto the execution row as well as held in
+ * memory: the renderer polls that row (see executionMonitorStore) and it is the
+ * only way the monitor can show "stopping…" on the run while the current node
+ * is still working.
+ */
+ipcMain.handle('workflow:cancel', async (_event, { executionId } = {}) => {
+  try {
+    if (!executionId) return { success: false, message: 'executionId is required.' };
+
+    const executionsDb = getDb('executions');
+    const ex = await executionsDb.findOneAsync({ executionId });
+    if (!ex) return { success: false, message: 'That execution no longer exists.' };
+    if (ex.status !== 'running') {
+      return { success: false, message: `This run has already ${ex.status === 'completed' ? 'finished' : ex.status}.` };
+    }
+
+    if (cancelRequests.has(executionId)) {
+      return { success: true, alreadyRequested: true, message: 'Stop already requested.' };
+    }
+
+    cancelRequests.add(executionId);
+    await executionsDb.updateAsync(
+      { executionId },
+      { $set: { cancelRequested: true, cancelRequestedAt: new Date().toISOString() } },
+      {},
+    );
+    await addExecutionLog(
+      executionsDb, executionId, 'warn',
+      'Stop requested — the run will end once the current step finishes.',
+    );
+
+    console.log(`[Workflow Execution] Stop requested for ${executionId}`);
+    return { success: true, message: 'Stopping after the current step.' };
+  } catch (err) {
+    console.error('[workflow:cancel]', err);
     return { success: false, message: err.message || String(err) };
   }
 });
@@ -3952,7 +4097,13 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
   // Generate unique execution ID
   const executionId = `exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-  // Create initial execution record
+  // Create initial execution record.
+  //
+  // `currentNodeId` / `currentNodeName` / `totalSteps` exist for the live UI
+  // (the canvas ring and the execution monitor panel): they are written before
+  // each node runs and cleared when the run ends, so a renderer polling this
+  // row can tell WHICH node is executing right now — nodeExecutions only gains
+  // an entry once a node has already finished.
   const executionRecord = {
     executionId,
     workflowId,
@@ -3961,6 +4112,9 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
     startTime,
     endTime: null,
     duration: null,
+    currentNodeId: null,
+    currentNodeName: null,
+    totalSteps: 0,
     nodeExecutions: [],
     logs: [],
     results: {
@@ -3973,6 +4127,15 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
     },
     username: 'local'
   };
+
+  // Everything the node layers below record — the SQL they run, the DDL that
+  // was skipped, the connector and skill calls they make — is written through
+  // this sink. See NodeExecution/executionLog.js for why it travels in an async
+  // context instead of being threaded through every signature. Declared out
+  // here so the failure path can drain it too: a run that threw is the one
+  // whose trace is worth reading.
+  const logSink = createExecutionSink(executionsDb, executionId);
+  const flushExecutionLogs = () => logSink.flush();
 
   try {
     await executionsDb.insertAsync(executionRecord);
@@ -3987,6 +4150,13 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       : nodes.map((node, index) => ({ nodeId: node.id, order: index }));
 
     const executionOrder = stepsToExecute.map(step => step.nodeId);
+
+    executionRecord.totalSteps = stepsToExecute.length;
+    await executionsDb.updateAsync(
+      { executionId },
+      { $set: { totalSteps: stepsToExecute.length, executionOrder } },
+      {}
+    );
 
     console.log(`[Workflow Execution] Starting execution ${executionId}`);
     console.log(`[Workflow Execution] Execution order:`, executionOrder);
@@ -4003,13 +4173,18 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       getFullConfig,
       getDb,
       appSqliteDbPath,
-      sqlitePool,
       buildSkillHelpers,         // available for output / vector skill calls
-      workflowId                 // scopes local NeDB output per workflow/node
+      workflowId                 // scopes local output per workflow/node
     };
+
+    // Set when the user stopped the run — see cancelRequests above. Checked at
+    // the top of each step, so the node in flight is always allowed to finish.
+    let cancelled = false;
 
     // Execute each node in order from executionSteps
     for (const step of stepsToExecute) {
+      if (isCancelRequested(executionId)) { cancelled = true; break; }
+
       const nodeId = step.nodeId;
       const node = nodeMap.get(nodeId);
 
@@ -4019,22 +4194,63 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       }
 
       const nodeStartTime = Date.now();
-      // The node's own name comes first: `nodeLabel` is a snapshot taken when
-      // the execution step was created and goes stale the moment the node is
-      // rebuilt, and `data.label` is the creation-time type name ("Transformer")
-      // that nothing ever updates. `config.node_name` is written on every save
-      // (see withPersistedNodeNames) and is what the canvas shows.
-      const nodeLabel = step.customName
-        || node.data?.config?.node_name
-        || step.nodeLabel
+      // The name comes from the node, never from the step: a step is
+      // `{ nodeId, order }` and carries no name of its own (it used to carry a
+      // snapshot, which went stale the moment the node was renamed or rebuilt).
+      // `config.node_name` is written on every save (see withPersistedNodeNames)
+      // and is what the canvas shows; `data.label` is the creation-time type
+      // name ("Transformer") that nothing ever updates, so it is the last resort.
+      const nodeLabel = node.data?.config?.node_name
         || node.data?.label
         || node.id;
 
-      await addExecutionLog(executionsDb, executionId, 'info', `Executing node: ${nodeLabel} (${node.type})`);
+      // Mark this node as the one in flight BEFORE running it, so the canvas
+      // and the execution monitor can light it up while it works.
+      executionRecord.currentNodeId = nodeId;
+      executionRecord.currentNodeName = nodeLabel;
+      await executionsDb.updateAsync(
+        { executionId },
+        { $set: { currentNodeId: nodeId, currentNodeName: nodeLabel } },
+        {}
+      );
+
+      await addExecutionLog(executionsDb, executionId, 'info', `Executing node: ${nodeLabel} (${node.type})`, nodeId);
+
+      // A node that returns { success: false } is recorded here and then
+      // thrown, landing in the catch below — which used to record it a SECOND
+      // time. Harmless while nodeExecutions was only written once at the end;
+      // now that the array is flushed as the run goes, the duplicate would show
+      // up in the monitor and the execution detail.
+      let stepRecorded = false;
 
       try {
-        // Execute the node using the helper function
-        const nodeResult = await executeNode(node, nodeMap, edges, helpers);
+        // Execute the node using the helper function, inside this node's log
+        // context so everything it calls files its trace under this node — and
+        // inside a cancellation context, so the chunk loops DOWN INSIDE the
+        // node can see a stop too. Without that second one a stop pressed
+        // during a 400k-row batch insert waited out the whole load, because the
+        // only check was the one between steps below.
+        const nodeResult = await runWithExecutionLog(logSink, nodeId, () =>
+          runWithCancellation(() => isCancelRequested(executionId), () =>
+            executeNode(node, nodeMap, edges, helpers)));
+
+        // Drain the node's trace before the verdict line below is written.
+        // Trace entries are batched while addExecutionLog writes immediately,
+        // so without this a node's SQL could be appended AFTER its own
+        // "completed successfully" — the log is read in array order.
+        await flushExecutionLogs();
+
+        // Safety net for a swallowed stop.
+        //
+        // The node layers convert exceptions to { success: false } in a dozen
+        // places; the ones on the main paths re-throw a cancellation, but a
+        // path that does not would turn a stop into a FAILED run — the worst
+        // possible reading, since nothing actually went wrong. A node that came
+        // back unsuccessful while a stop was pending is treated as stopped: the
+        // request is the more reliable witness than the return value.
+        if (!nodeResult?.success && isCancelRequested(executionId)) {
+          throw new ExecutionCancelledError(`"${nodeLabel}"`, nodeResult?.message || null);
+        }
 
         const nodeDuration = Date.now() - nodeStartTime;
 
@@ -4058,38 +4274,145 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
         };
 
         executionRecord.nodeExecutions.push(nodeExecution);
+        stepRecorded = true;
+
+        // Flush the finished step immediately. The whole record is $set again
+        // at the end of the run with this same array, so persisting it here
+        // only makes progress visible sooner — it never double-writes.
+        await executionsDb.updateAsync(
+          { executionId },
+          { $set: { nodeExecutions: executionRecord.nodeExecutions } },
+          {}
+        );
 
         if (nodeResult?.success) {
           totalRecordsProcessed += nodeResult?.recordsProcessed || 0;
-          await addExecutionLog(executionsDb, executionId, 'info', `Node ${nodeLabel} completed successfully`);
+          // Succeeded, but with something the user needs to see — an empty
+          // source, so the node had nothing to do. Logged at 'warn' (the level
+          // ExecutionTab renders amber) rather than folded into the generic
+          // "completed successfully", which is how a run that wrote nothing
+          // used to look exactly like one that wrote everything.
+          if (nodeResult.warning) {
+            await addExecutionLog(executionsDb, executionId, 'warn', `Node ${nodeLabel}: ${nodeResult.message}`, nodeId);
+          } else {
+            await addExecutionLog(executionsDb, executionId, 'info', `Node ${nodeLabel} completed successfully`, nodeId);
+          }
         } else {
           await addExecutionLog(executionsDb, executionId, 'error', `Node ${nodeLabel} failed: ${nodeResult?.message || 'Unknown error'}`, nodeId);
           throw new Error(`Node ${nodeLabel} failed: ${nodeResult?.message || 'Unknown error'}`);
         }
 
       } catch (nodeError) {
-        console.error(`[Workflow Execution] Error executing node ${nodeId}:`, nodeError);
+        // A stop the user asked for, raised by a chunk loop inside the node —
+        // NOT a failure. It gets its own status so the execution detail and the
+        // canvas don't ring this node red for something that never went wrong,
+        // and it leaves the loop rather than unwinding to the outer catch,
+        // which would mark the whole run 'failed'.
+        const stoppedHere = isCancelledError(nodeError);
+
+        console[stoppedHere ? 'log' : 'error'](
+          `[Workflow Execution] Node ${nodeId} ${stoppedHere ? 'stopped' : 'failed'}:`,
+          stoppedHere ? nodeError.message : nodeError,
+        );
+
+        // The trace leading up to the failure is the point of the trace — get
+        // it down before the error line, same ordering reason as above.
+        await flushExecutionLogs();
 
         const nodeDuration = Date.now() - nodeStartTime;
 
-        executionRecord.nodeExecutions.push({
-          nodeId,
-          nodeName: nodeLabel,
-          nodeType: node.type,
-          status: 'failed',
-          startTime: new Date(nodeStartTime).toISOString(),
-          duration: nodeDuration,
-          error: { message: nodeError.message },
-          metrics: {
-            recordsProcessed: 0,
-            recordsSuccess: 0,
-            recordsFailed: 0
-          }
-        });
+        if (!stepRecorded) {
+          executionRecord.nodeExecutions.push({
+            nodeId,
+            nodeName: nodeLabel,
+            nodeType: node.type,
+            status: stoppedHere ? 'cancelled' : 'failed',
+            startTime: new Date(nodeStartTime).toISOString(),
+            duration: nodeDuration,
+            error: { message: nodeError.message },
+            metrics: {
+              recordsProcessed: 0,
+              recordsSuccess: 0,
+              recordsFailed: 0
+            }
+          });
+        }
+
+        // Persist the failed step before unwinding: the catch below marks the
+        // run failed, and the canvas reads this array to ring the node that
+        // broke on the most recent run.
+        await executionsDb.updateAsync(
+          { executionId },
+          { $set: { nodeExecutions: executionRecord.nodeExecutions } },
+          {}
+        );
+
+        if (stoppedHere) {
+          // The message carries how far the write got ("12000 of 400000 rows
+          // already written to sales") — the one thing the user needs, since
+          // nothing rolls those rows back.
+          await addExecutionLog(executionsDb, executionId, 'warn', `Node ${nodeLabel}: ${nodeError.message}`, nodeId);
+          cancelled = true;
+          break;
+        }
 
         await addExecutionLog(executionsDb, executionId, 'error', `Node execution failed: ${nodeError.message}`, nodeId);
         throw nodeError;
       }
+    }
+
+    // Stopped by the user. Output validation is deliberately skipped: it asks
+    // "did this workflow produce what it was supposed to", and a run that was
+    // cut short did not get the chance — reporting it as invalid would be
+    // noise, not a finding.
+    if (cancelled) {
+      const stoppedAt = new Date().toISOString();
+      executionRecord.status = 'cancelled';
+      executionRecord.endTime = stoppedAt;
+      executionRecord.duration = Date.now() - new Date(startTime).getTime();
+      executionRecord.currentNodeId = null;
+      executionRecord.currentNodeName = null;
+      executionRecord.results.totalRecordsProcessed = totalRecordsProcessed;
+
+      // "Stopped after 3 of 7 nodes" is only half the story when the stop
+      // landed INSIDE a node: that node wrote part of its output and nothing
+      // rolled it back, so the summary has to name it.
+      const interrupted = executionRecord.nodeExecutions.find((n) => n.status === 'cancelled');
+      const finished = executionRecord.nodeExecutions.filter((n) => n.status === 'completed').length;
+      executionRecord.results.summary = interrupted
+        ? `Stopped by the user during "${interrupted.nodeName}" (${finished} of ${executionOrder.length} nodes finished). `
+          + `${interrupted.error?.message || ''}`.trim()
+        : `Stopped by the user after ${finished} of ${executionOrder.length} nodes.`;
+
+      await flushExecutionLogs();
+      await executionsDb.updateAsync(
+        { executionId },
+        {
+          $set: {
+            status: 'cancelled',
+            endTime: executionRecord.endTime,
+            duration: executionRecord.duration,
+            currentNodeId: null,
+            currentNodeName: null,
+            cancelRequested: false,
+            nodeExecutions: executionRecord.nodeExecutions,
+            results: executionRecord.results,
+            executionOrder,
+          },
+        },
+        {}
+      );
+      await addExecutionLog(executionsDb, executionId, 'warn', executionRecord.results.summary);
+
+      console.log(`[Workflow Execution] Execution ${executionId} stopped by the user`);
+
+      return {
+        success: false,
+        cancelled: true,
+        executionId,
+        message: executionRecord.results.summary,
+        results: executionRecord.results,
+      };
     }
 
     // Output validation — every node has produced its output, so run the
@@ -4098,7 +4421,10 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
     // 'completed' and record the result for the UI to surface.
     try {
       const wfDoc = await getDb('workflows').findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
-      const validation = await runOutputValidation({ workflow: wfDoc, helpers });
+      // Traced with no node id: validation belongs to the run, not to any one
+      // node, so its queries group under the execution's own log section.
+      const validation = await runWithExecutionLog(logSink, null, () =>
+        runOutputValidation({ workflow: wfDoc, helpers }));
       if (validation) {
         executionRecord.validation = validation;
         executionRecord.results.validation = validation;
@@ -4119,13 +4445,39 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
     executionRecord.status = 'completed';
     executionRecord.endTime = endTime;
     executionRecord.duration = duration;
+    // Nothing is in flight any more — the canvas stops pulsing this node.
+    executionRecord.currentNodeId = null;
+    executionRecord.currentNodeName = null;
     executionRecord.results.totalRecordsProcessed = totalRecordsProcessed;
     executionRecord.results.summary = `Successfully executed ${executionOrder.length} nodes`;
     executionRecord.executionOrder = executionOrder;
 
+    // Field by field, NOT `$set: executionRecord`.
+    //
+    // `executionRecord.logs` is the empty array this record was inserted with
+    // and is never appended to in memory — addExecutionLog and the trace sink
+    // both `$push` straight to the datastore. Writing the whole object back
+    // therefore reset `logs` to [] at the end of every run, erasing every line
+    // the run had produced; the only survivor was the "completed successfully"
+    // line added just below, after the overwrite. That is why a finished
+    // execution appeared to have no per-node logs at all.
+    await flushExecutionLogs();
     await executionsDb.updateAsync(
       { executionId },
-      { $set: executionRecord },
+      {
+        $set: {
+          status: executionRecord.status,
+          endTime: executionRecord.endTime,
+          duration: executionRecord.duration,
+          currentNodeId: null,
+          currentNodeName: null,
+          cancelRequested: false,
+          nodeExecutions: executionRecord.nodeExecutions,
+          results: executionRecord.results,
+          executionOrder,
+          ...(executionRecord.validation ? { validation: executionRecord.validation } : {}),
+        },
+      },
       {}
     );
 
@@ -4149,14 +4501,31 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
     executionRecord.status = 'failed';
     executionRecord.endTime = endTime;
     executionRecord.duration = duration;
+    executionRecord.currentNodeId = null;
+    executionRecord.currentNodeName = null;
     executionRecord.error = {
       message: error.message,
       stack: error.stack
     };
 
+    // Field by field — see the note on the success path. A failed run is the
+    // one whose logs matter most, so this is the overwrite that hurt.
+    await flushExecutionLogs();
     await executionsDb.updateAsync(
       { executionId },
-      { $set: executionRecord },
+      {
+        $set: {
+          status: executionRecord.status,
+          endTime: executionRecord.endTime,
+          duration: executionRecord.duration,
+          currentNodeId: null,
+          currentNodeName: null,
+          cancelRequested: false,
+          nodeExecutions: executionRecord.nodeExecutions,
+          results: executionRecord.results,
+          error: executionRecord.error,
+        },
+      },
       {}
     );
 
@@ -4168,12 +4537,56 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       message: error.message,
       error: error.message
     };
+  } finally {
+    // However the run ended — finished, failed, or stopped — the request must
+    // not outlive it, or a later execution reusing nothing but the same Set
+    // would find a stale id. Idempotent, so the cancelled path above needn't
+    // repeat it.
+    clearCancelRequest(executionId);
   }
 });
 
 // ---------------------------------------------------------------------------
 // Start Trigger Management (CRON and File Watchers)
 // ---------------------------------------------------------------------------
+
+/**
+ * Close out executions left marked 'running' by a previous app session.
+ * Called once on startup — see the call site in app.whenReady.
+ * @returns {Promise<number>} How many rows were reconciled
+ */
+async function reconcileOrphanedExecutions() {
+  try {
+    const executionsDb = getDb('executions');
+    const stale = await executionsDb.findAsync({ status: 'running' });
+    if (!stale.length) return 0;
+
+    const endTime = new Date().toISOString();
+    for (const ex of stale) {
+      await executionsDb.updateAsync(
+        { executionId: ex.executionId },
+        {
+          $set: {
+            status: 'failed',
+            endTime,
+            duration: ex.startTime ? Date.now() - new Date(ex.startTime).getTime() : null,
+            // currentNodeId is left as it was: it names the step the run died
+            // on, which is the only record of where it got to, and the canvas
+            // uses it to mark that node.
+            cancelRequested: false,
+            error: { message: 'Execution was interrupted (the app closed while it was running).' },
+            'results.summary': 'Execution was interrupted (the app closed while it was running).'
+          }
+        }
+      );
+    }
+    console.log(`[Electron] Reconciled ${stale.length} interrupted execution(s) from a previous session`);
+    return stale.length;
+  } catch (err) {
+    console.error('[Electron] Could not reconcile interrupted executions:', err);
+    return 0;
+  }
+}
 
 // Track active workflow executions to prevent concurrent runs
 const activeWorkflowExecutions = new Map();
@@ -4186,6 +4599,9 @@ const activeWorkflowExecutions = new Map();
  * @returns {Promise<Object>} Execution result
  */
 async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
+  // Declared out here so the catch — and the finally that releases a pending
+  // stop request — can name the run even when it fell over mid-setup.
+  let executionId = null;
   try {
     console.log('activeWorkflowExecutions: ', activeWorkflowExecutions)
     // Check if workflow is already executing
@@ -4231,7 +4647,7 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
     // Execute workflow
     const executionsDb = getDb('executions');
     const startTime = new Date().toISOString();
-    const executionId = `exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    executionId = `exec-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     // Create execution record
     const executionRecord = {
@@ -4242,6 +4658,11 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       startTime,
       endTime: null,
       duration: null,
+      // See the manual runner (workflow:execute) — these drive the live canvas
+      // ring and the execution monitor panel.
+      currentNodeId: null,
+      currentNodeName: null,
+      totalSteps: 0,
       nodeExecutions: [],
       logs: [],
       results: {
@@ -4266,6 +4687,11 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       ? workflow.executionSteps.sort((a, b) => a.order - b.order)
       : workflow.nodes.map((node, index) => ({ nodeId: node.id, order: index }));
 
+    await executionsDb.updateAsync(
+      { executionId },
+      { $set: { totalSteps: stepsToExecute.length } }
+    );
+
     await addExecutionLog(
       executionsDb,
       executionId,
@@ -4273,52 +4699,88 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       `Starting workflow execution: ${workflow.name} (triggered by ${triggerInfo.type}: ${triggerInfo.description})`
     );
 
+    // Same per-node tracing the manual runner gets — a scheduled run is the one
+    // nobody was watching, so its trace is the only account of what happened.
+    const logSink = createExecutionSink(executionsDb, executionId);
+
     // Prepare helpers
     const helpers = {
       pluginManager,
       getFullConfig,
       getDb,
       appSqliteDbPath,
-      sqlitePool,
       buildSkillHelpers,         // available for output / vector skill calls
-      workflowId                 // scopes local NeDB output per workflow/node
+      workflowId                 // scopes local output per workflow/node
     };
 
     let totalRecordsProcessed = 0;
+    // A scheduled run is stoppable from the monitor exactly like a manual one —
+    // see cancelRequests. `stepsRun` only exists to say how far it got in the
+    // summary, since this runner $pushes node rows rather than keeping an array.
+    let cancelled = false;
+    let stepsRun = 0;
+    // Set only when the stop landed inside a node rather than between two —
+    // that node wrote part of its output, and the summary has to say so.
+    let interruptedNode = null;
 
     // Execute each node
     for (const step of stepsToExecute) {
+      if (isCancelRequested(executionId)) { cancelled = true; break; }
+
       const node = nodeMap.get(step.nodeId);
       if (!node) continue;
 
       const nodeStartTime = Date.now();
-      // The node's own name comes first: `nodeLabel` is a snapshot taken when
-      // the execution step was created and goes stale the moment the node is
-      // rebuilt, and `data.label` is the creation-time type name ("Transformer")
-      // that nothing ever updates. `config.node_name` is written on every save
-      // (see withPersistedNodeNames) and is what the canvas shows.
-      const nodeLabel = step.customName
-        || node.data?.config?.node_name
-        || step.nodeLabel
+      // The name comes from the node, never from the step: a step is
+      // `{ nodeId, order }` and carries no name of its own (it used to carry a
+      // snapshot, which went stale the moment the node was renamed or rebuilt).
+      // `config.node_name` is written on every save (see withPersistedNodeNames)
+      // and is what the canvas shows; `data.label` is the creation-time type
+      // name ("Transformer") that nothing ever updates, so it is the last resort.
+      const nodeLabel = node.data?.config?.node_name
         || node.data?.label
         || node.id;
+
+      await executionsDb.updateAsync(
+        { executionId },
+        { $set: { currentNodeId: node.id, currentNodeName: nodeLabel } }
+      );
 
       await addExecutionLog(
         executionsDb,
         executionId,
         'info',
-        `Executing node: ${nodeLabel} (${node.type})`
+        `Executing node: ${nodeLabel} (${node.type})`,
+        node.id,
       );
 
+      // Whether this node already has a nodeExecutions row, so the catch below
+      // records one for a node that threw outright without duplicating one for
+      // a node that merely returned { success: false }.
+      let stepRecorded = false;
+
       try {
-        const nodeResult = await executeNode(node, nodeMap, workflow.edges, helpers);
+        // Both contexts, same as the manual runner: the log sink so the node's
+        // trace files under it, and the cancellation predicate so the chunk
+        // loops inside the node can see a stop.
+        const nodeResult = await runWithExecutionLog(logSink, node.id, () =>
+          runWithCancellation(() => isCancelRequested(executionId), () =>
+            executeNode(node, nodeMap, workflow.edges, helpers)));
+        // Batched trace lines down before this node's verdict line.
+        await logSink.flush();
         const nodeDuration = Date.now() - nodeStartTime;
+
+        // Safety net for a swallowed stop — see the manual runner for why the
+        // pending request is a more reliable witness than the return value.
+        // Decided BEFORE the row is written, or a stopped node would be filed
+        // as failed and no later branch could correct it.
+        const stoppedHere = !nodeResult?.success && isCancelRequested(executionId);
 
         const nodeExec = {
           nodeId: node.id,
           nodeName: nodeLabel,
           nodeType: node.type,
-          status: nodeResult?.success ? 'completed' : 'failed',
+          status: nodeResult?.success ? 'completed' : (stoppedHere ? 'cancelled' : 'failed'),
           startTime: new Date(nodeStartTime).toISOString(),
           duration: nodeDuration,
           error: nodeResult?.success ? null : { message: nodeResult?.message || 'Unknown error' },
@@ -4333,18 +4795,77 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
           { executionId },
           { $push: { nodeExecutions: nodeExec } }
         );
+        stepRecorded = true;
+        // Counts nodes that FINISHED. It feeds "N of M nodes finished" in the
+        // stop summary, and a node that failed or was cut short did neither.
+        if (nodeResult?.success) stepsRun += 1;
 
         if (!nodeResult?.success) {
+          if (stoppedHere) {
+            throw new ExecutionCancelledError(`"${nodeLabel}"`, nodeResult?.message || null);
+          }
           throw new Error(nodeResult?.message || 'Node execution failed');
+        }
+
+        // Same as the interactive runner: a node that ran but had nothing to
+        // do says so, at the level the execution log paints amber.
+        if (nodeResult.warning) {
+          await addExecutionLog(
+            executionsDb,
+            executionId,
+            'warn',
+            `Node ${nodeLabel}: ${nodeResult.message}`,
+            node.id,
+          );
         }
 
         totalRecordsProcessed += nodeResult?.recordsProcessed || 0;
       } catch (error) {
+        // A stop raised by a chunk loop inside the node. Recorded as cancelled
+        // rather than failed, and it leaves the loop instead of falling through
+        // to the "mark the run failed" block below. See the manual runner.
+        const stoppedHere = isCancelledError(error);
+
+        // The trace up to the failure, before the error line below.
+        await logSink.flush();
+        // A node that threw before producing a result still needs its row, or
+        // nothing on the canvas marks which step broke the run.
+        if (!stepRecorded) {
+          await executionsDb.updateAsync(
+            { executionId },
+            {
+              $push: {
+                nodeExecutions: {
+                  nodeId: node.id,
+                  nodeName: nodeLabel,
+                  nodeType: node.type,
+                  status: stoppedHere ? 'cancelled' : 'failed',
+                  startTime: new Date(nodeStartTime).toISOString(),
+                  duration: Date.now() - nodeStartTime,
+                  error: { message: error.message },
+                  metrics: { recordsProcessed: 0, recordsSuccess: 0, recordsFailed: 0 }
+                }
+              }
+            }
+          );
+        }
+
+        if (stoppedHere) {
+          await addExecutionLog(
+            executionsDb, executionId, 'warn',
+            `Node ${nodeLabel}: ${error.message}`, node.id,
+          );
+          cancelled = true;
+          interruptedNode = { name: nodeLabel, message: error.message };
+          break;
+        }
+
         await addExecutionLog(
           executionsDb,
           executionId,
           'error',
-          `Node execution failed: ${error.message}`
+          `Node execution failed: ${error.message}`,
+          node.id,
         );
 
         // Mark as failed
@@ -4358,6 +4879,8 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
               status: 'failed',
               endTime,
               duration,
+              currentNodeId: null,
+              currentNodeName: null,
               'results.totalRecordsProcessed': totalRecordsProcessed,
               'results.summary': `Workflow failed: ${error.message}`
             }
@@ -4374,6 +4897,47 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
 
         throw error;
       }
+    }
+
+    // Stopped by the user. Validation is skipped for the same reason as in the
+    // manual runner: a run that was cut short never got the chance to produce
+    // what it would be validated against.
+    if (cancelled) {
+      const stoppedAt = new Date().toISOString();
+      const summary = interruptedNode
+        ? `Stopped by the user during "${interruptedNode.name}" `
+          + `(${stepsRun} of ${stepsToExecute.length} nodes finished). ${interruptedNode.message}`
+        : `Stopped by the user after ${stepsRun} of ${stepsToExecute.length} nodes.`;
+
+      await logSink.flush();
+      await executionsDb.updateAsync(
+        { executionId },
+        {
+          $set: {
+            status: 'cancelled',
+            endTime: stoppedAt,
+            duration: new Date(stoppedAt) - new Date(startTime),
+            currentNodeId: null,
+            currentNodeName: null,
+            cancelRequested: false,
+            'results.totalRecordsProcessed': totalRecordsProcessed,
+            'results.summary': summary,
+          }
+        }
+      );
+      await addExecutionLog(executionsDb, executionId, 'warn', summary);
+
+      clearCancelRequest(executionId);
+      activeWorkflowExecutions.delete(workflowId);
+
+      if (Notification.isSupported()) {
+        new Notification({
+          title: 'Ternlux - Workflow Stopped',
+          body: `Workflow "${workflow.name}" was stopped. ${summary}`,
+        }).show();
+      }
+
+      return { success: false, cancelled: true, executionId, message: summary };
     }
 
     // Output validation — run the workflow's validate(ctx) function (if
@@ -4405,6 +4969,8 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
           status: 'completed',
           endTime,
           duration,
+          currentNodeId: null,
+          currentNodeName: null,
           'results.totalRecordsProcessed': totalRecordsProcessed,
           'results.summary': `Workflow completed successfully. Processed ${totalRecordsProcessed} records.`,
           ...(validation ? { validation, 'results.validation': validation } : {})
@@ -4469,6 +5035,10 @@ async function executeWorkflowFromTrigger(workflowId, nodeId, triggerInfo) {
       success: false,
       message: error.message
     };
+  } finally {
+    // Same reason as the manual runner: a stop request must not outlive the run
+    // it was aimed at.
+    if (executionId) clearCancelRequest(executionId);
   }
 }
 
@@ -4712,11 +5282,18 @@ app.whenReady().then(async () => {
 
   // Initialize node execution module with dependencies (skill helpers
   // builder is passed so vector-DB join hooks can access embedding libs).
-  nodeExecution.initialize(appSqliteDbPath, getFullConfig, sqlitePool, buildSkillHelpers);
+  nodeExecution.initialize(appSqliteDbPath, getFullConfig, buildSkillHelpers);
   apiFetch.initialize(getFullConfig);
 
   // Load connector plugins
   pluginManager.loadPlugins();
+
+  // Nothing survives a process exit, so any execution still marked 'running'
+  // when we start belongs to a previous session that was quit or crashed
+  // mid-run. Left alone it is a permanent ghost: the editor's "a run is in
+  // progress" gate never lifts and the execution monitor lists a workflow that
+  // is not executing. Close them out as failed.
+  await reconcileOrphanedExecutions();
 
   // Register all workflow triggers (CRON jobs and file watchers)
   await registerAllWorkflowTriggers(getDb, executeWorkflowFromTrigger);
@@ -4749,13 +5326,6 @@ app.on('before-quit', async (event) => {
   // Stop all editor code watchers
   console.log('[Electron] Stopping all code watchers...');
   await stopAllCodeWatchers();
-
-  // Close SQLite connection pool
-  if (sqlitePool) {
-    console.log('[Electron] Closing SQLite connection pool...');
-    await sqlitePool.close();
-    sqlitePool = null;
-  }
 
   // Checkpoint every attached workflow database so none is left with a
   // write-ahead log beside it, then release the DuckDB connection.

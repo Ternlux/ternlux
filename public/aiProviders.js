@@ -142,6 +142,139 @@ const FALLBACK_CONTEXT_WINDOW = 128000;
 // structured answers (workflow plans, generated transformer code) mid-JSON.
 const DEFAULT_MAX_TOKENS = 16000;
 
+// ── Request pacing ─────────────────────────────────────────────────────────
+//
+// All three SDKs ship the same default: a TEN-MINUTE request timeout with
+// automatic retries stacked on top of it. A connection that opens and then
+// never answers therefore buys ten minutes of complete silence before the SDK
+// even begins its first retry — which is exactly what froze one workflow build
+// for 608 seconds on a join:analysis call the model itself answered in two.
+//
+// So the three text paths below STREAM, and are watched by two clocks instead:
+//
+//   first chunk — nothing has come back at all yet. That is the stalled
+//                 connection above, and it is now caught in seconds.
+//   stall       — the answer started, then went quiet mid-sentence.
+//
+// Neither is a cap on how long a legitimate answer may take: a model writing
+// steadily for ten minutes trips neither clock, which is why these REPLACE the
+// SDKs' total-duration timeouts rather than merely shortening them. The paths
+// that cannot stream (native tool calls, the models list) get a bounded total
+// timeout instead — generous enough for a slow reasoning turn, far short of
+// ten minutes.
+//
+// Every value is overridable in milliseconds via the environment, for a slow
+// local model server (Ollama on CPU can legitimately take minutes to start).
+function envMs(name, fallback) {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+const AI_FIRST_CHUNK_TIMEOUT_MS = envMs('TERNLUX_AI_FIRST_CHUNK_TIMEOUT_MS', 60000);
+const AI_STALL_TIMEOUT_MS       = envMs('TERNLUX_AI_STALL_TIMEOUT_MS', 60000);
+const AI_REQUEST_TIMEOUT_MS     = envMs('TERNLUX_AI_REQUEST_TIMEOUT_MS', 180000);
+// One retry, not the SDKs' two: each attempt now costs at most
+// AI_REQUEST_TIMEOUT_MS, and three of those is back to the wait this exists to
+// remove. A timeout WE raise is never retried by the SDK (it arrives as a user
+// abort), so this only covers connection errors and 5xx/429 responses.
+const AI_MAX_RETRIES = Number.isFinite(Number(process.env.TERNLUX_AI_MAX_RETRIES))
+  ? Math.max(0, Number(process.env.TERNLUX_AI_MAX_RETRIES))
+  : 1;
+
+/** Client options every SDK construction in this file shares. */
+function sdkClientOptions(extra = {}) {
+  return { timeout: AI_REQUEST_TIMEOUT_MS, maxRetries: AI_MAX_RETRIES, ...extra };
+}
+
+/**
+ * The clock behind every streamed call.
+ *
+ * A stream that goes quiet is a failed request, but only the code reading it
+ * knows when the quiet started. This hands back an AbortSignal that fires when
+ * nothing has arrived for `firstChunkMs` (before the first chunk) or
+ * `stallMs` (after it), the `touch()` each chunk calls to push that deadline
+ * out, and the `done()` that disarms it.
+ *
+ * `explain()` is what makes the failure readable: the SDKs all surface our
+ * abort as a bare "Request was aborted", which tells the user nothing. It
+ * replaces that with which clock ran out and how far the answer had got.
+ */
+function streamWatchdog({
+  label = 'The model',
+  firstChunkMs = AI_FIRST_CHUNK_TIMEOUT_MS,
+  stallMs = AI_STALL_TIMEOUT_MS,
+  onProgress = null,
+} = {}) {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const state = { chars: 0, firstChunkAt: null, expired: null };
+  let timer = null;
+  let lastReport = 0;
+
+  const arm = (ms, which) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { state.expired = which; controller.abort(); }, ms);
+    // Never let a pending watchdog hold the process open.
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+  arm(firstChunkMs, 'first-chunk');
+
+  const report = (force) => {
+    if (typeof onProgress !== 'function') return;
+    // Once a second is all a human watching a build log can read, and it keeps
+    // a fast stream from spending its time in the reporter.
+    if (!force && Date.now() - lastReport < 1000) return;
+    lastReport = Date.now();
+    try {
+      onProgress({
+        chars: state.chars,
+        elapsedMs: Date.now() - startedAt,
+        waitingForFirstChunk: state.firstChunkAt === null,
+      });
+    } catch (_err) { /* progress is best-effort */ }
+  };
+
+  /**
+   * Turn our own abort into an error that names the clock that fired.
+   * Anything else — a real API error — passes through untouched.
+   */
+  const explain = (err, partialText = '') => {
+    if (!state.expired) return err;
+    const secs = Math.round((state.expired === 'first-chunk' ? firstChunkMs : stallMs) / 1000);
+    const e = new Error(state.expired === 'first-chunk'
+      ? `${label} sent nothing back for ${secs}s — the request timed out. It may be overloaded; try again, or pick another provider in Settings → AI Provider.`
+      : `${label} went quiet for ${secs}s after ${state.chars} characters — the request timed out before the answer was finished.`);
+    e.code = 'AI_TIMEOUT';
+    e.userFacing = true;
+    e.expired = state.expired;
+    e.partialText = partialText || null;
+    return e;
+  };
+
+  return {
+    signal: controller.signal,
+    state,
+    explain,
+    /** Every chunk — text or not. Anything arriving is proof the call is alive. */
+    touch(text = '') {
+      if (state.firstChunkAt === null) state.firstChunkAt = Date.now();
+      state.chars += text.length;
+      arm(stallMs, 'stall');
+      report(false);
+    },
+    done() { clearTimeout(timer); },
+    /**
+     * Raise the timeout a stream SWALLOWED. The OpenAI SDK's SSE iterator
+     * treats an abort as a clean end of stream and simply returns — so a call
+     * our clock killed comes back looking like a short but complete answer,
+     * which downstream JSON parsing then blames on the model. Called after
+     * every stream loop: if a clock fired, this is the throw the loop owed us.
+     */
+    assertAlive(partialText = '') {
+      if (state.expired) throw explain(new Error('aborted'), partialText);
+    },
+  };
+}
+
 /**
  * The ceiling actually sent to a provider. Anthropic REQUIRES max_tokens (a
  * request without it is a 400), so it gets the static fallback; OpenAI and
@@ -407,7 +540,7 @@ function stripMarkdownCodeBlocks(text) {
   return text;
 }
 
-async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], onUsage = null, jsonMode = false) {
+async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], onUsage = null, jsonMode = false, onProgress = null) {
   const genAI = new GoogleGenerativeAI(apiKey);
   const generationConfig = maxTokens ? { maxOutputTokens: maxTokens } : {};
   // Gemini has no tool API in this app (see TOOL_CAPABLE_PROVIDERS), so every
@@ -430,11 +563,15 @@ async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null,
   // turn contract (the JSON envelope the reply has to match, the tool catalogue,
   // the planner brief). Dropping it leaves the model answering in free prose and
   // every downstream JSON.parse failing.
+  // The watchdog's signal is handed to the model, not to a single call: this
+  // SDK takes its request options (signal, timeout) when the model handle is
+  // made, and applies them to every request that handle issues.
+  const watch = streamWatchdog({ label: 'Gemini', onProgress });
   const geminiModel = genAI.getGenerativeModel({
     model,
     generationConfig,
     ...(systemPrompt ? { systemInstruction: systemPrompt } : {}),
-  });
+  }, { signal: watch.signal });
 
   let fullPrompt = prompt;
   if (chatHistory && chatHistory.length > 0) {
@@ -444,8 +581,30 @@ async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null,
     fullPrompt = `Previous Conversation:\n${historyText}\n\nCurrent Request:\n${prompt}`;
   }
 
-  const result = await geminiModel.generateContent(fullPrompt);
-  const response = await result.response;
+  // Streamed for the reason given at AI_FIRST_CHUNK_TIMEOUT_MS: a request that
+  // never answers has to be distinguishable from one that is answering slowly,
+  // and only a stream can tell them apart. `result.response` still resolves to
+  // the same aggregated response the non-streaming call returned, so
+  // everything below is unchanged.
+  let text = '';
+  let response;
+  try {
+    const result = await geminiModel.generateContentStream(fullPrompt);
+    for await (const chunk of result.stream) {
+      // A chunk carrying only a safety verdict or a function call throws from
+      // .text(); it still counts as the stream being alive.
+      let piece = '';
+      try { piece = chunk.text() || ''; } catch (_err) { piece = ''; }
+      text += piece;
+      watch.touch(piece);
+    }
+    watch.assertAlive(text);
+    response = await result.response;
+  } catch (err) {
+    throw watch.explain(err, text);
+  } finally {
+    watch.done();
+  }
 
   if (typeof onUsage === 'function') {
     const u = response.usageMetadata || {};
@@ -459,7 +618,13 @@ async function callGemini(prompt, model, maxTokens, apiKey, systemPrompt = null,
     });
   }
 
-  return stripMarkdownCodeBlocks(response.text());
+  // response.text() re-derives exactly what the loop above accumulated, but it
+  // THROWS when the answer was blocked or came back empty. Falling back to the
+  // accumulated text keeps a partial answer readable instead of replacing it
+  // with an SDK error about a response we can see.
+  let finalText = text;
+  try { finalText = response.text() || text; } catch (_err) { /* keep what streamed */ }
+  return stripMarkdownCodeBlocks(finalText);
 }
 
 // The Anthropic SDK refuses a NON-streaming request whose max_tokens implies a
@@ -472,17 +637,31 @@ const CLAUDE_NONSTREAMING_MAX_TOKENS = 20000;
 /**
  * One Messages call, streamed or not depending on the output budget. Returns
  * the same shape either way, so callers never have to care which path ran.
+ *
+ * `watch` is optional: pass one and the call is ALWAYS streamed, whatever the
+ * budget, because a stream is the only thing a stall clock can watch. The
+ * tool-calling path (which assembles blocks rather than text) passes none and
+ * keeps the budget-based split above.
  */
-async function createClaudeMessage(anthropic, params) {
-  if ((params.max_tokens || 0) <= CLAUDE_NONSTREAMING_MAX_TOKENS) {
-    return anthropic.messages.create(params);
+async function createClaudeMessage(anthropic, params, watch = null) {
+  if (!watch) {
+    if ((params.max_tokens || 0) <= CLAUDE_NONSTREAMING_MAX_TOKENS) {
+      return anthropic.messages.create(params);
+    }
+    return anthropic.messages.stream(params).finalMessage();
   }
-  return anthropic.messages.stream(params).finalMessage();
+  const stream = anthropic.messages.stream(params, { signal: watch.signal });
+  // `streamEvent` fires for EVERY event, `text` only for visible output. Both
+  // are needed: a long thinking block emits no text at all, and treating that
+  // silence as a stall would kill exactly the calls that need the time most.
+  stream.on('streamEvent', () => watch.touch(''));
+  stream.on('text', (delta) => watch.touch(delta || ''));
+  return stream.finalMessage();
 }
 
-async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], onUsage = null) {
+async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], onUsage = null, onProgress = null) {
   const AnthropicCtor = Anthropic.default || Anthropic;
-  const anthropic = new AnthropicCtor({ apiKey });
+  const anthropic = new AnthropicCtor(sdkClientOptions({ apiKey }));
 
   const messages = [];
   for (const msg of chatHistory || []) {
@@ -510,7 +689,16 @@ async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null,
 
   if (systemPrompt) requestParams.system = systemPrompt;
 
-  const message = await createClaudeMessage(anthropic, requestParams);
+  const watch = streamWatchdog({ label: 'Claude', onProgress });
+  let message;
+  try {
+    message = await createClaudeMessage(anthropic, requestParams, watch);
+    watch.assertAlive();
+  } catch (err) {
+    throw watch.explain(err);
+  } finally {
+    watch.done();
+  }
 
   // `content` is a list of blocks, and the first one is NOT necessarily the
   // answer — with thinking on it's a `thinking` block (whose text is empty
@@ -562,11 +750,20 @@ async function callClaude(prompt, model, maxTokens, apiKey, systemPrompt = null,
   throw new Error(`Claude returned no text content (stop_reason: ${message?.stop_reason || 'unknown'}).`);
 }
 
-async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onUsage = null, jsonMode = false) {
+// Models whose org isn't verified for streaming, remembered for the process.
+// OpenAI rejects a streamed request from an unverified organisation with a 400
+// naming the model, and that verdict does not change between two calls a second
+// apart — so the first such refusal is enough to send every later call for that
+// model straight down the non-streaming path.
+const openAiNoStreamModels = new Set();
+
+const STREAM_REFUSED = /must be verified to stream|stream.*not supported|unsupported_value.*stream|'stream' .*not supported/i;
+
+async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onUsage = null, jsonMode = false, onProgress = null) {
   const OpenAICtor = OpenAI.default || OpenAI;
   // Local servers (Ollama, LM Studio) need no real key, but the SDK rejects an
   // empty apiKey — pass a placeholder when none was supplied.
-  const clientOptions = { apiKey: apiKey || 'not-needed' };
+  const clientOptions = sdkClientOptions({ apiKey: apiKey || 'not-needed' });
   if (baseURL) clientOptions.baseURL = baseURL;
   const openai = new OpenAICtor(clientOptions);
 
@@ -587,11 +784,60 @@ async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null,
   // Optional for OpenAI — only send when the caller specified a cap.
   applyMaxTokens(params, maxTokens, baseURL);
   applyJsonMode(params, jsonMode, baseURL);
-  const completion = await openai.chat.completions.create(params);
+
+  // Streamed unless this model has already refused to stream (see
+  // openAiNoStreamModels). A non-streamed call can only be timed by its total
+  // duration, which is the ten-minute wait this file exists to get rid of —
+  // so streaming is the default and falling back is the exception.
+  const canStream = !openAiNoStreamModels.has(model);
+  let text = '';
+  let usage = null;
+  let finishReason = null;
+
+  if (canStream) {
+    const watch = streamWatchdog({ label: 'OpenAI', onProgress });
+    try {
+      // include_usage adds one final chunk carrying the token counts, which a
+      // streamed response otherwise omits entirely — without it the prompt log
+      // loses the numbers it is read for. OpenAI's own option: the same
+      // baseURL discriminator applyMaxTokens documents.
+      const streamed = await openai.chat.completions.create(
+        { ...params, stream: true, ...(baseURL ? {} : { stream_options: { include_usage: true } }) },
+        { signal: watch.signal },
+      );
+      for await (const chunk of streamed) {
+        const delta = chunk.choices?.[0]?.delta?.content || '';
+        text += delta;
+        // Touched for EVERY chunk, not just the ones carrying text: a reasoning
+        // model sends content-free chunks while it thinks, and those are proof
+        // the call is alive.
+        watch.touch(delta);
+        if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+        if (chunk.usage) usage = chunk.usage;
+      }
+      watch.assertAlive(text);
+    } catch (err) {
+      watch.done();
+      // An organisation that isn't verified for streaming is told so in a 400
+      // that names the model. Remember it and answer this call the old way
+      // rather than failing a request that would have worked unstreamed.
+      if (err?.status === 400 && STREAM_REFUSED.test(String(err?.message || ''))) {
+        openAiNoStreamModels.add(model);
+        return callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt, chatHistory, baseURL, onUsage, jsonMode, onProgress);
+      }
+      throw watch.explain(err, text);
+    } finally {
+      watch.done();
+    }
+  } else {
+    const completion = await openai.chat.completions.create(params);
+    text = completion.choices?.[0]?.message?.content || '';
+    usage = completion.usage || null;
+    finishReason = completion.choices?.[0]?.finish_reason || null;
+  }
 
   if (typeof onUsage === 'function') {
-    const u = completion.usage || {};
-    const finishReason = completion.choices?.[0]?.finish_reason || null;
+    const u = usage || {};
     onUsage({
       inputTokens:    u.prompt_tokens ?? null,
       outputTokens:   u.completion_tokens ?? null,
@@ -602,9 +848,7 @@ async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null,
     });
   }
 
-  if (completion.choices && completion.choices[0]?.message?.content) {
-    return stripMarkdownCodeBlocks(completion.choices[0].message.content);
-  }
+  if (text) return stripMarkdownCodeBlocks(text);
   throw new Error('Invalid response format from OpenAI API');
 }
 
@@ -679,7 +923,7 @@ async function listModels(provider, { apiKey, baseURL } = {}) {
 
   if (p === 'claude') {
     const AnthropicCtor = Anthropic.default || Anthropic;
-    const anthropic = new AnthropicCtor({ apiKey });
+    const anthropic = new AnthropicCtor(sdkClientOptions({ apiKey }));
     const page = await anthropic.models.list({ limit: 1000 });
     // More recent models are returned first; preserve that order.
     // `max_tokens` (output cap) and `max_input_tokens` (context window) are
@@ -695,7 +939,9 @@ async function listModels(provider, { apiKey, baseURL } = {}) {
   if (p === 'gemini') {
     // @google/generative-ai has no list endpoint, so hit the REST models API.
     const url = `https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=${encodeURIComponent(apiKey || '')}`;
-    const res = await fetch(url);
+    // Bounded like every other provider request here: this one runs on the way
+    // into resolveModelLimits, so a hang costs every call that follows it.
+    const res = await fetch(url, { signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`Gemini models request failed: ${res.status} ${res.statusText}`);
     const body = await res.json();
     return (body.models || [])
@@ -710,7 +956,7 @@ async function listModels(provider, { apiKey, baseURL } = {}) {
 
   // openai + any OpenAI-compatible provider (same /models shape).
   const OpenAICtor = OpenAI.default || OpenAI;
-  const clientOptions = { apiKey: apiKey || 'not-needed' };
+  const clientOptions = sdkClientOptions({ apiKey: apiKey || 'not-needed' });
   if (baseURL) clientOptions.baseURL = baseURL;
   const openai = new OpenAICtor(clientOptions);
   const page = await openai.models.list();
@@ -753,6 +999,19 @@ function humanizeAIError(err, provider, model) {
   const status = statusMatch ? Number(statusMatch[1]) : null;
 
   let friendly;
+  if (err && err.code === 'AI_TIMEOUT') {
+    // streamWatchdog already wrote this for a person — which clock ran out,
+    // after how long, and how far the answer had got. The generic branches
+    // below would flatten all of that into "took too long to respond".
+    const e = new Error(err.message);
+    e.userFacing = true;
+    e.code = 'AI_TIMEOUT';
+    e.expired = err.expired || null;
+    e.provider = provider || null;
+    e.originalMessage = raw;
+    if (err.partialText) e.partialText = err.partialText;
+    return e;
+  }
   if (err && err.code === 'MAX_TOKENS') {
     // Already a precise, user-readable message — and the generic branches below
     // would misread "token"/"too long" as a context-window problem, which this
@@ -810,7 +1069,13 @@ function humanizeAIError(err, provider, model) {
  * Provider-agnostic dispatcher. Caller supplies the apiKey explicitly.
  */
 async function callAI(prompt, options = {}) {
-  const { provider, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onTrim = null, jsonMode = false, promptMeta = null } = options;
+  // `onProgress` is called while the answer streams in — { chars, elapsedMs,
+  // waitingForFirstChunk } about once a second — so a caller with somewhere to
+  // show it (the build log, a status line) can say what is happening instead
+  // of leaving a spinner on screen. Main-process only: it is a function, so it
+  // cannot cross IPC; the renderer hears about this through the build-progress
+  // channel that workflowBuilder feeds.
+  const { provider, model, maxTokens, apiKey, systemPrompt = null, chatHistory = [], baseURL = null, onTrim = null, jsonMode = false, promptMeta = null, onProgress = null } = options;
   if (!provider) throw new Error('provider is required');
   const compatConf = OPENAI_COMPAT_PROVIDERS[provider.toLowerCase()];
   // Keyless OpenAI-compatible providers (local servers) may run without a key.
@@ -864,14 +1129,14 @@ async function callAI(prompt, options = {}) {
   try {
     switch (provider.toLowerCase()) {
       case 'gemini':
-        response = await callGemini(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage, jsonMode);
+        response = await callGemini(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage, jsonMode, onProgress);
         break;
       case 'claude':
-        response = await callClaude(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage);
+        response = await callClaude(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, onUsage, onProgress);
         break;
       case 'openai':
       case 'chatgpt':
-        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, null, onUsage, jsonMode);
+        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, null, onUsage, jsonMode, onProgress);
         break;
       default: {
         // Any OpenAI-compatible provider (OpenRouter, Groq, Together, Mistral,
@@ -884,7 +1149,7 @@ async function callAI(prompt, options = {}) {
         if (!model) throw new Error(`Provider "${provider}" requires a model name.`);
         // jsonMode is forwarded but applyJsonMode drops it for any non-OpenAI
         // base URL — the policy lives there, not in a second place here.
-        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, url, onUsage, jsonMode);
+        response = await callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, url, onUsage, jsonMode, onProgress);
         break;
       }
     }
@@ -1269,7 +1534,7 @@ function toOpenAITools(tools) {
 
 async function callClaudeTools({ model, maxTokens, apiKey, systemPrompt, turns, tools, onUsage }) {
   const AnthropicCtor = Anthropic.default || Anthropic;
-  const anthropic = new AnthropicCtor({ apiKey });
+  const anthropic = new AnthropicCtor(sdkClientOptions({ apiKey }));
 
   const budget = maxTokens || DEFAULT_MAX_TOKENS;
   const params = { model, max_tokens: budget, messages: toClaudeMessages(turns) };
@@ -1390,7 +1655,10 @@ function toResponsesTools(tools) {
 
 async function callOpenAITools({ model, maxTokens, apiKey, systemPrompt, turns, tools, baseURL, onUsage }) {
   const OpenAICtor = OpenAI.default || OpenAI;
-  const clientOptions = { apiKey: apiKey || 'not-needed' };
+  // A tool turn assembles blocks rather than text, so it is one of the two
+  // paths here that cannot stream — it is bounded by the total-duration
+  // timeout in sdkClientOptions instead of a stall clock.
+  const clientOptions = sdkClientOptions({ apiKey: apiKey || 'not-needed' });
   if (baseURL) clientOptions.baseURL = baseURL;
   const openai = new OpenAICtor(clientOptions);
 
