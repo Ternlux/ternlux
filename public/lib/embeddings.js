@@ -5,6 +5,7 @@
 
 const { OpenAI } = require('openai');
 const { HfInference } = require('@huggingface/inference');
+const { throwIfCancelled } = require('../NodeExecution/executionCancel');
 
 /**
  * Generate embeddings for an array of data rows
@@ -117,6 +118,12 @@ async function generateOpenAIEmbeddings(texts, model = 'text-embedding-3-small',
   const allEmbeddings = [];
 
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    // Embedding a large source is one HTTP round-trip per 100 texts — a
+    // 100k-row upsert is a thousand of them, all inside a single node, and by
+    // far the longest thing a vector write does. Every batch is also billed, so
+    // stopping here stops the spend as well as the wait.
+    throwIfCancelled('generating embeddings', `${allEmbeddings.length} of ${texts.length} embedded`);
+
     const batch = texts.slice(i, i + BATCH_SIZE);
 
     console.log(`Processing OpenAI batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(texts.length / BATCH_SIZE)}...`);
@@ -153,6 +160,10 @@ async function generateHuggingFaceEmbeddings(texts, model = 'sentence-transforme
   // HuggingFace Inference API processes texts individually or in small batches
   // depending on the model
   for (let i = 0; i < texts.length; i++) {
+    // One request PER TEXT here, so this is the slowest embedding path there
+    // is and the one most worth being able to stop.
+    throwIfCancelled('generating embeddings', `${i} of ${texts.length} embedded`);
+
     const text = texts[i];
 
     if ((i + 1) % 10 === 0 || i === texts.length - 1) {

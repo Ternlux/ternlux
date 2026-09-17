@@ -5,8 +5,9 @@
  *
  * `dbPath` is one of two things:
  *
- *   • a workflow database (`*.duckdb`) — node outputs are tables in it, and a
- *     query names them directly: `SELECT * FROM orders_clean`.
+ *   • a database (`*.duckdb`, or a `*.sqlite` / `*.db` DuckDB reads through its
+ *     sqlite extension) — its tables are attached under an alias and a query
+ *     names them directly: `SELECT * FROM orders_clean`.
  *   • a data file (csv / json / parquet) — not a database. It is registered as
  *     a view named after itself, so `SELECT * FROM orders` means the file.
  */
@@ -14,8 +15,18 @@
 const path = require('path');
 const duck = require('../duckdb');
 
-/** True when the path is a database rather than a data file. */
-const isDb = (dbPath) => /\.duckdb$/i.test(String(dbPath || ''));
+/**
+ * True when the path is a database rather than a data file.
+ *
+ * The shared predicate, not a local one. This used to test `/\.duckdb$/`, which
+ * left SQLite out — so a `.sqlite` / `.db` file reached through here was taken
+ * for a data file and handed to `tableRef`, which knows nothing about database
+ * formats and answered "DuckDB cannot read transcripts.sqlite — supported
+ * formats are csv, json, parquet, xlsx and avro" for a file the Data Explorer
+ * browses perfectly well. The Explorer goes through the connector, whose own
+ * rule always included SQLite; this module had a third copy that disagreed.
+ */
+const isDb = duck.isDatabaseFile;
 
 /** The view name a bare file is addressable by. */
 const viewNameFor = (dbPath) => path.basename(dbPath, path.extname(dbPath)) || 'data';
@@ -91,7 +102,7 @@ async function ensureView(dbPath) {
  * runQuery({ dbPath, query })                      — read, returns rows
  * runQuery({ dbPath, operation: 'insert', docs })  — write rows
  *
- * The write form mirrors the NeDB lib's shape, so a caller that used to write a
+ * The write form mirrors the old local-store shape, so a caller that used to write a
  * local collection can address local data the same way. Where the rows land
  * follows the path: a database gets a table (`tableName` required), a file is
  * written in its own format. `mode: 'append'` only applies to a table — a file
