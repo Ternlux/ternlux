@@ -28,6 +28,10 @@ const fs = require('fs');
 const path = require('path');
 
 const duck = require('../duckdb');
+const { logStep } = require('../NodeExecution/executionLog');
+// Was defined here; moved to lib/ when the output node's reader needed the same
+// connector-streaming adapter. See public/lib/pluginRowStream.js.
+const { streamPluginRows } = require('../lib/pluginRowStream');
 
 /**
  * The table an in-place file update is staged under.
@@ -66,6 +70,39 @@ function resolveTargetDb(targetLocalPath, scope) {
 const isWorkflowDb = (filePath) => /\.duckdb$/i.test(String(filePath || ''));
 
 /**
+ * What a NEW-TABLE transform reads from.
+ *
+ * Never the target. A new-table transform always reads something that already
+ * exists and has its own name — a file, or an upstream node's table — so if the
+ * source name is missing, that is a caller that failed to pass it, not a value
+ * to be guessed at.
+ *
+ * It used to fall back to `targetTableName`, which produced
+ * `CREATE TABLE x AS SELECT * FROM x` — a node reading the output it has not
+ * written yet. That surfaced as "Table x does not exist" from deep inside the
+ * catalog, several steps away from the missing argument. A file source masked
+ * it (registerSource also registers the file's basename, which the SQL usually
+ * names), so it only ever bit when reading another node's output.
+ *
+ * A FILE may fall back to its own basename: that is a real name for the data,
+ * and registerSource registers it regardless. A workflow DATABASE has no such
+ * fallback — the table name is the only way in.
+ */
+function resolveSourceName(sourceTableName, sourceLocalPath) {
+  const given = String(sourceTableName || '').trim();
+  if (given) return given;
+  if (isWorkflowDb(sourceLocalPath)) {
+    throw new Error(
+      'This transform reads another node\'s output table, but no source table name was passed to it. '
+      + '(sourceTableName is required whenever sourceLocalPath is a workflow database.)',
+    );
+  }
+  const base = sourceLocalPath ? path.basename(sourceLocalPath, path.extname(sourceLocalPath)) : '';
+  if (base) return base;
+  throw new Error('This transform has no source table name and no source file to derive one from.');
+}
+
+/**
  * Make the source addressable by the name the transform SQL refers to.
  *
  * The model writes `SELECT … FROM orders`, so `orders` has to resolve. The
@@ -90,6 +127,26 @@ async function registerSource(sourceLocalPath, tableName, format = null, { workf
   }
 
   if (!fs.existsSync(sourceLocalPath)) throw new Error(`Source file not found: ${sourceLocalPath}`);
+
+  // A non-workflow DATABASE file — .sqlite/.sqlite3/.db, read through DuckDB's
+  // sqlite extension. Attached, not tableRef'd: tableRef only knows data-file
+  // formats and threw "cannot read x.sqlite — supported formats are csv, json,
+  // parquet, xlsx and avro" for a source the Data Explorer browses fine. Same
+  // predicate as the connector's, so the two cannot disagree (a .duckdb source
+  // was already caught by the workflow branch above).
+  if (duck.isDatabaseFile(sourceLocalPath)) {
+    if (!tableName) {
+      throw new Error(`Reading a table out of ${path.basename(sourceLocalPath)} requires the source's table name.`);
+    }
+    const dbRef = await duck.attachedTableRef(sourceLocalPath, tableName);
+    await duck.registerAddressableViews({
+      body: `SELECT * FROM ${dbRef}`,
+      names: [tableName, path.basename(sourceLocalPath, path.extname(sourceLocalPath))],
+      connectionName: connectionName || path.basename(sourceLocalPath, path.extname(sourceLocalPath)),
+    });
+    return dbRef;
+  }
+
   // For a workbook the table name is the sheet; for everything else it is just
   // a label and this resolves to null.
   const ref = await duck.tableRef(sourceLocalPath, format, {
@@ -154,7 +211,11 @@ async function describeResult({
   const asColumns = (cols) => cols.map((c) => ({ name: c.name, type: c.type }));
 
   try {
-    const sourceName = sourceTableName || targetTableName;
+    // Same rule as the executor — see resolveSourceName. A throw here is caught
+    // by this function's own catch and reported as "shape unknown", which is
+    // the right outcome: a build should not invent a schema from a source it
+    // could not identify.
+    const sourceName = resolveSourceName(sourceTableName, sourceLocalPath);
 
     // A new table is just the shape of its SELECT.
     if (operationMode !== 'in_place') {
@@ -192,14 +253,22 @@ async function describeResult({
       const ref = await duck.stagingRef(stagingDb, stageTable);
       const from = isWorkflowDb(sourceLocalPath)
         ? await duck.workflowTableRef(workflowId, sourceName)
-        // The preview has to read the same sheet the real run will, or it
-        // describes a shape the transform never sees.
-        : await duck.tableRef(sourceLocalPath, sourceFormat, {
-          sheet: duck.sheetFor(sourceLocalPath, sourceName),
-        });
+        // A .sqlite/.db source is a real table in an attachable database —
+        // tableRef only speaks data-file formats and would throw on it.
+        : duck.isDatabaseFile(sourceLocalPath)
+          ? await duck.attachedTableRef(sourceLocalPath, sourceName)
+          // The preview has to read the same sheet the real run will, or it
+          // describes a shape the transform never sees.
+          : await duck.tableRef(sourceLocalPath, sourceFormat, {
+            sheet: duck.sheetFor(sourceLocalPath, sourceName),
+          });
       await duck.exec(`CREATE OR REPLACE TABLE ${ref} AS SELECT * FROM ${from} LIMIT ${limit}`);
       try {
-        await duck.execInStaging(stagingDb, sql);
+        // Statement by statement, for the same reason the real run is: when the
+        // node is re-generated against a source that already carries an earlier
+        // run's structural change, the ALTER fails and the shape is still
+        // derivable from the statements behind it.
+        await duck.execScriptInStaging(stagingDb, sql);
         const columns = asColumns(await duck.describe(ref));
         let sampleData = [];
         if (limit > 0) {
@@ -253,7 +322,7 @@ async function createLocalTable({
   if (!targetTableName) throw new Error('DuckDB transform requires a target table name');
 
   const outPath = resolveTargetDb(targetLocalPath, { workflowId, nodeId });
-  const sourceName = sourceTableName || targetTableName;
+  const sourceName = resolveSourceName(sourceTableName, sourceLocalPath);
 
   const rowCount = await duck.withWorkflowLock(workflowId, async () => {
     await registerSource(sourceLocalPath, sourceName, sourceFormat, { workflowId, connectionName });
@@ -263,12 +332,54 @@ async function createLocalTable({
 
   return {
     success: true,
-    message: `Transformed ${rowCount} row(s) into ${targetTableName}`,
+    // The transform ran; it just selected nothing. `rowCount` is read back off
+    // the table that was actually created, so a zero here is the real thing
+    // and not a connector that declines to report counts — worth flagging,
+    // because everything downstream of an empty table is empty too.
+    warning: rowCount === 0,
+    message: rowCount === 0
+      ? `Transformed 0 rows into ${targetTableName} — the source matched no rows, so this node produced an empty table.`
+      : `Transformed ${rowCount} row(s) into ${targetTableName}`,
     rowCount,
     localPath: outPath,
     localDbPath: outPath,
     targetTableName,
   };
+}
+
+/**
+ * What an in-place run reports, naming any statement that did not apply.
+ *
+ * A skipped statement is not a failure — it is what a re-run of a structural
+ * change looks like — but it is not nothing either, since a real schema problem
+ * reads identically from here. So it is said out loud rather than swallowed,
+ * and the caller flags the node amber.
+ */
+function inPlaceMessage(subject, rowCount, tolerated = []) {
+  const base = `Updated ${subject} — ${rowCount} row(s)`;
+  return tolerated.length
+    ? `${base}. ${tolerated.length} statement(s) did not apply: ${tolerated.map((m) => String(m).split('\n')[0]).join('; ')}`
+    : base;
+}
+
+/**
+ * Record the statements execScript let through.
+ *
+ * These are the local equivalent of a remote in-place DDL failure: an ALTER
+ * that could not run because a previous run already applied it, or one that
+ * genuinely cannot run and is about to show up as a missing column downstream.
+ * The two look identical from here, which is exactly why each one gets its own
+ * warn line rather than being summarised into the node's message — the message
+ * shows a count, the log shows which statements and what they said.
+ */
+function logTolerated(tolerated, subject) {
+  for (const err of tolerated || []) {
+    logStep('warn', `Statement did not apply on ${subject}: ${String(err).split('\n')[0]}`, {
+      kind: 'duckdb',
+      phase: 'in_place',
+      error: String(err),
+    });
+  }
 }
 
 /**
@@ -311,21 +422,29 @@ async function inPlaceLocalUpdate({
   const dbTableName = sourceTableName || targetTableName;
   const stageTable = stagingTableFor(nodeId, sourceTableName || targetTableName);
 
-  // ── a table in a DuckDB database: modify it where it is ──────────────────
-  if (isWorkflowDb(target)) {
+  // ── a table in a database: modify it where it is ──────────────────────────
+  // Any attachable database, not just a workflow's .duckdb: a .sqlite/.db is
+  // attached through DuckDB's sqlite extension and written natively — no copy,
+  // no write-back. It used to fall into the file branch below, where
+  // detectFormat has no answer for .sqlite and tableRef threw on a source that
+  // reads fine everywhere else.
+  if (duck.isDatabaseFile(target)) {
     const run = async () => {
-      await duck.execInDb(target, sql);
-      return duck.tableRowCountIn(target, dbTableName);
+      const { tolerated } = await duck.execScriptInDb(target, sql);
+      return { rowCount: await duck.tableRowCountIn(target, dbTableName), tolerated };
     };
     // A workflow's own database is written under its lock; another database
     // addressed by path has no workflow to serialise against.
-    const rowCount = workflowId && target === duck.workflowDbPath(workflowId)
+    const { rowCount, tolerated } = workflowId && target === duck.workflowDbPath(workflowId)
       ? await duck.withWorkflowLock(workflowId, run)
       : await run();
 
+    logTolerated(tolerated, dbTableName);
+
     return {
       success: true,
-      message: `Updated ${dbTableName} — ${rowCount} row(s)`,
+      warning: tolerated.length > 0,
+      message: inPlaceMessage(dbTableName, rowCount, tolerated),
       rowCount,
       localPath: target,
       localDbPath: target,
@@ -343,7 +462,7 @@ async function inPlaceLocalUpdate({
   // whatever the node meant, and the write replaces the entire workbook.
   const sheet = duck.sheetFor(target, dbTableName);
 
-  const rowCount = await duck.withWorkflowLock(workflowId, async () => {
+  const { rowCount, tolerated } = await duck.withWorkflowLock(workflowId, async () => {
     // The scratch copy is a staging table in this workflow's own database. It
     // gives the statements something they can modify and takes the file out of
     // the picture before it is rewritten.
@@ -351,24 +470,32 @@ async function inPlaceLocalUpdate({
     const fileRef = await duck.tableRef(target, format, { sheet });
     await duck.exec(`CREATE OR REPLACE TABLE ${ref} AS SELECT * FROM ${fileRef}`);
     try {
-      await duck.execInStaging(stagingDb, sql);
+      // Statement by statement, so a re-run over a file that ALREADY carries
+      // last run's structural change is not stopped by the ALTER that would add
+      // it again. The file is written back only if the whole script got
+      // through, so a genuine failure still leaves it untouched.
+      const result = await duck.execScriptInStaging(stagingDb, sql);
       await duck.copyToFile(`SELECT * FROM ${ref}`, target, format, { sheet });
       const { rows } = await duck.query(`SELECT count(*) AS c FROM ${ref}`);
-      return Number(rows[0]?.c ?? 0);
+      return { rowCount: Number(rows[0]?.c ?? 0), tolerated: result.tolerated };
     } finally {
       await duck.dropStaging(stagingDb, [stageTable]);
     }
   });
 
+  logTolerated(tolerated, path.basename(target));
+
   return {
     success: true,
-    message: `Updated ${path.basename(target)} — ${rowCount} row(s)`,
+    warning: tolerated.length > 0,
+    message: inPlaceMessage(path.basename(target), rowCount, tolerated),
     rowCount,
     localPath: target,
     localDbPath: target,
     targetTableName: dbTableName,
   };
 }
+
 
 /**
  * A remote database source landing locally.
@@ -392,12 +519,15 @@ async function databaseToLocal({
 
   async function* rows() {
     if (typeof plugin.streamQuery === 'function') {
-      for await (const batch of plugin.streamQuery(fullConfig, connectionId, { query: sql })) {
-        for (const row of (Array.isArray(batch) ? batch : batch?.rows || [])) yield row;
-      }
+      yield* streamPluginRows(plugin, fullConfig, connectionId, sql);
       return;
     }
-    const result = await plugin.runQuery(fullConfig, connectionId, { query: sql, limit: 1000000 });
+    // No cursor to page with, so this one read returns everything — but it
+    // returns EVERYTHING. The `limit: 1000000` that used to sit here silently
+    // truncated any source past a million rows on the connectors that honour it
+    // (MongoDB does; the SQL ones ignore the field entirely, which made the cap
+    // arbitrary as well as wrong).
+    const result = await plugin.runQuery(fullConfig, connectionId, { query: sql });
     if (result && result.success === false) throw new Error(result.message || 'Source query failed');
     for (const row of (result.rows || result.data || [])) yield row;
   }
@@ -409,7 +539,11 @@ async function databaseToLocal({
 
   return {
     success: true,
-    message: `Loaded ${rowCount} row(s) into ${targetTableName}`,
+    // Counted from the rows actually ingested — see createLocalTable above.
+    warning: rowCount === 0,
+    message: rowCount === 0
+      ? `Loaded 0 rows into ${targetTableName} — the source query returned nothing, so this node produced an empty table.`
+      : `Loaded ${rowCount} row(s) into ${targetTableName}`,
     rowCount,
     localPath: outPath,
     localDbPath: outPath,
