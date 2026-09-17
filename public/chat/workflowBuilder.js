@@ -30,23 +30,58 @@ const DuckDB = require('../transfomers/DuckDB');
 // Same reason: an Excel sheet name settled at build time has to be one the
 // writer will accept at run time.
 const xlsxFile = require('../duckdb/xlsx');
+const duckdbCore = require('../duckdb');
 
 const DOCS_ROOT       = path.join(__dirname, '..', 'docs');
 const NODE_DOCS_ROOT  = path.join(DOCS_ROOT, 'nodes');
 const CHAT_DOCS_ROOT  = path.join(DOCS_ROOT, 'chat-prompts');
 const SKILL_DOCS_ROOT = path.join(DOCS_ROOT, 'plugins', 'skills');
+// Two different jobs, deliberately two constants.
+//
+// SAMPLE_ROW_LIMIT is how many rows get embedded in a node's
+// `sourceTableSchema.sampleData` — a handful, purely so the builder and the
+// prompts can see what the data looks like.
+//
+// PREVIEW_ROW_LIMIT is the limit written into a preview query that is STORED on
+// the node and re-run later by the Data Preview panel. It matches every
+// connector's `getPreviewQuery(tableName, limit = 100)` default and the 100 that
+// DataSourceNodeChat passes, so a node built from chat previews the same as one
+// built through the panel.
+//
+// These were one constant. The preview-query builders defaulted to it, so a
+// chat-built node stored "SELECT TOP 5 * FROM [dbo].[transaction_products]" and
+// a Mongo destination stored {"limit":5} — the sampling number, presented as the
+// node's own query. Runs were never affected (nothing executes these), but the
+// node read as though it only ever saw 5 rows.
 const SAMPLE_ROW_LIMIT = 5;
+const PREVIEW_ROW_LIMIT = 100;
 const PICK_TABLE_RETRIES = 1;
 const PLAN_RETRIES = 3;
 // How many consecutive questions one skill may ask about a single node before we
 // stop routing to it and build with the standard path instead. Bounds a skill
 // that never converges (see the skill turn in buildTransformerConfig).
-const MAX_SKILL_ROUNDS = 3;
+const MAX_SKILL_ROUNDS = 5;
 
+/**
+ * Skills whose work has no fallback.
+ *
+ * Every other skill is a shortcut: the standard SQL/NoSQL path can express what
+ * it would have produced, so a skill that gives up costs nothing but its
+ * convenience. Embedding is not like that — no engine has a function for it, so
+ * a vector skill that gives up leaves the request unbuildable, and falling
+ * through only invents SQL that fails at run time. These fail the build instead.
+ */
+const VECTOR_SKILL_IDS = new Set(['vector-db-executor']);
+const isVectorSkillId = (skillId) => VECTOR_SKILL_IDS.has(String(skillId || ''));
+
+// Same wrapping as the chatPrompts:build IPC registry in electron.js: the
+// headless builder reaches these modules by a direct require, so sanitising
+// only at the IPC boundary would leave this path leaking vectors.
+const { stripVectors, stripVectorsFromSchema, sanitizePromptModule } = require('../lib/promptSanitize');
 const ChatPrompts = {
-  join:       require('../ChatPrompts/Join').join,
-  transfomer: require('../ChatPrompts/Transfomer').transfomer,
-  restApi:    require('../ChatPrompts/RestApi'),
+  join:       sanitizePromptModule(require('../ChatPrompts/Join').join),
+  transfomer: sanitizePromptModule(require('../ChatPrompts/Transfomer').transfomer),
+  restApi:    sanitizePromptModule(require('../ChatPrompts/RestApi')),
 };
 
 // REST API data sources are materialised locally by running the AI-authored
@@ -54,6 +89,7 @@ const ChatPrompts = {
 // (workflowExecutionHelpers' API source path). Requiring the singleton here
 // reuses the instance electron.js already wired up via apiFetch.initialize().
 const { handleExecuteApiFetch } = require('../NodeExecution/ApiFetch');
+const { qualifierFor } = require('../lib/tableRef');
 
 // A local node's output is a table in its workflow's database. Compute the path
 // here so the builder can record targetLocalPath even when the source is a
@@ -103,7 +139,7 @@ function defaultLanceDBPath() {
 // folder, falling back to userData, then /tmp.
 function defaultOutputSavePath(format, baseName) {
   const extByFormat = {
-    json: 'json', csv: 'csv', excel: 'xlsx', nedb: 'db',
+    json: 'json', csv: 'csv', excel: 'xlsx', duckdb: 'duckdb',
     sqlite: 'db', parquet: 'parquet', avro: 'avro', lancedb: 'lance',
   };
   const ext = extByFormat[format] || 'json';
@@ -288,6 +324,23 @@ function matchSourceForKey(key, sources, index) {
  * leniently, and names repeated across sources are kept once.
  */
 function joinOutputColumns(gen, joinSettings, sources = []) {
+  // What the join DECLARED its result contains — the generator's `targetColumns`,
+  // same field and same meaning as the transformer's. Preferred over anything
+  // derived, because it is the only thing that describes the output rather than
+  // the input.
+  //
+  // `selectedColumns` records which columns are READ from each source, so it
+  // reports a name the result may not have: a join emitting
+  // `c.name AS customer_name` selects `name` and outputs `customer_name`. The
+  // schema built from it advertised `name`, the next node was configured against
+  // that, and its SQL then selected a column the joined table did not contain.
+  // Aliases are invisible to the selection list, by definition.
+  const declared = declaredTargetColumns(gen?.targetColumns, []);
+  if (declared.length > 0) return declared;
+
+  // Older configs, and any generator that omits it, fall back to the selection
+  // list. Still wrong for aliased columns — but a schema derived from the inputs
+  // beats no schema at all, which leaves a downstream node with nothing.
   const filled = (m) => m && typeof m === 'object' && Object.keys(m).length > 0;
   const sel = filled(gen?.selectedColumns) ? gen.selectedColumns : joinSettings?.selectedColumns;
   if (!filled(sel)) return [];
@@ -641,6 +694,35 @@ function chatPromptDocsAsPromptSection() {
   return docsToPromptSection(loadChatPromptDocs());
 }
 
+// Node type → the basename its docs are filed under.
+const DOC_BASENAME_BY_NODE_TYPE = {
+  dataSource: 'data-source',
+  transformer: 'transformer',
+  join: 'join',
+  output: 'output',
+  start: 'start',
+};
+
+/**
+ * The docs for ONE node type — its node reference plus the chat-prompt
+ * reference for the same type, when both exist.
+ *
+ * The full bundle is ~36KB; a caller that only ever looks at joins has no use
+ * for the other five. Used by the node-build router, which has to understand
+ * how a join or transformer is actually configured in order to judge whether a
+ * user's reply is about that configuration at all.
+ */
+function nodeTypeDocsAsPromptSection(nodeType) {
+  const base = DOC_BASENAME_BY_NODE_TYPE[nodeType];
+  if (!base) return '';
+  const parts = [];
+  const nodeDoc = loadNodeDocs()[base];
+  if (nodeDoc) parts.push(`\n## nodes/${base}.md\n\n${nodeDoc}`);
+  const chatDoc = loadChatPromptDocs()[base];
+  if (chatDoc) parts.push(`\n## chat-prompts/${base}.md\n\n${chatDoc}`);
+  return parts.join('\n');
+}
+
 /**
  * Ask the AI which skill docs (if any) are relevant for this user
  * request. Cheap small-context call — only the skill names + their
@@ -688,11 +770,15 @@ Reply with a SINGLE JSON object — nothing else:
 Rules:
 - Only include skills that are PLAUSIBLY useful for this specific request.
 - If plain SQL/NoSQL clearly handles it, return an empty array.
+- Searching a vector store from ONE fixed probe text ("the 5 most similar to
+  'clothes'") runs as a JavaScript transformer, so include javascript-executor
+  for those — vector-db-executor covers embedding a column and maintaining a
+  store's own records, not a one-off search.
 - Use only ids from the "Installed skills" list above; do not invent ids.
 - Be conservative — every extra skill costs prompt tokens at planning time.`;
 
   try {
-    const out = await callJson(helpers, prompt, { maxTokens: 200, chatHistory });
+    const out = await timedCall('skillDocs:pick', prompt, () => callJson(helpers, prompt, { maxTokens: 200, chatHistory }));
     const ids = Array.isArray(out?.skillIds) ? out.skillIds : [];
     return ids.filter((id) => installedIds.includes(id));
   } catch (_err) {
@@ -726,8 +812,13 @@ function skillDocsAsPromptSection(skillIds) {
 
 function slimSchema(schema) {
   if (!schema || typeof schema !== 'object') return schema;
-  const sample = Array.isArray(schema.sampleData) ? schema.sampleData.slice(0, 1) : schema.sampleData;
-  return { ...schema, sampleData: sample };
+  // Truncating to one row is not enough on a vector table: that ONE row still
+  // carries a full embedding. Strip vectors as well — this serializer feeds
+  // get_workflow / get_workflow_nodes, so it is what the planner and the chat
+  // agent read a saved workflow through.
+  const clean = stripVectorsFromSchema(schema);
+  const sample = Array.isArray(clean.sampleData) ? clean.sampleData.slice(0, 1) : clean.sampleData;
+  return { ...clean, sampleData: sample };
 }
 
 // A join's `sourcesConfig` is the single heaviest thing in any workflow: one
@@ -783,6 +874,15 @@ function slimWorkflowForPrompt(wf) {
     nodes: nodes.map((n) => ({
       id:   n.id,
       type: n.type,
+      // Provenance. A node built from chat records the instruction it was built
+      // from; a node the user configured by hand in the editor never has one.
+      // Without this marker a reader with only the conversation in front of it
+      // sees an unexplained node and concludes nobody asked for it — which is
+      // how a change review came to propose deleting two nodes the user had
+      // added themselves.
+      ...(n?.data?.config && !n.data.config.builderPrompt
+        ? { configuredInEditor: true }
+        : {}),
       data: slimNodeData(n.data),
     })),
     edges: edges.map((e) => ({ source: e.source, target: e.target })),
@@ -934,10 +1034,106 @@ function parseBuilderJson(text) {
  * needs back, so ai:continue knows whether the finished text must parse as JSON
  * before the build can resume.
  */
-async function callJsonResumable(helpers, prompt, options = {}, { stage, resumed = null } = {}) {
-  if (resumed && resumed[stage] !== undefined) return resumed[stage];
+// ---------------------------------------------------------------------------
+// Build timing.
+//
+// A node build is a handful of SEQUENTIAL round trips to the model, and the
+// wait is the sum of them — so "why is this slow" is answered by which stage
+// took the time and how big its prompt was, not by anything in this process.
+// Every builder call funnels through callJson/TextResumable, so timing them
+// there covers each stage of every node type with nothing to thread through.
+//
+// `[build]` lines land in the main-process console beside the other execution
+// logs. `buildTimings.report()` prints the breakdown when the node finishes.
+// ---------------------------------------------------------------------------
+const buildTimings = {
+  stages: [],
+  reset() { this.stages = []; },
+  add(entry) {
+    this.stages.push(entry);
+    const size = entry.promptChars != null ? `, prompt ${fmtChars(entry.promptChars)}` : '';
+    const back = entry.replyChars != null ? `, reply ${fmtChars(entry.replyChars)}` : '';
+    const detail = entry.detail ? `, ${entry.detail}` : '';
+    console.log(`[build] ${entry.stage} — ${(entry.ms / 1000).toFixed(1)}s${size}${back}${detail}${entry.failed ? ' (FAILED)' : ''}`);
+  },
+  report(label, totalMs) {
+    if (this.stages.length === 0) {
+      console.log(`[build] ${label} — ${(totalMs / 1000).toFixed(1)}s, nothing timed`);
+      return;
+    }
+    // Split by what the wait actually WAS. A build that is slow because it read
+    // three databases needs a different answer from one that is slow because
+    // the model wrote a long reply, and a single total cannot tell them apart.
+    const group = (of) => {
+      const picked = this.stages.filter(of);
+      const ms = picked.reduce((sum, s) => sum + s.ms, 0);
+      return { ms, count: picked.length, parts: picked.map((s) => `${s.stage} ${(s.ms / 1000).toFixed(1)}s`).join(' + ') };
+    };
+    const ai = group((s) => s.promptChars != null);
+    const io = group((s) => s.promptChars == null);
+    const said = [
+      ai.count ? `${(ai.ms / 1000).toFixed(1)}s in ${ai.count} AI call${ai.count === 1 ? '' : 's'} (${ai.parts})` : null,
+      io.count ? `${(io.ms / 1000).toFixed(1)}s in ${io.count} live read${io.count === 1 ? '' : 's'} (${io.parts})` : null,
+      `${((totalMs - ai.ms - io.ms) / 1000).toFixed(1)}s elsewhere`,
+    ].filter(Boolean).join(', ');
+    console.log(`[build] ${label} — ${(totalMs / 1000).toFixed(1)}s total: ${said}`);
+  },
+};
+
+const fmtChars = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k chars` : `${n} chars`);
+
+/**
+ * Time a step of a build that is NOT a model call — a live schema read, a file
+ * scan — and record it beside the AI stages.
+ *
+ * Worth its own entry whenever the step talks to something outside this
+ * process: a join that spent thirty seconds before its first prompt was reading
+ * three source databases two round trips at a time, and the summary could only
+ * report that as "elsewhere".
+ */
+async function timedStep(stage, detail, run) {
+  const started = Date.now();
+  let failed = false;
   try {
-    return await callJson(helpers, prompt, options);
+    return await run();
+  } catch (err) {
+    failed = true;
+    throw err;
+  } finally {
+    buildTimings.add({ stage, ms: Date.now() - started, detail, failed });
+  }
+}
+
+/** Time one model round trip and record it under `stage`. */
+async function timedCall(stage, prompt, run) {
+  const started = Date.now();
+  try {
+    const reply = await run();
+    buildTimings.add({
+      stage,
+      ms: Date.now() - started,
+      promptChars: typeof prompt === 'string' ? prompt.length : null,
+      replyChars: reply == null ? 0 : (typeof reply === 'string' ? reply.length : JSON.stringify(reply).length),
+    });
+    return reply;
+  } catch (err) {
+    buildTimings.add({
+      stage,
+      ms: Date.now() - started,
+      promptChars: typeof prompt === 'string' ? prompt.length : null,
+      failed: true,
+    });
+    throw err;
+  }
+}
+
+async function callJsonResumable(helpers, prompt, options = {}, { stage, resumed = null } = {}) {
+  if (resumed && resumed[stage] !== undefined) {
+    console.log(`[build] ${stage} — replayed from a resumed call, no round trip`);
+    return resumed[stage];
+  }
+  try {
+    return await timedCall(stage || 'json', prompt, () => callJson(helpers, prompt, options));
   } catch (err) {
     if (err && err.code === 'MAX_TOKENS') { err.resumeStage = stage; err.resumeFormat = 'json'; }
     throw err;
@@ -950,9 +1146,12 @@ async function callJsonResumable(helpers, prompt, options = {}, { stage, resumed
  * cached and replayed verbatim rather than parsed.
  */
 async function callTextResumable(helpers, prompt, options = {}, { stage, resumed = null } = {}) {
-  if (resumed && resumed[stage] !== undefined) return resumed[stage];
+  if (resumed && resumed[stage] !== undefined) {
+    console.log(`[build] ${stage} — replayed from a resumed call, no round trip`);
+    return resumed[stage];
+  }
   try {
-    return await helpers.callAI(prompt, options);
+    return await timedCall(stage || 'text', prompt, () => helpers.callAI(prompt, options));
   } catch (err) {
     if (err && err.code === 'MAX_TOKENS') { err.resumeStage = stage; err.resumeFormat = 'text'; }
     throw err;
@@ -998,7 +1197,7 @@ The "table" value MUST match one of the names above EXACTLY.`;
 
   for (let attempt = 0; attempt <= PICK_TABLE_RETRIES; attempt++) {
     try {
-      const out = await callJson(helpers, prompt);
+      const out = await timedCall('dataSource:pickTable', prompt, () => callJson(helpers, prompt));
 
       console.log('pickTable+out: ', out)
 
@@ -1024,7 +1223,7 @@ The "table" value MUST match one of the names above EXACTLY.`;
  * Falls back to a plain double-quoted "schema"."table" + LIMIT when no
  * plugin is registered for the dbType (best-effort for older configs).
  */
-function sqlPreviewQuery(table, schema, dbType, helpers, limit = SAMPLE_ROW_LIMIT) {
+function sqlPreviewQuery(table, schema, dbType, helpers, limit = PREVIEW_ROW_LIMIT) {
   const connector = getConnectorPlugin(helpers, dbType);
   const quoted = (typeof connector?.quoteIdentifier === 'function')
     ? connector.quoteIdentifier(table, schema || null)
@@ -1035,8 +1234,34 @@ function sqlPreviewQuery(table, schema, dbType, helpers, limit = SAMPLE_ROW_LIMI
   return `SELECT * FROM ${quoted} LIMIT ${limit}`;
 }
 
-function nosqlPreviewQuery(collection) {
-  return JSON.stringify({ collection, filter: {}, limit: SAMPLE_ROW_LIMIT });
+/**
+ * The name a generated statement should address a table by — qualified and
+ * quoted the way its own engine spells it.
+ *
+ * Built by the connector, never by joining the two strings with a dot. A
+ * hand-built `${schema}.${table}` is wrong twice over. It loses the QUOTING, so
+ * an engine that folds unquoted identifiers (Snowflake upper-cases them) looks
+ * up a name the table does not answer to. And it is ambiguous: a table may
+ * genuinely be called "public.transactions", and `PUBLIC.public.transactions`
+ * then reads as a schema repeated by mistake — which is exactly how a model
+ * "tidies" it into PUBLIC.transactions and addresses a table that isn't there.
+ * `"PUBLIC"."public.transactions"` says which is which and cannot be re-read.
+ *
+ * Falls back to plain double quotes when no connector is registered, which at
+ * least keeps the two parts distinguishable.
+ */
+function qualifiedTableName(table, schema, dbType, helpers) {
+  const name = table == null ? '' : String(table);
+  if (!name) return '';
+  const connector = getConnectorPlugin(helpers, dbType);
+  if (typeof connector?.quoteIdentifier === 'function') {
+    return connector.quoteIdentifier(name, schema || null);
+  }
+  return schema ? `"${schema}"."${name}"` : `"${name}"`;
+}
+
+function nosqlPreviewQuery(collection, limit = PREVIEW_ROW_LIMIT) {
+  return JSON.stringify({ collection, filter: {}, limit });
 }
 
 /**
@@ -1047,18 +1272,41 @@ function nosqlPreviewQuery(collection) {
  */
 async function loadSchemaSample(connection, table, schema, helpers, warnings, dbPath = null) {
   const isNoSQL = connection.dbType === 'mongodb';
+  // LanceDB has no SQL surface: lib/lancedb.js dispatches on an `operation`,
+  // and a query string arrives there as an unnamed 'list' with no table to
+  // open. So the sample read threw, was swallowed into a warning, and every
+  // LanceDB source got a schema with no sampleData — invisible unless you went
+  // looking for the warning.
+  const isLanceDB = connection.dbType === 'lancedb';
   let columns = [];
   let sampleData = [];
 
+  // Both reads are timed and logged: this pair is the slowest thing in most
+  // builds, it is two separate round trips to the source engine, and when a
+  // build stalls here the question is always WHICH of them.
+  const readStarted = Date.now();
   try { columns = await helpers.getColumns(connection, table, schema, dbPath); }
   catch (err) { warnings.push(`getColumns(${table}) failed: ${err.message}`); }
+  console.log(
+    `[build]   getColumns(${table}) — ${((Date.now() - readStarted) / 1000).toFixed(1)}s`
+    + `, ${columns?.length || 0} columns`,
+  );
 
   try {
-    const query = isNoSQL
-      ? { collection: table, filter: {}, limit: SAMPLE_ROW_LIMIT }
-      : sqlPreviewQuery(table, schema, connection.dbType, helpers);
+    // SAMPLE_ROW_LIMIT explicitly: this query is run once, here, to fill
+    // `sampleData`. It is NOT the preview query stored on the node — that one
+    // defaults to PREVIEW_ROW_LIMIT and is built separately by the callers below.
+    let query;
+    if (isNoSQL) query = { collection: table, filter: {}, limit: SAMPLE_ROW_LIMIT };
+    else if (isLanceDB) query = { operation: 'list', tableName: table, limit: SAMPLE_ROW_LIMIT };
+    else query = sqlPreviewQuery(table, schema, connection.dbType, helpers, SAMPLE_ROW_LIMIT);
+    const sampleStarted = Date.now();
     sampleData = await helpers.runQuery(connection, query, dbPath);
     if (!Array.isArray(sampleData)) sampleData = sampleData?.rows || sampleData?.data || [];
+    console.log(
+      `[build]   sample read(${table}) — ${((Date.now() - sampleStarted) / 1000).toFixed(1)}s`
+      + `, ${sampleData.length} rows`,
+    );
   } catch (err) { warnings.push(`sample query for ${table} failed: ${err.message}`); }
 
   // When getColumns returns nothing but we have sample rows, derive columns from row keys.
@@ -1077,7 +1325,40 @@ async function loadSchemaSample(connection, table, schema, helpers, warnings, db
 
 // Local stores the helper layer addresses by PATH rather than by saved
 // connection — the same set buildSkillHelpers routes on (electron.js).
-const LOCAL_STORE_TYPES = new Set(['duckdb', 'nedb', 'sqlite', 'lancedb']);
+const LOCAL_STORE_TYPES = new Set(['duckdb', 'sqlite', 'lancedb']);
+
+/**
+ * Local export formats whose FILE holds many datasets, so the output node has
+ * to name the one it writes — the same reason an Excel export names a sheet.
+ * Mirrors TABLE_FORMATS in OutputNodeChat.js.
+ */
+const LOCAL_TABLE_FORMATS = new Set(['sqlite', 'duckdb', 'lancedb']);
+
+/**
+ * Does this upstream DECLARE the shape it produces?
+ *
+ * A transformer and a join both do: `targetTableSchema` is written by their own
+ * builder from the columns their generated statements produce. It describes the
+ * table that node will WRITE on the next run — not whatever its previous run
+ * happened to leave on disk.
+ *
+ * That distinction is why a live re-read is the wrong answer for these parents.
+ * A transformer drops and recreates its target before its DDL runs
+ * (NodeExecution issues `DROP TABLE IF EXISTS` ahead of the CREATE), and a join
+ * always replaces its target — so the table a child reads live holds columns
+ * that are about to be removed. That produced a node whose DDL was
+ * `ALTER TABLE … MODIFY COLUMN revenue_band`: correct against the table as it
+ * stood, and guaranteed to fail with "Unknown column" on the next full run,
+ * because by then the parent had recreated the table without that column.
+ *
+ * A data source is the opposite case — it reads a table it does not write, so
+ * nothing in the workflow makes its snapshot newer than the table itself, and
+ * the live read stands.
+ */
+function upstreamDeclaresItsOutput(upstreamNode) {
+  const type = upstreamNode?.type || upstreamNode?.data?.config?.nodeType || null;
+  return type === 'transformer' || type === 'join';
+}
 
 /**
  * The source's schema as it is NOW, read from the table itself.
@@ -1139,16 +1420,20 @@ async function refreshSourceSchema(source, helpers) {
 }
 
 // Build a `sourceTableSchema` for a REST API source AFTER its fetch function
-// has materialised rows into local NeDB. Unlike loadSchemaSample, there is no
-// connector getColumns to call — the API response shape is only knowable from
-// the rows it returned — so columns are derived from the materialised rows
-// (falling back to the single sampleRow handleExecuteApiFetch returns when the
-// NeDB read comes back empty). _id is NeDB-internal and excluded.
+// has materialised rows into the workflow's DuckDB database. Unlike
+// loadSchemaSample, there is no connector getColumns to call — the API response
+// shape is only knowable from the rows it returned — so columns are derived from
+// the materialised rows (falling back to the single sampleRow
+// handleExecuteApiFetch returns when the read comes back empty).
 async function loadApiSchemaSample(collection, localPath, sampleRow, helpers, warnings) {
   let sampleData = [];
   if (localPath) {
     try {
-      sampleData = await helpers.runQuery('nedb', { filter: {}, limit: SAMPLE_ROW_LIMIT }, localPath);
+      sampleData = await helpers.runQuery(
+        'duckdb',
+        `SELECT * FROM ${duckdbCore.quoteIdentifier(duckdbCore.sanitizeIdentifier(collection))} LIMIT ${SAMPLE_ROW_LIMIT}`,
+        localPath,
+      );
       if (!Array.isArray(sampleData)) sampleData = sampleData?.rows || sampleData?.data || [];
     } catch (err) {
       warnings.push(`API sample read for "${collection}" failed: ${err.message}`);
@@ -1214,10 +1499,11 @@ For file (file or directory watch):
 }
 
 
-Pick the most natural choice from the intent. If unclear, choose "manual".
+Default to "manual". Choose "time" or "file" only if the intent explicitly asks
+for a schedule or a path to watch — never infer one from what the workflow does.
 Return ONLY the JSON object.`;
 
-  const out = await callJson(helpers, prompt);
+  const out = await timedCall('start:gen', prompt, () => callJson(helpers, prompt));
   console.log('buildStartConfig+out: ', out)
   const summary = out?.description
     ? `Configured start node (${out.triggerType || 'manual'}): ${out.description}`
@@ -1259,7 +1545,7 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
   };
 
   // Branch 1 — REST API. Generates an async fetch function via the existing
-  // RestApi prompt. No table step; the runner materialises rows into NeDB.
+  // RestApi prompt. No table step; the runner materialises rows into DuckDB.
   if (conn.dbType === 'rest-api') {
     const restPrompt = ChatPrompts.restApi.restApiAnalysisRequest({
       userRequest: stepPrompt,
@@ -1313,39 +1599,62 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     // Run the fetch NOW so downstream nodes get a real schema. The API
     // response shape can't be known statically (no getTables/getColumns for a
     // REST source), so we execute the AI-authored function exactly the way the
-    // runtime does, materialise the rows into local NeDB, and derive
-    // sourceTableSchema + sourceLocalPath from the result. Without this,
-    // transformer/join steps that read this source have no columns to plan
-    // against. Failures are non-fatal: the node is still saved and re-fetches
-    // at execution time, but downstream schema will be missing until then.
+    // runtime does, materialise the rows into local DuckDB, and derive
+    // sourceTableSchema + sourceLocalPath from the result.
+    //
+    // A fetch that returns nothing is a FAILED BUILD, not a warning. This used
+    // to be best-effort — the node was saved with no schema and the build
+    // carried on — and the cost landed two steps later, on the transformer,
+    // which found no columns and asked "which table should it transform?" about
+    // an API that has no tables. That question cannot be answered: the recovery
+    // path looks the source's connection up among saved connections, and an API
+    // source records `local-duckdb`, which is not one. So the build stopped on a
+    // question with no answer and no mention of the API call that actually
+    // failed. Throwing puts the real reason in the chat, where the user can act
+    // on it — a wrong endpoint, a missing credential, an empty result.
     if (out.action === 'create_plan' && out.code) {
+      const apiFailed = (reason) => new Error(
+        `The API call for "${conn.name}" ${reason}. The data source can't be built until it returns rows — `
+        + 'check the endpoint, the credentials saved on the connection, and any query parameters it needs. '
+        + 'The workflow has been left as it was.',
+      );
+      let fetchResult;
       try {
-        const fetchResult = await handleExecuteApiFetch({
+        fetchResult = await handleExecuteApiFetch({
           apiConnectionId: conn.id || conn._id,
           apiConnectionConfig: config.apiConnectionPublicConfig,
           apiFetchCode: out.code,
-          nedbCollection: apiCollection,
+          targetCollection: apiCollection,
           operationMode: 'new_table',
           workflowId,
           nodeId,
         });
-        if (fetchResult?.success) {
-          config.sourceLocalPath = fetchResult.localPath || null;
-          config.sourceTableSchema = await loadApiSchemaSample(
-            apiCollection, fetchResult.localPath, fetchResult.sampleRow, helpers, warnings,
-          );
-          config.apiFetchResult = {
-            rowCount: fetchResult.rowCount || 0,
-            localPath: fetchResult.localPath || null,
-            collection: fetchResult.collection || apiCollection,
-          };
-          pushBotMsg(chat, `Fetched ${fetchResult.rowCount || 0} row${fetchResult.rowCount === 1 ? '' : 's'} from API "${conn.name}" into "${apiCollection}" (${config.sourceTableSchema.columns.length} columns detected).`);
-        } else {
-          warnings.push(`REST API fetch for "${conn.name}" failed: ${fetchResult?.error || 'unknown error'} — downstream nodes will have no schema until this source runs.`);
-        }
       } catch (err) {
-        warnings.push(`REST API fetch for "${conn.name}" threw: ${err.message} — downstream nodes will have no schema until this source runs.`);
+        throw apiFailed(`threw: ${err.message}`);
       }
+      if (!fetchResult?.success) {
+        throw apiFailed(`failed: ${fetchResult?.error || 'unknown error'}`);
+      }
+      // Zero rows never reaches the store — handleExecuteApiFetch returns before
+      // the write — so the table the schema read is about to open does not
+      // exist. Caught here rather than letting that read fail into a warning and
+      // hand back a source with no columns.
+      if (!fetchResult.rowCount) {
+        throw apiFailed('returned no rows');
+      }
+      config.sourceLocalPath = fetchResult.localPath || null;
+      config.sourceTableSchema = await loadApiSchemaSample(
+        apiCollection, fetchResult.localPath, fetchResult.sampleRow, helpers, warnings,
+      );
+      config.apiFetchResult = {
+        rowCount: fetchResult.rowCount || 0,
+        localPath: fetchResult.localPath || null,
+        collection: fetchResult.collection || apiCollection,
+      };
+      if (!config.sourceTableSchema?.columns?.length) {
+        throw apiFailed(`returned ${fetchResult.rowCount} row(s) but no readable columns`);
+      }
+      pushBotMsg(chat, `Fetched ${fetchResult.rowCount} row${fetchResult.rowCount === 1 ? '' : 's'} from API "${conn.name}" into "${apiCollection}" (${config.sourceTableSchema.columns.length} columns detected).`);
     }
 
     return config;
@@ -1360,9 +1669,36 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     return config;
   }
 
-  // Branch 3 — LanceDB file connection. Tables come directly from fileInfo.
+  // Branch 3 — LanceDB file connection.
   if (conn.dbType === 'lancedb' && (conn.connectionType || 'file') === 'file') {
-    const tableList = (conn.fileInfo?.tables || []).map((t) => (typeof t === 'string' ? { name: t } : t));
+    // Ask the store first. `fileInfo.tables` is a SNAPSHOT written when the
+    // connection was created: it is empty whenever that listing failed at the
+    // time (what a connection pointed at a `.lance` dataset produced, since
+    // opening a dataset reports no tables at all), and it is stale whenever the
+    // directory gained or lost a table afterwards. helpers.getTables reads the
+    // store and already falls back to the snapshot itself, so the snapshot here
+    // is only for the case where that call throws outright.
+    let tableList = [];
+    try {
+      const live = await helpers.getTables(conn);
+      tableList = (live || []).map((t) => (typeof t === 'string' ? { name: t } : t));
+    } catch (err) {
+      warnings.push(`Listing LanceDB tables for "${conn.name}" failed: ${err.message}`);
+    }
+    if (!tableList.length) {
+      tableList = (conn.fileInfo?.tables || []).map((t) => (typeof t === 'string' ? { name: t } : t));
+    }
+    if (!tableList.length) {
+      // Fail rather than half-build, for the same reason Branch 4 does: `config`
+      // holds the connection and nothing else, and the caller treats whatever
+      // comes back as a finished node.
+      throw new Error(
+        `LanceDB connection "${conn.name}" reports no tables, so there is nothing to point this data source at. `
+        + 'A LanceDB connection must point at the database DIRECTORY — the folder that CONTAINS the .lance '
+        + 'table folders — not at a .lance folder itself. Check it in the Data Explorer, then try again '
+        + '— the node has been left as it was.',
+      );
+    }
     const picked = await pickTable(stepPrompt, tableList, helpers, warnings);
     Object.assign(config, {
       sourceConnectionType: 'file',
@@ -1378,14 +1714,22 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     return config;
   }
 
-  // Branch 4 — Live database (incl. local SQLite/NeDB files). Real getTables call.
+  // Branch 4 — Live database (incl. local DuckDB/SQLite files). Real getTables call.
   const isDatabaseLike = conn.connectionType === 'database';
   if (isDatabaseLike) {
     const tables = await helpers.getTables(conn);
     if (!tables.length) {
-      warnings.push(`Connection "${conn.name}" returned no tables.`);
-      pushBotMsg(chat, `Connection "${conn.name}" has no tables — please open the node in the editor.`);
-      return config;
+      // FAIL, don't return a half-built config. `config` at this point carries
+      // the connection and nothing else — no table, no schema, no SQL — and the
+      // caller treats whatever comes back as a finished build: it saved that
+      // over a node that was working, reported "Configuration saved!", and the
+      // run then failed somewhere else entirely. Throwing aborts the build with
+      // this message and leaves the existing node untouched.
+      throw new Error(
+        `Connection "${conn.name}" reports no tables, so there is nothing to point this data source at. `
+        + 'The connection may be unreachable, or the table may live in a schema this connection cannot see. '
+        + 'Check it in the Data Explorer, then try again — the node has been left as it was.',
+      );
     }
     const picked = await pickTable(stepPrompt, tables, helpers, warnings);
     const isNoSQL = conn.dbType === 'mongodb';
@@ -1426,15 +1770,63 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     return config;
   }
 
-  // Branch 5 — Local file connections (CSV / JSON / Parquet, and Excel / Avro
-  // converted to Parquet when they were added). Nothing was imported: the file
-  // is read in place by DuckDB, so the path IS the source.
+  // Branch 5 — Local file connections (CSV / JSON / Parquet, Excel / Avro
+  // converted to Parquet when they were added, and the .sqlite / .duckdb
+  // database files DuckDB attaches). Nothing was imported: the file is read in
+  // place by DuckDB, so the path IS the source.
   if ((conn.connectionType || '') === 'file') {
     config.sourceDataset = conn.name;
     config.sourceLocalPath = conn.fileInfo?.filePath || null;
-    const single = conn.fileInfo?.tables?.[0] || conn.fileInfo?.collection || conn.name;
-    if (single) {
-      const name = typeof single === 'string' ? single : (single.name || conn.name);
+
+    // What this connection can offer, in the order that is TRUSTWORTHY for each
+    // kind of file — the same distinction WorkflowEditor's table listing draws.
+    //
+    //   Recorded first. `fileInfo.tables` is written when the file is added and
+    //   is the only complete answer for a multi-sheet workbook: its sheets were
+    //   each registered as their own Parquet file, so asking the store would
+    //   report whichever single sheet `filePath` happens to point at. For an
+    //   imported CSV on the shared app database it is stronger still — an
+    //   ownership SCOPE, not a cache (helpers.getTables refuses to go live
+    //   there for exactly that reason).
+    //
+    //   Live second. A .sqlite / .duckdb file the user picked records NOTHING:
+    //   its tables live in its own catalog, so `fileInfo.tables` is null by
+    //   design (LocalFileConnectionForm only fills it for csv/json/parquet/xlsx
+    //   and LanceDB). This listing is what that case has always needed — without
+    //   it the fallback below named the table after the CONNECTION, and a source
+    //   pointed at a table that does not exist reads downstream as "no schema".
+    const recorded = (conn.fileInfo?.tables || [])
+      .map((t) => (typeof t === 'string' ? { name: t } : (t && t.name ? { name: t.name, schema: t.schema || null } : null)))
+      .filter(Boolean);
+    let candidates = recorded;
+    if (!candidates.length) {
+      try {
+        candidates = (await helpers.getTables(conn) || [])
+          .map((t) => (typeof t === 'string' ? { name: t } : (t && t.name ? { name: t.name, schema: t.schema || null } : null)))
+          .filter(Boolean);
+      } catch (err) {
+        warnings.push(`Listing tables in "${conn.name}" failed: ${err.message}`);
+      }
+    }
+
+    // One candidate needs no choosing; several are put to the same picker the
+    // live-database branch uses, so the step's own words ("the table called
+    // data") decide. Nothing listed at all falls back to what the connection
+    // records about itself, as this branch always did — a single-table CSV whose
+    // registration predates `fileInfo.tables` still resolves that way.
+    let picked = null;
+    if (candidates.length > 1) picked = await pickTable(stepPrompt, candidates, helpers, warnings);
+    else if (candidates.length === 1) picked = candidates[0];
+    else {
+      const fallback = conn.fileInfo?.collection || conn.name;
+      if (fallback) {
+        warnings.push(`"${conn.name}" reports no tables; assuming the source is called "${fallback}".`);
+        picked = { name: fallback };
+      }
+    }
+
+    if (picked) {
+      const name = picked.name;
       config.sourceSelectedTables = [name];
       if (conn.dbType === 'duckdb') {
         // A connection can span several files, so the chosen table picks one.
@@ -1446,17 +1838,51 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
         config.sourceFormat = conn.fileInfo?.format || null;
         config.sourceTableName = name;
       } else if (conn.dbType === 'sqlite') config.sourceTableName = name;
-      else if (conn.dbType === 'nedb') config.sourceCollection = name;
-      try { config.sourceTableSchema = await loadSchemaSample(conn, name, null, helpers, warnings); }
-      catch (_) { /* schema is best-effort for local files */ }
+      // Best-effort, but never SILENT. A swallowed failure here produced a
+      // zero-column `sourceTableSchema`, which every downstream builder reads as
+      // "I have no schema for this source" and stops to ask the user about — a
+      // question whose real cause was this read, several nodes earlier.
+      try { config.sourceTableSchema = await loadSchemaSample(conn, name, picked.schema || null, helpers, warnings); }
+      catch (err) { warnings.push(`Reading the schema of "${name}" in "${conn.name}" failed: ${err.message}`); }
+      if (!config.sourceTableSchema?.columns?.length) {
+        warnings.push(`No columns could be read from "${name}" in "${conn.name}" — downstream nodes will have no schema to plan against.`);
+      }
     }
-    pushBotMsg(chat, `Configured local-file data source "${conn.name}" (${conn.dbType}).`);
+    pushBotMsg(chat, picked
+      ? `Configured local-file data source "${conn.name}" (${conn.dbType}) → "${picked.name}".`
+      : `Configured local-file data source "${conn.name}" (${conn.dbType}).`);
     return config;
   }
 
   warnings.push(`Connection "${conn.name}" (type=${conn.connectionType}, dbType=${conn.dbType}) is not handled by the workflow builder; open the node in the editor to finish configuration.`);
   pushBotMsg(chat, `Connection "${conn.name}" (${conn.dbType}) isn't auto-configurable — please open the node in the editor to finish setup.`);
   return config;
+}
+
+/**
+ * The output table name when the analyser proposed none.
+ *
+ * It used to be `transformer_${nodeId}`, and since a node id already starts with
+ * its type that read `transformer_transformer_1787772063904` — which is also
+ * what the node ends up CALLED, because a transformer's display name is derived
+ * from the table it writes. Naming it after the data instead keeps the card
+ * legible.
+ *
+ * The numeric tail is not decoration: every node in a workflow writes into the
+ * same DuckDB database, and the write is CREATE OR REPLACE, so two transformers
+ * reading one source and both falling back to a name would silently overwrite
+ * each other's output. It comes from the node id, so it is stable across
+ * rebuilds of the same node.
+ */
+function defaultTransformerTableName(base = {}, nodeId = null) {
+  const source = base.sourceTableName
+    || base.sourceCollection
+    || base.sourceTableSchema?.tableName
+    || base.sourceDataset;
+  const suffix = String(nodeId || Date.now()).replace(/\D/g, '').slice(-6);
+  return source
+    ? `${sanitizeCollectionName(source)}_transformed_${suffix}`
+    : `transformed_${suffix}`;
 }
 
 function sanitizeCollectionName(s) {
@@ -1492,6 +1918,263 @@ function copySourceFromUpstream(upstreamNode) {
 }
 
 /**
+ * Push a just-rebuilt node's output shape down to the nodes that read it.
+ *
+ * A downstream node records its input as `sourceTableSchema`, copied from its
+ * parent's `targetTableSchema` at the time IT was built. A plan build refreshes
+ * that naturally — executeBuild resolves each step's upstream from the nodes it
+ * has just built. A SINGLE-node rebuild from chat does not: it writes one node
+ * and stops, so every child keeps describing an output that no longer exists.
+ *
+ * That is how a join can start emitting `customer_name` while the transformer
+ * below it still believes the column is called `name`, and generates SQL
+ * against a column the joined table does not have.
+ *
+ * This only refreshes what a child says about its INPUT. It never touches a
+ * child's own logic — that SQL was written against the old shape and may now be
+ * wrong, which is a judgement for the reviewer and a decision for the user, not
+ * something to rewrite here.
+ *
+ * @returns {{nodes: Array, impacted: Array}} `nodes` is the rewritten node list
+ *          (unchanged when nothing was affected); `impacted` describes each
+ *          child whose input shape moved, for the reviewer and the user.
+ */
+/** Two {connectionId, tableName} pairs naming the same object. */
+const sameJoinSourceIdentity = (a, b) => (a?.connectionId || null) === (b?.connectionId || null)
+  && (a?.tableName || null) === (b?.tableName || null);
+
+/**
+ * One entry of the `sourceBuiltAgainst` baseline the editor's "your input
+ * moved" card reads. Shape mirrors workflowUtils' baselineOf — identity keys,
+ * a display label, and the column names — because that pass consumes it
+ * verbatim and compares it against the live parent.
+ */
+const SOURCE_IDENTITY_KEYS = [
+  'sourceConnectionId', 'sourceTableName', 'sourceCollection',
+  'sourceIndexName', 'sourceNamespace', 'sourceLocalPath', 'sourceSchema',
+];
+function sourceBaselineEntry(block, nodeId, nodeLabel) {
+  const identity = {};
+  for (const key of SOURCE_IDENTITY_KEYS) if (block?.[key]) identity[key] = block[key];
+  const file = block?.sourceLocalPath ? String(block.sourceLocalPath).split(/[\\/]/).pop() : null;
+  const what = block?.sourceTableName || block?.sourceCollection || block?.sourceIndexName || file;
+  return {
+    nodeId: nodeId || null,
+    nodeLabel: nodeLabel || nodeId || null,
+    identity,
+    dataset: [block?.sourceConnectionName, what].filter(Boolean).join(' · '),
+    columns: (block?.sourceTableSchema?.columns || []).map((c) => c?.name).filter(Boolean),
+  };
+}
+
+/**
+ * Re-point ONE entry of a join's `sourcesConfig` at what its parent now
+ * produces — the connection to open, the table to read, the shape it has.
+ *
+ * Deliberately NOT touched: that entry's `sql` / `ddl` / `tempTableName`. Those
+ * were generated against the old source, in the old engine's quoting, and
+ * rewriting them is the node chat's job — the same rule this whole function
+ * follows for a child's own logic. So a source that moved to a DIFFERENT TABLE
+ * now fails loudly at the read ("invalid object name") instead of quietly
+ * returning the old table's rows, and one that merely moved to another
+ * connection holding the same table keeps working. Which it is, the caller
+ * reports through `moved` so the reviewer can say so.
+ *
+ * @returns {{entry: Object, moved: boolean, from: Object, to: Object}}
+ */
+function repointJoinSourceConfig(entry, fresh, newSchema) {
+  const table = fresh.sourceTableName
+    || fresh.sourceCollection
+    || newSchema?.tableName
+    || entry.tableName
+    || null;
+  const connId = fresh.sourceConnectionId || entry.connection?.id || null;
+  const from = { connectionId: entry.connection?.id || null, tableName: entry.tableName || null };
+  const to = { connectionId: connId, tableName: table };
+  const connMoved = !!from.connectionId && !!connId && from.connectionId !== connId;
+
+  // A different connection's dbConfig describes a different server, so it is
+  // replaced rather than merged; the same connection keeps the config it was
+  // enriched with (getFullConfig resolves credentials by id either way).
+  const dbConfig = {
+    ...(connMoved ? (fresh.sourceDbConfig || {}) : (entry.connection?.dbConfig || {})),
+    ...(table ? { tableName: table } : {}),
+  };
+
+  // Where this step's `sql` and `ddl` still point: the FIRST divergence, kept
+  // through however many moves follow.
+  const origin = entry.sourceMoved?.from || from;
+  const moved = connMoved || from.tableName !== to.tableName;
+  // Marked only while the step reads something other than what its statements
+  // were written for. Back on that original — the source pointed at the old
+  // table again, or the old connection reconnected — and there is nothing
+  // stale left to warn about, so the mark goes. The other way it clears is a
+  // rebuild, which regenerates the statements instead.
+  const stillAway = !sameJoinSourceIdentity(origin, to);
+  return {
+    entry: {
+      ...entry,
+      ...(table ? { tableName: table } : {}),
+      sourceTableSchema: newSchema || entry.sourceTableSchema,
+      ...(moved && stillAway
+        ? { sourceMoved: { from: origin, to } }
+        : { sourceMoved: undefined }),
+      connection: {
+        ...(entry.connection || {}),
+        // fileInfo describes the file behind the OLD connection — an imported
+        // CSV/SQLite — and the loaders read `fileInfo.filePath` BEFORE
+        // `localPath`, so keeping it would let the abandoned file outrank the
+        // new one. It cannot survive a move to another connection.
+        ...(connMoved ? { fileInfo: null } : {}),
+        id: connId,
+        dbType: fresh.sourceDbType || entry.connection?.dbType || null,
+        localPath: fresh.sourceLocalPath ?? entry.connection?.localPath ?? null,
+        dbConfig,
+      },
+    },
+    moved: moved && stillAway,
+    from: origin,
+    to,
+  };
+}
+
+function propagateSourceSchema(workflow, nodeId, config) {
+  const nodes = Array.isArray(workflow?.nodes) ? workflow.nodes : [];
+  const edges = Array.isArray(workflow?.edges) ? workflow.edges : [];
+  if (!nodeId || !config || nodes.length === 0) return { nodes, impacted: [] };
+
+  const childIds = new Set(edges.filter((e) => e && e.source === nodeId).map((e) => e.target));
+  if (childIds.size === 0) return { nodes, impacted: [] };
+
+  // The parent as its children should now see it.
+  const parent = { id: nodeId, data: { config } };
+  const fresh = copySourceFromUpstream(parent);
+  // What the parent produces NOW. Read through `fresh` rather than off
+  // `config.targetTableSchema`, because a dataSource has no target* side — its
+  // output is the table it reads — so that field is undefined for one and every
+  // column of a rebuilt data source was reported as GONE.
+  const newSchema = fresh.sourceTableSchema || null;
+  const newColumns = (newSchema?.columns || []).map((c) => c.name).filter(Boolean);
+
+  const impacted = [];
+  const nextNodes = nodes.map((node) => {
+    if (!childIds.has(node.id)) return node;
+    const cfg = node.data?.config || {};
+
+    // Which columns this child THOUGHT it was reading, so the delta can be
+    // reported. A join names its sources in an array; everything else has one.
+    const joinIdx = Array.isArray(cfg.sources)
+      ? cfg.sources.findIndex((s) => s && s.sourceNodeId === nodeId)
+      : -1;
+    const isFlatChild = cfg.sourceNodeId === nodeId;
+    if (joinIdx < 0 && !isFlatChild) return node;
+
+    const oldColumns = (joinIdx >= 0
+      ? cfg.sources[joinIdx]?.sourceTableSchema?.columns
+      : cfg.sourceTableSchema?.columns || []) || [];
+    const oldNames = oldColumns.map((c) => c.name).filter(Boolean);
+
+    let nextConfig;
+    let moved = null;
+    if (joinIdx >= 0) {
+      // Refresh only this parent's entry; the join's other sources are untouched.
+      const sources = cfg.sources.map((s, i) => (i === joinIdx
+        ? {
+          ...s,
+          sourceConnectionId: fresh.sourceConnectionId ?? s.sourceConnectionId,
+          sourceConnectionName: fresh.sourceConnectionName ?? s.sourceConnectionName,
+          sourceDbType: fresh.sourceDbType ?? s.sourceDbType,
+          sourceSchema: fresh.sourceSchema ?? s.sourceSchema,
+          sourceTableName: fresh.sourceTableName ?? s.sourceTableName,
+          sourceTableSchema: newSchema || s.sourceTableSchema,
+          sourceLocalPath: fresh.sourceLocalPath ?? s.sourceLocalPath,
+        }
+        : s));
+      // `sources` is what the join's prompts and the editor's card read.
+      // `sourcesConfig` is what EXECUTES — executeJoinNode hands it to the join
+      // handler untouched — so leaving it behind is not a display problem: the
+      // join goes on opening the connection and reading the table its parent
+      // abandoned, and SUCCEEDS, with rows from the wrong place.
+      const scIdx = Array.isArray(cfg.sourcesConfig)
+        ? cfg.sourcesConfig.findIndex((s) => s && s.sourceNodeId === nodeId)
+        : -1;
+      let sourcesConfig = cfg.sourcesConfig;
+      if (scIdx >= 0) {
+        const repointed = repointJoinSourceConfig(cfg.sourcesConfig[scIdx], fresh, newSchema);
+        sourcesConfig = cfg.sourcesConfig.map((s, i) => (i === scIdx ? repointed.entry : s));
+        moved = repointed.moved ? { movedFrom: repointed.from, movedTo: repointed.to } : null;
+      }
+      nextConfig = { ...cfg, sources, sourcesConfig };
+    } else {
+      nextConfig = { ...cfg, ...fresh };
+      // A TRANSFORMER's own SQL names its source table, and an in-place one
+      // writes back to it — `targetTableName` IS that table — so once the
+      // object moves it cannot run as it stands, exactly like a join source.
+      // An OUTPUT owns no SQL naming its input and simply forwards the rows it
+      // is handed, so it follows its parent silently.
+      if (node.type === 'transformer') {
+        const to = {
+          connectionId: fresh.sourceConnectionId || null,
+          tableName: fresh.sourceTableName || fresh.sourceCollection || null,
+        };
+        // Where the SQL still points: the first divergence, or — if this is it —
+        // what the node read a moment ago.
+        const origin = cfg.sourceMoved?.from || {
+          connectionId: cfg.sourceConnectionId || null,
+          tableName: cfg.sourceTableName || cfg.sourceCollection || null,
+        };
+        // Back on the original clears the mark; away from it raises or keeps
+        // one. Same rule as a join step, and as the editor's own pass.
+        if (sameJoinSourceIdentity(origin, to)) delete nextConfig.sourceMoved;
+        else nextConfig.sourceMoved = { from: origin, to };
+      }
+    }
+
+    const added = newColumns.filter((c) => !oldNames.includes(c));
+    const removed = oldNames.filter((c) => !newColumns.includes(c));
+
+    // The refresh above has just made this child's recorded copy agree with its
+    // parent again — and the editor's "your input moved" card is DERIVED by
+    // comparing that copy against a baseline, not latched (workflowUtils
+    // syncNodeSourcesToEdges). So a refresh that lands before the renderer has
+    // ever captured a baseline erases the only evidence the node's own SQL was
+    // written for something else, and the card never appears. Capture it here,
+    // in the field that pass reads, from what the copy said a moment ago.
+    // Never overwrite one: an existing baseline is the ORIGINAL input, and
+    // rewiring A→B→C still has to report A.
+    // `moved` only, while the editor's column check is disabled (see
+    // syncNodeSourcesToEdges). A baseline captured for a column-only change
+    // describes an input the pass no longer considers changed, so it would be
+    // written here and dropped there on the next tick.
+    // Restore alongside that check: `(moved || added.length || removed.length)`.
+    if (!cfg.sourceBuiltAgainst && moved) {
+      nextConfig.sourceBuiltAgainst = joinIdx >= 0
+        // Every recorded source, not just the one that moved: the pass reads
+        // this array as the whole set of parents the node was built against,
+        // and a short one reads as a REWIRE.
+        ? cfg.sources.map((s) => sourceBaselineEntry(s, s?.sourceNodeId, s?.sourceNodeLabel))
+        : [sourceBaselineEntry(cfg, cfg.sourceNodeId, cfg.sourceNodeLabel)];
+    }
+
+    if (added.length || removed.length || oldNames.length !== newColumns.length || moved) {
+      impacted.push({
+        nodeId: node.id,
+        nodeType: node.type || cfg.nodeType || null,
+        nodeLabel: node.data?.label || node.id,
+        wasReading: oldNames,
+        nowReading: newColumns,
+        added,
+        removed,
+        ...(moved || {}),
+      });
+    }
+    return { ...node, data: { ...(node.data || {}), config: nextConfig } };
+  });
+
+  return { nodes: nextNodes, impacted };
+}
+
+/**
  * Dispatch to the connector plugin's getTransformPrompts() for non-local
  * SQL/NoSQL targets. Mirrors what TransformerNodeChat does via the
  * dbconn:generate-transform-prompt IPC — same arg shape, same prompt
@@ -1521,9 +2204,15 @@ function renderPluginTransformPrompt({
       ? String(targetTableName).split('.')[0]
       : null;
   }
+  // Both branches hand the prompt a name the generated SQL will use verbatim,
+  // so both go through the connector — see qualifiedTableName for why joining
+  // schema and table with a dot is not good enough. An in-place transform is
+  // given the SOURCE's name (already built by the caller); a new table is named
+  // here from the target it is about to create.
   const fullName = operationMode === 'in_place'
-    ? (sourceFullTableName || sourceTableSchema?.tableName || targetTableName)
-    : (targetSchema ? `${targetSchema}.${targetTableName}` : targetTableName);
+    ? (sourceFullTableName
+      || qualifiedTableName(sourceTableSchema?.tableName || targetTableName, sourceSchemaClean, dbType, helpers))
+    : qualifiedTableName(targetTableName, targetSchema, dbType, helpers);
 
   return promptFn(
     settings,
@@ -1538,8 +2227,10 @@ function renderPluginTransformPrompt({
 /**
  * Run one round-trip with a skill: buildSkillPrompt → callAI →
  * processSkillResponse. Returns a normalised envelope:
- *   { action, question?, directAnswer?, executionParams?, state, explanation? }
- * where `action ∈ { execute, ask_questions, answer_directly, unrelateSkill }`.
+ *   { action, question?, executionParams?, state, explanation? }
+ * where `action ∈ { execute, ask_questions, unrelateSkill }` — a skill either
+ * hands back something to run or asks for more input, and `unrelateSkill` is
+ * its way of saying the request was never its to handle.
  *
  * Both the per-node builders (transformer/join) and the renderer-driven
  * the node route (build_*) and the plan route (executeBuild) call this same
@@ -1547,7 +2238,7 @@ function renderPluginTransformPrompt({
  * from. There is no separate skill IPC — a skill that needs input raises an
  * ordinary ClarificationNeeded carrying its state.
  */
-async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, context = {}, stage = 'skill', resumed = null }) {
+async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, context = {}, stage = 'skill', resumed = null, chatHistory = [] }) {
   if (!helpers?.pluginManager?.buildSkillPrompt) {
     throw new Error('pluginManager.buildSkillPrompt unavailable; cannot run skill subagent.');
   }
@@ -1557,6 +2248,17 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
     currentState,
     helpers,
     operationType,
+    // The node's transcript, in `params` as well as on the AI call below.
+    //
+    // A skill that ORCHESTRATES ITS OWN AI calls never reaches that call: it
+    // returns a finished result with no `prompt`, so the only history that can
+    // reach its planner is the copy it reads out of here (javascript-executor
+    // passes `params.chatHistory` to both of its internal callAI calls).
+    // Without it, its planner saw only `userRequest` — which on a second round
+    // is the bare answer to its own last question — and asked what
+    // transformation the user wanted, about a node whose transformation had
+    // been described in full one turn earlier.
+    chatHistory,
     // Splat the rest of the context so each skill's buildSkillPrompt
     // sees the same shape the NodeChat panel hands it (sourceConnection,
     // sourceTableSchema, sources, joinSettings, etc.).
@@ -1595,7 +2297,18 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
   }
   let result;
   if (built && built.prompt) {
-    const aiResponse = await callTextResumable(helpers, built.prompt, {}, { stage, resumed });
+    // The node's transcript goes with the prompt, exactly as it does for the
+    // analysis and generation calls above.
+    //
+    // A skill turn's `userRequest` is the answer to the skill's OWN last
+    // question — just that answer, replacing the original request. So a skill
+    // asking a second question saw only the word "small", with no memory of
+    // what was being built or what had already been settled, and asked for the
+    // same fields again; answering one question unasked another, round after
+    // round, until the round limit gave up. Everything said on this node is
+    // here, so a re-ask now costs the skill nothing and the answer is already
+    // in front of it.
+    const aiResponse = await callTextResumable(helpers, built.prompt, { chatHistory }, { stage, resumed });
     result = await helpers.pluginManager.processSkillResponse(
       skillId,
       aiResponse,
@@ -1609,16 +2322,26 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
     // back the final result directly.
     result = built || {};
   }
-  const action = result.action || 'execute';
+  // A skill either hands back something to run or asks for more input. Anything
+  // that is neither — including the `answer_directly` older skill builds emitted
+  // for "the user asked a question" AND for "I cannot do this" — is folded into
+  // ask_questions here, at the one boundary every skill turn passes through.
+  // Collapsing it here rather than at each call site is what lets the builders
+  // below test for their build action and treat everything else as a pause: a
+  // skill that replies with something unrecognised can then never be mistaken
+  // for one that succeeded.
+  const rawAction = result.action || 'execute';
+  const action = (rawAction === 'execute' || rawAction === 'unrelateSkill')
+    ? rawAction
+    : 'ask_questions';
   const executionParams = result.executionParams || result.skillParams || (action === 'execute' ? result : null);
   // Different skills use different field names for the user-facing text:
   //   vector-db-executor returns { action: 'ask_questions', questionsNeeded: {
-  //     <field>: "<question text>" } } (and { action: 'answer_directly',
-  //     message: ... } with no JSON envelope), other skills return
-  //   `directAnswer` / `followUpQuestion`. Normalise so the renderer always
-  //   sees populated `question` for ask_questions and `directAnswer` for
-  //   answer_directly — otherwise the chat falls back to the generic
-  //   "Skill … needs more input." and the real question is lost.
+  //     <field>: "<question text>" } }, other skills return `followUpQuestion`
+  //   — and an older build may still send `directAnswer` / a bare `message`.
+  //   Normalise so the renderer always sees a populated `question`; otherwise
+  //   the chat falls back to the generic "Skill … needs more input." and the
+  //   real question is lost.
   //
   // questionsNeeded is a { field: questionText } map; values are usually the
   // question string but can be `true` (skill wants the field but gave no
@@ -1631,23 +2354,19 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
   };
   const question = result.followUpQuestion || result.question
     || (action === 'ask_questions'
-          ? (result.message || questionFromNeeded(result.questionsNeeded))
+          ? (questionFromNeeded(result.questionsNeeded) || result.directAnswer || result.message)
           : null)
-    || null;
-  const directAnswer = result.directAnswer
-    || (action === 'answer_directly' ? result.message : null)
     || null;
   return {
     action,
     question,
-    directAnswer,
     executionParams: executionParams && typeof executionParams === 'object' ? executionParams : null,
     state:           { ...currentState, ...(result.state || {}), ...(executionParams || {}) },
     explanation:     result.explanation || null,
   };
 }
 
-async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeId, warnings, chat, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null }) {
+async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeId, warnings, chat, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null, action = null }) {
   if (!upstreamNode) throw new Error('Transformer needs an upstream source node.');
   const base = { nodeType: 'transformer', ...copySourceFromUpstream(upstreamNode) };
   // The AI-facing history is derived from the chat transcript (answers to
@@ -1683,12 +2402,18 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
     base.sourceDbConfig = conn.dbConfig || {};
   }
 
-  // Re-read the source before anything is asked or generated: the upstream's
+  // Re-read the source before anything is asked or generated: a DATA SOURCE's
   // stored schema is a snapshot from when that node was configured, and the
   // prompts below have to describe the table as it stands now. Runs BEFORE the
   // guard so a source whose snapshot was never populated can be answered by the
   // read itself rather than by a question to the user.
-  base.sourceTableSchema = await refreshSourceSchema(base, helpers);
+  //
+  // Not for a transformer or join upstream: that parent declares what it will
+  // produce, and its declaration outranks whatever its last run left on disk —
+  // see upstreamDeclaresItsOutput.
+  if (!upstreamDeclaresItsOutput(upstreamNode)) {
+    base.sourceTableSchema = await refreshSourceSchema(base, helpers);
+  }
 
   // Without a source schema we can't write a sensible transformation prompt —
   // ask the user which table / collection feeds the transformer.
@@ -1743,6 +2468,12 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
     ? null
     : (pendingSkill ? pendingSkill.skillId : stickySkillId(existingConfig, availableSkills));
 
+  // Where the output lands when nobody says otherwise: the source's own schema,
+  // else the connection's. Null for an engine that has no schemas and for a
+  // local target — and null is what keeps the `schema` field, and the line
+  // describing it, out of the analyser's prompt entirely.
+  const defaultTargetSchema = base.sourceSchema || base.sourceDbConfig?.schema || null;
+
   // Stage 1 — decide operationMode + storageLocation + custom table name.
   let analysis = null;
   if (!routedSkillId) {
@@ -1752,40 +2483,42 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       dbType,
       base.sourceConnectionType === 'file',
       availableSkills,
+      defaultTargetSchema,
     );
     analysis = await callJsonResumable(helpers, analysisPrompt, { chatHistory }, { stage: 'transformer:analysis', resumed: resumedCalls });
     console.log('buildTransformerConfig+analysis: ', analysis)
   }
 
-  // The analyser asked for more information — pause and put the question to the
-  // user instead of falling through with guessed inferredSettings (which is how
-  // a vague request ended up with an invented table name and a hallucinated
+  // The analyser did not produce a transformation — pause and put its message to
+  // the user instead of falling through with guessed inferredSettings (which is
+  // how a vague request ended up with an invented table name and a hallucinated
   // transformation). TransformerNodeChat branches on `action` the same way. On
   // the re-run the answer is already in the chat history the analyser sees, so
   // it should return a real plan; if it stubbornly re-asks we already have the
   // answer and fall through to generation.
-  // `answer_directly` on a node that ALREADY has a config is not a question —
-  // it is the analyser saying the node is finished, which happens whenever a
-  // cascade-rebuild re-runs a transformer whose SQL is still correct ("Nothing
-  // further to do for this node — the configuration is final"). Treating it as
-  // a clarification pauses the build on a question the user cannot answer: the
-  // analyser is handed the same prompt on the re-run and answers the same way,
-  // so the build never advances. Keep what is there and move on.
   //
-  // The upstream binding is refreshed from the node above, since the only
-  // reason a keep-step is re-run at all is that an upstream schema moved; the
-  // transformation itself — SQL, settings, target — is left exactly as it was.
-  if (analysis && analysis.action === 'answer_directly' && existingConfig) {
-    warnings.push(
-      `Transformer "${existingConfig.targetTableName || nodeId}" needed no change — `
-      + 'kept its existing transformation and refreshed its source binding.',
-    );
-    return { ...existingConfig, ...base };
-  }
-
-  // A genuine question, or an `answer_directly` on a node with nothing to keep
-  // — both need the user before anything can be generated.
-  if (analysis && (analysis.action === 'ask_questions' || analysis.action === 'answer_directly')) {
+  // The test is for the ONE action that means "I built it" — everything else is
+  // a pause. Written that way round on purpose. The analyser used to have a
+  // third action, `answer_directly`, which it returned both to answer a question
+  // and to REFUSE ("the requested source is not available in the provided
+  // metadata"); read as approval, a refusal spliced a new source binding onto
+  // SQL written for the previous source — a Snowflake-bound node still carrying
+  // DuckDB SQL, saved as though it had been built, failing only at run time.
+  // Its prompt now offers `generate_transformation` or `ask_questions` and
+  // nothing else, and testing for the build action means any reply that is
+  // neither — a stray value, an older cached response — asks rather than being
+  // mistaken for a finished node.
+  //
+  // Routing to a SKILL counts as building: `activeSkillId` below is derived from
+  // `usesSkill`/`skillId` and never looks at `action`, so a skill-routed reply
+  // has made its decision even if it labels the action oddly — and the skill's
+  // own turn asks its own questions a few lines down. An explicit
+  // `ask_questions` still pauses, skill or not.
+  const analyserBuilt = !!analysis && (
+    analysis.action === 'generate_transformation'
+    || (!!analysis.usesSkill && !!analysis.skillId)
+  );
+  if (analysis && (analysis.action === 'ask_questions' || !analyserBuilt)) {
     const q = clarificationQuestionFrom(analysis, 'Can you give me more detail about how this transformation should work?');
     const answer = findClarificationAnswer(chat, q);
     if (!answer) throw new ClarificationNeeded(q, { nodeId, kind: 'transformer.analysis' });
@@ -1795,7 +2528,26 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // so a refinement can't silently relocate the target table or flip the write
   // mode. An existing target name was already qualified when it was first built
   // — don't run it through qualifyLocalTableName twice.
-  const prevSettings   = existingConfig?.transformationSettings || {};
+  //
+  // An explicit `modify` is a FULL rebuild: the user gave a new instruction and
+  // the analyser has just read it against the node's CURRENT source, so what it
+  // decided this run stands on its own and the node's prior settings are stale
+  // state, not a fallback. Inheriting them is how a `storageLocation: 'local'`
+  // decided against a local file survived a rewire onto a Snowflake source and
+  // made the pipeline round-trip every row through local DuckDB on its way from
+  // Snowflake back to Snowflake.
+  //
+  // A cascade-rebuild is the opposite case — it runs with no new prompt (the
+  // step is a keep whose upstream schema moved), so the node's own settings are
+  // the only ones there are and must carry. Same when there is no analysis at
+  // all: a skill-routed node never runs stage 1, and dropping its settings would
+  // relocate its output on every edit.
+  const isFullRebuild  = action === 'modify' && !!analysis;
+  const prevSettings   = isFullRebuild ? {} : (existingConfig?.transformationSettings || {});
+  // `existingTarget` is deliberately NOT reset by a full rebuild: the output
+  // table's name is this node's identity — downstream nodes were built to read
+  // it — not a setting the analyser is re-deciding. The analyser's own
+  // `tableName` still wins when it names one, which is how a rename is asked for.
   const existingTarget = existingConfig?.targetTableName || existingConfig?.targetCollection || null;
   const operationMode  = analysis?.inferredSettings?.operationMode || prevSettings.operationMode || 'new_table';
   const storageLocation = analysis?.inferredSettings?.storageLocation
@@ -1804,9 +2556,16 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   const targetTableName = (!analysis && existingTarget)
     ? existingTarget
     : qualifyLocalTableName(
-        analysis?.tableName || existingTarget || `transformer_${(nodeId || Date.now()).toString().replace(/-/g, '_')}`,
+        analysis?.tableName || existingTarget || defaultTransformerTableName(base, nodeId),
         { workflowId, isLocal: storageLocation === 'local' },
       );
+  // The analyser returns the schema as its own field, so `tableName` is the
+  // table alone and the two are never glued together. Its answer wins; the
+  // default stands whenever it says nothing — which is every engine and every
+  // local target where the field is not offered at all.
+  const resolvedTargetSchema = (typeof analysis?.schema === 'string' && analysis.schema.trim())
+    ? analysis.schema.trim()
+    : defaultTargetSchema;
   const transformationSettings = { userRequest: stepPrompt, operationMode, storageLocation, tableName: targetTableName };
 
   // ── Skill turn — one round per user message, handled exactly like a builder's
@@ -1828,6 +2587,19 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       storageLocation,
       tableName: targetTableName,
       isSourceLocal: base.sourceConnectionType === 'file',
+      // Where a local result is written, resolved rather than asked for.
+      //
+      // A skill told to produce local output is told (correctly) that it must
+      // pass an absolute dbPath — and with no path in its context the only
+      // honest thing it can do is ask for one. The user cannot answer: this
+      // file is an internal per-workflow database whose path they have never
+      // seen. That question is unanswerable and the round it costs is spent
+      // losing the request, so the path is supplied here. It is the same
+      // `localOutputPath` the node records as targetLocalPath, so what the
+      // skill writes to and what the node claims to write to cannot diverge.
+      targetLocalPath: storageLocation === 'local'
+        ? localOutputPath(targetTableName, { workflowId, nodeId })
+        : null,
     };
     // The reply to the skill's OWN question is its input this turn. It is looked
     // up by the exact question text we committed, so a reworded re-ask can never
@@ -1841,6 +2613,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       // of room is finished by Continue and replayed here verbatim.
       stage: 'transformer:skill',
       resumed: resumedCalls,
+      chatHistory,
     });
 
     if (result.action === 'execute') {
@@ -1894,6 +2667,24 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
           config: {},
         };
       }
+      // javascript-executor picks outputType "lancedb" on its own whenever the
+      // function emits records with a numeric `vector` field, and then writes
+      // to a LanceDB directory at run time. That is a vector destination even
+      // though the skill isn't one of the vector skills, so it needs the same
+      // target as those: without this the node fell through to the generic
+      // local default (local-duckdb, targetLocalPath = the workflow database),
+      // the rows went to LanceDB anyway, and every downstream node read a
+      // DuckDB table that was never created.
+      const isLanceDbSkill = !isVectorSkill && skillOutputType === 'lancedb';
+      if (isLanceDbSkill && !targetConn) {
+        targetConn = {
+          id: ep.targetConnectionId || 'local-lancedb',
+          name: ep.targetConnectionName || 'Local LanceDB',
+          type: 'file',
+          dbType: 'lancedb',
+          config: {},
+        };
+      }
       // A DuckDB result is a table, so it takes the SQL branch of
       // assembleTransformerConfig — targetTableName plus a SQL preview, the
       // same shape every other local node writes.
@@ -1909,7 +2700,8 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
         sql: ep.sql || '',
         insertSql: ep.insertSql || null,
         previewSql: ep.previewSql || null,
-        operationType: ep.operationType || (isVectorSkill || isLocalFileSkill ? null : (isNoSQL ? 'aggregation' : null)),
+        operationType: ep.operationType
+          || (isVectorSkill || isLocalFileSkill || isLanceDbSkill ? null : (isNoSQL ? 'aggregation' : null)),
         nosqlOperation: ep.nosqlOperation || null,
         transformFunction: ep.transformFunction || null,
       };
@@ -1918,6 +2710,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
         operationMode, storageLocation,
         targetTableName: resolvedTargetTableName,
         targetConn,
+        targetSchema: resolvedTargetSchema,
         transformationSettings, stepPrompt, chat,
         workflowId, nodeId,
         gen: skillGen,
@@ -1930,8 +2723,8 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       });
     }
 
-    const asks     = result.action === 'ask_questions' || result.action === 'answer_directly';
-    const question = String(result.question || result.directAnswer || '').trim();
+    const asks     = result.action === 'ask_questions';
+    const question = String(result.question || '').trim();
     const rounds   = (pendingSkill?.rounds || 0) + 1;
     if (asks && question && rounds <= MAX_SKILL_ROUNDS) {
       throw new ClarificationNeeded(question, {
@@ -1939,6 +2732,25 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
         kind:  `skill.${activeSkillId}`,
         skill: { skillId: activeSkillId, state: result.state || {}, question, rounds },
       });
+    }
+
+    // A skill that gave up on a VECTOR transformation fails the build.
+    //
+    // The standard path is plain SQL, and plain SQL cannot embed anything —
+    // there is no engine function for it. Falling through produced a node that
+    // BUILT cleanly and died at run time against a function the model invented
+    // to fill the gap (`ai.embed(...)` → "Scalar Function with name embed does
+    // not exist"). Nothing downstream of the skill can do this job, so the
+    // honest outcome is to stop and say which skill could not resolve it.
+    if (isVectorSkillId(activeSkillId)) {
+      throw new Error(
+        `The "${activeSkillId}" skill could not resolve this transformation`
+        + `${asks && question ? ` — it is still asking: ${question}` : ''}. `
+        + 'Embedding is only possible through that skill, so there is no other way to build this node. '
+        + 'Answer what it asked in one message naming every setting (column to embed, embedding model, '
+        + 'vector database, target table), or configure the node in the editor. '
+        + 'The workflow has been left as it was.',
+      );
     }
 
     // unrelateSkill, a question with no text to show, or a dialog that never
@@ -1955,7 +2767,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   }
 
   // Stage 2 — generate the actual SQL / NoSQL operation. Local file targets
-  // (NeDB / SQLite) use the ChatPrompts templates because there's no plugin
+  // (DuckDB / SQLite) use the ChatPrompts templates because there's no plugin
   // file for them; everything else (Mongo / Postgres / MySQL / Snowflake /
   // MSSQL / BigQuery / …) goes through the plugin's getTransformPrompts so
   // the per-dialect prompt lives in exactly one place.
@@ -1968,7 +2780,16 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // the file under a per-node table, and the prompt derives that same name from
   // `{ nodeId }`. A source that is already a table is addressed by its real
   // name; a new table by the generated one.
-  const inPlaceOnFile = operationMode === 'in_place' && !DuckDB.isWorkflowDb(base.sourceLocalPath);
+  //
+  // "a FILE" means there IS a local path and it is not a workflow database. A
+  // REMOTE source (Postgres, MySQL, …) has no `sourceLocalPath` at all, and
+  // testing only for the `.duckdb` suffix answered "yes, a file" for every one
+  // of them — which fed the connector's prompt a DuckDB staging table name as
+  // its target, and replaced the model's schema-qualified previewSql with a
+  // bare one (see targetPreviewSql in assembleTransformerConfig).
+  const inPlaceOnFile = operationMode === 'in_place'
+    && !!base.sourceLocalPath
+    && !DuckDB.isWorkflowDb(base.sourceLocalPath);
   const promptTableName = operationMode !== 'in_place'
     ? targetTableName
     : (inPlaceOnFile
@@ -2003,22 +2824,29 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
     );
     console.log('buildTransformerConfig+gen: ', gen)
   } else {
-    const targetSchema = storageLocation === 'local'
-      ? null
-      : (base.sourceSchema || base.sourceDbConfig?.schema || null);
+    const targetSchema = storageLocation === 'local' ? null : resolvedTargetSchema;
     const sourceConnectionForPrompt = {
       dbType,
       name: base.sourceConnectionName,
       connectionType: base.sourceConnectionType,
       dbConfig: base.sourceDbConfig,
     };
-    const sourceFullTableName = base.sourceSchema
-      ? `${base.sourceSchema}.${base.sourceTableName || base.sourceTableSchema?.tableName || ''}`
-      : (base.sourceTableName || base.sourceTableSchema?.tableName || '');
+    // The name the in-place statements will address the source by. Built by the
+    // connector so it arrives quoted and unambiguously split into schema and
+    // table — a table whose own name contains a dot is why that matters.
+    const sourceFullTableName = qualifiedTableName(
+      base.sourceTableName || base.sourceTableSchema?.tableName || '',
+      base.sourceSchema,
+      dbType,
+      helpers,
+    );
     const pluginPrompt = renderPluginTransformPrompt({
       helpers, dbType, operationMode,
       settings: transformationSettings,
-      sourceTableInfo: sourceSchemaInfo,
+      // Re-described with the connector-built source name, for BOTH modes. Only
+      // the in_place branch used to receive it (as `fullName`), so a new_table
+      // step was left to work the FROM clause out from the bare name.
+      sourceTableInfo: describeTableSchema(base.sourceTableSchema, sourceFullTableName),
       settingsContext,
       sourceConnection: sourceConnectionForPrompt,
       sourceTableSchema: base.sourceTableSchema,
@@ -2038,6 +2866,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   return await assembleTransformerConfig({
     base, dbType, isNoSQL, helpers,
     operationMode, storageLocation, targetTableName, targetConn: null,
+    targetSchema: resolvedTargetSchema,
     transformationSettings, stepPrompt, chat, gen, skillInfo: null,
     workflowId, nodeId,
   });
@@ -2051,8 +2880,12 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
 async function assembleTransformerConfig({
   base, dbType, isNoSQL, helpers,
   operationMode, storageLocation, targetTableName, targetConn,
+  // Where the output table lives: the analyser's answer, or the default the
+  // caller derived from the source. Threaded in for the same reason as the two
+  // below — the analysis this comes from happens in the caller.
+  targetSchema = null,
   transformationSettings, stepPrompt, chat, gen, skillInfo,
-  // Both are used to scope a local NeDB target file (localNeDBPath below).
+  // Both are used to scope this node's local target table.
   // They MUST be threaded in from the caller — deriving them here is not
   // possible, and referencing them undeclared throws at assembly time.
   workflowId = null, nodeId = null,
@@ -2063,14 +2896,18 @@ async function assembleTransformerConfig({
   // from the caller: it is a pure function of two arguments this function
   // already takes, so neither call site can forget it (see workflowId/nodeId
   // above for the version of this that IS threaded, and why).
-  const inPlaceOnFile = operationMode === 'in_place' && !DuckDB.isWorkflowDb(base.sourceLocalPath);
+  //
+  // A local path has to EXIST for this to be a file at all — a remote source
+  // has none. See the matching guard in buildTransformerConfig.
+  const inPlaceOnFile = operationMode === 'in_place'
+    && !!base.sourceLocalPath
+    && !DuckDB.isWorkflowDb(base.sourceLocalPath);
 
   if (!targetConn) {
     const isInPlace = operationMode === 'in_place';
     const isLocal = storageLocation === 'local';
     if (isInPlace) targetConn = { id: base.sourceConnectionId, name: base.sourceConnectionName, type: base.sourceConnectionType, dbType, config: base.sourceDbConfig };
     else if (isLocal) {
-      const localDb = isNoSQL ? 'nedb' : 'sqlite';
       targetConn = { id: 'local-duckdb', name: 'Local file', type: 'file', dbType: 'duckdb', config: {} };
     } else targetConn = { id: base.sourceConnectionId, name: base.sourceConnectionName, type: base.sourceConnectionType, dbType, config: base.sourceDbConfig };
   }
@@ -2141,16 +2978,22 @@ async function assembleTransformerConfig({
     // downstream nodes and previews can find the output before the workflow has
     // run once. In-place updates the source where it lies, so that IS the
     // output; a new dataset gets a table in this workflow's database.
-    if (storageLocation === 'local' || config.targetDbType === 'duckdb') {
-      config.targetLocalPath = operationMode === 'in_place'
+    //
+    // WRITTEN as null when the target is remote, never left off: the node route
+    // MERGES this config onto the node, so an omitted key keeps whatever the
+    // node already had. A transformer rebuilt from a local target onto a remote
+    // one otherwise carries its old workflow-.duckdb path forever, and the
+    // preview and every downstream node keep reading the output from there.
+    config.targetLocalPath = (storageLocation === 'local' || config.targetDbType === 'duckdb')
+      ? (operationMode === 'in_place'
         ? (base.sourceLocalPath || null)
-        : localOutputPath(config.targetCollection, { workflowId, nodeId });
-    }
+        : localOutputPath(config.targetCollection, { workflowId, nodeId }))
+      : null;
   } else {
     config.targetDdl = gen?.ddl || '';
     config.targetSql = gen?.sql || '';
     config.targetInsertSql = gen?.insertSql || null;
-    config.targetSchema = storageLocation === 'local' ? null : (base.sourceSchema || base.sourceDbConfig?.schema || null);
+    config.targetSchema = storageLocation === 'local' ? null : targetSchema;
     config.targetTableName = operationMode === 'in_place'
       ? (base.sourceTableName || base.sourceTableSchema?.tableName)
       : targetTableName;
@@ -2173,20 +3016,26 @@ async function assembleTransformerConfig({
     // with no targetLocalPath at all, and the Transformed tab then fell back to
     // the connection's own data file — asking the SOURCE file for the output
     // table. Mirrors the NoSQL branch above.
-    if (storageLocation === 'local' || config.targetDbType === 'duckdb') {
-      config.targetLocalPath = operationMode === 'in_place'
+    // Written as null for a remote target rather than omitted — see the NoSQL
+    // branch above for why an absent key is not the same as no path here.
+    config.targetLocalPath = (storageLocation === 'local' || config.targetDbType === 'duckdb')
+      ? (operationMode === 'in_place'
         ? (base.sourceLocalPath || null)
-        : localOutputPath(config.targetTableName, { workflowId, nodeId });
-    }
+        : localOutputPath(config.targetTableName, { workflowId, nodeId }))
+      : null;
   }
 
-  // Vector targets (LanceDB) address a *directory*, not a per-collection NeDB
-  // file. Inheriting the source NeDB path here makes LanceDB try to create a
+  // Vector targets (LanceDB) address a *directory*, not a single file.
+  // Inheriting the source file path here makes LanceDB try to create a
   // table inside a file at run time ("Not a directory"). Honor an explicit path
   // from the skill's execution params; otherwise use the same default LanceDB
   // directory the skill resolves to, and mirror it into targetDbConfig so the
   // node matches a manually-built vector node (dbPath + tableName).
-  if (skillInfo?.isVectorSkill && targetConn?.dbType === 'lancedb') {
+  //
+  // Keyed on the resolved TARGET, not on which skill built it: javascript-executor
+  // reaches LanceDB too (outputType "lancedb"), and the local-DuckDB path the
+  // branches above assign is wrong for every one of them.
+  if (skillInfo && targetConn?.dbType === 'lancedb') {
     const ep = skillInfo.executionParams || {};
     const lancedbPath = ep.targetLocalPath || ep.dbPath || ep.lancedbPath || defaultLanceDBPath();
     config.targetLocalPath = lancedbPath;
@@ -2253,6 +3102,12 @@ async function assembleTransformerConfig({
   // produces 0 rows (TLX-008 / the empty-config nodes seen in exports). Fail
   // the build loudly instead. Skill-routed nodes execute via their skill
   // params and legitimately have no targetSql.
+  //
+  // Every SQL engine's new-table prompt states the same two-statement contract:
+  // `ddl` creates the table, `sql` loads it. So an empty `sql` always means the
+  // node would create an empty table, whatever the dialect — there is no engine
+  // where it is the correct answer, and nothing here has to inspect the DDL to
+  // decide.
   if (!skillInfo) {
     // This build used the standard path. Clear any earlier skill binding —
     // the node route MERGES this config onto the node, so a stale
@@ -2272,7 +3127,10 @@ async function assembleTransformerConfig({
       const hasSql = (config.targetSql && String(config.targetSql).trim())
         || (config.targetInsertSql && String(config.targetInsertSql).trim());
       if (!hasSql) {
-        throw new Error(`Transformer "${targetTableName}" generation was incomplete — no SQL was produced (the AI output was likely truncated). Try a simpler transform or fewer columns.`);
+        const hasDdl = !!(config.targetDdl && String(config.targetDdl).trim());
+        throw new Error(`Transformer "${targetTableName}" generation was incomplete — ${hasDdl
+          ? 'it produced a CREATE statement but no INSERT to load the table. The SELECT was probably folded into the CREATE (a CREATE ... AS SELECT), which cannot run here: the two statements are executed separately.'
+          : 'it produced no statements at all, which usually means the output was cut short.'} Try again, or simplify the transform.`);
       }
     }
   }
@@ -2295,11 +3153,30 @@ async function assembleTransformerConfig({
   return config;
 }
 
-function describeTableSchema(schema) {
+/**
+ * @param {string|null} [sqlName] - The name generated SQL must address this
+ *   table by, already qualified and quoted by its connector. Given for a
+ *   database source so the model never has to assemble one: handed only the bare
+ *   `tableName`, it read a dot inside that name as a schema qualifier and split
+ *   it — `public.transactions` became `"public"."transactions"`, a schema that
+ *   does not exist. Omitted for a local source, whose prompts address the table
+ *   by its bare name on purpose.
+ */
+function describeTableSchema(schema, sqlName = null) {
   if (!schema) return '(schema unavailable)';
-  const cols = (schema.columns || []).map((c) => `${c.name}: ${c.type || 'unknown'}`).join(', ');
-  const sample = JSON.stringify((schema.sampleData || []).slice(0, 3), null, 2);
-  return `Table: ${schema.tableName}\nColumns: ${cols}\nSample rows: ${sample}`;
+  // Via the schema-aware stripper: it uses the declared column types as well as
+  // the value shape, so a short demo vector the length heuristic would let past
+  // is still caught by its `type: 'vector'`.
+  const clean = stripVectorsFromSchema(schema);
+  const cols = (clean.columns || []).map((c) => `${c.name}: ${c.type || 'unknown'}`).join(', ');
+  const sample = JSON.stringify((clean.sampleData || []).slice(0, 3), null, 2);
+  const nameLine = sqlName
+    ? `Table — read FROM exactly this, already qualified and quoted for this engine: ${sqlName}\n`
+      + '  Use it verbatim: do not re-quote it, do not split it on a dot, do not drop a part of\n'
+      + "  it, and do not \"tidy\" it — a table's own name may contain a dot, so what looks like a\n"
+      + '  qualifier may be the name.'
+    : `Table: ${clean.tableName}`;
+  return `${nameLine}\nColumns: ${cols}\nSample rows: ${sample}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2341,10 +3218,18 @@ function resolveJoinSource(n) {
     // schema is not findable by bare name.
     sourceSchema:      pick(cfg.sourceSchema,      cfg.targetSchema),
     sourceLocalPath: cfg.targetLocalPath || cfg.sourceLocalPath,
+    // A Pinecone index is NOT addressable by table name — `indexName` and
+    // `namespace` are what identify it, and they live on the node that wrote
+    // the vectors (a vector transformer records both at config top level).
+    // Without them the executor falls back to the table name and either queries
+    // the wrong index or, when nothing resolves, fails with
+    // "Index name is required".
+    sourceIndexName: cfg.indexName || cfg.targetIndexName || cfg.sourceIndexName || null,
+    sourceNamespace: cfg.namespace || cfg.targetNamespace || cfg.sourceNamespace || null,
   };
 }
 
-async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, warnings, chat, connectionId = null, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null }) {
+async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, warnings, chat, connectionId = null, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null, action = null }) {
   if (!upstreamNodes || upstreamNodes.length < 2) throw new Error('Join needs at least 2 upstream source nodes.');
 
   const sources = upstreamNodes.map((n) => resolveJoinSource(n));
@@ -2352,8 +3237,24 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // configured. Join keys are picked from column names, so a source that has
   // gained or lost a column since then produces join conditions on columns that
   // are not there. Re-read every source before the analyser sees any of them.
-  for (const source of sources) {
-    source.sourceTableSchema = await refreshSourceSchema(source, helpers);
+  // Every source's columns and sample rows, read LIVE. Two round trips per
+  // source against its own database (getColumns, then a sample SELECT), and
+  // they run one after another — so a join over three remote sources waits for
+  // six network calls before its first prompt is even built. Timed per source
+  // because that wait is invisible otherwise: the build log went quiet between
+  // "join — starting" and "join:analysis" with nothing to say why.
+  // Skipped for a transformer or join upstream, which declares the shape it
+  // writes — reading its target live describes what the LAST run left there,
+  // and that node replaces it before this one runs (upstreamDeclaresItsOutput).
+  for (const [idx, source] of sources.entries()) {
+    if (upstreamDeclaresItsOutput(upstreamNodes[idx])) continue;
+    const label = source.sourceTableName || source.sourceCollection
+      || source.sourceTableSchema?.tableName || source.sourceNodeId || 'source';
+    source.sourceTableSchema = await timedStep(
+      'join:readSchema',
+      `${label} on ${source.sourceDbType || 'unknown'}`,
+      () => refreshSourceSchema(source, helpers),
+    );
   }
   // AI-facing history derived from the chat transcript. The analyser sees the
   // prior Q&A through this (including any "Clarification by AI:" turns), so we
@@ -2388,7 +3289,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     if (bypassSkills) return [];
     try {
       if (helpers?.pluginManager?.getSkillDescriptions) {
-        const operationType = sources.some((s) => s.sourceDbType === 'mongodb' || s.sourceDbType === 'nedb') ? 'nosql' : 'sql';
+        const operationType = sources.some((s) => s.sourceDbType === 'mongodb') ? 'nosql' : 'sql';
         return (helpers.pluginManager.getSkillDescriptions('join', {
           operationType,
           sourceSchemas: sources.map((s) => s.sourceTableSchema),
@@ -2434,7 +3335,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     if (analysis?.usesSkill && analysis?.skillId === 'vector-db-executor') {
       analysis.usesSkill = false;
       analysis.skillId = null;
-      if (analysis.action !== 'ask_questions' && analysis.action !== 'answer_directly') {
+      if (analysis.action !== 'ask_questions') {
         analysis.action = 'generate_join';
       }
     }
@@ -2446,10 +3347,10 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   const prevJoin = existingConfig?.joinSettings || {};
   const inferred = analysis?.inferredSettings || {
     destinationSelection: prevJoin.destinationSelection || existingConfig?.targetConnectionId || null,
-    operationMode:        prevJoin.operationMode || 'new_table',
+    // Not carried over from the saved node: a join is always new_table. See
+    // joinSettings below.
+    operationMode:        'new_table',
     targetTableName:      prevJoin.targetTableName || existingConfig?.targetTableName || existingConfig?.targetCollection || null,
-    joinType:             prevJoin.joinType || 'INNER',
-    joinColumns:          prevJoin.joinColumns || [],
     selectedColumns:      prevJoin.selectedColumns || {},
   };
   // The analyser is the single authority for whether this join needs
@@ -2466,18 +3367,19 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // asked an irrelevant question while discarding the analyser's real
   // followUpQuestion (e.g. which embedding model to use). JoinNodeChat branches
   // purely on analysis.action; the headless builder now does the same.
-  // Same rule as the transformer: on a node that already has a config,
-  // `answer_directly` means "this join is finished", not "I have a question".
-  // Pausing there would ask the user something the analyser will answer the
-  // same way on every re-run, and the build would never advance.
-  if (analysis && analysis.action === 'answer_directly' && existingConfig) {
-    warnings.push(
-      `Join "${existingConfig.targetTableName || nodeId}" needed no change — kept its existing configuration.`,
-    );
-    return { ...existingConfig };
-  }
-
-  if (analysis && (analysis.action === 'ask_questions' || analysis.action === 'answer_directly')) {
+  //
+  // Same rule as the transformer: test for the ONE action that means "I built
+  // it" and treat everything else as a pause. `answer_directly` used to mean
+  // "this join is finished, keep it" on a node that already had a config, but
+  // the analyser returned the same action to refuse a request it could not
+  // satisfy, and keeping the old config on a refusal saved a join still wired to
+  // whatever it was built against. See buildTransformerConfig.
+  // Routing to a skill counts as building — same reasoning as the transformer.
+  const analyserBuilt = !!analysis && (
+    analysis.action === 'generate_join'
+    || (!!analysis.usesSkill && !!analysis.skillId)
+  );
+  if (analysis && (analysis.action === 'ask_questions' || !analyserBuilt)) {
     const q = String(
       analysis.followUpQuestion
       || analysis.directAnswer
@@ -2521,7 +3423,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 
   // Resolve the destination connection (AI may return id, name, or local-* token).
   // Mirror JoinNodeChat: a local-* destination has NO saved connection — it lands
-  // in the local SQLite/NeDB workspace — so targetConn is null and the
+  // in the local DuckDB workspace — so targetConn is null and the
   // destination's dbType / id come from the token (exactly like JoinNodeChat's
   // local placeholder). resolveTargetConnection returns a fallback SOURCE
   // connection for local tokens, which would wrongly mark every source as
@@ -2533,7 +3435,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // The next four derivations are kept 1:1 with JoinNodeChat.js (generateJoin).
   const targetDbType = targetConn?.dbType
     || (isLocalStorage ? inferred.destinationSelection.replace('local-', '') : 'duckdb');
-  const isNoSQL = targetDbType === 'mongodb' || targetDbType === 'nedb';
+  const isNoSQL = targetDbType === 'mongodb';
   const isVectorDestination = targetConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetDbType);
   const destinationConnectionId = targetConn?.id || targetConn?._id || inferred.destinationSelection;
   // A name carried over from the existing node was already qualified when it was
@@ -2547,11 +3449,20 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 
   const joinSettings = {
     userRequest: stepPrompt,
-    operationMode: inferred.operationMode || 'new_table',
+    // A join ALWAYS replaces its target — truncate-and-load, never append.
+    // Every destination route implements that: a SQL destination is
+    // DROP + targetDdl + INSERT, local DuckDB is CREATE OR REPLACE TABLE AS, and
+    // a document store drops the collection before inserting.
+    //
+    // FORCED rather than read from `inferred`, so neither a model slip nor a node
+    // saved back when "merge_existing" was still offered can put an append-mode
+    // join into the graph. That mode is unrunnable: NodeExecution only creates
+    // the destination under `new_table`, so anything else yields a join that
+    // cannot make the table it inserts into — see the note on
+    // joinAnalysisRequest in ChatPrompts/Join.js.
+    operationMode: 'new_table',
     destinationSelection: inferred.destinationSelection || (targetConn?.id || targetConn?._id) || 'local-duckdb',
     targetTableName,
-    joinType: inferred.joinType || 'INNER',
-    joinColumns: inferred.joinColumns || [],
     selectedColumns: inferred.selectedColumns || {},
   };
 
@@ -2577,13 +3488,14 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
       // of room is finished by Continue and replayed here verbatim.
       stage: 'join:skill',
       resumed: resumedCalls,
+      chatHistory,
     });
 
     if (result.action === 'execute') {
       const ep = result.executionParams || {};
       gen = {
         explanation:       result.explanation || ep.explanation || `Built via ${activeSkillId}.`,
-        joinColumns:       ep.joinColumns || joinSettings.joinColumns,
+        joinColumns:       ep.joinColumns || [],
         sourcesConfig:     ep.sourcesConfig || [],
         joinSql:           ep.joinSql || null,
         targetDdl:         ep.targetDdl || '',
@@ -2591,12 +3503,17 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         transformFunction:  ep.transformFunction || null,
         previewSql:        ep.previewSql || null,
         vectorDestination: ep.vectorDestination || null,
+        // What the skill's result actually contains. This list is what
+        // downstream nodes are configured from — see joinOutputColumns. A skill
+        // that omits it falls back to the selection list, which cannot see
+        // aliases.
+        targetColumns:     ep.targetColumns || null,
         _skillId:          activeSkillId,
         _skillExplanation: analysis?.skillExplanation || existingConfig?.skillExplanation || null,
       };
     } else {
-      const asks     = result.action === 'ask_questions' || result.action === 'answer_directly';
-      const question = String(result.question || result.directAnswer || '').trim();
+      const asks     = result.action === 'ask_questions';
+      const question = String(result.question || '').trim();
       const rounds   = (pendingSkill?.rounds || 0) + 1;
       if (asks && question && rounds <= MAX_SKILL_ROUNDS) {
         throw new ClarificationNeeded(question, {
@@ -2605,6 +3522,20 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
           skill: { skillId: activeSkillId, state: result.state || {}, question, rounds },
         });
       }
+      // Same rule as the transformer: a vector skill that gave up leaves no
+      // other way to embed, so the build stops rather than producing SQL that
+      // cannot do it.
+      if (isVectorSkillId(activeSkillId)) {
+        throw new Error(
+          `The "${activeSkillId}" skill could not resolve this join's vector step`
+          + `${asks && question ? ` — it is still asking: ${question}` : ''}. `
+          + 'Embedding is only possible through that skill, so there is no other way to build this node. '
+          + 'Answer what it asked in one message naming every setting (column to embed, embedding model, '
+          + 'vector database, target table), or configure the node in the editor. '
+          + 'The workflow has been left as it was.',
+        );
+      }
+
       // unrelateSkill, a question with no text to show, or a dialog that never
       // converges: gen stays null and generateJoinQuery below handles the request
       // in this same run. The note is tagged as context so the analyser reads it
@@ -2621,6 +3552,43 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 
   // Standard SQL/JS join generation when no skill was selected.
   if (!gen) {
+    // The DESTINATION's connector, for quoting the temp tables below. They are
+    // created and written on the destination, not on the source each one holds.
+    const destConnector = (() => {
+      try { return helpers.pluginManager?.getConnector?.(targetDbType) || null; }
+      catch (err) {
+        console.log(`[Join] No connector for destination ${targetDbType}:`, err.message || err);
+        return null;
+      }
+    })();
+    const destDbConfig = targetConn?.dbConfig || null;
+
+    // The DESTINATION table as this engine must see it written.
+    //
+    // Every source and temp table below is handed to the model pre-quoted, with
+    // three paragraphs telling it not to re-case or re-quote them. The target
+    // was the one identifier in the whole prompt left to the model's judgement
+    // — the examples in Join.js spell it bare — and the result was exactly what
+    // those rules exist to prevent: one run emitted `CREATE TABLE
+    // pg_txn_customers`, which Snowflake folded to PG_TXN_CUSTOMERS, while the
+    // output node addressed the same configured name through the connector's
+    // quoting and asked for "pg_txn_customers". Two tables, no error, and the
+    // workflow appending to the one nothing else read.
+    //
+    // Same one-qualifier rule as the sources — see public/lib/tableRef.js.
+    let quotedTargetRef = null;
+    try {
+      if (destConnector && typeof destConnector.quoteIdentifier === 'function' && targetTableName) {
+        quotedTargetRef = destConnector.quoteIdentifier(
+          targetTableName,
+          qualifierFor(targetTableName, destDbConfig?.schema || null),
+          destDbConfig,
+        );
+      }
+    } catch (err) {
+      console.log(`[Join] Could not quote target table for ${targetDbType}:`, err.message || err);
+    }
+
     // generateJoinQuery expects the richer per-source shape that the interactive
     // JoinNodeChat builds (tableName / columns / dbType / isInDestinationDb /
     // isSourceVector / requiredFields). Our `sources` array uses the saved-config
@@ -2631,7 +3599,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     const sourcesForPrompt = sources.map((s) => {
       const sourceDbType = s.sourceDbType;
       const srcConn = (helpers.connections || []).find((c) => (c.id || c._id) === s.sourceConnectionId);
-      const isSourceNoSQL = sourceDbType === 'mongodb' || sourceDbType === 'nedb';
+      const isSourceNoSQL = sourceDbType === 'mongodb';
       const isSourceVector = srcConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(sourceDbType);
       const isInDestinationDb = s.sourceConnectionId === destinationConnectionId;
 
@@ -2652,11 +3620,102 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         else requiredFields = ['tempTableName', 'ddl', 'sql', 'insertSql'];
       }
 
+      const tableName = s.sourceTableName || s.sourceCollection || s.sourceTableSchema?.tableName || null;
+
+      // The table as this engine must see it written. Asking the CONNECTOR
+      // means every dialect's own rule applies — backticks vs double quotes vs
+      // brackets, and whether a dotted string is a qualifier or part of the
+      // name. The model used to be given the bare name and wrote the FROM
+      // clause itself, which is only safe where unquoted names happen to fold
+      // the way the table was created: `FROM public.transactions` against
+      // Snowflake asked for PUBLIC.TRANSACTIONS and missed a table actually
+      // named "public.transactions".
+      //
+      // Columns need the same treatment for the same reason: a table created
+      // under a quoted lower-case name has lower-case COLUMNS, and Snowflake
+      // folded a bare `SELECT transaction_id` to TRANSACTION_ID and rejected it
+      // as an invalid identifier.
+      //
+      // Only for a dataSource, though. Its columns were read from the engine's
+      // own catalog (getColumns), so quoting them is always right. An upstream
+      // join/transformer's columns are what that node DECLARED it would write,
+      // and an unquoted CREATE TABLE folds those (Snowflake up, PostgreSQL
+      // down) — quoting a name whose case never matched what was stored would
+      // break a bare read that works today.
+      //
+      // Quote a column BARE — no schema, no config. A column is never
+      // qualified by the database, and MySQL's quoteIdentifier would otherwise
+      // prepend it (`db`.`col`), which is a syntax error in a select list.
+      const columns = s.sourceTableSchema?.columns || [];
+      let quotedTableRef = null;
+      const quotedColumns = {};
+      try {
+        const connector = helpers.pluginManager?.getConnector?.(sourceDbType);
+        if (connector && typeof connector.quoteIdentifier === 'function') {
+          if (tableName) {
+            quotedTableRef = connector.quoteIdentifier(
+              tableName, s.sourceSchema || null, srcConn?.dbConfig || null,
+            );
+          }
+          if (s.sourceNodeType === 'dataSource') {
+            for (const c of columns) {
+              const name = typeof c === 'string' ? c : c?.name;
+              if (name) quotedColumns[name] = connector.quoteIdentifier(name, null, null);
+            }
+          }
+        }
+      } catch (err) {
+        console.log(`[Join] Could not quote identifiers for ${sourceDbType}:`, err.message || err);
+      }
+
+      // The staging table this source is loaded into, named here rather than by
+      // the model — because the executor addresses it through the DESTINATION
+      // connector's own quoting (insertDataToTempTable → destPlugin.batchInsert),
+      // and only a name we chose can be quoted the same way in advance.
+      //
+      // A model-written bare `CREATE TABLE temp_x` is not that name on every
+      // engine: Snowflake folds an unquoted identifier to UPPER case, so the
+      // table was created as TEMP_X while the load, which quotes, asked for
+      // "temp_x" and failed with `Table '"temp_x"' does not exist`. Quoting
+      // through the connector settles it per dialect — Snowflake/Postgres get
+      // "temp_x", MySQL and BigQuery additionally qualify it with the
+      // connection's own database/dataset, which is exactly what batchInsert
+      // resolves a bare name to. Only for a temp table that is CREATEd on a SQL
+      // destination ('ddl'); a local DuckDB destination takes the same branch of
+      // requiredFields but registers VIEWS under this name and never runs a
+      // CREATE TABLE, so it keeps the readable names the model picks.
+      const needsTempTable = requiredFields.includes('tempTableName')
+        && requiredFields.includes('ddl')
+        && targetDbType !== 'duckdb';
+      let tempTableName = null;
+      let quotedTempTableRef = null;
+      if (needsTempTable) {
+        // Lower case, because the name is derived from a node id that carries
+        // capitals ('dataSource-…-2'). The DDL above CREATEs it quoted, so
+        // PostgreSQL kept the capital S — and anything that then addressed the
+        // table UNQUOTED folded it away, asking for temp_datasource_… and
+        // failing with `relation "temp_datasource_…" does not exist` after the
+        // whole source had been read. A name that is already lower case is the
+        // same table quoted or not, on every engine that folds either way.
+        tempTableName = `temp_${String(s.sourceNodeId || '').replace(/[^A-Za-z0-9_]/g, '_')}`.toLowerCase();
+        try {
+          if (destConnector && typeof destConnector.quoteIdentifier === 'function') {
+            quotedTempTableRef = destConnector.quoteIdentifier(tempTableName, null, destDbConfig);
+          }
+        } catch (err) {
+          console.log(`[Join] Could not quote temp table for ${targetDbType}:`, err.message || err);
+        }
+      }
+
       return {
         sourceNodeId: s.sourceNodeId,
         sourceNodeLabel: s.sourceNodeLabel,
-        tableName: s.sourceTableName || s.sourceCollection || s.sourceTableSchema?.tableName || null,
-        columns: s.sourceTableSchema?.columns || [],
+        tableName,
+        quotedTableRef,
+        quotedColumns: Object.keys(quotedColumns).length ? quotedColumns : null,
+        tempTableName,
+        quotedTempTableRef,
+        columns,
         sampleData: s.sourceTableSchema?.sampleData || [],
         connectionId: s.sourceConnectionId,
         dbType: sourceDbType,
@@ -2669,7 +3728,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     });
 
     // hasLocalConnection mirrors JoinNodeChat: any source with a local path, or a
-    // destination whose dbType is a local file format (nedb / sqlite / lancedb).
+    // destination whose dbType is a local file format (duckdb / sqlite / lancedb).
     const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['duckdb', 'lancedb']);
     const genPrompt = ChatPrompts.join.generateJoinQuery(
       targetDbType,
@@ -2677,6 +3736,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
       joinSettings,
       {
         tableName: targetTableName,
+        quotedTargetRef,
         isVectorDestination,
         vectorRequired: !!analysis?.vectorRequired,
         hasLocalConnection: sourcesForPrompt.some((s) => s.localPath) || LOCAL_DB_TYPES_FOR_PROMPT.has(targetDbType),
@@ -2690,7 +3750,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // table name (see enrichJoinSourcesConfig). Without it the executor can't
   // open the source — a vector source in particular throws "no tableName".
   if (gen && Array.isArray(gen.sourcesConfig)) {
-    gen.sourcesConfig = enrichJoinSourcesConfig(gen.sourcesConfig, sources, helpers);
+    gen.sourcesConfig = enrichJoinSourcesConfig(gen.sourcesConfig, sources, helpers, warnings);
   }
 
   return assembleJoinConfig({
@@ -2709,21 +3769,58 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 // sourcesConfig only carries a vectorFetchOperation, so without this the loader
 // throws "no tableName/indexName found on sourceConfig or connection.dbConfig".
 // Mirrors the per-source shape the interactive JoinNodeChat persists.
-function enrichJoinSourcesConfig(sourcesConfig, sources, helpers) {
+function enrichJoinSourcesConfig(sourcesConfig, sources, helpers, warnings = []) {
   if (!Array.isArray(sourcesConfig)) return sourcesConfig;
-  return sourcesConfig.map((sc) => {
+  return sourcesConfig.map((sc, i) => {
     if (!sc) return sc;
-    const src = sources.find((s) => s.sourceNodeId === sc.sourceNodeId);
-    if (!src) return sc;
+    // The model is asked to echo back each source's id, and mostly does — but
+    // it can also invent one that LOOKS right (source 1's id with source 2's
+    // suffix, a truncation, the label instead of the id). An unmatched entry
+    // used to be returned as-is, which means with no `connection` on it: the
+    // build succeeds, the workflow saves, and the run dies much later at
+    // NodeExecution's "Source connection not found for <id>", naming an id
+    // that exists nowhere in the workflow.
+    //
+    // The prompt lists the sources in this order, so position is a sound
+    // second key when the counts agree. When they don't, there is nothing to
+    // map to and the build should say so now, while the id is still on screen.
+    let src = sources.find((s) => s.sourceNodeId === sc.sourceNodeId);
+    if (!src && sourcesConfig.length === sources.length) {
+      src = sources[i];
+      warnings.push(
+        `Join: the AI named an unknown source "${sc.sourceNodeId}"; matched it to `
+        + `"${src.sourceNodeId}" by position (source ${i + 1} of ${sources.length}).`,
+      );
+    }
+    if (!src) {
+      throw new Error(
+        `Join: sourcesConfig entry ${i + 1} names an unknown source "${sc.sourceNodeId}". `
+        + `This join's sources are: ${sources.map((s) => s.sourceNodeId).join(', ')}.`,
+      );
+    }
     const conn = (helpers.connections || []).find((c) => (c.id || c._id) === src.sourceConnectionId);
     const tableName = sc.tableName
       || src.sourceTableName
       || src.sourceCollection
       || src.sourceTableSchema?.tableName
       || null;
+    // Vector index coordinates, resolved once here and written everywhere the
+    // executor looks for them (pullJoinSourceRows checks sourceConfig first,
+    // then connection, then connection.dbConfig). A saved Pinecone connection
+    // may carry them in its own dbConfig; the upstream node's recorded values
+    // win, since they name the index this workflow actually wrote to.
+    const indexName = src.sourceIndexName || sc.indexName || conn?.dbConfig?.indexName || null;
+    const namespace = src.sourceNamespace || sc.namespace || conn?.dbConfig?.namespace || null;
+
     return {
       ...sc,
+      // The resolved id, not the one the model wrote: everything downstream
+      // (withVectorIndexCoordinates, the executor's error messages) keys off
+      // this, so a positionally-matched entry must not keep a phantom id.
+      sourceNodeId: src.sourceNodeId,
       tableName,
+      ...(indexName ? { indexName } : {}),
+      ...(namespace ? { namespace } : {}),
       sourceTableSchema: sc.sourceTableSchema || src.sourceTableSchema || (tableName ? { tableName } : null),
       connection: {
         id: src.sourceConnectionId,
@@ -2731,7 +3828,14 @@ function enrichJoinSourcesConfig(sourcesConfig, sources, helpers) {
         // Fold the table name into dbConfig too — for a local-lancedb source
         // there is no saved connection, so the executor's
         // connection.dbConfig.tableName fallback would otherwise be empty.
-        dbConfig: { ...(conn?.dbConfig || {}), ...(tableName ? { tableName } : {}) },
+        dbConfig: {
+          ...(conn?.dbConfig || {}),
+          ...(tableName ? { tableName } : {}),
+          ...(indexName ? { indexName } : {}),
+          ...(namespace ? { namespace } : {}),
+        },
+        ...(indexName ? { indexName } : {}),
+        ...(namespace ? { namespace } : {}),
         fileInfo: conn?.fileInfo,
         localPath: conn?.localPath || src.sourceLocalPath || null,
       },
@@ -2765,7 +3869,7 @@ function assembleJoinConfig({
     sources,
     joinRequest: stepPrompt,
     joinSettings,
-    joinColumns: gen?.joinColumns || joinSettings.joinColumns,
+    joinColumns: gen?.joinColumns || [],
     sourcesConfig: gen?.sourcesConfig || [],
     joinSql: gen?.joinSql || null,
     targetDdl: gen?.targetDdl || '',
@@ -2835,7 +3939,10 @@ function assembleJoinConfig({
 
   if (isNoSQL) {
     config.targetCollection = targetTableName;
-    config.targetPreviewSql = nosqlPreviewQuery(targetTableName);
+    // Prefer what the join generated, same as the SQL branch below. This used to
+    // discard it unconditionally, which is why a Mongo destination was the only
+    // one that could not carry its own preview query.
+    config.targetPreviewSql = gen?.previewSql || nosqlPreviewQuery(targetTableName);
   } else {
     config.targetTableName = targetTableName;
     config.targetSql = gen?.joinSql || null;
@@ -2854,19 +3961,41 @@ function assembleJoinConfig({
     throw new Error(`Join "${targetTableName}" generation was incomplete — the AI returned no joinSql or function (its output was likely truncated). Try a simpler join (exact-key match, fewer columns, no CTEs/temp tables).`);
   }
 
+  // A SQL destination is BUILT from targetDdl: the executor runs
+  // DROP TABLE IF EXISTS, then this CREATE, then joinSql. Without it the target
+  // is never created and the join dies at the INSERT with "table doesn't
+  // exist" — with nothing in the node to explain why. Fail the build instead.
+  //
+  // Only a real SQL destination needs it. Local DuckDB builds its target with
+  // CREATE OR REPLACE TABLE AS, a document store drops the collection and
+  // inserts, and a vector destination is written through its skill — all three
+  // derive the target from the result and take no DDL.
+  const destDbType = config.targetDbType;
+  const needsTargetDdl = !isLocalStorage
+    && !isNoSQL
+    && !VECTOR_DB_TYPES.has(destDbType)
+    && destDbType !== 'duckdb';
+  if (!gen?._skillId && needsTargetDdl && !String(gen?.targetDdl || '').trim()) {
+    throw new Error(`Join "${targetTableName}" generation was incomplete — no targetDdl was produced, so the destination table on ${targetConn?.name || destDbType} could never be created. A join always replaces its target, and needs a CREATE TABLE to do it.`);
+  }
+
   const destLabel = isLocalStorage
     ? localDestName
     : (targetConn?.name || 'destination');
   const joinExplanation = gen?.explanation
-    || `Built ${joinSettings.joinType} join "${targetTableName}" on ${sources.length} sources → ${destLabel}.`;
+    || `Built join "${targetTableName}" on ${sources.length} sources → ${destLabel}.`;
   const skillBanner = gen?._skillId ? ` via skill "${gen._skillId}"` : '';
   pushBotMsg(
     chat,
-    `✓ Join generated${skillBanner}!\n\n${joinExplanation}\n\nSources: ${sources.length}\nDestination: ${destLabel}\nTarget table: ${targetTableName}\nJoin type: ${joinSettings.joinType}`,
+    // No "Join type" line: the analyser no longer reports one, and the single
+    // value it used to print was wrong for the multi-stage joins this builds
+    // routinely — an INNER feeding a LEFT anti-join was announced as "LEFT".
+    // `gen.explanation` above already describes what was actually built.
+    `✓ Join generated${skillBanner}!\n\n${joinExplanation}\n\nSources: ${sources.length}\nDestination: ${destLabel}\nTarget table: ${targetTableName}`,
     {
       metadata: {
         joinSettings,
-        joinColumns: gen?.joinColumns || joinSettings.joinColumns || [],
+        joinColumns: gen?.joinColumns || [],
         sourcesConfig: gen?.sourcesConfig || [],
         joinSql: gen?.joinSql || null,
         targetDdl: gen?.targetDdl || null,
@@ -2900,7 +4029,13 @@ async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, 
   // shape to write into, so it is choosing against the columns it will actually
   // receive. This also fills in an upstream that never stored a schema at all,
   // which is the case the synthesis below only papers over.
-  source.sourceTableSchema = await refreshSourceSchema(source, helpers);
+  //
+  // A transformer or join upstream is exempt for the same reason as everywhere
+  // else: it declares what it will write, and this output receives that — not
+  // whatever its previous run left behind (upstreamDeclaresItsOutput).
+  if (!upstreamDeclaresItsOutput(upstreamNode)) {
+    source.sourceTableSchema = await refreshSourceSchema(source, helpers);
+  }
 
   // The output executor dereferences sourceTableSchema.tableName when loading
   // the source rows. Some upstreams (e.g. a join's target) may not expose a
@@ -2912,19 +4047,24 @@ async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, 
     || source.sourceTableSchema?.tableName;
   const sourceTableSchema = source.sourceTableSchema
     || (resolvedSourceTable ? { tableName: resolvedSourceTable, columns: [] } : null);
+  // Record the WHOLE input block copySourceFromUpstream resolved, not a
+  // hand-picked subset of it. OutputNodeChat.buildConfig spreads it the same
+  // way for the same reason (see its comment): a subset silently drops whatever
+  // the shared copy learns to carry. It was dropping `sourcePreviewSql` — the
+  // statement the Data Preview runs to show an output node's input — so a
+  // chat-built output node had nothing to preview and reported "No SQL query
+  // found in node configuration". `sourceType`, `sourceSchema` and
+  // `sourceDataset` were being lost here too.
+  //
+  // The three resolved fields below still win: sourceTableSchema is re-read
+  // from the live upstream above, so it describes the columns this node will
+  // actually receive rather than the ones recorded when the upstream was built.
   const config = {
     nodeType: 'output',
-    sourceNodeId: source.sourceNodeId,
-    sourceNodeLabel: source.sourceNodeLabel,
-    sourceConnectionId: source.sourceConnectionId,
-    sourceConnectionName: source.sourceConnectionName,
-    sourceConnectionType: source.sourceConnectionType,
-    sourceDbType: source.sourceDbType,
-    sourceDbConfig: source.sourceDbConfig,
+    ...source,
     sourceTableSchema,
     sourceTableName: source.sourceTableName || sourceTableSchema?.tableName,
     sourceCollection: source.sourceCollection || sourceTableSchema?.tableName,
-    sourceLocalPath: source.sourceLocalPath,
   };
 
   const connectionList = summarizeConnections(helpers.connections || []);
@@ -2940,10 +4080,28 @@ ${JSON.stringify(connectionList, null, 2)}
 Return JSON: { "outputSettings": { ... } }
 
 For a database connection output:
-{ "outputSettings": { "outputType": "connection", "connectionId": "<id-from-list>", "tableName": "<table>", "format": null, "savePath": null } }
+{ "outputSettings": { "outputType": "connection", "connectionId": "<id-from-list>", "tableName": "<table>", "format": null, "savePath": null, "writeMode": "append"|"truncate" } }
+- writeMode: what happens to rows that are ALREADY at the destination when this
+  runs again. "append" adds to them; "truncate" empties the table / collection /
+  vector namespace / sheet tab first, so it ends up holding only this run's
+  rows. The destination itself is kept either way — nothing is dropped and
+  re-created.
+  Choose "truncate" when the user describes a REPLACEMENT — "refresh", "reload",
+  "overwrite", "sync", "keep it in step with", "should mirror", "replace what's
+  there" — or when the pipeline recomputes the whole dataset each run and
+  appending would duplicate it. Choose "append" for a log, a history, an
+  accumulating table, or when the user says "add to" / "append". Default to
+  "append" when the request says nothing either way: it cannot destroy data
+  that is already there.
+  Ignored for a local file output and for cloud-storage objects — a file is
+  rewritten whole every run regardless.
 
 For a local file output:
-{ "outputSettings": { "outputType": "local", "format": "json"|"csv"|"excel"|"nedb"|"sqlite"|"parquet"|"avro", "savePath": "<absolute path>", "connectionId": null, "tableName": null, "sheetName": null } }
+{ "outputSettings": { "outputType": "local", "format": "json"|"csv"|"excel"|"duckdb"|"sqlite"|"lancedb"|"parquet"|"avro", "savePath": "<absolute path>", "connectionId": null, "tableName": "<table name, sqlite/duckdb/lancedb only>", "sheetName": null } }
+- lancedb: a local vector DATABASE DIRECTORY at savePath, holding the table
+  named by tableName. The rows must already carry a vector column. A saved
+  LanceDB CONNECTION is a different destination that already exists somewhere
+  else; never substitute one for a path the user gave.
 - savePath: a real absolute path the user gave. If the user did NOT give a
   concrete path (e.g. they said "use the save dialog" or didn't mention one),
   set savePath to null — the builder fills in a sensible default. Never invent
@@ -2953,11 +4111,20 @@ For a local file output:
   output nodes at one .xlsx with different sheet names builds up a multi-sheet
   file — one node per sheet. Set it only when the user named a sheet; leave it
   null and the builder names it after the source table.
+- tableName: SQLITE, DUCKDB and LANCEDB ONLY, null for every other local format.
+  Those hold many tables, exactly as a workbook holds many sheets, so the node
+  has to say which one it writes. An existing database keeps its other tables
+  and only this one is replaced each run. Set it only when the user named a
+  table; leave it null and the builder names it after the source table.
 
 Return ONLY the JSON object.`;
-  const out = await callJson(helpers, prompt);
+  const out = await timedCall('output:gen', prompt, () => callJson(helpers, prompt));
   console.log('buildOutputConfig: ', out)
   config.outputSettings = out.outputSettings || { outputType: null, format: null, savePath: null, connectionId: null, tableName: null, sheetName: null };
+  // Only two values mean anything downstream, and the safe one wins when the
+  // model answers with something else (or nothing) — appending can be undone
+  // by hand, a truncate the user did not ask for cannot.
+  config.outputSettings.writeMode = config.outputSettings.writeMode === 'truncate' ? 'truncate' : 'append';
 
   if (config.outputSettings.outputType === 'connection') {
     const exists = (helpers.connections || []).some((c) => (c.id || c._id) === config.outputSettings.connectionId);
@@ -2986,15 +4153,31 @@ Return ONLY the JSON object.`;
       || sourceTableSchema?.tableName,
     );
   } else {
-    // Meaningless for every other format — one table per file.
+    // Meaningless for every other format — a workbook is the only one with tabs.
     config.outputSettings.sheetName = null;
+  }
+
+  // The same rule for the local formats whose file holds many TABLES. Left
+  // unset the export would land on the generic fallback, so two nodes writing
+  // one .sqlite/.duckdb would overwrite each other's table instead of building
+  // the file up. Only touched for a local output — on a connection destination
+  // `tableName` IS the destination table and must not be rewritten here.
+  if (config.outputSettings.outputType === 'local') {
+    config.outputSettings.tableName = LOCAL_TABLE_FORMATS.has(config.outputSettings.format)
+      ? duckdbCore.sanitizeIdentifier(
+        config.outputSettings.tableName
+        || config.sourceTableName
+        || sourceTableSchema?.tableName
+        || 'data',
+      )
+      : null;
   }
 
   const os = config.outputSettings;
   const outputSummary = os.outputType === 'connection'
     ? `Configured output → connection "${os.connectionId}" / table "${os.tableName || '(none)'}".`
     : os.outputType === 'local'
-      ? `Configured local output → ${os.format} at "${os.savePath || '(no path)'}"${os.sheetName ? `, sheet "${os.sheetName}"` : ''}.`
+      ? `Configured local output → ${os.format} at "${os.savePath || '(no path)'}"${os.sheetName ? `, sheet "${os.sheetName}"` : ''}${os.tableName ? `, table "${os.tableName}"` : ''}.`
       : 'Configured output node (settings incomplete — open the node in the editor).';
   pushBotMsg(chat, outputSummary, { metadata: { outputSettings: os } });
 
@@ -3053,16 +4236,33 @@ function extractBuilderPromptFromNode(node) {
   return fallback ? [{ sender: 'user', text: fallback }] : [];
 }
 
-// First user message from the node's chat. Used by executeBuild as the
-// stepPrompt when cascade-rebuilding a string-form keep — the builder
-// needs a single instruction string to seed its prompt templates while
-// the full chat array rides along on ctx.chatHistory for AI context.
-function firstUserPromptFromNode(node) {
+// The node's current instruction. Used by executeBuild as the stepPrompt when
+// cascade-rebuilding a string-form keep — the builder needs a single
+// instruction string to seed its prompt templates, while the full chat array
+// rides along on ctx.chatHistory for AI context.
+/**
+ * What the node was LAST asked to be.
+ *
+ * `builderPrompt` is rewritten by every successful build, so it is the node's
+ * current intent; the last user message covers a node whose build never
+ * completed. A node that has been refined more than once — the usual case for
+ * anything the user came back to — has a first chat message describing a
+ * version of itself that no longer exists, which is exactly what a rebuild
+ * must not be driven from.
+ *
+ * The whole chat still rides along as history (see stepChat in executeBuild),
+ * so the earlier turns are context for the AI rather than the instruction.
+ */
+function latestPromptFromNode(node) {
   const cfg = node?.data?.config || {};
+  const builder = String(cfg.builderPrompt || '').trim();
+  if (builder) return builder;
   const chat = Array.isArray(cfg.chat) ? cfg.chat : [];
-  const firstUser = chat.find((m) => m && m.sender === 'user' && m.text);
-  if (firstUser) return String(firstUser.text);
-  return String(cfg.builderPrompt || node?.data?.label || '').trim();
+  for (let i = chat.length - 1; i >= 0; i--) {
+    const m = chat[i];
+    if (m && m.sender === 'user' && m.text) return String(m.text);
+  }
+  return String(node?.data?.label || '').trim();
 }
 
 // DFS-style topological ordering — ported from src/utils/workflowUtils.js so
@@ -3141,12 +4341,23 @@ function summarizeWorkflowAsSteps(wf) {
 function computeEdgesFromFinalSteps(finalSteps) {
   const edges = [];
   const pushed = new Set();
-  const push = (src, tgt) => {
+  // Every node card has ONE input dot except a join, which has one per source.
+  // An edge into a join that doesn't name its dot is drawn to the first one
+  // (ReactFlow's getHandle falls back to it), so both inputs stacked on the top
+  // dot and the second edge crossed the card to reach it. The ids match the
+  // ones JoinNode renders — see joinInputHandleId in nodes/nodeCardShared.js.
+  const push = (src, tgt, targetHandle = null) => {
     if (!src || !tgt || src === tgt) return;
     const key = `${src}->${tgt}`;
     if (pushed.has(key)) return;
     pushed.add(key);
-    edges.push({ id: edgeId(src, tgt), source: src, target: tgt, type: 'default' });
+    edges.push({
+      id: edgeId(src, tgt),
+      source: src,
+      target: tgt,
+      ...(targetHandle ? { targetHandle } : {}),
+      type: 'default',
+    });
   };
   const startStep = finalSteps.find((s) => s.stepType === 'start');
   for (const step of finalSteps) {
@@ -3161,7 +4372,8 @@ function computeEdgesFromFinalSteps(finalSteps) {
       }
       continue;
     }
-    for (const s of step.resolvedSources || []) push(s, step.nodeId);
+    const sources = step.resolvedSources || [];
+    sources.forEach((s, i) => push(s, step.nodeId, t === 'join' ? `input${i + 1}` : null));
   }
   return edges;
 }
@@ -3197,49 +4409,61 @@ The five node types (the only stepTypes you may emit) and how they relate:
   N inputs? Emit N dataSource nodes. What it can read depends on the
   connection's category:
     • Relational / document DB (Postgres, MySQL, MSSQL, Snowflake, BigQuery,
-      Mongo, NeDB, SQLite) → a named table/collection; downstream reads live.
+      Mongo, DuckDB, SQLite) → a named table/collection; downstream reads live.
     • Vector DB (Pinecone, LanceDB) → an index/table (+ namespace for
       Pinecone); rows come back flattened (id + metadata).
-    • REST API → an AI-generated fetch function pulls rows into a local
-      collection (auth is injected at run time — never mention credentials).
-    • Imported local file (CSV/Excel/JSON/Parquet/Avro/SQLite/NeDB/LanceDB) →
-      re-imported fresh each run and read with DuckDB.
-    • Cloud storage (GCS/S3/Dropbox/Drive) → can't be configured by chat;
-      at run time it lands locally as a Parquet file. No vector-file import.
-      See the picker-based rule below.
+    • REST API → an AI-generated fetch function materialises the rows as a
+      table in this workflow's own DuckDB database (auth is injected at run
+      time — never mention credentials).
+    • Local file (CSV/Excel/JSON/Parquet/Avro/DuckDB/SQLite/LanceDB) → stays
+      where it is, in its own format, and is read in place by DuckDB. Nothing
+      is imported or converted.
+    • Cloud storage (GCS/S3/Dropbox/Drive) → can't be configured by chat; at
+      run time the object is written to the path the user picked, in its own
+      format, and read in place by DuckDB. No vector-file import. See the
+      picker-based rule below.
     • Spreadsheet service (Google Sheets) → can't be configured by chat (same
-      rule below); lands locally as a Parquet file.
+      rule below); lands on disk the same way and is read in place.
 
 - transformer — takes exactly ONE upstream (a dataSource, transformer, or
   join) and reshapes it (filter, map, aggregate, rename, cast, derive, or
   in-place update/delete) across SQL, document, or local sources. It is a
-  TERMINAL WRITE: the reshaped result is persisted to a table/collection (or a
-  local Parquet file this node owns) as part of running — there is NO separate
-  save step.
-  Its only vector ops are: vectorise/embed a column into a vector table, and
-  in-place maintenance of a vector source (update/delete/tag its own records).
-  Matching rows to OTHER rows by similarity is NOT a transformer — that's a
-  join (see below).
+  TERMINAL WRITE: the reshaped result is persisted as part of running — to a
+  table/collection on its source connection, or to a table in this workflow's
+  own DuckDB database — so there is NO separate save step.
+  Its vector ops are: vectorise/embed a column into a vector table, in-place
+  maintenance of a vector source (update/delete/tag its own records), and a
+  FIXED-PROBE search of a vector source — one query text given in the request
+  ("the 5 most similar to \`clothes\`"), not read from a table. Matching the ROWS
+  of one side to other rows by similarity is NOT a transformer — that's a join
+  (see below).
 
 - join — takes TWO OR MORE upstreams and merges them. Also a TERMINAL WRITE:
   the joined rows are written to its destination as it runs. The sources may
   live in entirely different systems (e.g. a relational table joined with a
   document collection) — that's fine. A vector source can be read as a normal
   table, OR similarity search can drive the join ("for each row, find the
-  top-K most similar"). ALL similarity matching / "find similar" / enrichment-
-  with-matches is a join — including a vector table searched against itself
-  (a self-join: list that source twice in 'sources').
+  top-K most similar"). Similarity matching is a join when EACH ROW of a left
+  side is matched — "find similar" per row, recommendations, enrichment-with-
+  matches — and it needs two DISTINCT upstream nodes: the rows being matched,
+  and the vector table searched. A search from a single fixed probe has no left
+  side and is a TRANSFORMER instead.
 
-- output — ONLY for delivering the final result somewhere the upstream
-  transformer/join CANNOT write itself: a file export (json/csv/excel/parquet/
-  avro/nedb/sqlite/lancedb), or a DIFFERENT connection/table than the one the
-  upstream already wrote to. If the pipeline already ends at the transformer/
-  join's own target, NO output node is needed.
+- output — for delivering the result somewhere the upstream transformer/join
+  CANNOT write itself: a file export (json/csv/excel/parquet/avro/duckdb/
+  sqlite/lancedb), a DIFFERENT connection/table than the upstream wrote to, or
+  the SAME table under a write mode — it is the only node type that has one.
+  If the pipeline ends at the transformer/join's own target and replacing that
+  target each run is what was asked, NO output node is needed.
 
 Key relational rules that follow from the above:
-- Because transformer and join already persist their own result, do NOT chain
-  an output node that re-writes the same data to the same place — that is a
-  planner bug.
+- A transformer and a join REPLACE their target: each run recreates that table
+  from the rows it just produced. Neither has a write mode, and neither can add
+  to rows already there. So do NOT chain an output that re-writes the same data
+  to the same place under the same semantics — that is a planner bug — but DO
+  plan one when the ask is append / incremental: upstream writes a staging
+  table BESIDE the real destination and the output appends from it. See
+  "Appending to a table that must survive the run".
 - 'sources' wires the graph: every transformer/join/output points at the
   upstream node(s) it consumes (by step index in this plan, or by an existing
   node id in modify-mode).
@@ -3258,22 +4482,24 @@ the work; a mismatch does not error loudly — the builder silently degrades (e.
 emits NULL columns, or writes to a place the next node can't read). Rules:
 
 - dataSource → no destination choice; it only materialises rows. Remote SQL/doc
-  DBs read live; a vector source returns flattened id+metadata rows; API /
-  imported-file / picker sources land locally as a Parquet file, read with
-  DuckDB.
+  DBs read live; a vector source returns flattened id+metadata rows; an
+  imported-file or picker source stays on disk in its own format and is read in
+  place by DuckDB; a REST API source materialises as a table in this workflow's
+  DuckDB database.
 
 - transformer → writes exactly ONE reshaped table. Its destination is ONLY its
-  own SOURCE connection (storageLocation='database') or a LOCAL Parquet file
-  (storageLocation='local') — it has NO field to target a different saved
-  connection, so it can NEVER move data from connection A into connection B.
+  own SOURCE connection (storageLocation='database') or a table in this
+  workflow's own DuckDB database (storageLocation='local') — it has NO field to
+  target a different saved connection, so it can NEVER move data from
+  connection A into connection B.
   Copying/loading/replicating rows into a DIFFERENT connection (an ETL load with
   no reshape) is an OUTPUT node (outputType='connection'), and a dataSource may
   feed that output DIRECTLY (no transformer in between). Beyond that, the
   destination type is constrained by HOW it computes:
     • Plain reshape (filter / map / aggregate / rename / cast / derive, or a
       MongoDB aggregation pipeline) → stays in the SAME engine: write back to
-      the source DB (storageLocation='database'), or to a local Parquet file
-      written and read by DuckDB (storageLocation='local'), which holds tabular
+      the source DB (storageLocation='database'), or to a table in this
+      workflow's DuckDB database (storageLocation='local'), which holds tabular
       and document-shaped rows alike. A Mongo→Mongo aggregate is fully
       expressible here — do NOT route it through a skill.
     • Per-row Node.js / crypto / SHA-256 / arbitrary JS logic → routed to the
@@ -3301,17 +4527,17 @@ emits NULL columns, or writes to a place the next node can't read). Rules:
       Output node to export that file/format.
 
 - output → delivery only; it never computes. A file export (csv / json / excel /
-  parquet / avro / nedb / sqlite / lancedb) or a DIFFERENT connection/table than
+  parquet / avro / duckdb / sqlite / lancedb) or a DIFFERENT connection/table than
   the upstream already wrote to.
 
 Rule of thumb: choose the destination from the KIND of execution, not just the
-data — "similarity / find-similar / semantic match" ⇒ nedb / lancedb / vector
-destination; "hash / per-row JS in a transformer" ⇒ nedb / lancedb; a plain SQL
+data — "similarity / find-similar / semantic match" ⇒ lancedb / vector
+destination; "hash / per-row JS in a transformer" ⇒ duckdb / lancedb; a plain SQL
 or Mongo reshape ⇒ that same engine or local-duckdb.
 ${skillDocs ? `\n# Skills (optional execution paths a transformer/join may route through instead of plain SQL/NoSQL — only the ones relevant to this request are loaded)\n${skillDocs}\n` : ''}
 ${systemContext ? `# System & file-path context
 This is the user's actual machine and Ternlux's on-disk layout. When a step
-involves a local file (an output node's absolute savePath, a local SQLite/NeDB/
+involves a local file (an output node's absolute savePath, a local DuckDB/SQLite/
 LanceDB target, or a path the user names), resolve it against THIS layout:
 interpret relative paths from the home directory, write absolute paths with the
 right separator for this OS, and default file exports to the Downloads folder
@@ -3361,9 +4587,9 @@ object / sheet, which only exists in the editor. The AI cannot set that path. So
   action="ask_questions" and tell the user to add and configure that node
   manually in the editor first (briefly note which node), then come back to chat.
 - Transformers and joins are ALWAYS fine through chat. Once such a SOURCE exists,
-  at RUN TIME it pulls its data into a LOCAL store — SQLite for tabular/SQL data
-  (CSV, Excel, Parquet, Avro, spreadsheets) or NeDB for document/NoSQL data
-  (JSON) — and downstream transformer / join steps operate on that local copy.
+  at RUN TIME the object is written to the path the user picked, in its own
+  format, and read in place by DuckDB — nothing is imported or converted — and
+  downstream transformer / join steps operate on that file.
   In modify-mode, plan those downstream steps as normal (reference the
   picker-based node by its existing id); just don't rebuild or reconfigure the
   picker-based node itself.
@@ -3373,7 +4599,8 @@ object / sheet, which only exists in the editor. The AI cannot set that path. So
 # Per-node-type requirements (what each step's 'prompt' MUST convey)
 
 ## start  (triggerType ∈ {manual, time, file})
-- "manual": no schedule. Default when the user is silent about timing.
+- "manual": no schedule. The DEFAULT — use it unless the user explicitly asks
+  for a schedule or a path to watch; never infer one from what the workflow does.
 - "time": describe cadence in plain English ("every Monday at 9:30 am",
   "every 15 minutes"). Builder produces a 5-field cron expression.
 - "file": absolute path + type ∈ {file, directory} + ≥1 event from
@@ -3405,7 +4632,7 @@ IS the table's name, so use it.
   means, return action="ask_questions" instead of guessing.
 - The connection's TYPE governs what else the step prompt must say:
   - Database connection (Postgres / MySQL / MSSQL / Snowflake / BigQuery /
-    MongoDB / NeDB / SQLite / etc.): name or describe the table /
+    MongoDB / DuckDB / SQLite / etc.): name or describe the table /
     collection to read. Builder runs getTables and picks from the live
     list.
   - REST API connection: describe the endpoint, query params, and any
@@ -3416,19 +4643,19 @@ IS the table's name, so use it.
     service (Google Sheets): the AI can't configure these — see the
     "Picker-based connections" rule above. Don't build the source through
     chat; ask the user to add and configure that node in the editor, then
-    chat builds the transformer / join steps that read from its
-    locally-materialised (SQLite / NeDB) data.
+    chat builds the transformer / join steps that read the file it leaves on
+    disk, in place, through DuckDB.
   - Vector DB (Pinecone / LanceDB): name the index/table; namespace
     for Pinecone if relevant.
   - Imported file connection (CSV / Excel / JSON / Parquet / Avro /
-    local SQLite / NeDB / LanceDB): the file is pre-loaded under a
+    local DuckDB / SQLite / LanceDB): the file is pre-loaded under a
     known table; just name the connection. Its table is a BARE name —
     these engines have no dataset or schema to qualify it with.
 
 ## transformer  ('sources' length 1)
 - IMPORTANT: a transformer ALREADY WRITES its result to a target table
   (in the same connection when storageLocation='database', or to a
-  local SQLite/NeDB file when storageLocation='local'). Treat the
+  local DuckDB file when storageLocation='local'). Treat the
   transformer as both compute AND persistence — do NOT add an output
   step to write the same data to the same destination again.
 - Describe the transformation concretely — name source columns and the
@@ -3436,29 +4663,77 @@ IS the table's name, so use it.
   invent columns.
 - operationMode: "new_table" (reversible, default) | "in_place"
   (mutates the upstream table, irreversible).
-- storageLocation (only meaningful when operationMode='new_table' and
-  the source is REMOTE): "database" (write back to source connection)
-  | "local" (write to local SQLite/NeDB on disk). Constraint:
+- AT MOST ONE STRUCTURAL CHANGE AND ONE DATA CHANGE PER NODE. A transformer
+  executes at most one DDL statement and at most one DML statement, in that
+  order. So plan each transformer step as one such pair:
+    new_table  → one CREATE, one load. The target is dropped and recreated on
+                 every run, so never plan a step whose job is to clear, refresh,
+                 or top up a table an earlier step or run created — that is
+                 already what happens.
+    in_place   → normally just the data change (an UPDATE or DELETE over the
+                 existing table). A structural change is NOT part of in_place by
+                 default: plan one only when the table's current schema cannot
+                 hold the result — most often when the column being set does not
+                 exist yet. If the columns are already there, say only what the
+                 data should become.
+                 A step BELOW a new_table transformer is the exception: that
+                 parent recreates its table every run, so the table holds only
+                 the columns the parent declares and anything else is gone. Keep
+                 the structural change in EVERY such step — say to add the
+                 column, never to "keep the existing" one — unless the user asks
+                 for it to be dropped. Re-adding a column that is already there
+                 is not a failure: the executor runs the DDL, carries on to the
+                 data change, and lets that decide the node.
+  A request needing two structural changes that cannot be expressed as one
+  statement is TWO transformer steps, chained. Don't write a step prompt asking
+  for a conditional, guarded, or multi-part change inside one node — say the
+  change plainly and let the node run it. A rerun where the structural change is
+  already applied is handled by the executor, and is not something a step prompt
+  has to defend against.
+- storageLocation (only meaningful when operationMode='new_table'):
+  "database" (write back to source connection) | "local" (write a table into
+  this workflow's own DuckDB database). Constraint:
   storageLocation='local' forces operationMode='new_table'.
+  A source whose connection has connectionType "file" — a csv, a json, a
+  parquet, a workbook — is NOT remote and has no catalog to add a table to, so
+  "database" and "on the same connection" are not available for it. A new table
+  from such a source always lands in this workflow's own local DuckDB. Say what
+  the table should be CALLED and leave the destination alone; asking for the
+  source connection there describes something that cannot be built, and the
+  builder overrides it.
+  storageLocation='local' is a WORKING AREA, not a deliverable: the table lives
+  inside this workflow's own database, where only its own nodes can read it and
+  the user cannot open it. So a request for a FILE the user keeps — a csv, an
+  excel, a json, a parquet, "save it to Downloads", "export it" — is NOT
+  finished by a local transformer. Add an OUTPUT step after it with the format
+  and path. A request that only says "store it locally" or "make a local table"
+  IS finished there, and needs no output step.
 - Optional custom target table/collection name.
-- Vector / embedding TRANSFORMER ops are limited to exactly two cases —
-  the builder routes both to the vector skill automatically:
+- Vector / embedding TRANSFORMER ops are limited to exactly three cases:
     1. Embed/vectorise a column of THIS one source and store the vectors
-       into a vector table (regular data → vector store).
+       into a vector table (regular data → vector store). Routed to the
+       vector skill automatically.
     2. In-place maintenance of a vector source: update / delete / tag its
        own records, optionally selected by a similarity or metadata search.
+       Routed to the vector skill automatically.
+    3. FIXED-PROBE search of a vector source: the request supplies ONE query
+       text ("the 5 most similar to \`clothes\`", "top 10 closest to this
+       description") rather than a column of rows to match. Say so in the
+       prompt and name javascript-executor — it embeds the probe, searches
+       the source index, and writes the hits to its own local table.
   CRITICAL — these do NOT cover matching rows to OTHER rows. If the request
   is "for each row, find the N most similar rows and combine / enrich /
-  attach the matches" (top-K similar, "find similar", recommendations,
-  semantic join), that is a JOIN (Scenario B), NOT a transformer — even
-  when the same vector table is searched against itself. Emit a join step
-  for it; never a transformer.
+  attach the matches" (top-K similar per row, recommendations, semantic
+  join), that is a JOIN (Scenario B), NOT a transformer — even when the same
+  vector table is searched against itself. Emit a join step for it.
 
 ## join  ('sources' length ≥ 2)
-- USE A JOIN FOR ALL SIMILARITY MATCHING. Any "for each row, find the N
+- USE A JOIN FOR PER-ROW SIMILARITY MATCHING. Any "for each row, find the N
   most similar rows and combine / enrich / attach them" request (top-K
-  similar, "find similar", recommendations, semantic / vector join) is a
-  JOIN — never a transformer, even when it is vector-based.
+  similar, recommendations, semantic / vector join) is a JOIN — never a
+  transformer, even when it is vector-based. A search from ONE fixed probe
+  text is the exception: no left-hand rows, so it is a transformer through
+  javascript-executor (see the transformer section above).
 - A join's 'sources' MUST list at least TWO DISTINCT upstream nodes. NEVER
   list the same node twice (no "sources": [3, 3]) — the same node cannot be
   attached to a join twice. For a vector similarity search where the data is
@@ -3474,26 +4749,35 @@ IS the table's name, so use it.
   transformer's output → "sources": [<itemsIdx>, <lancedbIdx>], two distinct
   indices. If a second real source is involved (e.g. join the similarity hits
   back to the original table), list both — but they must still be distinct.
+  NEVER add a data source node just to reach two sources. Every source must be
+  a node the workflow already has, or one it genuinely needs for its own data.
+  If the request has only one real side, it is not a join — re-read the
+  transformer cases above (a fixed-probe search is the usual one).
 - IMPORTANT: a join IS a terminal write step for its own result. It
   ALREADY OUTPUTS the joined rows to its destination — a saved connection,
   "local-duckdb" or "local-lancedb" — as part of running
-  the join. It does
-  NOT need, and MUST NOT be followed by, an Output node to persist that
-  result. Same rule as transformer: do NOT chain an output step after a
-  join. If the user just wants the joined data "saved", "written", or
-  "stored" somewhere, point the join's own 'connectionId' at that
-  destination — do not add an Output node.
-  - The ONLY time an Output node may follow a join is when the user
-    explicitly wants the SAME joined data ALSO delivered to a genuinely
-    DIFFERENT destination the join itself cannot write to: a file export
-    in a format the join can't produce (csv / json / excel / parquet /
-    avro), or a DIFFERENT database connection/table than the join wrote
-    to. A plain database/local-duckdb/local-lancedb table the
-    join already targets is NOT such a case — the join writes those
-    directly (local-lancedb embeds + upserts the rows as vectors). A
-    cloud-storage destination IS such a case but is MANUAL-ONLY (see the
-    rule above) — don't emit it; tell the user to add the cloud-storage
-    output node in the editor.
+  the join. So when the user just wants the joined data "saved", "written",
+  or "stored" somewhere, point the join's own 'connectionId' at that
+  destination and add NOTHING after it — an Output step that re-writes the
+  same rows to the same place under the same semantics is a planner bug.
+- A join's write REPLACES its target — no write mode, no merge, no
+  preserving what the table held. Never write "append", "insert only the
+  new rows", "don't truncate" or "preserve existing rows" into a join
+  prompt: the builder cannot build it and stops the build to ask an
+  unanswerable question. That request is the staging shape — see
+  "Appending to a table that must survive the run" under ## output.
+- An Output step MAY follow a join, and MUST when either:
+  - the same rows must ALSO go somewhere the join can't write: a csv /
+    json / excel / parquet / avro export, or a DIFFERENT connection/table
+    than the join wrote to. (Cloud storage is such a case but MANUAL-ONLY
+    — don't emit it; tell the user to add that node in the editor.)
+  - the destination must KEEP its existing rows: the join writes a staging
+    table on the DESTINATION's own connection and the output appends from
+    it. "local-duckdb" only when the user asked for the work to happen
+    locally. See "Appending to a table that must survive the run".
+  Otherwise a database/local-duckdb/local-lancedb table the join already
+  targets needs no Output step — the join writes it directly
+  (local-lancedb embeds + upserts the rows as vectors).
 - REQUIRED field 'connectionId': the destination the join writes to.
   Set it to ONE of:
   - The EXACT id of a saved connection from the connections list
@@ -3509,7 +4793,10 @@ IS the table's name, so use it.
     that silently drops the embeddings. (A SAVED vector connection such as
     Pinecone is referenced by its connection id, not a local-* token.)
   - The user wants a relational / scratch table, or didn't mention
-    vectors → "local-duckdb". EXCEPTION: a SIMILARITY / embedding join
+    vectors → "local-duckdb". But a STAGING table for an append (see
+    "Appending to a table that must survive the run") belongs on the
+    destination's own connection, not here — local only if the user asked
+    for the work to happen locally. EXCEPTION: a SIMILARITY / embedding join
     (Scenario B — "for each row find the most similar", per-row vector
     search) must NEVER use "local-duckdb" even though its output looks
     tabular; a SQL destination can't run the per-row search and the match
@@ -3539,25 +4826,32 @@ IS the table's name, so use it.
   only to be unambiguous about destination + intent.
 
 ## output  ('sources' length 1)
-- An output step is ONLY needed when the data must land somewhere the
-  upstream transformer/join CANNOT write to itself. The transformer and
-  join builders already persist their result to a table or local file —
-  adding a redundant output that writes the same data to the same
-  destination is a planner bug.
-- EMIT an output step when ALL of these are true:
+- An output step is needed when the data must land somewhere the upstream
+  transformer/join CANNOT write to itself — a different destination, or the
+  same one under write semantics the upstream does not have. The transformer
+  and join builders already persist their result to a table or local file,
+  so an output that re-writes the same data to the same place under the same
+  semantics is a planner bug.
+- EMIT an output step when EITHER of these holds:
   1. The user wants the result delivered somewhere OTHER than the
      transformer/join's own target — a different saved connection/table,
-     or a local file export (csv/json/excel/parquet/avro/nedb/sqlite/
+     or a local file export (csv/json/excel/parquet/avro/duckdb/sqlite/
      lancedb). EXCEPTION: a cloud-storage destination is MANUAL-ONLY —
      do not emit an output step for it; per the rule above, ask the user
      to add and configure the cloud-storage output node in the editor
      instead.
-  2. The destination is not already the upstream's targetConnection
-     and targetTableName/targetCollection.
+  2. The destination must KEEP what earlier runs put there — append,
+     incremental, "add the new rows", "only what isn't in there yet",
+     "don't reload the whole table". A transformer/join REPLACES its
+     target, so it cannot do this at any destination, including one it
+     could otherwise write to. Upstream writes a staging table, the
+     output appends — see "Appending to a table that must survive the
+     run" below.
 - OMIT the output step when:
-  - The pipeline ends at the transformer or join's target itself
-    (e.g. "transform Mongo collection A into Mongo collection B" — the
-    transformer already wrote B; no output needed).
+  - The pipeline ends at the transformer or join's target itself AND
+    rebuilding that target each run is what was asked (e.g. "transform
+    Mongo collection A into Mongo collection B" — the transformer already
+    wrote B; no output needed).
   - The user only described a transformation/aggregation and didn't
     ask for a separate destination.
 - When you DO emit one:
@@ -3568,11 +4862,57 @@ IS the table's name, so use it.
     never emit one here. For vector DBs, name the index (+ namespace for
     Pinecone). BigQuery and Snowflake — and ONLY those — take a qualified
     table name (dataset.table / schema.table), because that is how those
-    engines address a table. See "Naming a table" below.
-  - outputType='local': format ∈ {json, csv, excel, nedb, sqlite,
+    engines address a table. See "Naming a table" above.
+  - outputType='local': format ∈ {json, csv, excel, duckdb, sqlite,
     lancedb, parquet, avro} + absolute savePath. Use this when the
     user wants a file export distinct from any database table the
-    transformer/join already produced.
+    transformer/join already produced. sqlite and duckdb hold many
+    tables per file, so say in the step's prompt what the TABLE should
+    be called when the user named one.
+    A local file output REPLACES what it writes, every run: for sqlite
+    and duckdb the named table is replaced and the file's other tables
+    are kept; every other format rewrites the file whole. There is no
+    append, merge or upsert to a local file, and a saved DUCKDB
+    connection cannot be written to at all. So a request to accumulate
+    rows in a local duckdb/sqlite file, or to merge on keys anywhere,
+    cannot be built — say so and ask whether to rebuild the table each
+    run instead. Do not offer append or upsert at a destination that
+    has neither.
+  - WRITE MODE, for outputType='connection' only: say in the step's
+    prompt whether the destination should be APPENDED to or TRUNCATED
+    AND RELOADED, when the request implies one. Truncate empties the
+    table / collection / vector namespace / sheet tab first so it holds
+    only this run's rows, keeping the destination itself. "Refresh",
+    "reload", "overwrite", "keep in sync", or a pipeline that recomputes
+    the whole dataset each run mean truncate; a log, a history, or "add
+    to" means append. Say nothing and it appends — which cannot destroy
+    data that is already there. A local file is rewritten whole every
+    run, so never raise the choice for one.
+
+## Appending to a table that must survive the run
+
+"Append the new rows", "add to the table instead of rebuilding it", "skip
+what's already loaded" — the write mode lives on the OUTPUT step only, so
+the plan must end at one:
+
+  sources → join/transformer → staging table → output (connection, APPEND)
+
+- STAGE ON THE DESTINATION'S OWN CONNECTION: the staging table is a table
+  beside the real destination (e.g. "stg_<target>"), so 'connectionId' is
+  that same connection. A source that already lives there is then read in
+  place and never crosses the wire, and the anti-join below runs inside
+  that engine. Use "local-duckdb" ONLY when the user asked for the work to
+  happen locally, or the destination cannot hold a table — staging a
+  destination-resident table locally pulls the whole table out and pushes
+  it back for nothing.
+- The upstream step targets the staging table and its prompt is written in
+  REPLACE terms — it builds this run's rows fresh. Never "append" or
+  "preserve" there.
+- The output step carries the real destination and the append mode.
+- Append matches no keys. To exclude rows already in the destination, add a
+  dataSource reading that destination table, feed it to the join as another
+  source, and state the anti-join: LEFT join on the identity column, keep
+  only rows with no match. Without it the append re-inserts what is there.
 
 # When to ask a clarifying question (return action="ask_questions")
 
@@ -3923,12 +5263,16 @@ function validatePlanEnvelope(out, { mode, wfSummary, connections }) {
     for (const ref of refs) {
       if (typeof ref === 'number') {
         if (ref < 0 || ref >= i || !Number.isInteger(ref)) {
-          throw new Error(`Step ${i} (${s.stepType}) source index ${ref} does not point to an earlier step in the plan.`);
+          throw new Error(`Step ${i} (${s.stepType}) has no source node at index ${ref} — it does not point to an earlier step in the plan. Check whether the index is wrong: source indices are 0-based positions in the steps array you returned, counting the string-form keep entries, so a valid source here is between 0 and ${i - 1}.`);
         }
         const parent = norm[ref];
         if (!parent) throw new Error(`Step ${i} (${s.stepType}) source step ${ref} does not exist.`);
+        // Stated as "the source you meant is not at that index", because that
+        // is nearly always what happened: the reference points at a real step,
+        // just the wrong one. Naming only the broken rule gave the model nothing
+        // to correct, so it re-emitted the same plan and the turn ended.
         if (!parentTypeOk(s.stepType, parent.stepType)) {
-          throw new Error(`Step ${i} (${s.stepType}) cannot have step ${ref} (${parent.stepType}) as a parent.`);
+          throw new Error(`Step ${i} (${s.stepType}) has no valid source node at index ${ref} — index ${ref} is a step of type "${parent.stepType}", and stepType "${s.stepType}" must be fed by a dataSource, transformer or join. Check whether the index is wrong: source indices are 0-based positions in the steps array you returned, counting the string-form keep entries. Recount and reference the step you actually meant.`);
         }
       } else if (typeof ref === 'string') {
         const existing = existingById.get(ref);
@@ -3981,7 +5325,7 @@ async function planBuild({ userRequest, workflow, helpers, chatHistory = [] }) {
     let out;
     let attemptError = null;
     try {
-      out = await callJson(helpers, userMessage, { systemPrompt, chatHistory });
+      out = await timedCall('planner', userMessage, () => callJson(helpers, userMessage, { systemPrompt, chatHistory }));
       console.log('::planBuild:: ', out)
     } catch (err) {
       // The plan didn't fit in the output budget. Retrying just burns another
@@ -4123,7 +5467,11 @@ const NODE_TYPE_BY_STEP = {
 };
 
 const STARTING_POSITION = { x: 100, y: 200 };
-const X_SPACING = 320;
+// Every card is 264px wide, so this is the card plus the corridor the edges
+// between two columns are drawn in. At 320 that corridor was 56px — not enough
+// for an edge to leave one dot, change rows and come into the next without
+// running over the cards on either side.
+const X_SPACING = 440;
 // Tall enough for the tallest card (a transformer with its SQL summary runs to
 // ~170px) plus breathing room, so stacked nodes in a column never overlap.
 const Y_SPACING = 200;
@@ -4140,10 +5488,33 @@ const Y_SPACING = 200;
  * Depth is tracked for EVERY node, including ones whose saved position is
  * preserved (a keep/modify never moves), so nodes built downstream of them
  * still land in the right column.
+ *
+ * Columns are CENTRED against the tallest one rather than all hanging from the
+ * same top edge: three sources fanning out of Start put Start at the middle of
+ * their span, and the two transformers they feed sit centred against those
+ * three. `expectedRows` (depth → how many nodes that column ends up holding)
+ * is what makes that possible mid-build — it comes from planColumnDepths,
+ * which reads the whole plan before the first node is built, so a column is
+ * centred from its first card instead of growing downward and only settling
+ * once the build is over. Without it (no plan to read) placement falls back to
+ * the top-aligned stack, which never has to move a node that is already drawn.
  */
-function createLayout() {
+function createLayout(expectedRows = null) {
   const depthById = new Map();
   const usedRows = new Map();   // depth → next free row
+
+  let tallest = 1;
+  if (expectedRows) for (const n of expectedRows.values()) if (n > tallest) tallest = n;
+
+  // Half the difference between this column's height and the tallest column's,
+  // in pixels. Read only from the pre-computed counts, never from the rows
+  // filled in so far, so it is the same value for every node in the column —
+  // including the ones already on the canvas.
+  const offsetOf = (depth) => {
+    if (!expectedRows) return 0;
+    const rows = expectedRows.get(depth) || 1;
+    return ((tallest - rows) * Y_SPACING) / 2;
+  };
 
   const depthOf = (sources = []) => {
     let deepest = -1;
@@ -4156,13 +5527,21 @@ function createLayout() {
 
   const positionAt = (depth, row) => ({
     x: STARTING_POSITION.x + depth * X_SPACING,
-    y: STARTING_POSITION.y + row * Y_SPACING,
+    y: STARTING_POSITION.y + offsetOf(depth) + row * Y_SPACING,
   });
+
+  // The plan's own column for this step when it has one, else derived from the
+  // sources placed so far. They agree by construction — planColumnDepths walks
+  // the same edges — but the hint is preferred so the counts that drive the
+  // centring can never describe a different column than the node lands in.
+  const columnFor = (sources, depthHint) => (
+    typeof depthHint === 'number' && depthHint >= 0 ? depthHint : depthOf(sources)
+  );
 
   return {
     /** Record a node's column without placing it — for preserved positions. */
-    note(nodeId, sources) {
-      const depth = depthOf(sources);
+    note(nodeId, sources, depthHint) {
+      const depth = columnFor(sources, depthHint);
       depthById.set(nodeId, depth);
       // The node still occupies its column, so the next new node in that
       // column starts below it rather than on top of it.
@@ -4170,8 +5549,8 @@ function createLayout() {
       return depth;
     },
     /** Column + next free row for a node being placed for the first time. */
-    place(nodeId, sources) {
-      const depth = depthOf(sources);
+    place(nodeId, sources, depthHint) {
+      const depth = columnFor(sources, depthHint);
       const row = usedRows.get(depth) || 0;
       depthById.set(nodeId, depth);
       usedRows.set(depth, row + 1);
@@ -4190,6 +5569,81 @@ function createLayout() {
       return pos;
     },
   };
+}
+
+/**
+ * Work out every step's column BEFORE the build runs.
+ *
+ * Nodes are drawn on the canvas one at a time, as each is built — so a column's
+ * final height has to be known while its first node is being placed, or the
+ * layout can only be centred retroactively (which means moving cards the user
+ * is already looking at). The plan carries everything needed to know it: each
+ * step's type and its sources, either as an index into the plan or as the id of
+ * an existing node, which is itself a step (modify plans must account for every
+ * existing node). So we resolve the DAG on the plan alone.
+ *
+ * Returns { depths: number[] (by step index), countByDepth: Map<depth, count> }.
+ */
+function planColumnDepths(steps, existingNodesById, existingSourcesByTarget) {
+  const list = Array.isArray(steps) ? steps : [];
+  const idxByNodeId = new Map();
+  list.forEach((s, i) => {
+    const id = typeof s === 'string' ? s : (s && s.existingNodeId) || null;
+    if (id && !idxByNodeId.has(id)) idxByNodeId.set(id, i);
+  });
+
+  // Type + source refs per step. String-form keeps carry neither: both come
+  // from the node and its edges as they stand in the saved workflow.
+  const typeByIdx = list.map((s) => (
+    typeof s === 'string' ? (existingNodesById.get(s)?.type || null) : (s?.stepType || null)
+  ));
+  // Object steps declare their own sources (validation makes that mandatory for
+  // every type that needs one); string-form keeps inherit theirs from the saved
+  // edges. Same two rules the walk itself uses, so the columns worked out here
+  // are the columns the walk arrives at.
+  const refsByIdx = list.map((s) => (
+    typeof s === 'string'
+      ? (existingSourcesByTarget.get(s) || [])
+      : (Array.isArray(s?.sources) ? s.sources : [])
+  ));
+
+  const startIdx = typeByIdx.findIndex((t) => t === 'start');
+  const depths = new Array(list.length).fill(null);
+  const resolving = new Set();
+
+  const depthAt = (i) => {
+    if (typeof i !== 'number' || i < 0 || i >= list.length) return -1;
+    if (depths[i] != null) return depths[i];
+    // A plan should never describe a cycle, but a malformed one must not
+    // recurse forever — treat the step being resolved as the graph's root.
+    if (resolving.has(i)) return 0;
+    resolving.add(i);
+    let depth;
+    if (typeByIdx[i] === 'start') {
+      depth = 0;
+    } else {
+      let deepest = -1;
+      for (const ref of refsByIdx[i] || []) {
+        const j = typeof ref === 'number' ? ref : idxByNodeId.get(ref);
+        const d = depthAt(j);
+        if (d > deepest) deepest = d;
+      }
+      // A data source declares no sources; the start node feeds it (see
+      // computeEdgesFromFinalSteps), so it belongs one column to the right.
+      if (deepest < 0 && typeByIdx[i] === 'dataSource' && startIdx >= 0) deepest = depthAt(startIdx);
+      depth = deepest + 1;
+    }
+    resolving.delete(i);
+    depths[i] = depth;
+    return depth;
+  };
+
+  const countByDepth = new Map();
+  for (let i = 0; i < list.length; i++) {
+    const d = depthAt(i);
+    countByDepth.set(d, (countByDepth.get(d) || 0) + 1);
+  }
+  return { depths, countByDepth };
 }
 
 function newNodeId(stepType, idx) {
@@ -4271,6 +5725,11 @@ async function buildNodeConfig({
   }
   const fn = builderFor(nodeType);
   const warnings = [];
+  // Each node build is timed as a whole and stage by stage — see buildTimings.
+  const buildStarted = Date.now();
+  buildTimings.reset();
+  const buildLabel = `${nodeType} ${nodeId || ''}`.trim();
+  console.log(`[build] ${buildLabel} — starting (${existingConfig ? 'modify' : 'add'})`);
 
   // The node's committed conversation is the single source of truth — there is
   // NO separate clarifications array. Seed from the node's existing history so
@@ -4308,9 +5767,25 @@ async function buildNodeConfig({
       // edit of this node doesn't resume a finished conversation. The renderer
       // MERGES this config onto the node, so the key must be written, not omitted.
       config.pendingSkill = null;
+      // A node this build just wrote has never run: its target table is a name
+      // in the config and nothing more, whether this is a first build or a
+      // rebuild that retargeted an already-executed node.
+      //
+      // That fact is recorded by the EDITOR, not here. This config travels back
+      // over `ternlux:apply-node-config` and the editor writes the node's id
+      // into the workflow's `executedNodes` map (markNodesPending in
+      // WorkflowEditor.js) — beside the nodes, so that a run or a rebuild never
+      // reads as an edit to the workflow itself. It used to be written into the
+      // config as `executed: false`, which made every run dirty the canvas and
+      // add a version to the history. See src/utils/executedNodes.js.
     }
+    buildTimings.report(buildLabel, Date.now() - buildStarted);
     return { success: true, config, chat, warnings };
   } catch (err) {
+    buildTimings.report(
+      `${buildLabel} — ${err?.isClarificationNeeded ? 'paused for a question' : 'failed'}`,
+      Date.now() - buildStarted,
+    );
     if (err && err.isClarificationNeeded) {
       // Commit the AI's follow-up question (tagged) so the user's next message
       // is recorded right after it as the answer — the chat IS the memory.
@@ -4342,6 +5817,45 @@ function sourcesByTarget(edges) {
 // The schema a node outputs (what downstream nodes will see as input).
 // dataSource publishes the source table; transformer/join publish their
 // target table. start/output have no meaningful downstream schema.
+/**
+ * A kept DATA SOURCE, re-read from its table.
+ *
+ * A step the planner keeps is reused verbatim — no builder runs — so its
+ * `sourceTableSchema` stays whatever the FIRST build recorded. That is fine
+ * until something changes the table, and the most common something is this
+ * workflow: an in-place transformer that adds a column alters the very table
+ * its own data source describes. The source then says five columns, the
+ * transformer (which re-reads live when IT is rebuilt) says six, and the saved
+ * workflow contains two contradictory accounts of one table.
+ *
+ * Both readers of that workflow then get it wrong. The change reviewer believes
+ * the stale one and fails a correct build — "store_daily does not have
+ * revenue_band, so the UPDATE will fail" — about a column the table has. And
+ * the canvas compares child against parent and reports the difference as the
+ * user's input having moved.
+ *
+ * Re-reading here costs one round trip per kept source and removes the
+ * contradiction at its origin. Best-effort, exactly like every other refresh:
+ * a source that cannot be reached keeps its snapshot.
+ *
+ * @returns {Promise<Object>} the same node when nothing changed.
+ */
+async function refreshKeptSourceNode(node, helpers) {
+  if (!node || node.type !== 'dataSource') return node;
+  const cfg = node.data?.config || {};
+  if (!cfg.sourceTableSchema) return node;
+  const live = await refreshSourceSchema(cfg, helpers);
+  if (!live || live === cfg.sourceTableSchema) return node;
+  const was = (cfg.sourceTableSchema.columns || []).map((c) => c?.name).join(' ');
+  const now = (live.columns || []).map((c) => c?.name).join(' ');
+  if (was === now) return node;
+  console.log(`[build] kept source "${node.id}" re-read: ${was.split(' ').length} → ${now.split(' ').length} columns`);
+  return {
+    ...node,
+    data: { ...node.data, config: { ...cfg, sourceTableSchema: live } },
+  };
+}
+
 function getOutputSchema(node) {
   if (!node) return null;
   const cfg = node.data?.config || {};
@@ -4374,17 +5888,29 @@ function getCachedInputSchemas(node) {
   return result;
 }
 
-// Schema equality: same column names + types (order-insensitive). Used to
-// gate "do we actually need to rebuild this downstream node?" so a string-
-// form keep that the AI emitted doesn't force a rebuild when nothing about
-// its inputs has actually moved.
+// Schema equality: same column NAMES (order-insensitive). Used to gate "do we
+// actually need to rebuild this downstream node?" so a string-form keep that
+// the AI emitted doesn't force a rebuild when nothing about its inputs has
+// actually moved.
+//
+// Names only, deliberately. The two schemas being compared are written by
+// different code paths and describe types in different vocabularies: a node
+// records its OUTPUT as the columns the model declared ("TEXT", "REAL",
+// "VECTOR(1536)"), while the node downstream records its INPUT from the real
+// table it read ("string", "number", "object"). Comparing those makes every
+// pair unequal forever, and the gate then rebuilds a node the user never
+// touched — silently, and from a stale prompt. A column appearing, vanishing
+// or being renamed is what actually invalidates a built config; a type spelled
+// two ways is not.
 function schemasEqual(a, b) {
   if (a == null && b == null) return true;
   if (!a || !b) return false;
   const colsA = Array.isArray(a.columns) ? a.columns : [];
   const colsB = Array.isArray(b.columns) ? b.columns : [];
   if (colsA.length !== colsB.length) return false;
-  const keyOf = (c) => `${String(c?.name || c?.column_name || '').toLowerCase()}::${String(c?.type || c?.data_type || '').toLowerCase()}`;
+  const keyOf = (c) => String(
+    (typeof c === 'string' ? c : (c?.name || c?.column_name)) || '',
+  ).toLowerCase();
   const setA = new Set(colsA.map(keyOf));
   for (const c of colsB) if (!setA.has(keyOf(c))) return false;
   return true;
@@ -4474,17 +6000,60 @@ async function registerStartTriggers({ nodes, workflowId, helpers, warnings }) {
   }
 }
 
+/**
+ * A workflow name nothing else is using: "Sales report", then "Sales report 2",
+ * "Sales report 3", …
+ *
+ * The editor refuses to save a workflow whose name matches another one
+ * (WorkflowsTab.saveWorkflowData), but the builder writes to the database
+ * directly and never went through that check — so a plan that reused a name
+ * produced a workflow the user could open and then not save. Two workflows
+ * sharing a name also share the folder their code is externalized into, which
+ * is named after the name (lib/workflowCode workflowDirName), so each save
+ * overwrote the other's files.
+ *
+ * The comparison is the editor's, exactly — trimmed and case-insensitive — so
+ * the name this hands back is one the editor will accept.
+ */
+async function uniqueWorkflowName(name, wfDb) {
+  const base = String(name || '').trim() || 'New Workflow';
+  let taken;
+  try {
+    const docs = await wfDb.findAsync({});
+    taken = new Set(
+      (Array.isArray(docs) ? docs : [])
+        .map((w) => String(w && w.name ? w.name : '').trim().toLowerCase())
+        .filter(Boolean),
+    );
+  } catch (err) {
+    // Unable to read the collection — better to build under the requested name
+    // than to fail the whole build over a naming nicety.
+    console.warn('[workflowBuilder] could not check existing names:', err.message);
+    return base;
+  }
+
+  if (!taken.has(base.toLowerCase())) return base;
+  // Start at 2: the untouched name is the first, so the next one is the second.
+  for (let n = 2; n <= 999; n++) {
+    const candidate = `${base} ${n}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  // 998 workflows of the same name is not a case worth a nicer answer than one
+  // that is certainly free.
+  return `${base} ${Date.now()}`;
+}
+
 async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
   const warnings = [];
   // Resolve the workflow id UP FRONT. The persist step below used to mint it,
   // but node builders write files (the REST API fetch materialises rows into
-  // local NeDB) long before that — so an id assigned at the end could never
+  // local DuckDB) long before that — so an id assigned at the end could never
   // scope them. Reuse it verbatim when persisting.
   //
   // A build that pauses to ask the user something resumes as a SEPARATE
   // executeBuild call, so minting the id here would hand each attempt its own:
   // files written by the steps already built (a REST API source materialises
-  // its rows into local NeDB) would stay scoped to an id the finished workflow
+  // its rows into local DuckDB) would stay scoped to an id the finished workflow
   // no longer has, and anything tracking the build — the live canvas, say —
   // loses it halfway through. The renderer carries `buildWorkflowId` back on
   // every resume so all attempts at one plan share an identity.
@@ -4558,8 +6127,26 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
   const builtByIdx = [];
 
   // Column-per-depth placement for every node this walk touches — see
-  // createLayout. Built once for the whole walk so depths accumulate.
-  const layout = createLayout();
+  // createLayout. Built once for the whole walk so depths accumulate, and fed
+  // the plan's own column map so each column can be centred from its first
+  // node instead of after the last one.
+  const columns = planColumnDepths(plan.steps, existingNodesById, existingSourcesByTarget);
+  const layout = createLayout(columns.countByDepth);
+
+  // The start node anchors the leftmost column and is the upstream of every
+  // data source that didn't name one. Both facts are only applied when the
+  // final edges are derived (computeEdgesFromFinalSteps) — far too late for a
+  // canvas that draws the graph as it is built, which is why the start node
+  // used to sit in the same column as the sources it feeds with no edge to any
+  // of them until the build finished. Resolving it up front lets every step
+  // event carry the real wiring. Modify builds start from the saved start node;
+  // a new build picks it up from step 0 before any data source is reached.
+  let startNodeId = existingNodes.find((n) => n && n.type === 'start')?.id || null;
+  const wiredSources = (nodeType, sources) => (
+    nodeType === 'dataSource' && !(sources || []).length && startNodeId
+      ? [startNodeId]
+      : (sources || [])
+  );
 
   // ── Resumable build cache.
   //
@@ -4597,10 +6184,12 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
     if (cached && cached.node && cached.node.id) {
       const cnode = cached.node;
       const cachedSources = Array.isArray(cached.resolvedSources) ? cached.resolvedSources : [];
+      if (cnode.type === 'start') startNodeId = cnode.id;
+      const cachedWired = wiredSources(cnode.type, cachedSources);
       // A cached node keeps the position it was given on the earlier pass, so
       // the layout only records its column; later steps place against that.
       const cachedPosition = cnode.position || null;
-      if (cachedPosition) layout.note(cnode.id, cachedSources);
+      if (cachedPosition) layout.note(cnode.id, cachedWired, columns.depths[i]);
       builtByIdx.push({
         node: cnode,
         stepType: cnode.type,
@@ -4615,8 +6204,8 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       emit({
         phase: 'step', status: 'done', stepIndex: i, stepType: cnode.type, label: cached.label, action: 'cached',
         nodeId: cnode.id, nodeType: cnode.type,
-        position: cachedPosition || layout.place(cnode.id, cachedSources),
-        sources: cachedSources,
+        position: cachedPosition || layout.place(cnode.id, cachedWired, columns.depths[i]),
+        sources: cachedWired,
       });
       continue;
     }
@@ -4639,9 +6228,13 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       stepType = ex.type;
       // Inherit sources from existing edges.
       sourcesRaw = (existingSourcesByTarget.get(existingNodeId) || []).slice();
-      // String-form keeps don't carry a prompt — fall back to the first user
-      // message stored in the node's chat for cascade-rebuilds.
-      stepPrompt = firstUserPromptFromNode(ex);
+      // String-form keeps don't carry a prompt. A cascade-rebuild is a rebuild
+      // of the node AS IT STANDS, so it is driven by what the node was LAST
+      // asked to be, with its whole chat inherited below as history. Using the
+      // FIRST message here rebuilt refined nodes from a superseded request —
+      // dropping every later correction and re-asking questions the user had
+      // already answered.
+      stepPrompt = latestPromptFromNode(ex);
       connectionId = ex?.data?.config?.connectionId || null;
       label = ex?.data?.label || labelFor(stepType);
     } else {
@@ -4695,36 +6288,49 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
     // references stay valid; ADD gets a fresh id. Preserve position on rebuild
     // so the editor doesn't jump nodes around.
     const nodeId = (action === 'add' || !existingNodeId) ? newNodeId(stepType, i) : existingNodeId;
+    if (nodeType === 'start') startNodeId = nodeId;
+    // What this node hangs off on the canvas: its resolved sources, plus the
+    // start node for a data source that named none. Placement and the live
+    // preview's edges both read this; the node's own build still sees only
+    // `resolvedSources` (a data source has no upstream data to build from).
+    const wired = wiredSources(nodeType, resolvedSources);
     // A node that already lives on the canvas keeps where the user put it; only
     // its column is recorded, so nodes built downstream of it still land right.
     const keepsPosition = action !== 'add' && existing?.position;
     const position = keepsPosition
-      ? (layout.note(nodeId, resolvedSources), existing.position)
-      : layout.place(nodeId, resolvedSources);
+      ? (layout.note(nodeId, wired, columns.depths[i]), existing.position)
+      : layout.place(nodeId, wired, columns.depths[i]);
 
     emit({
       phase: 'step', status: 'running', stepIndex: i, stepType, label, action,
-      nodeId, nodeType, position, sources: resolvedSources,
+      nodeId, nodeType, position, sources: wired,
     });
 
     // ── KEEP: reuse the existing node verbatim. No builder run.
+    //
+    // Verbatim except for what a DATA SOURCE says its table holds, which is
+    // re-read: that snapshot is the one thing here that another node in this
+    // same workflow can have invalidated since the last build.
     if (action === 'keep') {
+      let kept = existing;
+      try { kept = await refreshKeptSourceNode(existing, helpers); }
+      catch (err) { console.warn(`[build] could not re-read kept source "${existing.id}": ${err.message}`); }
       emit({
         phase: 'step', status: 'done', stepIndex: i, stepType, label, action: 'keep',
-        nodeId, nodeType, position, sources: resolvedSources,
+        nodeId, nodeType, position, sources: wired,
       });
       const keepEntry = {
-        node: existing,
+        node: kept,
         stepType: nodeType,
         resolvedSources,
         action: 'keep',
         prompt: stepPrompt,
         stepIndex: i,
-        label: existing.data?.label || label,
+        label: kept.data?.label || label,
       };
       builtByIdx.push(keepEntry);
-      builtStepsOut[i] = { node: existing, resolvedSources, action: 'keep', prompt: stepPrompt, label: keepEntry.label };
-      currentOutputSchema.set(existing.id, getOutputSchema(existing));
+      builtStepsOut[i] = { node: kept, resolvedSources, action: 'keep', prompt: stepPrompt, label: keepEntry.label };
+      currentOutputSchema.set(kept.id, getOutputSchema(kept));
       continue;
     }
 
@@ -4752,7 +6358,10 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       for (const m of priorChat) if (m && m.text) stepChat.push({ ...m });
       // For an explicit modify with a new prompt, record the new ask in
       // chat so the conversation reflects the change the user requested.
-      if (action === 'modify' && stepPrompt && stepPrompt !== firstUserPromptFromNode(existing)) {
+      // Compared against the node's LATEST ask: re-sending what the node was
+      // most recently built from is not a new request, and appending it again
+      // would grow the chat by a duplicate on every plan.
+      if (action === 'modify' && stepPrompt && stepPrompt !== latestPromptFromNode(existing)) {
         pushUserMsg(stepChat, stepPrompt, { ref: 'modifyRequest' });
       }
     } else {
@@ -4775,6 +6384,8 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
     }
 
     let config;
+    let stepStarted = 0;
+    let stepLabel = '';
     try {
       const ctx = {
         stepPrompt: stepPrompt || label || '',
@@ -4793,7 +6404,7 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
         pendingSkill: (plan.pendingSkills && (plan.pendingSkills[i] || plan.pendingSkills[nodeId])) || null,
         action,
         bypassSkills: !!(plan.skipSkills && (plan.skipSkills[i] || plan.skipSkills[nodeId])),
-        // Scope for any file this step writes (local NeDB collections).
+        // Scope for any file this step writes (local DuckDB tables).
         workflowId: scopedWorkflowId,
         // This step's finished-by-Continue AI calls, as { [stage]: result }.
         // The builder returns each at its exact call site instead of re-asking
@@ -4801,8 +6412,17 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
         resumedCalls: (plan.resumedCalls && (plan.resumedCalls[i] || plan.resumedCalls[nodeId])) || null,
       };
       const fn = builderFor(stepType);
+      // Each step of a plan build is timed on its own, same as a single-node
+      // build from chat — a plan's wait is the sum of its steps, and this is
+      // what says which one owns it.
+      stepStarted = Date.now();
+      stepLabel = `step ${i + 1}/${plan.steps.length} ${stepType} ${nodeId || ''}`.trim();
+      buildTimings.reset();
+      console.log(`[build] ${stepLabel} — starting`);
       config = await fn(ctx);
+      buildTimings.report(stepLabel, Date.now() - stepStarted);
     } catch (err) {
+      if (stepStarted) buildTimings.report(`${stepLabel} — ${err?.isClarificationNeeded ? 'paused for a question' : 'failed'}`, Date.now() - stepStarted);
       if (err && err.isClarificationNeeded) {
         err.stepIndex = i;
         err.stepType = stepType;
@@ -4847,13 +6467,6 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
     // Stash the most recent planner prompt — used as the cascade-rebuild
     // fallback when this node has no user-message in its chat (legacy).
     config.builderPrompt = stepPrompt || '';
-    // A node this build just wrote has never run: its target table is a name in
-    // the config and nothing more, whether this is a first build or a rebuild
-    // that retargeted an already-executed node. Readers (the Data Preview)
-    // check this before querying that table; executeNode sets it true.
-    if (nodeType === 'transformer' || nodeType === 'join' || nodeType === 'output') {
-      config.executed = false;
-    }
 
     const node = {
       id: nodeId,
@@ -4883,7 +6496,7 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
 
     emit({
       phase: 'step', status: 'done', stepIndex: i, stepType, label, action,
-      nodeId, nodeType, position, sources: resolvedSources,
+      nodeId, nodeType, position, sources: wired,
     });
   }
 
@@ -4902,7 +6515,8 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
   const keyOf = (pos) => `${Math.round((pos?.x || 0) / 5)}:${Math.round((pos?.y || 0) / 5)}`;
   for (let i = 0; i < builtByIdx.length; i++) {
     const b = builtByIdx[i];
-    let pos = b.node.position || layout.place(b.node.id, b.resolvedSources);
+    let pos = b.node.position
+      || layout.place(b.node.id, wiredSources(b.node.type, b.resolvedSources), columns.depths[b.stepIndex]);
     let k = keyOf(pos);
     if (placedKeys.has(k)) {
       pos = layout.nextFreeIn(b.node.id, (p) => placedKeys.has(keyOf(p)));
@@ -4940,25 +6554,50 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
     nodes: finalNodes.map((n) => ({
       id: n.id, type: n.type, position: n.position, label: n.data?.label || labelFor(n.type),
     })),
-    edges: finalEdges.map((e) => ({ id: e.id, source: e.source, target: e.target })),
+    edges: finalEdges.map((e) => ({
+      id: e.id, source: e.source, target: e.target, targetHandle: e.targetHandle || null,
+    })),
   });
 
   // ── executionSteps for the workflow doc — same shape WorkflowStepsEditor
-  // saves so the editor can round-trip without surprises.
+  // saves so the editor can round-trip without surprises: which node, and where
+  // in the run it sits. Everything else about a step is read from the node it
+  // names (see src/utils/workflowUtils.js).
   const finalExecutionSteps = builtByIdx.map((b, idx) => ({
-    id: `step-${b.node.id}`,
     nodeId: b.node.id,
-    nodeType: b.stepType,
-    nodeLabel: b.label || b.node.data?.label || labelFor(b.stepType),
-    customName: '',
-    description: b.prompt || '',
     order: idx,
-    config: b.node.data?.config || {},
   }));
+
+  // ── Which nodes have run: none of them.
+  //
+  // Every node here was just written, so each one that materialises something
+  // (a table, a collection, a file) describes an output that does not exist
+  // yet — a first build and a rebuild that retargeted an already-run node are
+  // the same case. Readers check this before querying that output; executeNode
+  // flips an entry to true (markNodeExecuted).
+  //
+  // It is a workflow field rather than a flag on each node so that a run is not
+  // an edit to the nodes: an open canvas would otherwise go dirty, auto-save,
+  // and add a version to the history whose entire content was this flag. See
+  // src/utils/executedNodes.js. A modify build carries nothing forward for the
+  // same reason it rewrites the nodes — whatever those nodes produced before
+  // was produced by different logic.
+  const MATERIALIZING = new Set(['transformer', 'join', 'output']);
+  const executedNodes = Object.fromEntries(
+    finalNodes.filter((n) => MATERIALIZING.has(n.type)).map((n) => [n.id, false]),
+  );
 
   // ── Persist.
   const wfDb = getDb('workflows');
   let workflowId = scopedWorkflowId;
+  // A modify keeps the workflow it was given, name included — only a new one
+  // needs a name of its own. Resolved here rather than when the plan was made:
+  // a build takes minutes, and what the name has to avoid is what exists when
+  // it lands.
+  let savedName = plan.mode === 'modify' && workflow
+    ? (workflow.name || 'New Workflow')
+    : await uniqueWorkflowName(plan.name, wfDb);
+
   if (plan.mode === 'modify' && workflow) {
     await wfDb.updateAsync(
       { $or: [{ id: workflowId }, { _id: workflowId }] },
@@ -4966,17 +6605,19 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
         nodes: finalNodes,
         edges: finalEdges,
         executionSteps: finalExecutionSteps,
+        executedNodes,
         updatedAt: new Date().toISOString(),
       } },
     );
   } else {
     const doc = {
       id: workflowId,
-      name: plan.name || 'New Workflow',
+      name: savedName,
       description: String(plan.description || '').trim(),
       nodes: finalNodes,
       edges: finalEdges,
       executionSteps: finalExecutionSteps,
+      executedNodes,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -4993,17 +6634,20 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
   // freshly-built workflow starts firing immediately.
   await registerStartTriggers({ nodes: finalNodes, workflowId, helpers, warnings });
 
+  // `savedName` throughout, not plan.name: when the requested name was taken
+  // the workflow was saved as "<name> 2", and the chat, the canvas and the
+  // caller all have to be told the name it actually has.
   emit({
     phase: 'done',
     workflowId,
-    workflowName: plan.name || workflow?.name || 'New Workflow',
+    workflowName: savedName,
     nodeCount: finalNodes.length,
     edgeCount: finalEdges.length,
   });
 
   return {
     workflowId,
-    workflowName: plan.name || workflow?.name || 'New Workflow',
+    workflowName: savedName,
     workflowDescription: plan.mode === 'modify'
       ? (workflow?.description || '')
       : String(plan.description || '').trim(),
@@ -5023,11 +6667,17 @@ module.exports = {
   buildNodeConfig,
   noteNodeContext,
   computeEdgesFromFinalSteps,
+  // Canvas placement — exported alongside the edge derivation it has to agree
+  // with, so both can be exercised without running a build.
+  planColumnDepths,
+  createLayout,
   summarizeWorkflowAsSteps,
   loadNodeDocs,
   loadChatPromptDocs,
   loadSkillDocs,
   nodeDocsAsPromptSection,
+  nodeTypeDocsAsPromptSection,
+  propagateSourceSchema,
   chatPromptDocsAsPromptSection,
   skillDocsAsPromptSection,
   pickRelevantSkillDocs,

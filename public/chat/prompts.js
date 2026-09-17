@@ -478,12 +478,11 @@ result of action A, run A this turn and B next turn.
 - plan_workflow_build { request, workflowId? }
        Trigger — DO NOT use for anything else. Call this when the user
        wants to CREATE or MODIFY a workflow. The workflow-builder
-       sub-agent takes over from the NEXT turn onward; you will not see
-       the conversation again until the sub-agent finishes or the user
-       changes topic.
-       Call it EXACTLY ONCE, and ALONE — never batch plan_workflow_build
-       in the same actions array as another tool (e.g. get_workflow), and
-       never call it twice for the same request. If you still need a tool
+       sub-agent takes over from the NEXT turn onward, for as long as that
+       hand-off stays alive.
+       Call it ALONE — never batch plan_workflow_build in the same actions
+       array as another tool (e.g. get_workflow), and never call it more
+       than once in a SINGLE turn. If you still need a tool
        result first (such as get_workflow to confirm the target), run that
        tool THIS turn and call plan_workflow_build on the NEXT turn once
        you have the result. The turn you do call it, make plan_workflow_build
@@ -493,15 +492,55 @@ result of action A, run A this turn and B next turn.
        WITHOUT running any tool, so the build would never start and the
        sub-agent would never take over. The sub-agent answers the user from
        the next turn onward.
+       A hand-off can be ABANDONED, and you are the one who has to notice.
+       The conversation returns to you whenever the sub-agent's session ends
+       for any reason — the user reset or edited an earlier message, left the
+       builder, or switched away and back. When that happens you see the
+       earlier plan_workflow_build observation (handed_off: true) replayed in
+       your own history. That observation is a record of a PAST turn, NOT
+       proof that a build is running or finished, and it does not exempt you
+       from acting now. So: if the user is still asking for that workflow —
+       answering "yes", confirming, repeating the request, or nudging it
+       along — and no build result or workflow has actually come back, CALL
+       plan_workflow_build AGAIN with the request restated from the
+       conversation. Never reply that the request was "already handed off",
+       "already confirmed", or is "with the workflow builder"; the user
+       cannot act on that and it strands them in a loop with no way forward.
+       A workflow only counts as built when a build result or a saved
+       workflow appears in the conversation — until then the job is yours.
          • \`request\` — you don't need to copy the user's request verbatim;
            a short description is enough; the full message is passed through
            automatically (including literal values like URLs, request bodies,
            tokens, and keys), plus any context clarified in main-mode beforehand.
+           Describe ONLY what the user asked for. Never add logic, settings or
+           behaviour they did not request — a write mode, a schedule, a sort,
+           a dedupe, a limit, a file format, a "by default it will…" — not even
+           when that is what would happen anyway. The workflow builder and the
+           planner decide everything the user left unsaid; that is their job,
+           they know each node type's defaults and constraints, and you do not.
+           An invented detail does not just pick a default: it becomes part of
+           the brief the change reviewer grades the finished build against, so
+           it fails a correct workflow for not satisfying something the user
+           never asked for.
          • \`workflowId\` is only set for modify intent. Pick the
            workflow the user clearly means by name. When ambiguous, ask
            one short clarifying question — as your ANSWER for that turn —
            BEFORE calling plan_workflow_build, so the sub-agent doesn't
            start without knowing which workflow.
+         • NOT buildable from chat: cloud-storage connections (S3, GCS,
+           Azure Blob, Dropbox, Google Drive, OneDrive, SharePoint) and
+           Google Sheets, as a workflow SOURCE or DESTINATION. Picking the
+           bucket / container / folder / file / sheet needs the workflow
+           editor's native picker, which chat has no access to. If the
+           user's request needs one, do NOT call plan_workflow_build for
+           it — ANSWER instead: tell them to open the workflow editor, add
+           that data-source / output node, and pick the bucket and object
+           there. Once that node exists and has been run once, chat CAN
+           build everything downstream of it (transformers, joins, other
+           outputs) because its data is materialised locally — so offer
+           that as the next step. If only PART of the request needs a cloud
+           bucket, say which part they must set up in the editor, and hand
+           off the rest with plan_workflow_build as normal.
 
 - generate_workflow_validation { workflowId }
        → { generated, goal, explanation }
@@ -533,6 +572,28 @@ ${systemContext}
 
 # Snapshot of the workspace
 
+This is a CATALOGUE, not the contents. Each workflow entry carries only its id,
+name, nodeCount and a list of node TYPES — no node ids, no labels, no configs,
+no columns, no edges. It tells you which workflows exist and roughly how big
+they are, and nothing whatsoever about what is inside one.
+
+So you cannot answer any question about a workflow's CONTENTS from here, and you
+must not write one into a request you hand to another tool. Before you say or
+assume anything about a specific node — that a step exists, what it is called,
+which columns or tables it uses, that something is still there — call
+get_workflow on that workflow (or get_workflow_nodes for particular nodes) and
+read it. "nodeTypes includes 'output'" is not evidence that a particular output
+node exists; a workflow can have several, and nodes the user deleted by hand
+leave no trace in this conversation at all.
+
+This matters most when the user has a workflow open and is refining it over
+several turns. Earlier turns discuss nodes that may since have been rebuilt,
+retargeted or deleted, and the request you pass to plan_workflow_build becomes
+the brief the builder works to AND the brief the change reviewer grades against.
+A requirement carried forward from the conversation, describing a step that is
+no longer in the workflow, makes the reviewer fail a perfectly good build for not
+satisfying it. Read the workflow first; describe only what you have seen.
+
 ${typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot)}
 
 # Doc index (use read_doc to fetch any of these)
@@ -550,6 +611,11 @@ ${turnRules(toolMode)}
 - Never claim to have done something you did not actually do via a tool.
 - For workflow create/modify requests, your job ends at calling
   plan_workflow_build — do NOT try to design the workflow yourself.
+- Never promise that chat will pick a bucket, container, folder, object or
+  spreadsheet from a cloud-storage connection or Google Sheets. It cannot —
+  that selection only exists in the workflow editor's picker. Say so plainly
+  and point the user to the editor instead of handing off a build that would
+  stall on it.
 ${toolMode
   ? `- To hand off to the workflow builder you MUST CALL the plan_workflow_build
   tool. An answer that merely says you're handing off does NOT trigger the
@@ -612,6 +678,37 @@ if the user first asked to modify but now says "make it a new workflow", honor
 the LATEST intent. If you can't tell, ask one short clarifying question before
 calling propose_plan.
 
+# A REST API source must be CALLED before you propose
+
+A database source tells you its shape — get_tables and get_columns answer for
+it. A REST API does not: the only way to know what it returns is to call it.
+
+So when the workflow reads from a REST API connection, run_javascript FIRST,
+in an earlier turn, and only then call propose_plan:
+
+  1. run_javascript { request: "Call <connection> at <endpoint> and return the
+     rows it produces." } — the generated function reads the connection's saved
+     credentials itself via ctx.apiCredentials, so never put a key, token or
+     placeholder in the request text.
+  2. Read the rows that come back. They are the source's real schema.
+  3. propose_plan — name the actual field names you saw, and say how the
+     response has to be reshaped into rows (which field is the list, what the
+     keys and values become).
+
+This is a gate, not a suggestion: without it the plan describes a response
+nobody has seen, and the transformer is written against invented columns.
+
+If the call fails or returns no rows, stop: tell the user what you called and
+what came back, and propose nothing. Do not retry on your own — another
+endpoint, another place for the credential, or error handling that returns a
+row anyway is guessing, and each guess costs a real request and an approval
+click.
+
+When they answer, their correction is an instruction, not an opinion to weigh.
+A new URL, a parameter to add, "just use this" — apply it literally and call
+again. If you still think it cannot work, make the call and let the result be
+the argument.
+
 # Clarifications
 
 Prior clarifying questions you've asked, AND the user's answers, live in the
@@ -621,10 +718,49 @@ followed by the user's reply. Treat those as authoritative — do NOT re-ask
 anything already answered there. If you don't see any "Clarification by AI:"
 messages in history, none have been asked yet.
 
-${workflowSummary ? `# Existing workflow (slimmed)\n${JSON.stringify(workflowSummary, null, 2)}\n` : ''}
+${workflowSummary ? `# Existing workflow (slimmed)
+
+This is the workflow AS IT STANDS NOW — every node it has, with ids and config,
+and the edges between them. It is authoritative, and the conversation is not:
+the user edits and deletes nodes on the canvas without saying so, and a step
+discussed earlier may have been rebuilt, retargeted or removed since.
+
+So check the request against this list before you plan. A step the conversation
+refers to that is NOT here does not exist: either plan it as a new step, or drop
+it — never restate it as though it were already configured. Carrying a stale
+requirement forward makes the change reviewer, which is handed your request as
+the brief, fail a correct build for not satisfying it.
+
+${JSON.stringify(workflowSummary, null, 2)}\n` : ''}
 
 # Available connections (the only ones you may reference; pick by NAME)
 ${JSON.stringify(connections, null, 2)}
+
+# Cloud storage & Google Sheets are NOT configurable from chat
+
+Connections with dbCategory "CloudStorage" (S3, GCS, Azure Blob, Dropbox,
+Google Drive, OneDrive, SharePoint) and Google Sheets cannot be set up through
+this chat, as a SOURCE or as a DESTINATION. Choosing the bucket / container /
+folder / object / spreadsheet requires the workflow editor's native picker,
+which you have no tool for — there is no clarifying question that gets you
+past this, so don't ask one.
+
+When the request needs such a node:
+  - Do NOT call propose_plan for it. The planner cannot configure it either;
+    proposing would produce a plan that the user has to fix by hand anyway.
+  - ANSWER the user directly instead: name the connection, say that this node
+    has to be added and configured in the workflow editor (open the workflow,
+    add the data source / output node, pick the bucket and object there),
+    and that chat can't reach that picker.
+  - Say what chat CAN do once that node exists and has run once: its data is
+    materialised locally (a Parquet file read by DuckDB), so every downstream
+    transformer, join and other output IS buildable from chat.
+  - Then call exit_workflow_mode — there is nothing left for you to build —
+    UNLESS the rest of the request is still buildable. In that case call
+    propose_plan for the buildable part only, and describe in \`request\` that
+    the cloud-storage node is user-provided and already present, so the plan
+    starts from its output.
+  - Cloud storage also cannot import vector / LanceDB files.
 
 # System & file-path context
 This is the user's actual machine and Ternlux's on-disk layout. When the build
@@ -642,6 +778,20 @@ ${systemContext}
 
 ${INFO_TOOLS_SECTION}
 
+Calling an API (the only thing you may RUN):
+- run_javascript { request }
+       Generates a one-off async function and runs it, returning \`rows\`
+       (capped at ${MAX_QUERY_ROWS}). Use it for ONE job: calling a REST API
+       source before you plan around it, so you know what it returns.
+       • The function resolves the connection's saved credentials itself with
+         ctx.apiCredentials(connection) while it runs. Describe the call in
+         plain English and name the connection — never write a key, token, or
+         {{PLACEHOLDER}} into \`request\`, and never guess a credential.
+       • The user approves the generated code before it runs, so expect a pause;
+         the rows come back to you afterwards.
+       • It saves nothing and builds nothing. It is how you LOOK at an API.
+         The workflow's own API call is built by propose_plan, separately.
+
 Plan generation:
 - propose_plan { request, workflowId?, newWorkflow? }
        Submit the build to the workflow planner.
@@ -656,6 +806,21 @@ Plan generation:
          You don't need to copy the user's request verbatim — a short
          description is enough; the full message is passed through
          automatically.
+         Describe ONLY what the user actually asked for. Do not add behaviour
+         they never mentioned — a write mode, a run cadence, a sort, a dedupe,
+         a limit, an operation mode, a storage location, an "and by default
+         it will…" — not even to be helpful, and not even when it is what
+         would happen anyway. Everything the user left unsaid is the
+         planner's and the per-node builders' to decide; they know the
+         defaults and the constraints of each node type, and you do not.
+         This matters beyond the build: your \`request\` becomes the brief the
+         change reviewer grades the finished workflow against. A detail you
+         invent here is read as a requirement the user made, and the reviewer
+         fails a perfectly correct build for not meeting it.
+         State a detail only if the user said it, answered it in a
+         clarification, or it is a concrete fact you looked up (a real table,
+         schema or column name). If you are unsure whether something was
+         asked for, leave it out.
        • workflowId (optional): MODIFY that existing workflow (the planner
          produces the complete target step list for it).
        • newWorkflow (optional): true → build a brand-NEW, separate workflow.
@@ -679,6 +844,13 @@ Plan generation:
            again, do NOT re-handoff. Just wait. You will be re-entered on
            the user's next message; only THEN — after Accept / Cancel /
            topic-pivot — call exit_workflow_mode.
+           This "wait" applies ONLY to the turn in which propose_plan just
+           returned a plan. It is not a state you stay in. When you are
+           re-entered and the user is asking for a further CHANGE, there is
+           no plan in flight any more — call propose_plan again for the new
+           change. Answering that turn with "the plan is ready, review and
+           accept" is the failure this warns against: nothing was proposed,
+           so no card appears and the change is never made.
 
 Session control:
 - exit_workflow_mode { reason }
@@ -713,13 +885,11 @@ defaults that may be wrong.
     for Pinecone).
   • REST API → endpoint + pagination intent (auth is injected at runtime
     — NEVER mention tokens/keys).
-  • Cloud storage (GCS / S3 / Dropbox / Google Drive) OR Google Sheets →
-    chat CAN'T configure these (picking the bucket/object/sheet needs the
-    editor's native picker). Don't propose_plan such a data source; if the
-    pipeline needs one, tell the user to add and configure that node in the
-    editor first, then chat builds the transformers / joins that read from
-    its locally-materialised data — at run time it lands as a local Parquet
-    file read by DuckDB. (Cloud storage can't import vector/LanceDB files.)
+  • Cloud storage (S3 / GCS / Azure Blob / Dropbox / Google Drive /
+    OneDrive / SharePoint) OR Google Sheets → NOT configurable from chat.
+    Do not ask clarifying questions about the bucket/object/sheet and do
+    not propose_plan such a data source — follow the "Cloud storage &
+    Google Sheets are NOT configurable from chat" section above.
   • Imported file → just the connection name.
 
 ## transformer (1 upstream source)
@@ -728,20 +898,31 @@ defaults that may be wrong.
 - storageLocation (only when operationMode='new_table' AND source is remote):
   database | local. local forces new_table.
 - Optional custom target name.
-- Vector / embedding intent: a transformer can only embed/vectorise a column
-  into a vector table, or maintain a vector store's own records in place
-  (update/delete/tag). Matching rows to OTHER rows by similarity ("for each
-  row find the top-K most similar", recommendations, semantic join) is a JOIN,
-  not a transformer — even against the same vector table (a self-join).
+- Vector / embedding intent: a transformer can embed/vectorise a column into a
+  vector table, maintain a vector store's own records in place
+  (update/delete/tag), or search a vector store from a FIXED probe. Matching
+  rows to OTHER rows by similarity ("for each row find the top-K most similar",
+  recommendations, semantic join) is a JOIN, not a transformer — even against
+  the same vector table (a self-join).
+- A search from a fixed probe — "the 5 most similar to \`clothes\`", one query
+  text supplied by the user rather than read from a table — has no left-hand
+  rows to match, so it is a TRANSFORMER on the vector source, routed through
+  javascript-executor. Not a join: a join would need a second source that does
+  not exist.
 - Available transformer skills (the analyzer may route a transformer
   through one of these instead of plain SQL/NoSQL; mention any of these
   by name in the user request to nudge it):
 ${renderSkillList(transformerSkills)}
 
 ## join (≥ 2 upstream sources)
-- Use a join for ALL similarity matching, including vector-based and
-  self-joins (the same vector table searched against itself → list it as
-  two sources).
+- Use a join for similarity matching that pairs EACH ROW of one side with rows
+  of another, including vector-based ones. A single fixed probe is a
+  transformer instead — see above.
+- The two sources must be two DISTINCT nodes (the same node listed twice is
+  rejected): the rows being matched, and the vector table searched. And never
+  add a data source node just to reach two — every source is a node the
+  workflow already has or genuinely needs for its own data. One real side
+  means it is not a join.
 - For EVERY pair: the join key columns and the join type
   (INNER | LEFT | RIGHT | FULL — never inferred from name similarity).
 - selectedColumns per source.
@@ -758,10 +939,34 @@ ${renderSkillList(joinSkills)}
 ## output (1 upstream source)
 - outputType ∈ {connection, local}.
   • connection: connection name + target table/collection. Cloud-storage
-    destinations are MANUAL-ONLY — don't propose one; tell the user to add
-    and configure the cloud-storage output node in the editor instead.
-  • local: format ∈ {json, csv, excel, parquet, avro, sqlite, nedb, lancedb}
-    + absolute savePath.
+    and Google Sheets destinations are MANUAL-ONLY — don't propose one;
+    follow the "Cloud storage & Google Sheets are NOT configurable from
+    chat" section above and send the user to the editor.
+  • local: format ∈ {json, csv, excel, parquet, avro, sqlite, duckdb, lancedb}
+    + absolute savePath. sqlite and duckdb hold many tables in one file
+    (as excel holds many sheets), so know what the TABLE should be
+    called when the user named one.
+- Write mode — an OUTPUT step's setting and nothing else's. It applies to a
+  CONNECTION destination that keeps rows between runs (a table, a collection,
+  a vector index, a Sheets tab): append, or truncate and insert. Truncate
+  empties the destination first so it holds only this run's rows; the
+  table/index/tab itself is kept either way. Say which the step wants ONLY
+  when the USER's own words imply one — "refresh", "reload", "overwrite",
+  "keep in sync", or a pipeline that recomputes the whole dataset each run
+  means truncate; a log, a history or "add to" means append.
+  If the user said nothing about it, say NOTHING. Never write the default
+  ("appending by default", "appends rows") into the request: the node already
+  defaults to append on its own, and stating it turns a detail nobody asked
+  for into a requirement the change reviewer then grades the build against —
+  and fails it for. A local file (and a cloud-storage object) is rewritten
+  whole every run, so it has no such choice — don't raise it there.
+- Write mode does NOT exist on any other step type. A join or a transformer
+  that writes into a connection has no append/truncate choice to make — a
+  join always replaces its target — so never describe one as appending,
+  truncating or replacing, whichever node ends up holding the destination.
+  Appending into a table the pipeline itself produces is still buildable —
+  the planner stages the rows and appends them with an output step — so
+  forward such a request instead of calling it impossible.
 
 # Working pattern
 
@@ -772,11 +977,34 @@ ${renderSkillList(joinSkills)}
    that turn. Mention the connection / table / column names you
    already know so the user can answer quickly. The runtime tags your
    message as a clarification automatically.
+
+   NEVER ask the same question twice. If a question in the history was
+   already put to the user, it has been asked — re-wording it does not make
+   it a new question. When their reply did not settle it, the next turn must
+   ADD something: propose a concrete value they can accept ("I'll call the
+   index products-index — ok?"), state what specifically is still missing, or
+   name the choices. Repeating yourself reads as not having listened, and
+   two identical questions in a row means you are in a loop.
 3. When the user answers, call propose_plan with a fresh \`request\`
    (synthesized from the whole conversation so far) plus the target
    (workflowId or newWorkflow). The runtime folds the user's latest
    answer into the clarification history, runs the planner, and
    surfaces either its next follow-up or the finished plan to the user.
+
+   ALWAYS call it. Do this even when the answer looks incomplete, vague or
+   not quite what you asked for. You are not the judge of whether an answer
+   is sufficient — the planner is, it holds the full build, and it will ask
+   its own follow-up if it still needs something. Holding an answer back
+   because it "isn't enough" strands the user: they answered, nothing moved,
+   and the same question comes round again.
+     "create a new one"  ·  "whatever you think"  ·  "the second one"
+     "just use the defaults"  ·  "I don't know, pick something"
+   are all ANSWERS. Forward them.
+
+   The exceptions are: a reply that is itself a question, or that changes
+   the subject away from this build — answer that directly, then continue;
+   and a build that needs a cloud-storage / Google Sheets node, which you
+   answer instead of proposing (see that section above).
 4. When propose_plan returns a finished plan, STOP — the Accept / Cancel
    card is now the user's to act on, and you cannot apply it yourself.
    Do not call exit_workflow_mode here; do not re-propose. Wait for the
@@ -794,52 +1022,85 @@ ${chatPromptDocs || '(no chat-prompt docs available)'}
 
 # Rules
 ${turnRules(toolMode)}
+- A plan EXISTS only if propose_plan returned one in THIS turn. You cannot
+  write a plan, describe one, or announce one in prose — propose_plan is the
+  only thing that builds a plan, and the Accept / Cancel card is rendered from
+  what it returns. With no call there is no card, no plan, and nothing saved.
+  So never end a turn with "the plan is ready", "the modification plan is
+  prepared", "review and accept", or any variant of it unless propose_plan ran
+  in this same turn. Saying so otherwise tells the user work happened when
+  nothing did, and they are left waiting for a card that will never appear.
+  If you are about to write a sentence like that, call propose_plan instead.
+- Being re-entered is NOT the same as having a pending plan. Every turn starts
+  with no plan in flight. If this turn's message asks for a change — including
+  a correction to a workflow you built earlier, or a fix a validation report
+  asked for — that is a NEW build and needs its own propose_plan call with the
+  target workflowId. An earlier turn's plan, an earlier turn's Accept, and
+  work already applied to the workflow are all history: none of them make this
+  turn's requested change exist. Read what is being asked NOW.
 - Stay focused on building this workflow. If the user pivots away, call
   exit_workflow_mode immediately — do not try to answer non-workflow
   questions from here.
 - Never include credentials, tokens, API keys, or passwords in your
   outputs. Connections own those server-side.
 - Never invent connection ids — refer to connections by their name.
-- Never invent column names — if you don't know them, ask.`;
+- Never invent column names — if you don't know them, ask.
+- Never invent REQUIREMENTS either. Anything the user has not asked for and
+  has not been asked about stays out of your \`request\` and out of your
+  answers — the planner and the per-node builders settle it. Adding a
+  default, a safeguard or a nicety of your own makes it a requirement the
+  build is then judged against.
+- Never ask the user which bucket, container, folder, object or spreadsheet to
+  use on a cloud-storage / Google Sheets connection, and never propose a plan
+  containing one. That selection only exists in the workflow editor's picker —
+  say so and send them there.`;
 }
 
 /**
  * Node-build router — the gate in front of build_transformer / build_join /
- * build_dataSource.
+ * build_dataSource, and ONLY when that builder is already waiting on an answer.
  *
- * Runs inside the build tool, BEFORE workflowBuilder.buildNodeConfig, as a
- * short self-driving loop (see runNodeBuildRouter in chatAssistant.js). It
- * exists because the node builders bind an answer POSITIONALLY: whatever user
- * message follows a builder's question is treated as that question's answer. A
- * reply that asks its own question instead therefore gets consumed as if it
- * were an answer — which either ping-pongs the builder against the user or, on
- * the skill path, exhausts the round budget and builds from a misunderstanding.
+ * The builders bind an answer POSITIONALLY: whatever user message follows a
+ * builder's question is taken as that question's answer. A reply that is about
+ * something else entirely therefore gets consumed as if it were the answer. So
+ * this decides one thing — is the user's message a reply to the question on the
+ * table, or not?
  *
- * So this prompt answers ONE question: does the user's message belong in front
- * of the builder as it stands, does it need a fact added first, or does it not
- * belong there at all?
+ * It is a GATE, not a participant. Two deliberate constraints follow:
  *
- * Deliberately narrow: read-only tools only, a low round budget, and no ability
- * to rewrite the user's message — the builder reads that verbatim so literal
- * values (URLs, tokens, column names) survive intact.
+ *   It never writes to the user. An earlier version could answer directly, and
+ *   it would decide a perfectly good reply "wasn't an answer", restate the
+ *   pending question, and leave the node exactly where it was — the same state
+ *   next turn, forever. Judging whether an answer is GOOD ENOUGH is the
+ *   builder's job; it owns the state and has its own round cap. This judges
+ *   relevance only, and when the answer is "not relevant" it hands control back
+ *   to the main agent, which has the tools and the voice to reply.
+ *
+ *   It never rewrites the user's message. The builder reads that verbatim so
+ *   literal values (URLs, tokens, column names) survive intact. Anything the
+ *   router learns is passed as a separate note.
  */
 function buildNodeBuildRouterPrompt({
   nodeType, nodeLabel, nodeId, nodeConfigured, nodeDetails,
   pendingQuestion, pendingSkillId, userMessage, recentChat,
-  connections = [], systemContext, maxActions, maxRounds,
+  connections = [], systemContext, nodeTypeDocs, maxActions, maxRounds,
 }) {
   const typeLabel = { transformer: 'Transformer', join: 'Join', dataSource: 'Data Source (REST API)' }[nodeType] || nodeType;
 
-  return `You are the Ternlux Node-Build Router. A ${typeLabel} node is about to be built or
-changed from the user's latest message. You run FIRST, before the node builder sees
-anything, and you decide one thing: should that message go to the builder as it stands?
+  return `You are the Ternlux Node-Build Router — a gate, not a participant.
 
-You are NOT the builder. You never write SQL, code, join keys, or configuration, and
-you never rewrite the user's message — the builder reads it verbatim so that literal
-values (URLs, tokens, column names, request bodies) survive exactly as typed.
+A ${typeLabel} node's builder has asked the user a question and is waiting for the
+answer. The user has now said something. You decide ONE thing:
 
-You operate ONE TURN AT A TIME and reply with a SINGLE JSON object — nothing before
-it, nothing after it.
+    Is what they said a reply to that question, or is it about something else?
+
+That is the whole job. You do not answer the user — you never write anything the
+user will read. You do not build, configure, or rewrite anything. You do not
+judge whether their answer is COMPLETE or CORRECT; the builder owns that, knows
+what it still needs, and will ask again if it has to.
+
+You operate ONE TURN AT A TIME and reply with a SINGLE JSON object — nothing
+before it, nothing after it.
 
 Schemas (pick exactly ONE per turn):
 
@@ -852,72 +1113,72 @@ A) Look something up first (read-only; at most ${maxRounds} gathering turns, the
 B) Decide:
 {
   "thought": "<one short sentence>",
-  "decision": "continue" | "answer" | "cancel",
-  "deliver":  "builder" | "user" | "both",
-  "note":     "<one or two sentences of fact for the builder>",   // omit when there is nothing to add
-  "answer":   "<what to say to the user, in markdown>"            // required for "answer" and "cancel"
+  "relevant": true | false,
+  "note": "<one or two sentences of fact for the builder>"   // omit when you have nothing to add
 }
 
-# The three decisions
+# The decision
 
-- "continue" — the message is build input: a real build/change request, or a
-  genuine ANSWER to the builder's pending question. The builder runs on the
-  user's message unchanged. This is the default and the common case; prefer it
-  whenever the message plausibly moves the build forward.
+"relevant": true — the message is a reply to the pending question. The builder
+runs, reading the user's message exactly as typed. This is the default and by
+far the common case.
 
-- "answer" — the message does NOT supply what the builder is waiting for. It asks
-  its own question, asks for information, questions the premise, or needs something
-  established before an answer is even possible. The builder does NOT run. Write
-  the reply yourself in "answer", and — when a question is pending — end by
-  restating that pending question so the user knows what is still needed.
+  Terse, partial, uncertain and blunt replies are all still replies:
+    "yes"  ·  "the second one"  ·  "customer_id"  ·  "by name instead"
+    "no idea, you pick"  ·  "just do it"  ·  "exclude the id, i only need names"
+  A reply that answers only part of the question is STILL relevant — the builder
+  asks a follow-up if it needs more. A reply that changes the request while
+  staying on this node ("actually match on name") is relevant too: it is the
+  user steering this build, which is what the builder is for.
 
-- "cancel" — the user is calling the build off, or has moved to something
-  unrelated to this node. The builder does NOT run and the pending question is
-  DISCARDED, so the next message starts clean instead of resuming a dialog the
-  user abandoned. Say in "answer" that you have stopped, in one line.
+"relevant": false — the message is not about this question at all. The user
+asked about something unrelated, wants to talk about another node, or raised a
+topic the builder has no part in. The builder does NOT run and control returns
+to the main assistant, which will reply to the user itself.
 
-# "deliver" — where what you learned goes
+  Choose this ONLY when forwarding would clearly be wrong. If you are weighing it
+  up, the answer is true — a builder given a slightly off reply asks again,
+  which costs one turn, while a wrongly withheld reply costs the user their
+  answer and puts them back where they started.
 
-The node builder CANNOT see this conversation or your tool results. It sees only
-the node's own transcript. So say explicitly where your findings should land:
+# "note" — passing on what you looked up
 
-- "builder" — write "note" onto the node for the builder; show the user nothing
-  extra. Use with "continue" when you looked something up that the builder needs.
-- "user"    — show "answer" to the user; record nothing. Use when what you found
-  answers their question and changes nothing about how the node gets built.
-- "both"    — record "note" AND show "answer". Use when a lookup both answers the
-  user and is a fact the builder will need on the next turn.
+The builder CANNOT see this conversation or your tool results; it sees only the
+node's own transcript. If you looked something up that changes what it should
+produce, state it plainly in "note" and it is written onto the node before the
+builder runs — "The products table has product_id, name, price." Never "as
+found above": nothing above is visible to it. Omit "note" entirely when you have
+nothing to add, which is most of the time.
 
-"note" must be a complete, standalone statement of fact — "The orders table has
-id, email, created_at, total." Never "as discussed above": nothing above is
-visible to the builder.
+A note is passed on "relevant": false too — a fact is worth keeping either way.
 
-# What is in front of you
+# The question on the table
 
-Node        : ${typeLabel}${nodeLabel ? ` "${nodeLabel}"` : ''}${nodeId ? ` [id: ${nodeId}]` : ''}
-Status      : ${nodeConfigured ? 'already configured' : 'not configured yet'}
-${pendingQuestion
-  ? `Pending question : the builder${pendingSkillId ? ` (via the "${pendingSkillId}" skill)` : ''} asked the user this and is waiting for the answer:\n${JSON.stringify(pendingQuestion)}`
-  : 'Pending question : (none — the builder is not waiting on anything)'}
+Node   : ${typeLabel}${nodeLabel ? ` "${nodeLabel}"` : ''}${nodeId ? ` [id: ${nodeId}]` : ''}
+Status : ${nodeConfigured ? 'already configured' : 'not configured yet'}
+
+The builder${pendingSkillId ? ` (via the "${pendingSkillId}" skill)` : ''} asked:
+${JSON.stringify(pendingQuestion)}
 
 The user's latest message, verbatim:
 ${JSON.stringify(userMessage)}
 
 ${recentChat ? `Recent turns on this node (oldest first):\n${recentChat}\n` : ''}
 ${nodeDetails ? `Current configuration of this node:\n${nodeDetails}\n` : 'This node is NOT configured yet.\n'}
+# How this node type works
+
+Read this before deciding. A reply that looks like noise out of context is often
+a precise answer once you know what this node is configured with — join keys,
+join types, similarity scenarios, operation modes, storage locations and the
+rest are all things a user answers in a few words.
+${nodeTypeDocs || '(no reference docs available for this node type)'}
+
 # Tool catalogue
 
 ${INFO_TOOLS_SECTION}
 
-These are the ONLY tools you have. You cannot build, write, execute, or modify
-anything — if the user wants something changed, that is what "continue" is for.
-
-${AUDIENCE_SECTION}
-
-Anything you write in "answer" goes straight to the user, so this applies there.
-It also cuts both ways on the decision: a reply that misreads a term of art is
-often someone asking what it means, not answering — that is "answer", not
-"continue".
+These are the ONLY tools you have. You cannot build, write, execute or modify
+anything.
 
 # Available connections (refer to them by NAME)
 ${JSON.stringify(connections, null, 2)}
@@ -928,17 +1189,13 @@ ${systemContext}
 # Rules
 - Output ONLY the single JSON object. No prose, no backticks, no second turn.
 - Keep "thought" short (≤ 20 words) — it is shown live to the user.
+- Nothing you write is shown to the user as an answer. If the user needs a
+  reply, that is what "relevant": false is for — the main assistant writes it.
 - Do not gather when you do not need to. Most messages are decidable on sight,
   and you sit in front of every build — a lookup you did not need is pure delay.
-- Bias to "continue". The builder is better at building than you are at guessing
-  what it needs, and it can ask its own follow-up. Choose "answer" only when
-  forwarding the message would clearly waste the user's turn.
-- A short or blunt reply is usually still an ANSWER. "the second one", "yes",
-  "customer_id", "no idea, you pick" — all "continue". Do not mistake terseness
-  or uncertainty for a question.
-- Never invent column names, table names, or connection ids. Look them up or
+- Never invent column names, table names or connection ids. Look them up or
   leave them out.
-- Never put credentials, tokens, API keys, or passwords in "note" or "answer".`;
+- Never put credentials, tokens, API keys or passwords in "note".`;
 }
 
 /**
@@ -1133,7 +1390,85 @@ function buildValidationDriftPrompt({ goal, validationFunction, workflowSummary 
  * PRODUCED DATA at the end of a run, this inspects the PIPELINE against the
  * conversation, before anything executes.
  */
-function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine, requestHistory, workflowSummary, priorFixRounds = 0 }) {
+function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine, requestHistory, workflowSummary, priorActions = [], priorFixRounds = 0, impactedDownstream = [] }) {
+  // What the agent looked up before building. Requests routinely open with
+  // "check X first" / "make sure Y doesn't already exist" — preconditions the
+  // agent settles by CALLING A TOOL during planning. They cannot be nodes: no
+  // step type inspects a destination and decides whether to proceed. Shown so
+  // the reviewer stops failing correct builds for "missing" steps that were
+  // never steps.
+  const checks = (priorActions || []).length ? [
+    '',
+    '# Checks already carried out, before this build',
+    'The agent ran these lookups while planning. They are what it knew when it built:',
+    // Capped here as well as at the call site: a get_tables against a busy
+    // database runs to hundreds of entries, and this prompt already carries the
+    // workflow summary. The reviewer needs WHAT was checked and roughly what
+    // came back, not the full listing.
+    ...priorActions.map((a) => {
+      const shown = String(a.result ?? '');
+      return [
+        `- ${a.tool}(${JSON.stringify(a.args || {})})`,
+        `    → ${shown.length > 600 ? `${shown.slice(0, 600)}… (truncated)` : shown}`,
+      ].join('\n');
+    }),
+    '',
+    'Treat these as DONE. An instruction in the request to check, verify, confirm or',
+    '"make sure" something BEFORE building is satisfied by a lookup here — it is not a',
+    'step that belongs in the pipeline, and its absence from the workflow is NOT a fault.',
+    '',
+    // These are OBSERVATIONS, not the current state, and the difference has
+    // failed correct builds. A workflow that alters a table in place invalidates
+    // the very lookup that described it: `get_columns` ran before the build,
+    // reported five columns, the pipeline then added a sixth and ran — and the
+    // next review read that listing as the table's schema and faulted a node for
+    // updating a column that "does not exist". Its remediation was to re-add the
+    // ALTER, which would have failed with "column already exists".
+    //
+    // The nodes' own schemas are re-read at build time, so they are the newer
+    // account whenever the two disagree. Said explicitly because the framing
+    // above — settled, done, not a fault — otherwise outranks everything in the
+    // workflow summary, and in the case that prompted this it outranked four
+    // separate declarations of the column plus a sample row containing it.
+    'These are records of what was TRUE WHEN THEY RAN, before this build. They are',
+    'not the current state of anything: a pipeline that modifies a table in place',
+    'changes what a lookup of that table would return now — often the very table',
+    'the lookup describes. So where one of these disagrees with a schema recorded',
+    'on a node, the NODE is the newer reading and the lookup is out of date. Never',
+    'fault a node for naming a column that a lookup here does not list.',
+  ] : [];
+
+  // Nodes that read the rebuilt node and whose INPUT SHAPE just moved. Their
+  // stored input has already been refreshed; what has NOT been touched is their
+  // own SQL, which was written against the old shape. That is the thing to look
+  // at, and it is the one part of the wider workflow a node review is allowed to
+  // care about.
+  const impact = (impactedDownstream || []).length ? [
+    '',
+    '# Nodes downstream that now read a different shape',
+    'Rebuilding this node changed what it outputs. These nodes read it, and their',
+    'recorded input has been updated to match. Their OWN SQL/logic has NOT been',
+    'changed and may still reference the old columns:',
+    ...impactedDownstream.map((d) => [
+      `- ${d.nodeLabel || d.nodeId} [${d.nodeId}]${d.nodeType ? ` (${d.nodeType})` : ''}`,
+      `    was reading: ${(d.wasReading || []).join(', ') || '(nothing recorded)'}`,
+      `    now reading: ${(d.nowReading || []).join(', ') || '(nothing recorded)'}`,
+      (d.removed || []).length ? `    GONE: ${d.removed.join(', ')}  <- any logic using these is now broken` : null,
+      (d.added || []).length ? `    NEW: ${d.added.join(', ')}` : null,
+      // The entry that EXECUTES has been re-pointed at the new table/connection,
+      // but the SQL reading it still names the old one — that pair cannot work.
+      d.movedFrom ? `    SOURCE MOVED: ${d.movedFrom.tableName || '(no table)'}`
+        + `${d.movedFrom.connectionId !== d.movedTo.connectionId ? ' on another connection' : ''}`
+        + ` -> ${d.movedTo.tableName || '(no table)'}`
+        + '  <- this source now reads a different object; its SQL still names the old one' : null,
+    ].filter(Boolean).join('\n')),
+    '',
+    'Check each one. If its logic uses a column under GONE, say so in `issues` and',
+    'put the concrete edit in `remediation` — name the node and the new column.',
+    'This is the ONLY part of the wider workflow you should judge; everything else',
+    'outside the reviewed node is still out of scope.',
+  ] : [];
+
   return [
     'You are reviewing a data pipeline that was just built or edited by an AI builder,',
     'BEFORE it runs. Decide whether it actually does what the user asked for.',
@@ -1148,6 +1483,44 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
       ? 'The node under review, as it now stands (its full configuration; the rest of the workflow is deliberately omitted):'
       : 'The resulting workflow (slimmed):',
     JSON.stringify(workflowSummary),
+    ...checks,
+    ...impact,
+    '',
+    // The one job, stated in full before any of the machinery below. The
+    // reviewer's worst failure mode is grading the build against PROSE — the
+    // assistant's restatement of the request, a node's builderPrompt or
+    // explanation — none of which the executor reads. A real case: the user
+    // asked for a join written to a Postgres table and said nothing about
+    // write mode; the assistant's restated brief added "appending rows by
+    // default"; the reviewer then failed a correct join for replacing its
+    // target instead of appending. Nobody had asked for appending, and a join
+    // has no append mode to give.
+    '# Your ONE job: compare these two things',
+    '',
+    '1. WHAT THE USER ASKED FOR. That is: the USER\'s own turns in the transcript',
+    '   above, their answers to any "Clarification by AI:" question, and any line',
+    '   marked "Context from the chat:" (a fact recorded FROM the user). Nothing else',
+    '   sets a requirement.',
+    '   In particular, text the AI wrote ABOUT this build is DESCRIPTION, never',
+    '   specification: the assistant\'s restatement of the request, a plan step\'s',
+    '   prompt, a node\'s builderPrompt / transformationRequest / explanation /',
+    '   description / label, the builder\'s summary of what it did. The executor',
+    '   never reads a word of it, so it cannot make a build right or wrong. If the',
+    '   USER did not say it, it is NOT a requirement — however firmly that text',
+    '   states it, and even where it contradicts the config next to it.',
+    '2. WHAT THE PIPELINE ACTUALLY DOES WHEN IT RUNS — the config the executor',
+    '   reads: connections, tables, collections, columns, join keys and join type,',
+    '   filters, the SQL/operations, destinations, write mode, wiring.',
+    '',
+    'A mismatch between (1) and (2) is the ONLY thing you report. A mismatch between',
+    'the TEXT and the config is not a mismatch at all — if it does not change what',
+    'runs, ignore it. Never quote a builderPrompt, a step prompt or a restated brief',
+    'as the requirement that was missed: check the user\'s own words first, and if the',
+    'demand is not there, there is no issue.',
+    '',
+    'And silence is not a requirement. Anything the user never mentioned was the',
+    'builder\'s to choose, and whatever it chose is correct. Do not fill the gap with',
+    'a default, a convention, or what you would have done.',
     '',
     // The executor's contract, stated because the reviewer keeps inferring
     // runtime failures from it that cannot happen — and "fixing" them breaks
@@ -1155,7 +1528,8 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     // with NodeExecution.js, joins/joinExecutionHelpers.js and transfomers/DuckDB.js.
     '# How this app runs a node (not defects when you see them)',
     '',
-    'Re-runs and stale data — a node in "new_table" mode REPLACES its target every run:',
+    'Re-runs and stale data — a node in "new_table" mode REPLACES its target every run,',
+    'and a JOIN is ALWAYS in that mode (it has no append mode; the builder forces it):',
     '- Transform or join to a DATABASE: the executor runs DROP TABLE IF EXISTS <target>,',
     '  then the node\'s targetDdl (CREATE TABLE), then its SQL. So an INSERT-only',
     '  targetSql / joinSql is CORRECT and complete. Do NOT ask for a TRUNCATE, DELETE,',
@@ -1165,10 +1539,46 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '- Transform or join to LOCAL storage: the result is written with',
     '  CREATE OR REPLACE TABLE, which replaces it just the same.',
     '- Join to a document store: "new_table" drops the collection, then inserts.',
-    '- The ONE exception is an OUTPUT node writing to a database connection: it creates',
-    '  the table only if missing and then appends. An output node writing to a FILE',
-    '  overwrites the file. Judge repeat-run behaviour only for output nodes, and only',
-    '  when the user actually said something about replacing or appending.',
+    '- An OUTPUT node writing to a database connection creates the table only if',
+    '  missing, then follows its own outputSettings.writeMode: "truncate" empties the',
+    '  table (TRUNCATE, falling back to DELETE) before loading, so the run REPLACES the',
+    '  previous load; anything else appends. Read writeMode and judge against THAT —',
+    '  never assume a database output appends. An output node writing to a FILE',
+    '  rewrites that file whole on every run REGARDLESS of writeMode: the field does',
+    '  not apply there and its value means nothing, so a file output already behaves',
+    '  as "replace" and needs no change to do so. Judge repeat-run behaviour only for',
+    '  output nodes, and only when the USER\'S OWN WORDS said something about replacing',
+    '  or appending. A restated brief, a step prompt or a node explanation mentioning',
+    '  append/truncate is not the user saying it — a join or transformer has no such',
+    '  setting at all, so wording like that describes nothing and requires nothing.',
+    '',
+    'Where a new table from a FILE source goes — a connection with connectionType',
+    '"file" (csv, json, parquet, a workbook) is a file read in place, not a database,',
+    'so it has no catalog to add a table to. A transformer reading one therefore',
+    'writes its new table to this workflow\'s own local DuckDB: targetConnectionId',
+    '"local-duckdb" with storageLocation "local" is the ONLY thing it can do, and the',
+    'builder sets it regardless of what any brief asked for. Never report that as',
+    'writing to the wrong place, and never ask for the table to be created "on the',
+    'source connection" — there is nowhere there to put it.',
+    '',
+    'Re-running an IN-PLACE transform — the EXECUTOR is what makes this safe, not the',
+    'SQL, so DO NOT audit the SQL for it:',
+    '- targetDdl runs first, then targetSql. When BOTH are present a failing DDL does',
+    '  NOT fail the node — only a failing SQL does. So an unconditional',
+    '  ALTER TABLE … ADD COLUMN paired with an UPDATE is CORRECT and IS re-runnable:',
+    '  the second run\'s ALTER fails as "column already exists", the UPDATE behind it',
+    '  still runs, and the node succeeds with a warning naming the skipped statement.',
+    '- The same holds for an in-place transform on LOCAL DuckDB storage, whose',
+    '  semicolon-separated statements are run one at a time under the same rule: the',
+    '  LAST statement decides, and a structural change in front of it may fail.',
+    '- So NEVER fail a node, and never propose a change, because its DDL omits',
+    '  IF NOT EXISTS, omits an information_schema / catalog guard, or "will fail on a',
+    '  second run". That is the designed behaviour, not a defect. Guarded or dynamic',
+    '  DDL (SET / PREPARE / EXECUTE, DO blocks, conditional batches) is multi-statement',
+    '  and would genuinely BREAK the node — never ask for it.',
+    '- The one case where a non-repeatable DDL matters is targetDdl with NO targetSql',
+    '  beside it: alone, its failure IS the node\'s failure. Even then, raise it only if',
+    '  the user actually asked for the node to be re-runnable.',
     '',
     'Statement granularity — each SQL field is executed as ONE statement:',
     '- targetDdl, targetSql, joinSql and each source\'s ddl / sql are passed to the',
@@ -1176,12 +1586,91 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '  batches, and START TRANSACTION / COMMIT wrappers are NOT supported and fail at',
     '  run time. Never ask for one. The exception is an in-place transform on LOCAL',
     '  DuckDB storage, where semicolon-separated statements are supported and expected.',
+    '- A transformer therefore carries at most ONE structural statement and ONE data',
+    '  statement. A node doing less than that is not incomplete: an in-place transform',
+    '  needs a DDL only when the table\'s current schema cannot hold the result, so a',
+    '  bare UPDATE or DELETE with no targetDdl is the NORMAL shape. Never ask for a DDL',
+    '  to be added to a node whose columns already exist.',
     '- Transactions are the executor\'s concern, not the SQL\'s.',
     '',
     'Temp tables — a join stages every source that is not already in the destination',
     'database into a temp table (the source\'s tempTableName), loads its rows, runs',
     'joinSql against those, then drops them. joinSql addressing "temp_…" names rather',
     'than the original tables is CORRECT.',
+    '',
+    'Which LOCAL store a transform writes to is the SKILL\'s choice, not the user\'s:',
+    '- A transformer routed through a skill writes locally to whichever local store fits',
+    '  the records it produces — LanceDB when they carry a numeric vector field, DuckDB',
+    '  otherwise. The skill picks that from the DATA, and the node records the pick as',
+    '  targetDbType / targetConnectionName ("Local LanceDB" or "Local DuckDB") with a',
+    '  matching targetLocalPath. Both are supported destinations for a local transform.',
+    '- Downstream nodes read whichever it picked: their source* fields are copied from',
+    '  this node\'s target*, so the two cannot disagree and nothing is left unreadable.',
+    '- So NEVER fail a node for writing to a LanceDB directory instead of the workflow\'s',
+    '  .duckdb file, or the reverse, and never propose switching targetConnectionName,',
+    '  targetDbType or targetLocalPath from one to the other. A local PATH appearing in',
+    '  the transcript describes where local results are kept; it does not override the',
+    '  store the records require, and a request naming a .duckdb file is still satisfied',
+    '  by a vector-bearing result landing in LanceDB.',
+    '- Judge a transform\'s destination only when the user asked for a specific SAVED',
+    '  CONNECTION (a database, a warehouse, a file export) and the node went somewhere else.',
+    '',
+    // The reviewer kept failing correct transformers for "not writing to
+    // BigQuery/Snowflake/…", and its remediation — "change the target connection
+    // to the requested one" — names an edit the builder has no field to make. Per
+    // the note above on remediation being re-sent as the next brief, that is a
+    // loop the user can only escape by abandoning the change.
+    'Where a TRANSFORMER can write — it has exactly TWO destinations and no field for',
+    'a third, so most "wrong destination" verdicts on a transformer are wrong:',
+    '- Its target is either its OWN SOURCE connection (storageLocation "database") or a',
+    '  local DuckDB table (storageLocation "local"). It can NEVER write into a different',
+    '  saved connection. Read targetConnectionName against the node\'s sourceConnectionName',
+    '  before judging: the two matching is the normal, correct shape, not a mistake.',
+    '- If the source is LOCAL (sourceConnectionType "file", a local path, dbType duckdb),',
+    '  the destination can only be local, whatever the request said. NEVER fail such a',
+    '  node for writing locally, and never propose moving it to a database or warehouse.',
+    '- If the source is a DATABASE, the destination is that same database BY DEFAULT.',
+    '  Only fail it for writing there when the user explicitly asked for the result to be',
+    '  kept locally instead — silence about storage is agreement with the default.',
+    '- When the request asks for the result to land in a DIFFERENT connection than the',
+    '  source ("create the table in BigQuery" on a node reading somewhere else), that is',
+    '  not a defect in this node and it is not fixable here — an OUTPUT node is what loads',
+    '  a result into another connection. Do not put "change the target connection" in',
+    '  `remediation`: the builder has nothing to change it with and the same verdict comes',
+    '  back every round. Say the transform itself is correct, and if the load is genuinely',
+    '  missing from the workflow, that is a point for a WORKFLOW review, not a node one.',
+    '',
+    // Stated right after the transformer rule because the two are opposites, and
+    // the reviewer carrying "source connection or local only" across to a join
+    // would fail correct joins for writing exactly where they were told to.
+    'Where a JOIN can write — the OPPOSITE of the transformer rule above, so do not',
+    'carry that rule across:',
+    '- A join\'s destination is a first-class choice and it does NOT have to be one of',
+    '  its sources. Any saved connection, "local-duckdb" (a local DuckDB table) or',
+    '  "local-lancedb" (a local vector table) is a valid target, recorded as',
+    '  targetConnectionId / targetConnectionName / targetDbType. A join writing into a',
+    '  connection none of its sources use is normal — the executor stages the outside',
+    '  sources as temp tables (see above) to make that work.',
+    '- Because it CAN go anywhere, a join\'s destination IS yours to judge: if the user',
+    '  named where the result should land and the node writes somewhere else, that is a',
+    '  real fault and "change the destination to X" is a remediation the builder can act',
+    '  on. This is the one place that instruction is useful — it is not for transformers.',
+    '- When the user said nothing about where the result goes, whatever the node carries',
+    '  is correct. The destination was settled earlier — the assistant\'s destination',
+    '  picker, set_join_destination, or an earlier build — and silence is not a request',
+    '  to move it. Never fail a join for choosing local-duckdb over a saved connection,',
+    '  or the reverse, on a request that never mentioned storage.',
+    '- The ONE destination rule that binds regardless of what the user said is the join',
+    '  KIND. A similarity / embedding join (the node carries vectorRequired: true — "find',
+    '  the most similar", per-row embed + vector search) runs its match as a JS function',
+    '  that the executor ONLY runs for a NoSQL or VECTOR destination. Such a join MUST',
+    '  write to local-lancedb or a saved vector connection; on a plain relational target',
+    '  it silently degrades to a static SQL join and the similarity columns come back',
+    '  NULL. Fail that and say so. A plain keyed / equality join (vectorRequired false)',
+    '  has no such constraint and may write anywhere — never impose a vector destination',
+    '  on one. If the user wants the matches as a FILE, local-lancedb plus an Output node',
+    '  is the correct shape; a vector destination is not a defect just because they asked',
+    '  for a CSV.',
     '',
     'In-place transform on a FILE — the file has no table of its own, so the executor',
     'copies it into a per-run staging table named "transformer_" + the node id with',
@@ -1203,30 +1692,151 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
       '- Is the generated SQL / operation consistent with the explanation attached to it?',
       '- Ignore the rest of the workflow. Unrelated nodes, unwired nodes, missing',
       '  downstream steps, and overall pipeline shape are NOT this review\'s concern.',
+      ...(impact.length ? [
+        '- The ONE exception is the nodes listed under "Nodes downstream that now read',
+        '  a different shape". Those read this node\'s output and it just changed under',
+        '  them, so they are part of this change whether or not they were edited.',
+      ] : []),
     ] : [
       '- Does the pipeline satisfy the user\'s stated goal? Missing sources, a filter',
       '  the user asked for that never appears, a join that drops requested inputs,',
       '  an output writing somewhere other than what was asked — all invalid.',
       '- Is it wired coherently: every node reachable from start, join sources present,',
       '  the output fed by the node that actually holds the result?',
+      // The builder wires every dataSource to start and the planner is forbidden
+      // to declare sources on one, so an edge INTO a dataSource cannot be built.
+      // A reviewer that asks for one fails every round forever: `remediation` is
+      // re-sent to the builder as the next round's brief, the builder cannot
+      // comply, and the same verdict comes back — a loop the user can only
+      // escape by abandoning the change.
+      '- A dataSource is ALWAYS wired to the start node. The builder attaches it there',
+      '  automatically and no other node type can feed one, so an edge INTO a dataSource',
+      '  cannot exist and cannot be built. NEVER report one as missing, and never propose',
+      '  adding, moving or removing an edge around a dataSource — not even when it reads',
+      '  a table that another node in this workflow writes. A dataSource hanging off',
+      '  start is the normal, correct shape, including in that case.',
+      '- Run ORDER is not carried by edges and is not part of what you are shown, so it',
+      '  is not yours to judge. "This has to run after that" is settled when the build is',
+      '  planned. Never fail a workflow, or propose a rewiring, on the grounds that one',
+      '  step appears to run before another.',
       '- Do node configs contradict the request (wrong table, wrong columns, wrong',
       '  destination, a filter value that does not match what was asked)?',
+      // The transcript is this change's brief, NOT an inventory of the workflow.
+      // A workflow accumulates nodes the user drew themselves and nodes built in
+      // sessions whose turns are long out of the window below, and neither can
+      // ever be vouched for by the text in front of you. Read as an inventory,
+      // the transcript makes every one of them look unrequested — and the fix
+      // that follows from that reading deletes the user's own work.
+      '- The transcript is the brief for THIS change, not a list of everything the',
+      '  workflow is allowed to contain. A node it does not mention is not thereby',
+      '  unrequested: the user may have added and configured it directly in the editor',
+      '  (those are marked `configuredInEditor` in the summary, and have no',
+      '  builderPrompt), or asked for it in an earlier session whose turns are no',
+      '  longer shown. Absence of evidence is not evidence a node is unwanted.',
+      '- NEVER report an existing node as extra, unrequested or surplus, and never',
+      '  propose deleting or unwiring one, unless the user asked in THIS transcript',
+      '  for it to go. Removing a node the user built is destructive and',
+      '  irreversible; a node you cannot account for is one to leave alone.',
+      // Named explicitly because these two lines are the ONLY thing separating
+      // what this build did from what the workflow already contained. They used
+      // to be one line — the whole plan as JSON — and it was trimmed to the
+      // per-message cap, cutting the tail: on a 20-step modify the six trailing
+      // output ids went missing, so nodes an earlier request had built read as
+      // part of this change and the reviewer failed the build over a correction
+      // the user had already declined.
+      '- Judge what this change DID. Two lines above say exactly which nodes it',
+      '  touched: "Built or rebuilt by THIS change" lists them in full, and "Left',
+      '  EXACTLY as it was by this change" names the ones it did not. Only the built',
+      '  or rebuilt ones are subjects of the verdict. Untouched nodes are context for',
+      '  reading the pipeline, never a fault of this change.',
+      // The request history is one turn of a long-running chat. A workflow the
+      // user keeps editing carries the results of every earlier turn, including
+      // ones where they saw a review's objection and chose to keep what they had.
+      '- The brief above is the NEWEST request and nothing else. Everything else in',
+      '  this workflow was settled before it — by an earlier request, by a hand edit,',
+      '  or by the user reading a previous review of yours and deciding to keep what',
+      '  they had. A fault belonging to an earlier request is NOT yours to re-raise:',
+      '  if the brief above does not ask for a node to change, that node is correct',
+      '  for the purposes of this review, however it looks.',
     ]),
     '',
     '# Rules',
-    '- Judge ONLY against what the user asked for. Do not invent requirements, and do',
-    '  not fail a workflow for style, naming, or an optimisation nobody requested.',
+    '- Judge ONLY against what the USER asked for, in their own words. Do not invent',
+    '  requirements, do not adopt one from text the assistant or the builder wrote, and',
+    '  do not fail a workflow for style, naming, or an optimisation nobody requested.',
     '- If something is merely unusual but consistent with the request, it is valid.',
     '- Be specific: name the node id and what is wrong.',
     // Every false verdict this reviewer has produced came from auditing machinery
     // it has no specification for — internal table names, preview queries, path
     // fields — and inferring a runtime failure from an apparent mismatch. It is
     // not the executor's test suite; it decides whether the change matches intent.
+    // The reviewer reads the user's raw message as the spec, and that message
+    // often opens with a precondition ("first check that…"). It then hunts for a
+    // node doing the checking, finds none — there is no step type that could —
+    // and fails a correct build, with an empty remediation because it cannot
+    // name a fix either.
+    '- Judge only what the pipeline DOES WHEN IT RUNS. An instruction about what to',
+    '  check, confirm, verify or decide BEFORE building ("first check that those tables',
+    '  don\'t exist", "make sure the connection works", "see which columns are there")',
+    '  is a precondition for the agent that planned this, and it was settled then. No',
+    '  step type performs such a check at run time, so never report one as a missing',
+    '  node, and never make it the reason a workflow is invalid.',
+    // The reviewer was reading the request as one fixed statement and failing
+    // builds that followed a correction the user had already agreed to — then
+    // offering, as the fix, a revert to the wording the clarification replaced.
+    '- The transcript is CHRONOLOGICAL, and a later turn settles an earlier one. A',
+    '  line marked "as FIRST TYPED" is the request BEFORE the conversation refined',
+    '  it: read it for literal values (URLs, request bodies, keys), never as the',
+    '  final spec. Where a "Clarification by AI:" question and the user\'s answer to',
+    '  it changed something — a table that turned out not to exist, a column named',
+    '  differently, a connection swapped — that ANSWER is the requirement and the',
+    '  first phrasing is not. A build matching the answer is CORRECT even where it',
+    '  contradicts the original wording, and "correcting" it back would undo a',
+    '  decision the user has already made. Fail it only when it matches neither.',
     '- You are checking INTENT, not plumbing. Do not judge internal identifiers,',
     '  generated table names, preview queries, or file paths, and never predict a',
     '  runtime failure from two config fields looking inconsistent. Those conventions',
     '  are the executor\'s and are not documented to you. Report a problem only when',
     '  the change does something the request did not ask for, or omits something it did.',
+    // The builder resolves every table against the live engine (getTables /
+    // getColumns) before writing it down; the reviewer has neither call. A user
+    // writes "the PUBLIC.transactions table" and means whatever the engine
+    // holds — which was once a table whose LITERAL name is "public.transactions",
+    // dot included. Read as a qualifier, the stored config looked doubled up,
+    // and the correction offered would have repointed a working node at a
+    // table that does not exist.
+    // A dataSource's sourceSql is named as if it were the fetch query, and the
+    // reviewer read it as one — failing a correct build because the PREVIEW it
+    // holds says TOP 100, and offering to "fix" a field nothing executes.
+    '- A dataSource node does NOT run a query of its own. Its `sourceSql` and',
+    '  `sourcePreviewSql` are the PREVIEW shown in the editor, capped at 100 rows on',
+    '  purpose, and no part of a run reads either one. The rows actually fetched come',
+    '  from the SQL on the node that consumes the source — a transformer\'s targetSql,',
+    '  a join\'s per-source sql — which carries no such cap. So a LIMIT, TOP or FETCH',
+    '  in a source preview NEVER limits the pipeline, is never a defect, and is never',
+    '  something to change. Judge row-limiting only where the request asked about it',
+    '  AND the cap sits in the consuming statement.',
+    '- A table, schema or column NAME in the config was resolved against the live',
+    '  database when the node was built — you have no such lookup. Do not "correct"',
+    '  one to match how the request spelled it. Differences in qualification, case,',
+    '  quoting or a dot inside a name are how engines address objects, and the',
+    '  spelling the builder recorded is the one the engine answered to. Report a',
+    '  naming problem only when a genuinely DIFFERENT object was used — another',
+    '  table, another connection — never a re-spelling of the same one.',
+    // A local file export has no append-vs-truncate switch: exportToLocalFile
+    // writes the file whole, every run. `writeMode` still sits in those output
+    // settings carrying its default "append", which this reviewer read as an
+    // unfulfilled truncate request — failing a correct build, and proposing a
+    // remediation that named a setting with no other value to move it to.
+    '- APPEND vs TRUNCATE exists ONLY for a connection output (outputType',
+    '  "connection"), which loads into a table, collection or index that already',
+    '  holds rows. A LOCAL FILE output (outputType "local": csv / json / excel /',
+    '  parquet / avro / duckdb / sqlite / lancedb) has no such choice — every run',
+    '  replaces what it writes, which is already the "replace" behaviour. Its',
+    '  `writeMode` field is inert, so the value sitting in it — usually "append" —',
+    '  is NEVER an issue and never something to change. A request to make outputs',
+    '  truncate-and-load is satisfied, for the file outputs, by their existing',
+    '  configuration.',
     // "Do the same as the other node" is resolved for the builder BEFORE it runs
     // and the resolution is recorded in the transcript. Re-deriving it from some
     // other node's config second-guesses a decision that was already settled.
@@ -1331,9 +1941,10 @@ const PROMPTS = {
       nodeType: p.nodeType || null,
       nodeId: p.nodeId || null,
       nodeConfigured: !!p.nodeConfigured,
-      hasPendingQuestion: !!p.pendingQuestion,
       pendingSkillId: p.pendingSkillId || null,
+      pendingQuestionChars: len(p.pendingQuestion),
       userMessageChars: len(p.userMessage),
+      nodeTypeDocChars: len(p.nodeTypeDocs),
       connectionCount: Array.isArray(p.connections) ? p.connections.length : 0,
       maxRounds: p.maxRounds ?? null,
     }),
@@ -1375,6 +1986,9 @@ const PROMPTS = {
       hasChangeSummary: !!p.changeSummary,
       requestHistoryChars: len(p.requestHistory),
       workflowSummaryChars: len(p.workflowSummary),
+      // A verdict faulting a "missing" precondition step reads very differently
+      // depending on whether the reviewer was shown the lookup that settled it.
+      priorActions: (p.priorActions || []).length,
       // In the log because a verdict produced mid-remediation-loop reads very
       // differently from a first-pass one.
       priorFixRounds: Number(p.priorFixRounds) || 0,
