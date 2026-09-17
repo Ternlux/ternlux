@@ -17,6 +17,9 @@
  *   keywords        string[]               extra statement keywords
  *   functions       string[]               extra function names
  *   quote           string                 identifier quote character
+ *   fold            'lower' | 'upper'      how the engine case-folds unquoted
+ *                                          identifiers; decides when completion
+ *                                          inserts must be quoted
  *   validate(text)  -> { ok, issues }      engine-specific syntax check
  *   parseQuery(txt) -> object              text → whatever runQuery expects
  *   previewQuery(schema, table, limit) -> string
@@ -53,6 +56,7 @@ const DEFAULTS = {
   keywords: SQL_KEYWORDS,
   functions: SQL_FUNCTIONS,
   quote: '"',
+  fold: 'lower',
 };
 
 /**
@@ -77,6 +81,7 @@ function resolveDialect(connector) {
     container: ext.container || DEFAULTS.container,
     objectLabel: ext.objectLabel || DEFAULTS.objectLabel,
     quote: ext.quote || DEFAULTS.quote,
+    fold: ext.fold || DEFAULTS.fold,
     // A doc store starts from an empty keyword baseline — SQL words would
     // only pollute its completions.
     keywords: ext.language === 'json'
