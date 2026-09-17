@@ -3,131 +3,161 @@
  * Shared utilities for executing output operations (export to file or insert to connection)
  */
 
-const Datastore = require('@seald-io/nedb');
 const { Parser } = require('@json2csv/plainjs');
 const fs = require('fs');
 const path = require('path');
 const parquet = require('parquetjs');
 const avro = require('avsc');
+const { batchChunkSizeFor } = require('../lib/batchChunkSize');
+const { throwIfCancelled, isCancelledError } = require('./executionCancel');
+const { setBatchWindow } = require('./executionLog');
+const { openSourcePages } = require('./sourcePages');
+const { resolveTableRef } = require('../lib/tableRef');
+// Needed by the READ as well as the write: an Excel destination has a row
+// ceiling, and the reader stops at it rather than filling memory with rows the
+// writer can never take.
+const xlsxFile = require('../duckdb/xlsx');
+const duckdb = require('../duckdb');
+const lanceLib = require('../lib/lancedb');
 
 /**
- * Infer SQL column type from sample data values
- * @param {string} columnName - Column name
- * @param {Array} sampleValues - Array of sample values from the column
- * @param {string} dbType - Database type (sqlite, postgresql, mysql, mssql)
- * @returns {string} SQL column type definition
+ * Drain a page stream into one array.
+ *
+ * For the destinations that genuinely cannot take rows a page at a time — a
+ * file rewritten whole, an object PUT to cloud storage, a vector upsert — the
+ * whole set has to exist at once and there is no way around it. What has gone
+ * is the CAP: this reads however many rows there are, where the old path
+ * stopped at a million and said nothing.
  */
-// 1. Define dialect mappings in a dictionary for easy maintenance
-const DIALECT_MAP = {
-  sqlite: {
-    NULL: () => 'TEXT',
-    DATE: () => 'TEXT',
-    BOOLEAN: () => 'INTEGER',
-    INTEGER: () => 'INTEGER',
-    FLOAT: () => 'REAL',
-    OBJECT: () => 'TEXT',
-    STRING: () => 'TEXT'
-  },
-  postgresql: {
-    NULL: () => 'TEXT',
-    DATE: () => 'TIMESTAMP',
-    BOOLEAN: () => 'BOOLEAN',
-    INTEGER: () => 'INTEGER',
-    FLOAT: () => 'DOUBLE PRECISION',
-    OBJECT: () => 'TEXT', // Consider 'JSONB' here depending on your needs
-    STRING: (maxLen) => maxLen > 255 ? 'TEXT' : `VARCHAR(${calculateVarchar(maxLen)})`
-  },
-  mysql: {
-    NULL: () => 'TEXT',
-    DATE: () => 'DATETIME',
-    BOOLEAN: () => 'BOOLEAN',
-    INTEGER: () => 'INT',
-    FLOAT: () => 'DOUBLE',
-    OBJECT: () => 'TEXT', // Consider 'JSON' 
-    STRING: (maxLen) => maxLen > 255 ? 'TEXT' : `VARCHAR(${calculateVarchar(maxLen)})`
-  },
-  mssql: {
-    NULL: () => 'TEXT',
-    DATE: () => 'DATETIME2',
-    BOOLEAN: () => 'BIT',
-    INTEGER: () => 'INT',
-    FLOAT: () => 'FLOAT',
-    OBJECT: () => 'TEXT',
-    STRING: (maxLen) => maxLen > 255 ? 'VARCHAR(MAX)' : `VARCHAR(${calculateVarchar(maxLen)})`
-  },
-  bigquery: {
-    NULL: () => 'STRING',
-    DATE: () => 'TIMESTAMP',
-    BOOLEAN: () => 'BOOL',
-    INTEGER: () => 'INT64',
-    FLOAT: () => 'FLOAT64',
-    OBJECT: () => 'STRING',
-    STRING: () => 'STRING'
-  }
-};
+async function collectPages(pages, { guard = null } = {}) {
+  const all = [];
+  for await (const page of pages) {
+    throwIfCancelled('reading the source', `${all.length} rows read so far`);
+    // push-spread would blow the stack on a page of any size; this is the
+    // boring loop that doesn't.
+    for (const row of page) all.push(row);
 
-// Helper for VARCHAR size logic
-function calculateVarchar(maxLength) {
-  return Math.ceil(Math.min(Math.max(maxLength * 1.5, 255), 65535));
+    // Stop the moment the destination's own ceiling is passed.
+    //
+    // Without this, an Excel export of a ten-million-row source read all ten
+    // million — minutes of work and gigabytes of heap — and only then handed
+    // them to a writer that cannot take a tenth of them, dying with
+    // "RangeError: Too many properties to enumerate" from inside SheetJS. The
+    // rows past the limit can never be written, so reading them is pure waste;
+    // one page over is enough to know.
+    //
+    // The guard is given the FIRST ROW as well as the count, because the real
+    // ceiling depends on the column count and that is not knowable until a row
+    // has been seen. It throws; it never trims. Silently writing the first
+    // 1,048,575 rows of a larger source is exactly the kind of quiet truncation
+    // this whole change set exists to remove.
+    if (guard) guard(all.length, all[0]);
+  }
+  return all;
 }
 
-// 2. Main inference function
-function inferColumnType(columnName, sampleValues, dbType = 'sqlite') {
+/**
+ * Read the first page without losing it.
+ *
+ * Two things need the first rows before the load can start — the column list
+ * and types for a CREATE TABLE, and the answer to "is this source empty at
+ * all" — and both used to come free from an array that was already fully read.
+ * Streaming has to ask for one page and then carry on from where it left off,
+ * which is what `rest` is: the same stream, first page included.
+ *
+ * @returns {Promise<{ firstPage: object[]|null, rest: AsyncIterable<object[]> }>}
+ *   `firstPage` is null when the source yielded nothing.
+ */
+async function peekPages(pages) {
+  const iterator = pages[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  if (first.done) return { firstPage: null, rest: (async function* () {})() };
+
+  return {
+    firstPage: first.value,
+    rest: (async function* () {
+      yield first.value;
+      for (;;) {
+        const next = await iterator.next();
+        if (next.done) return;
+        yield next.value;
+      }
+    })(),
+  };
+}
+
+/**
+ * SQLite's column-type names, kept here for ONE reason: as the last-resort
+ * fallback when a connector declares no `types` block of its own.
+ *
+ * Every dialect's names live on its connector now (`plugin.types`, see
+ * plugins/connectors/snowflake/index.js). They used to be a hardcoded table in
+ * this file with five entries and a silent `|| DIALECTS.sqlite`, so every
+ * destination it did not happen to name — snowflake, redshift, duckdb — was
+ * handed SQLite's names without a word. A Snowflake output node created
+ * `("total_amount" REAL, "transaction_date" TEXT)` and survived only because
+ * REAL and TEXT are aliases there; on Redshift a bare TEXT silently means
+ * VARCHAR(256) and truncates every longer value on load.
+ */
+const SQLITE_TYPES = {
+  NULL: () => 'TEXT',
+  DATE_ONLY: () => 'TEXT',
+  TIMESTAMP: () => 'TEXT',
+  BOOLEAN: () => 'INTEGER',
+  INTEGER: () => 'INTEGER',
+  FLOAT: () => 'REAL',
+  OBJECT: () => 'TEXT',
+  STRING: () => 'TEXT',
+};
+
+/**
+ * The type names to build this destination's CREATE TABLE with.
+ *
+ * A SQL connector with no `types` block is a bug in that connector, not a
+ * situation to paper over: the old fallback was silent, which is why a
+ * Snowflake destination emitted SQLite DDL for as long as it did. Name the
+ * connector that needs the block so the next one is a one-line fix.
+ *
+ * @param {Object|null} plugin - The destination connector.
+ * @param {string} dbType - Its id, for the message.
+ * @returns {Object} A map of the shape in SQLITE_TYPES.
+ */
+function dialectFor(plugin, dbType) {
+  if (plugin && plugin.types) return plugin.types;
+  console.warn(
+    `[Output] Connector "${dbType}" declares no "types" block — falling back to `
+    + `SQLite's column types, which are probably wrong for it. Add a "types" block `
+    + `to plugins/connectors/${dbType}/index.js (see the snowflake connector).`,
+  );
+  return SQLITE_TYPES;
+}
+
+// Helper for VARCHAR size logic
+/**
+ * Infer the SQL column type for one column from its sampled values.
+ *
+ * This decides what the column HOLDS — all integers, has a time component,
+ * nested objects. What that is CALLED belongs to the destination, and arrives
+ * as `dialect` (a `plugin.types` map; see dialectFor above). Passing a dbType
+ * string instead is what let an unrecognised engine quietly receive SQLite's
+ * names, so the name is no longer this function's business.
+ *
+ * @param {string} columnName - Column name (unused; kept for call-site clarity).
+ * @param {Array} sampleValues - Sampled values from the column.
+ * @param {Object} dialect - The destination's type map.
+ * @returns {string} SQL column type definition.
+ */
+function inferColumnType(columnName, sampleValues, dialect = SQLITE_TYPES) {
   const validValues = sampleValues.filter(v => v !== null && v !== undefined);
 
-  // 1. Dialect Mapping Configuration
-  const DIALECTS = {
-    sqlite: {
-      DATE_ONLY: 'TEXT',
-      TIMESTAMP: 'TEXT',
-      BOOLEAN: 'INTEGER',
-      INTEGER: 'INTEGER',
-      FLOAT: 'REAL',
-      OBJECT: 'TEXT',
-      STRING: () => 'TEXT'
-    },
-    postgresql: {
-      DATE_ONLY: 'DATE',
-      TIMESTAMP: 'TIMESTAMP',
-      BOOLEAN: 'BOOLEAN',
-      INTEGER: 'INTEGER',
-      FLOAT: 'DOUBLE PRECISION',
-      OBJECT: 'TEXT',
-      STRING: (len) => len > 255 ? 'TEXT' : `VARCHAR(${calculateVarchar(len)})`
-    },
-    mysql: {
-      DATE_ONLY: 'DATE',
-      TIMESTAMP: 'DATETIME',
-      BOOLEAN: 'BOOLEAN',
-      INTEGER: 'INT',
-      FLOAT: 'DOUBLE',
-      OBJECT: 'TEXT',
-      STRING: (len) => len > 255 ? 'TEXT' : `VARCHAR(${calculateVarchar(len)})`
-    },
-    mssql: {
-      DATE_ONLY: 'DATE',
-      TIMESTAMP: 'DATETIME2',
-      BOOLEAN: 'BIT',
-      INTEGER: 'INT',
-      FLOAT: 'FLOAT',
-      OBJECT: 'TEXT',
-      STRING: (len) => len > 255 ? 'VARCHAR(MAX)' : `VARCHAR(${calculateVarchar(len)})`
-    },
-    bigquery: {
-      DATE_ONLY: 'DATE',      // Fix: BigQuery needs DATE for YYYY-MM-DD
-      TIMESTAMP: 'TIMESTAMP', // BigQuery needs HH:MM:SS for TIMESTAMP
-      BOOLEAN: 'BOOL',
-      INTEGER: 'INT64',
-      FLOAT: 'FLOAT64',
-      OBJECT: 'STRING',
-      STRING: () => 'STRING'
-    }
+  const typeName = (key, len) => {
+    const entry = dialect[key] != null ? dialect[key] : SQLITE_TYPES[key];
+    return typeof entry === 'function' ? entry(len) : entry;
   };
 
-  const dialect = DIALECTS[dbType] || DIALECTS.sqlite;
-
   if (validValues.length === 0) {
-    return dbType === 'bigquery' ? 'STRING' : 'TEXT';
+    // Nothing to infer from — the dialect's own answer for a column of nulls.
+    return typeName('NULL', 0);
   }
 
   // 2. State tracking for single-pass detection
@@ -183,25 +213,25 @@ function inferColumnType(columnName, sampleValues, dbType = 'sqlite') {
 
   // 4. Final Type Resolution
   if (isAllDates) {
-    return hasTimeComponent ? dialect.TIMESTAMP : dialect.DATE_ONLY;
+    return typeName(hasTimeComponent ? 'TIMESTAMP' : 'DATE_ONLY', maxLength);
   }
-  if (isAllBools) return dialect.BOOLEAN;
-  if (isAllInts) return dialect.INTEGER;
-  if (isAllFloats) return dialect.FLOAT;
-  if (hasObjects) return dialect.OBJECT;
+  if (isAllBools) return typeName('BOOLEAN', maxLength);
+  if (isAllInts) return typeName('INTEGER', maxLength);
+  if (isAllFloats) return typeName('FLOAT', maxLength);
+  if (hasObjects) return typeName('OBJECT', maxLength);
 
   // Default to String
-  return typeof dialect.STRING === 'function' ? dialect.STRING(maxLength) : dialect.STRING;
+  return typeName('STRING', maxLength);
 }
 
 /**
  * Infer column types for all columns from sample data
  * @param {Array} data - Array of data rows
- * @param {string} dbType - Database type (sqlite, postgresql, mysql, mssql)
+ * @param {Object} dialect - The destination's type map (see dialectFor)
  * @param {number} sampleSize - Number of rows to sample for type inference
  * @returns {Object} Map of column names to SQL types
  */
-function inferColumnTypes(data, dbType = 'sqlite', sampleSize = 100) {
+function inferColumnTypes(data, dialect = SQLITE_TYPES, sampleSize = 100) {
   if (!data || data.length === 0) return {};
 
   const columns = Object.keys(data[0]);
@@ -212,7 +242,7 @@ function inferColumnTypes(data, dbType = 'sqlite', sampleSize = 100) {
 
   columns.forEach(col => {
     const sampleValues = sampleRows.map(row => row[col]);
-    columnTypes[col] = inferColumnType(col, sampleValues, dbType);
+    columnTypes[col] = inferColumnType(col, sampleValues, dialect);
   });
 
   return columnTypes;
@@ -223,35 +253,113 @@ function inferColumnTypes(data, dbType = 'sqlite', sampleSize = 100) {
  * @param {Array} data - Array of data rows
  * @returns {Object} Parquet schema definition
  */
-function inferParquetSchema(data) {
+/**
+ * The shape of one column, decided ONCE and then used by both the schema and
+ * the row writer.
+ *
+ * Inference and writing used to be independent: the schema was read off the
+ * first sampled value while every row was written as-is. Anything the
+ * inference had no case for — an embedding vector, a nested object — became
+ * `string`/`UTF8` in the schema and was still handed over as an array, so the
+ * encoder rejected it ("invalid [\"null\",\"string\"]: [0.0375…]"). A column
+ * of mixed types failed the same way.
+ *
+ * Returns { kind, items? } where kind is one of:
+ *   boolean | long | double | timestamp | array | string
+ */
+function inferColumnShape(sampleValues) {
+  if (sampleValues.length === 0) return { kind: 'string' };
+
+  const every = (test) => sampleValues.every(test);
+
+  if (every((v) => typeof v === 'boolean')) return { kind: 'boolean' };
+  if (every((v) => typeof v === 'number' && Number.isFinite(v))) {
+    return { kind: every(Number.isInteger) ? 'long' : 'double' };
+  }
+  if (every((v) => v instanceof Date)) return { kind: 'timestamp' };
+  if (every(Array.isArray)) {
+    const elements = sampleValues.flat().filter((v) => v !== null && v !== undefined);
+    if (elements.length === 0) return { kind: 'array', items: 'string' };
+    if (elements.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+      return { kind: 'array', items: elements.every(Number.isInteger) ? 'long' : 'double' };
+    }
+    return { kind: 'array', items: 'string' };
+  }
+  // Mixed types, objects, or anything else: text, written as JSON where the
+  // value is not already a string.
+  return { kind: 'string' };
+}
+
+/** Per-column shapes for a batch of rows, keyed by column name. */
+function inferColumnShapes(data) {
+  const shapes = {};
+  if (!data || data.length === 0) return shapes;
+  const sample = data.slice(0, 100);
+  Object.keys(data[0]).forEach((col) => {
+    shapes[col] = inferColumnShape(
+      sample.map((row) => row[col]).filter((v) => v !== null && v !== undefined),
+    );
+  });
+  return shapes;
+}
+
+/** A single value in the shape its column was declared as. */
+function coerceExportValue(value, shape, { arraysAsJson = false } = {}) {
+  if (value === null || value === undefined) return null;
+  switch (shape.kind) {
+    case 'boolean':
+      return typeof value === 'boolean' ? value : Boolean(value);
+    case 'long':
+    case 'double':
+      return typeof value === 'number' ? value : Number(value);
+    case 'timestamp':
+      return value instanceof Date ? value.getTime() : Number(value);
+    case 'array': {
+      if (!Array.isArray(value)) return arraysAsJson ? JSON.stringify(value) : [];
+      // A null inside a typed list has no representation in either encoder;
+      // substitute the zero value for the item type rather than fail the row.
+      const items = value.map((v) => {
+        if (v === null || v === undefined) return shape.items === 'string' ? '' : 0;
+        if (shape.items === 'string') return typeof v === 'string' ? v : JSON.stringify(v);
+        return typeof v === 'number' ? v : Number(v);
+      });
+      return arraysAsJson ? JSON.stringify(items) : items;
+    }
+    default:
+      if (typeof value === 'string') return value;
+      if (value instanceof Date) return value.toISOString();
+      return typeof value === 'object' ? JSON.stringify(value) : String(value);
+  }
+}
+
+/** A whole row in the shapes its columns were declared as. */
+function coerceExportRow(row, shapes, options) {
+  const out = {};
+  Object.keys(row).forEach((key) => {
+    const shape = shapes[key] || { kind: 'string' };
+    out[key] = coerceExportValue(row[key], shape, options);
+  });
+  return out;
+}
+
+function inferParquetSchema(data, shapes = inferColumnShapes(data)) {
   if (!data || data.length === 0) return {};
 
   const schema = {};
-  const sampleRow = data[0];
-
-  Object.keys(sampleRow).forEach(col => {
-    const sampleValues = data.slice(0, 100).map(row => row[col]).filter(v => v !== null && v !== undefined);
-
-    if (sampleValues.length === 0) {
-      schema[col] = { type: 'UTF8', optional: true };
-      return;
-    }
-
-    const firstValue = sampleValues[0];
-
-    if (typeof firstValue === 'boolean') {
+  Object.keys(shapes).forEach((col) => {
+    const shape = shapes[col];
+    if (shape.kind === 'boolean') {
       schema[col] = { type: 'BOOLEAN', optional: true };
-    } else if (typeof firstValue === 'number') {
-      // Check if all numbers are integers
-      const allIntegers = sampleValues.every(v => Number.isInteger(v));
-      if (allIntegers) {
-        schema[col] = { type: 'INT64', optional: true };
-      } else {
-        schema[col] = { type: 'DOUBLE', optional: true };
-      }
-    } else if (firstValue instanceof Date) {
+    } else if (shape.kind === 'long') {
+      schema[col] = { type: 'INT64', optional: true };
+    } else if (shape.kind === 'double') {
+      schema[col] = { type: 'DOUBLE', optional: true };
+    } else if (shape.kind === 'timestamp') {
       schema[col] = { type: 'TIMESTAMP_MILLIS', optional: true };
     } else {
+      // Lists included: this writer emits them as JSON text rather than a
+      // repeated field, so a vector column stays readable without depending on
+      // the library's list support.
       schema[col] = { type: 'UTF8', optional: true };
     }
   });
@@ -264,7 +372,7 @@ function inferParquetSchema(data) {
  * @param {Array} data - Array of data rows
  * @returns {Object} Avro schema definition
  */
-function inferAvroSchema(data) {
+function inferAvroSchema(data, shapes = inferColumnShapes(data)) {
   if (!data || data.length === 0) {
     return {
       type: 'record',
@@ -273,33 +381,24 @@ function inferAvroSchema(data) {
     };
   }
 
-  const fields = [];
-  const sampleRow = data[0];
-
-  Object.keys(sampleRow).forEach(col => {
-    const sampleValues = data.slice(0, 100).map(row => row[col]).filter(v => v !== null && v !== undefined);
-
-    let avroType = 'string';
-
-    if (sampleValues.length > 0) {
-      const firstValue = sampleValues[0];
-
-      if (typeof firstValue === 'boolean') {
-        avroType = 'boolean';
-      } else if (typeof firstValue === 'number') {
-        const allIntegers = sampleValues.every(v => Number.isInteger(v));
-        avroType = allIntegers ? 'long' : 'double';
-      } else if (firstValue instanceof Date) {
-        avroType = 'long'; // Store as timestamp
-      }
+  const avroTypeFor = (shape) => {
+    switch (shape.kind) {
+      case 'boolean': return 'boolean';
+      case 'long': return 'long';
+      case 'double': return 'double';
+      case 'timestamp': return 'long'; // Store as timestamp
+      // A list keeps its element type here — an embedding exports as a real
+      // array of doubles, which is what any Avro reader expects to find.
+      case 'array': return { type: 'array', items: shape.items };
+      default: return 'string';
     }
+  };
 
+  const fields = Object.keys(shapes).map((col) => ({
+    name: col,
     // Make all fields nullable
-    fields.push({
-      name: col,
-      type: ['null', avroType]
-    });
-  });
+    type: ['null', avroTypeFor(shapes[col])],
+  }));
 
   return {
     type: 'record',
@@ -315,7 +414,7 @@ function inferAvroSchema(data) {
  * @param {Object} outputSettings - Output settings (outputType, format, savePath, connectionId, tableName, sheetName)
  * @param {Object} pluginManager - Plugin manager instance
  * @param {Function} getFullConfig - Function to get full config with credentials
- * @param {Function} getDb - Function to get NeDB database instance by collection name
+ * @param {Function} getDb - Function to get an app-metadata datastore by collection name
  * @param {Object} [skillHelpers] - Helpers bundle for skill calls (e.g. vector-db-executor)
  * @returns {Promise<Object>} Result with success, message, filePath/rowsInserted
  */
@@ -330,210 +429,180 @@ async function executeOutput(
 ) {
   try {
     const { outputType, format, savePath, connectionId, tableName, sheetName } = outputSettings;
+    // How this node treats what is already at the destination.
+    //
+    //   'append'   add these rows to whatever is there (the default, and what
+    //              every output node did before this option existed)
+    //   'truncate' empty the table/collection/tab/index first, then insert
+    //
+    // Only a destination that can hold rows ACROSS runs has a choice to make.
+    // A file — local export or an object in cloud storage — is rewritten whole
+    // every time by definition, so it is always effectively 'truncate' and the
+    // setting is ignored rather than half-honoured.
+    const writeMode = outputSettings.writeMode === 'truncate' ? 'truncate' : 'append';
 
-    console.log(`[Output] Starting ${outputType} output operation`);
+    console.log(`[Output] Starting ${outputType} output operation (${writeMode})`);
 
-    // Step 1: Load source data
-    let sourceData = [];
+    // Step 0: source and destination on ONE connection? Then the engine can do
+    // the copy itself and no row needs to travel through this process. Returns
+    // null whenever that is not possible, and everything below runs unchanged.
+    const copied = await trySameConnectionCopy({
+      sourceConnection,
+      sourceTableSchema,
+      outputSettings,
+      pluginManager,
+      getFullConfig,
+      getDb,
+      sourceName: sourceTableSchema?.tableName || sourceConnection?.name || 'the source',
+    });
+    if (copied) return copied;
 
-    // Check if source is a vector database
-    const plugin = pluginManager.getConnector(sourceConnection.dbType);
-    // console.log('plugin: ', sourceConnection, plugin)
-    const isSourceVector = plugin?.dbCategory === 'Vector' ||
-                          sourceConnection.dbType === 'pinecone' ||
-                          sourceConnection.dbType === 'lancedb';
+    // Step 1: Open the source for reading — in PAGES, with no row limit.
+    //
+    // This used to build one array, capped at a million rows by every branch
+    // (`readTableHeadAt(path, table, 1000000)`, `.limit(1000000)`, and so on).
+    // A ten-million-row source loaded as one million, the node reported
+    // "Successfully inserted 1000000 rows", and the run went green — and with
+    // writeMode 'truncate' the destination had been emptied first, so the
+    // silent truncation was silent data loss. See NodeExecution/sourcePages.js
+    // for what each source type can and cannot stream.
+    const { pages, pagesAreStreamed } = openSourcePages({
+      sourceConnection,
+      sourceTableSchema,
+      pluginManager,
+      getFullConfig,
+      lanceLib,
+    });
 
-    if (isSourceVector) {
-      // Load data from vector database
-      console.log(`[Output] Loading vectors from ${sourceConnection.dbType}...`);
+    console.log(
+      `[Output] Reading ${sourceTableSchema?.tableName || 'source'} `
+      + `(${pagesAreStreamed ? 'streamed' : 'buffered'})`,
+    );
 
-      const indexName = sourceTableSchema.indexName || sourceTableSchema.tableName;
-      const namespace = sourceTableSchema.schema || sourceTableSchema.namespace || '';
+    // Whether the destination can take rows a page at a time, or needs the
+    // whole set at once.
+    //
+    // Only a database connection can be fed progressively — its rows go in
+    // through repeated batchInserts, which is what the write loop has always
+    // done anyway. Everything else here is write-the-whole-thing by nature: a
+    // local file is rewritten in full, a cloud object is one PUT, and a vector
+    // upsert hands the skill one array. Those still buffer; they are simply no
+    // longer capped.
+    const destinationTakesPages = outputType === 'connection';
 
-      if (sourceConnection.dbType === 'lancedb') {
-        // LanceDB: embedded library
-        const dbPath = sourceConnection.localPath || sourceConnection.dbConfig?.dbPath;
-        if (!dbPath) {
-          return {
-            success: false,
-            message: 'LanceDB path not found in connection config'
-          };
-        }
 
-        const lancedb = require('@lancedb/lancedb');
-        const db = await lancedb.connect(dbPath);
+    const sourceName = sourceTableSchema?.tableName || sourceConnection?.name || 'the source';
 
-        try {
-          const table = await db.openTable(indexName);
-          const query = table.query().limit(1000000);
-          sourceData = await query.toArray();
-        } catch (error) {
-          return {
-            success: false,
-            message: `Failed to load LanceDB data: ${error.message}`
-          };
-        }
-      } else {
-        // Pinecone or other vector DBs: use connector
-        const fullConfig = await getFullConfig(sourceConnection.id);
+    // An empty source is not a failure of this node.
+    //
+    // The write paths below had no notion of "nothing to do": a SQL
+    // destination fell through insertToConnection to `success: false, 'No data
+    // to insert'`, which failed the node and, with it, the whole run — an
+    // empty upstream table reported as a broken output. Mongo was worse: it
+    // handed insertMany an empty array, which throws.
+    //
+    // It is also the one case where writeMode 'truncate' is destructive for
+    // nothing. Emptying the destination and then writing zero rows turns an
+    // empty source into data loss, which is the same reasoning the failed-read
+    // check in sourcePages already applies.
+    //
+    // Emptiness is now "the reader yielded no pages" rather than "the array is
+    // length zero" — which is the same question asked without reading the whole
+    // source to answer it. The page-consuming path below learns it from the
+    // first page; the buffering path from the array it drains.
 
-        if (!plugin || !plugin.fetchAllVectors) {
-          return {
-            success: false,
-            message: `${sourceConnection.dbType} connector does not support fetchAllVectors method`
-          };
-        }
-
-        const result = await plugin.fetchAllVectors(
-          fullConfig,
-          sourceConnection.id,
-          {
-            indexName: indexName,
-            namespace: namespace,
-            filter: {},
-            includeValues: true,
-            includeMetadata: true,
-            limit: 1000000
-          }
-        );
-
-        if (!result.success) {
-          return {
-            success: false,
-            message: `Failed to load vectors: ${result.message}`
-          };
-        }
-
-        sourceData = result.rows || [];
-        // console.log('sourceData: ', sourceData)
+    // A local JSON or CSV file is written front to back, so it can be fed
+    // straight from the page reader — no array, and no single string holding
+    // the whole export. This is the path a large export takes: building it as
+    // one string first hit V8's ~512MB string cap and failed the node with
+    // "RangeError: Invalid string length", however much memory was free.
+    if (outputType === 'local' && STREAMABLE_LOCAL_FORMATS.has(format)) {
+      const { rows } = await streamToLocalFile(pages, format, savePath, {
+        // Only reached when the source turns out to be empty, so a CSV still
+        // gets its header row from the schema the node was configured with.
+        fallbackColumns: (sourceTableSchema?.columns || [])
+          .map((c) => c?.name).filter(Boolean),
+      });
+      console.log(`[Output] Wrote ${rows} rows to ${savePath}`);
+      const message = `Successfully exported ${rows} rows to ${format === 'json' ? 'JSON' : 'CSV'}`;
+      if (rows === 0) {
+        return {
+          success: true,
+          warning: true,
+          message: `${message} — "${sourceName}" is empty, so the file contains no rows.`,
+          filePath: savePath,
+        };
       }
-
-      console.log(`[Output] Loaded ${sourceData.length} vectors from source`);
-
-    } else {
-      // Handle local files separately (they don't use plugin system)
-      const isLocalFile = sourceConnection.localPath;
-
-      if (isLocalFile) {
-        if (sourceConnection.dbType === 'duckdb') {
-          // Either the upstream node's output table in the workflow database,
-          // or a plain data file (the user's csv/json/parquet). DuckDB reads
-          // both directly; nothing was ever imported.
-          const duck = require('../duckdb');
-          const result = /\.duckdb$/i.test(sourceConnection.localPath)
-            ? await duck.readTableHeadAt(
-                sourceConnection.localPath,
-                sourceTableSchema?.tableName || sourceConnection.tableName,
-                1000000,
-              )
-            : await duck.readHead(sourceConnection.localPath, 1000000, null, {
-              sheet: duck.sheetFor(
-                sourceConnection.localPath,
-                sourceTableSchema?.tableName || sourceConnection.tableName,
-              ),
-            });
-          sourceData = result.rows;
-        } else if (sourceConnection.dbType === 'nedb') {
-          // Local NeDB file
-          const db = new Datastore({ filename: sourceConnection.localPath, autoload: false });
-
-          await new Promise((resolve, reject) => {
-            db.loadDatabase((err) => err ? reject(err) : resolve());
-          });
-
-          sourceData = await new Promise((resolve, reject) => {
-            db.find({}).limit(1000000).exec((err, docs) => {
-              if (err) reject(err);
-              else resolve(docs);
-            });
-          });
-        } else if (sourceConnection.dbType === 'sqlite') {
-          // Local SQLite file
-          const sqlite3 = require('sqlite3').verbose();
-          const db = new sqlite3.Database(sourceConnection.localPath);
-
-          const query = `SELECT * FROM ${sourceTableSchema.tableName}`;
-          sourceData = await new Promise((resolve, reject) => {
-            db.all(query, (err, rows) => {
-              if (err) reject(err);
-              else resolve(rows);
-            });
-          });
-
-          db.close();
-        }
-      } else {
-        // Remote connection - use plugin system. Build a queryObj shaped
-        // to the source DB's category — sending a SQL `query` field to a
-        // NoSQL connector breaks because Mongo's runQuery prefers `query`
-        // when present and tries to JSON.parse the SQL string.
-        const schema = sourceConnection.dbConfig?.schema;
-        const dbType = sourceConnection.dbType;
-        const dbCategory = plugin?.dbCategory || sourceConnection.dbCategory || null;
-        const isNoSQL = dbType === 'mongodb' || dbType === 'nedb' || dbCategory === 'NoSQL';
-        const isSheets = dbType === 'google-sheets';
-
-        let queryObj;
-        if (isNoSQL) {
-          // Mongo / NeDB envelope. Limit kept high enough to bulk-pull.
-          queryObj = {
-            collection: sourceTableSchema.tableName,
-            filter: {},
-            limit: 1000000,
-          };
-        } else if (isSheets) {
-          queryObj = {
-            spreadsheetId: sourceTableSchema.tableName,
-            sheetName: sourceTableSchema.sheetName,
-            range: sourceTableSchema.sheetName,
-            limit: 1000000,
-          };
-        } else {
-          // Generic SQL: prefer plugin's quoteIdentifier when available so
-          // identifiers with reserved words or mixed case survive.
-          let fullTableName;
-          if (plugin && typeof plugin.quoteIdentifier === 'function') {
-            fullTableName = plugin.quoteIdentifier(sourceTableSchema.tableName, schema, sourceConnection.dbConfig);
-          } else {
-            fullTableName = schema ? `${schema}.${sourceTableSchema.tableName}` : sourceTableSchema.tableName;
-          }
-          queryObj = {
-            query: `SELECT * FROM ${fullTableName}`,
-            tableName: sourceTableSchema.tableName,
-            schema,
-            limit: 1000000,
-          };
-        }
-
-        const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
-        const result = await plugin.runQuery(fullConfig, sourceConnection.id, queryObj);
-        sourceData = result.rows || result.data || [];
-
-        console.log(`[Output] Loaded ${sourceData.length} rows from source`);
-      }
+      return { success: true, message, filePath: savePath };
     }
 
+    if (!destinationTakesPages) {
+      // Destinations that need the whole set at once. Uncapped, EXCEPT where
+      // the destination format has a ceiling of its own — see below.
+      //
+      // An .xlsx sheet holds at most 1,048,576 rows — a limit of the file
+      // format, not of this app, and not one any amount of streaming can lift —
+      // and this writer runs out of cells before that on a wide source. Reading
+      // past either and then failing wastes the whole read, so the reader stops
+      // one page over and says which limit it hit.
+      const guard = (outputType === 'local' && format === 'excel')
+        ? (seen, sample) => xlsxFile.assertSheetBudgetSoFar(
+          seen, sample ? Object.keys(sample).length : 0,
+        )
+        : null;
 
-    if (outputType === 'local') {
-      // Export to local file. An Excel sheet name falls back to the source
-      // table when the node never got one — an older node, or one the AI built
-      // before the field existed — so a workbook still gets a meaningful tab
-      // rather than every node fighting over "Data".
-      return await exportToLocalFile(
-        sourceData, format, savePath, pluginManager, skillHelpers,
-        sheetName || sourceTableSchema?.tableName || null,
-      );
-    } else if (outputType === 'connection') {
-      // Insert to database connection
-      return await insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers);
-    } else {
+      const sourceData = await collectPages(pages, { guard });
+      const sourceIsEmpty = sourceData.length === 0;
+      console.log(`[Output] Read ${sourceData.length} rows from ${sourceName}`);
+
+      if (outputType === 'local') {
+        // Export to local file. An Excel sheet name — and, for the database
+        // formats, a table name — falls back to the source table when the node
+        // never got one: an older node, or one the AI built before the field
+        // existed. That way a workbook still gets a meaningful tab and a
+        // database a meaningful table, rather than every node fighting over
+        // "Data".
+        //
+        // A single-dataset file is rewritten whole every run, so an empty source
+        // still writes a (headers-only) file rather than being skipped — that is
+        // what the node was asked to do. It carries the warning so the run can
+        // say why the file has no rows in it.
+        const result = await exportToLocalFile(
+          sourceData, format, savePath, pluginManager, skillHelpers,
+          sheetName || sourceTableSchema?.tableName || null,
+          tableName || sourceTableSchema?.tableName || null,
+        );
+        if (sourceIsEmpty && result?.success) {
+          return {
+            ...result,
+            warning: true,
+            message: `${result.message} — "${sourceName}" is empty, so the file contains no rows.`,
+          };
+        }
+        return result;
+      }
+
       return {
         success: false,
         message: `Invalid output type: ${outputType}`
       };
     }
 
+    // A database destination: rows go in a page at a time and the whole source
+    // is never resident.
+    return await insertToConnection(
+      pages, connectionId, tableName, pluginManager, getFullConfig, getDb,
+      skillHelpers, writeMode, { sourceName },
+    );
+
   } catch (error) {
+    // A stop the user asked for is not an output failure, and it must reach the
+    // runner as an exception: flattened into { success: false } here it would
+    // be indistinguishable from a broken write, and the run would be recorded
+    // as failed. Every catch between a throwIfCancelled and the runner needs
+    // this — see public/NodeExecution/executionCancel.js.
+    if (isCancelledError(error)) throw error;
+
     console.error('Output execution error:', error);
     return {
       success: false,
@@ -544,39 +613,208 @@ async function executeOutput(
 }
 
 /**
+ * A table name SQLite and DuckDB will both accept. Same rules as
+ * duckdb.sanitizeIdentifier, applied here so the SQLite path — which builds its
+ * SQL by hand and cannot bind an identifier as a parameter — can never be handed
+ * a name that closes the quoting. Returns null when nothing usable is left, so
+ * the caller can fall back rather than write to a table called "_".
+ */
+function sanitizeTableIdentifier(name) {
+  const cleaned = String(name || '')
+    .replace(/[^a-zA-Z0-9_]/g, '_')
+    .replace(/^(?=\d)/, '_')
+    .slice(0, 80);
+  return cleaned && /[a-zA-Z0-9]/.test(cleaned) ? cleaned : null;
+}
+
+/**
+ * The local formats that are SERIAL — written front to back, one row after
+ * another, with nothing to seek back and fix up at the end. Those can be
+ * streamed straight to disk; the rest (an .xlsx workbook, a parquet/avro file
+ * with a schema and footer, a SQLite/DuckDB database) need the whole set.
+ */
+const STREAMABLE_LOCAL_FORMATS = new Set(['json', 'csv']);
+
+/**
+ * Make sure the folder a local export is being written into exists.
+ *
+ * The save path is typed or picked in the output node's chat, and nothing
+ * guarantees its folder is there — a path under a folder the user has not
+ * created yet is an ordinary thing to configure. Every writer below opens the
+ * destination directly, so the missing folder surfaced as a raw
+ * `ENOENT: no such file or directory, open '…/s01.csv.part'` naming the scratch
+ * file rather than the folder, from a node that had already read its source.
+ *
+ * Creating it is what the rest of the app does for paths it owns (a cloud file
+ * refreshed in place, a workflow database), and it is the only reading of the
+ * user's intent that makes sense: they named where the file goes.
+ */
+function ensureSaveDir(savePath) {
+  const dir = path.dirname(String(savePath || ''));
+  if (!dir) return;
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+/**
+ * Write a JSON or CSV export to disk a page at a time.
+ *
+ * Neither the rows nor the text is ever resident in full, and that matters for
+ * more than memory. `JSON.stringify(allRows, null, 2)` on a large export died
+ * with "RangeError: Invalid string length": V8 refuses to build a single string
+ * past ~512MB, a ceiling no amount of RAM lifts and which a pretty-printed
+ * export reaches at a few million rows. Serializing one row at a time has no
+ * such limit — the biggest string here is one row (JSON) or one 5,000-row page
+ * (CSV).
+ *
+ * The file is built beside the destination and renamed over it only once it is
+ * complete, so a run that fails or is cancelled half way leaves the previous
+ * export intact instead of a truncated file that still looks like one.
+ *
+ * @param {AsyncIterable<object[]>} pages - The source, in pages
+ * @param {string} format - 'json' or 'csv'
+ * @param {string} savePath - File path to write
+ * @param {{ fallbackColumns?: string[] }} options - Column names to use for a
+ *   CSV header when the source turns out to be empty, so an empty export is
+ *   still a readable headers-only file rather than a blank one.
+ * @returns {Promise<{ rows: number }>}
+ */
+async function streamToLocalFile(pages, format, savePath, { fallbackColumns = null } = {}) {
+  ensureSaveDir(savePath);
+  const partPath = `${savePath}.part`;
+  const stream = fs.createWriteStream(partPath, { encoding: 'utf8' });
+
+  // One error listener for the life of the stream. Attaching a fresh one per
+  // write would pile up thousands of listeners on a large export.
+  let streamError = null;
+  stream.on('error', (err) => { streamError = streamError || err; });
+
+  // Respecting backpressure is what makes this actually stream: without the
+  // drain wait, every chunk queues in the stream's internal buffer and the
+  // whole file ends up in memory regardless.
+  const write = (chunk) => {
+    if (streamError) return Promise.reject(streamError);
+    if (stream.write(chunk)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        stream.off('drain', onDrain);
+        stream.off('error', onError);
+      };
+      const onDrain = () => { cleanup(); resolve(); };
+      const onError = (err) => { cleanup(); reject(err); };
+      stream.once('drain', onDrain);
+      stream.once('error', onError);
+    });
+  };
+
+  const close = () => new Promise((resolve, reject) => {
+    stream.end((err) => ((err || streamError) ? reject(err || streamError) : resolve()));
+  });
+
+  let rows = 0;
+  let fields = null;
+
+  try {
+    for await (const page of pages) {
+      throwIfCancelled('writing the export', `${rows} rows written so far`);
+      if (!page.length) continue;
+
+      if (format === 'json') {
+        for (const row of page) {
+          // Each row is serialized alone and indented to sit inside the array,
+          // reproducing exactly what JSON.stringify(rows, null, 2) produced —
+          // without ever building that string.
+          const body = JSON.stringify(row, null, 2).split('\n').join('\n  ');
+          await write(`${rows === 0 ? '[\n' : ',\n'}  ${body}`);
+          rows += 1;
+        }
+      } else {
+        // The column list is fixed from the FIRST page and every later page is
+        // written against it, so the columns stay aligned down the file. A
+        // whole-array parse could union the keys of every row; a streaming one
+        // cannot see rows it has not read yet, and a source whose shape changes
+        // half way through would misalign either way.
+        if (!fields) fields = [...new Set(page.flatMap((row) => Object.keys(row)))];
+        const chunk = new Parser({ fields, header: rows === 0 }).parse(page);
+        await write(rows === 0 ? chunk : `\n${chunk}`);
+        rows += page.length;
+      }
+    }
+
+    if (format === 'json') {
+      // Close the array. An empty source never opened it, so it gets the whole
+      // literal — which is what JSON.stringify([], null, 2) produces too.
+      await write(rows === 0 ? '[]' : '\n]');
+    } else if (rows === 0 && fallbackColumns?.length) {
+      // An empty source still writes a file — that is what the node was asked
+      // to do, and a missing file reads as "the run never happened". With the
+      // configured columns it can at least be a readable headers-only CSV.
+      // Without them it is genuinely empty; json2csv throws on that rather
+      // than write nothing, which is why this is guarded.
+      await write(new Parser({ fields: fallbackColumns, header: true }).parse([]));
+    }
+
+    await close();
+    fs.renameSync(partPath, savePath);
+    return { rows };
+  } catch (err) {
+    // Leave the destination as it was, and don't leave the scratch file behind.
+    stream.destroy();
+    try { fs.unlinkSync(partPath); } catch (_) { /* never existed, or already gone */ }
+    throw err;
+  }
+}
+
+/** Wrap an in-memory array as a page stream, so array callers share one writer. */
+async function* pagesFromArray(rows, pageSize = 5000) {
+  for (let i = 0; i < rows.length; i += pageSize) yield rows.slice(i, i + pageSize);
+}
+
+/**
  * Export data to local file
+ *
+ * Three of these formats hold MANY datasets in one file — an .xlsx workbook of
+ * sheets, a SQLite or DuckDB database of tables — and for those the file is NOT
+ * rewritten: an existing one is opened and only the named sheet/table is
+ * replaced, so several output nodes can build up a single file, one dataset
+ * each, and a hand-made file keeps whatever else is in it. The single-dataset
+ * formats (json, csv, parquet, avro) have nothing to preserve and are still
+ * written whole.
+ *
  * @param {Array} sourceData - Array of data rows
- * @param {string} format - File format (json, csv, excel, nedb, sqlite, parquet, avro)
+ * @param {string} format - File format (json, csv, excel, duckdb, sqlite, lancedb, parquet, avro)
  * @param {string} savePath - File path to save to
- * @param {string} [sheetName] - Excel only: the sheet to write. Other formats
- *   hold one table per file and ignore it.
+ * @param {string} [sheetName] - Excel only: the sheet to write.
+ * @param {string} [tableName] - SQLite / DuckDB / LanceDB only: the table to write.
  * @returns {Promise<Object>} Result with success, message, filePath
  */
-async function exportToLocalFile(sourceData, format, savePath, pluginManager, skillHelpers = null, sheetName = null) {
+async function exportToLocalFile(
+  sourceData, format, savePath, pluginManager, skillHelpers = null,
+  sheetName = null, tableName = null,
+) {
+  // Every branch below opens `savePath` — a workbook, a database, a parquet or
+  // avro writer — and each would fail its own way on a folder that is not there.
+  ensureSaveDir(savePath);
 
-  if (format === 'json') {
-    fs.writeFileSync(savePath, JSON.stringify(sourceData, null, 2), 'utf8');
+  // The serial formats go through the streaming writer even when the caller
+  // already holds an array, so there is one implementation of each and an
+  // array-holding caller gets the same ~512MB-string immunity. executeOutput
+  // does not come through here for these — it streams from the page reader and
+  // never builds the array at all.
+  if (STREAMABLE_LOCAL_FORMATS.has(format)) {
+    const { rows } = await streamToLocalFile(pagesFromArray(sourceData || []), format, savePath);
     return {
       success: true,
-      message: `Successfully exported ${sourceData.length} rows to JSON`,
-      filePath: savePath
+      message: `Successfully exported ${rows} rows to ${format === 'json' ? 'JSON' : 'CSV'}`,
+      filePath: savePath,
     };
-  } else if (format === 'csv') {
-    const parser = new Parser();
-    const csv = parser.parse(sourceData);
-    fs.writeFileSync(savePath, csv, 'utf8');
-    return {
-      success: true,
-      message: `Successfully exported ${sourceData.length} rows to CSV`,
-      filePath: savePath
-    };
-  } else if (format === 'excel') {
+  }
+
+  if (format === 'excel') {
     // One sheet per output node, named by the node. An existing workbook keeps
     // every other sheet — writing a fresh book would throw the user's other
     // sheets away while reporting success — so several output nodes can build
     // up one file, a sheet each, by pointing at the same path with different
     // sheet names. A path with no file at it gets a new workbook.
-    const xlsxFile = require('../duckdb/xlsx');
     const sheet = xlsxFile.sanitizeSheetName(sheetName);
     const columns = Object.keys(sourceData[0] || {});
     xlsxFile.writeSheet(savePath, sheet, sourceData, columns);
@@ -586,39 +824,35 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
       filePath: savePath,
       sheetName: sheet
     };
-  } else if (format === 'nedb') {
-    const db = new Datastore({ filename: savePath, autoload: false });
-    await new Promise((resolve, reject) => {
-      db.loadDatabase((err) => err ? reject(err) : resolve());
-    });
-    await new Promise((resolve, reject) => {
-      db.insert(sourceData, (err, docs) => {
-        if (err) reject(err);
-        else resolve(docs);
-      });
-    });
-    return {
-      success: true,
-      message: `Successfully exported ${sourceData.length} documents to NeDB`,
-      filePath: savePath
-    };
   } else if (format === 'sqlite') {
+    // The table this node writes. It used to be hard-coded to "data", so two
+    // output nodes pointed at one .sqlite file silently overwrote each other and
+    // the file could hold only ever one dataset. The node names it now, and the
+    // fallback keeps a node built before the field existed writing where it
+    // always did.
+    const table = sanitizeTableIdentifier(tableName) || 'data';
     const sqlite3 = require('sqlite3').verbose();
+    // Opens an existing database in place — only the table below is replaced, so
+    // whatever else the file holds survives, exactly as an .xlsx keeps its other
+    // sheets. A path with no file at it gets a new database.
     const db = new sqlite3.Database(savePath);
-    console.log('savePath: ', savePath)
     // Infer columns and types from data
     if (sourceData.length > 0) {
       const columns = Object.keys(sourceData[0]);
-      const columnTypes = inferColumnTypes(sourceData, 'sqlite');
-      const columnDefs = columns.map(col => `${col} ${columnTypes[col]}`).join(', ');
+      // A real .db file, so the SQLite connector's own types — asked for the
+      // same way every other destination's are, rather than named by a string
+      // here. It falls back to SQLITE_TYPES anyway if the connector is absent.
+      const columnTypes = inferColumnTypes(
+        sourceData, dialectFor(pluginManager?.getConnector?.('sqlite'), 'sqlite'),
+      );
+      const columnDefs = columns.map(col => `"${col}" ${columnTypes[col]}`).join(', ');
 
-      // Drop table if it exists to ensure fresh schema
+      // Drop THIS table if it exists to ensure fresh schema
       await new Promise((res, rej) => {
-        db.run('DROP TABLE IF EXISTS data', (err) => err ? rej(err) : res());
+        db.run(`DROP TABLE IF EXISTS "${table}"`, (err) => err ? rej(err) : res());
       });
 
-      const createTableSql = `CREATE TABLE data (${columnDefs})`;
-      // console.log('columnDefs: ', columnDefs, columns)
+      const createTableSql = `CREATE TABLE "${table}" (${columnDefs})`;
 
       await new Promise((res, rej) => {
         db.run(createTableSql, (err) => err ? rej(err) : res());
@@ -629,7 +863,8 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
         db.serialize(() => {
           db.run("BEGIN TRANSACTION");
           const placeholders = columns.map(() => '?').join(', ');
-          const stmt = db.prepare(`INSERT INTO data (${columns.join(', ')}) VALUES (${placeholders})`);
+          const quotedCols = columns.map((c) => `"${c}"`).join(', ');
+          const stmt = db.prepare(`INSERT INTO "${table}" (${quotedCols}) VALUES (${placeholders})`);
 
           for (const row of sourceData) {
             const values = columns.map(col => {
@@ -655,13 +890,48 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
 
     return {
       success: true,
-      message: `Successfully exported ${sourceData.length} rows to SQLite`,
-      filePath: savePath
+      message: `Successfully exported ${sourceData.length} rows to table "${table}" in ${path.basename(savePath)}`,
+      filePath: savePath,
+      tableName: table
     };
+  } else if (format === 'duckdb') {
+    // Same contract as SQLite and Excel: the file is opened, not rewritten, and
+    // only this node's table is replaced. ingestRowsToTableAt attaches the
+    // database and runs CREATE OR REPLACE TABLE, so the file's other tables are
+    // untouched and a path with no file at it gets a new database.
+    const table = sanitizeTableIdentifier(tableName) || 'data';
+    if (sourceData.length === 0) {
+      // ingestRowsToTableAt refuses an empty batch (it has no columns to declare
+      // a table from). Report it as the empty write it is rather than failing
+      // the node — the caller adds the "source is empty" note.
+      return {
+        success: true,
+        message: `No rows to write to table "${table}" in ${path.basename(savePath)}`,
+        filePath: savePath,
+        tableName: table
+      };
+    }
+    try {
+      const { rowCount } = await duckdb.ingestRowsToTableAt(sourceData, savePath, table, { mode: 'replace' });
+      return {
+        success: true,
+        message: `Successfully exported ${rowCount} rows to table "${table}" in ${path.basename(savePath)}`,
+        filePath: savePath,
+        tableName: table
+      };
+    } catch (error) {
+      console.error('DuckDB export error:', error);
+      return {
+        success: false,
+        message: `Failed to export DuckDB: ${error.message}`
+      };
+    }
   } else if (format === 'parquet') {
     try {
-      // Infer schema from data
-      const schemaFields = inferParquetSchema(sourceData);
+      // Infer schema from data. The same shapes drive the rows below, so what
+      // is written can never disagree with what was declared.
+      const shapes = inferColumnShapes(sourceData);
+      const schemaFields = inferParquetSchema(sourceData, shapes);
       const schema = new parquet.ParquetSchema(schemaFields);
 
       // Create writer
@@ -669,19 +939,7 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
 
       // Write rows
       for (const row of sourceData) {
-        // Convert dates to timestamps
-        const processedRow = {};
-        Object.keys(row).forEach(key => {
-          const value = row[key];
-          if (value instanceof Date) {
-            processedRow[key] = value.getTime();
-          } else if (value === null || value === undefined) {
-            processedRow[key] = null;
-          } else {
-            processedRow[key] = value;
-          }
-        });
-        await writer.appendRow(processedRow);
+        await writer.appendRow(coerceExportRow(row, shapes, { arraysAsJson: true }));
       }
 
       await writer.close();
@@ -700,25 +958,15 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
     }
   } else if (format === 'avro') {
     try {
-      // Infer schema from data
-      const schemaDefinition = inferAvroSchema(sourceData);
+      // Infer schema from data. The same shapes drive the rows below, so what
+      // is written can never disagree with what was declared.
+      const shapes = inferColumnShapes(sourceData);
+      const schemaDefinition = inferAvroSchema(sourceData, shapes);
       const avroType = avro.Type.forSchema(schemaDefinition);
 
-      // Process data (convert dates to timestamps)
-      const processedData = sourceData.map(row => {
-        const processedRow = {};
-        Object.keys(row).forEach(key => {
-          const value = row[key];
-          if (value instanceof Date) {
-            processedRow[key] = value.getTime();
-          } else if (value === null || value === undefined) {
-            processedRow[key] = null;
-          } else {
-            processedRow[key] = value;
-          }
-        });
-        return processedRow;
-      });
+      // Process data (dates become timestamps, lists stay lists, anything the
+      // schema calls text is written as text)
+      const processedData = sourceData.map(row => coerceExportRow(row, shapes));
 
       // Write to file. Pipe a BlockEncoder into the file stream and resolve on
       // the FILE stream's finish — avsc's encoder 'finish' fires before the
@@ -766,6 +1014,11 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
       const result = await vectorSkill.exportToLanceDB({
         sourceData,
         savePath,
+        // A LanceDB database holds many tables, so the node names the one it
+        // writes — same as a .duckdb or .sqlite export. Left unset, the skill
+        // falls back to naming it after the directory, which is what it did
+        // before this was passed.
+        tableName,
         helpers: skillHelpers
       });
 
@@ -780,22 +1033,231 @@ async function exportToLocalFile(sourceData, format, savePath, pluginManager, sk
   } else {
     return {
       success: false,
-      message: `Format ${format} is not supported. Supported formats: json, csv, excel, nedb, sqlite, lancedb, parquet, avro`
+      message: `Format ${format} is not supported. Supported formats: json, csv, excel, duckdb, sqlite, lancedb, parquet, avro`
     };
   }
 }
 
 /**
- * Insert data to database connection
- * @param {Array} sourceData - Array of data rows
+ * Empty a table before a load: TRUNCATE, falling back to DELETE.
+ *
+ * TRUNCATE first because it is far cheaper than a row-by-row DELETE on every
+ * engine that has it; SQLite has no TRUNCATE at all and some engines refuse it
+ * on a table with inbound foreign keys, so DELETE is the fallback rather than
+ * the first choice. Neither is swallowed — silently appending to rows the user
+ * asked to have removed is the one outcome worth failing over, so the caller is
+ * told when BOTH failed.
+ *
+ * @returns {Promise<{ok: boolean, error: Error|null}>}
+ */
+async function clearTable(plugin, fullConfig, connectionId, quotedTableName, label) {
+  const attempts = [
+    `TRUNCATE TABLE ${quotedTableName}`,
+    `DELETE FROM ${quotedTableName}`,
+  ];
+  let lastError = null;
+  for (const query of attempts) {
+    try {
+      const result = await plugin.runQuery(fullConfig, connectionId, { query });
+      if (result && result.success === false) throw new Error(result.message);
+      console.log(`[Output] Cleared ${label} with: ${query.split(' ')[0]}`);
+      return { ok: true, error: null };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+/**
+ * Copy the source straight into the destination when both are the SAME SQL
+ * connection — `INSERT INTO dst (…) SELECT … FROM src`, run by the engine.
+ *
+ * The ordinary path reads every row out of the database into this process and
+ * sends it all back as INSERT literals: for a node whose source and destination
+ * are one connection that is two network crossings and a full serialisation
+ * round trip for a copy the engine can do internally. Nothing about the result
+ * differs; only where the rows travel.
+ *
+ * Returns null when this cannot be done — the caller then takes the ordinary
+ * streaming path, whose behaviour is unchanged. The cases deliberately handed
+ * back are:
+ *
+ *   · a different connection on either side, or a non-SQL one (vector, cloud
+ *     storage, Sheets, Mongo) — there is no single engine to run the statement;
+ *   · a destination that does NOT already exist. The streaming path creates it,
+ *     and it can only do so because it infers the column TYPES from the first
+ *     page of rows it read. A path that reads nothing has nothing to infer
+ *     from, so a first-ever run falls back and the table exists from then on.
+ *
+ * The row count comes from a COUNT(*) on the source rather than from the
+ * INSERT. Snowflake's runQuery reports `rowCount: rows.length` — for an
+ * INSERT…SELECT that is the one-row summary the engine returns, i.e. 1 — and
+ * reading the real figure out of it means parsing a column name that is
+ * engine-specific prose. The COUNT is dialect-neutral, and it answers "is the
+ * source empty" as well, which is what the streaming path gets from its first
+ * page.
+ *
+ * @returns {Promise<Object|null>} An executeOutput-shaped result, or null to fall back.
+ */
+async function trySameConnectionCopy({
+  sourceConnection, sourceTableSchema, outputSettings,
+  pluginManager, getFullConfig, getDb, sourceName,
+}) {
+  const { outputType, connectionId, tableName, writeMode } = outputSettings;
+  if (outputType !== 'connection' || !connectionId || !tableName) return null;
+
+  // Same connection on both sides — the whole premise.
+  if (!sourceConnection?.id || sourceConnection.id !== connectionId) return null;
+
+  const sourceTable = sourceTableSchema?.tableName;
+  if (!sourceTable) return null;
+
+  const connectionsDb = getDb('connections');
+  const targetConnection = (await connectionsDb.findAsync({})).find((c) => c.id === connectionId);
+  if (!targetConnection) return null;
+
+  const plugin = pluginManager.getConnector(targetConnection.dbType);
+  if (!plugin || typeof plugin.runQuery !== 'function' || typeof plugin.getColumns !== 'function') return null;
+
+  // SQL only. A vector upsert embeds, a cloud object is a PUT, Sheets speaks an
+  // API and Mongo a document protocol — none of them is a statement the engine
+  // can run over its own tables.
+  const isCloudStorage = plugin.storageType === 'cloud-storage' || targetConnection.dbType === 'google-sheets';
+  const isVector = plugin.dbCategory === 'Vector' || targetConnection.dbType === 'pinecone' || targetConnection.dbType === 'lancedb';
+  const isNoSQL = targetConnection.dbType === 'mongodb' || plugin.dbCategory === 'NoSQL';
+  if (isCloudStorage || isVector || isNoSQL) return null;
+
+  const fullConfig = await getFullConfig(targetConnection.id, targetConnection.dbConfig || {});
+  const defaultSchema = targetConnection.dbConfig?.schema || null;
+
+  // Which objects do these two names actually name? ASK THE CONNECTOR — see
+  // lib/tableRef.resolveTableRef. Quoting alone is not enough: this used to
+  // call getColumns with the name as written, and on Snowflake a destination
+  // recorded as `pg_txn_customers` found nothing while PG_TXN_CUSTOMERS sat
+  // next to it, so the copy declined, the streaming path created a SECOND
+  // table under the quoted lower-case name, and the load went into that.
+  //
+  // A destination that genuinely does NOT exist still falls back: the
+  // streaming path creates it, and it can only do so because it infers the
+  // column TYPES from the first page of rows it read. A path that reads
+  // nothing has nothing to infer from, so a first-ever run streams and the
+  // table exists from then on.
+  const dest = await resolveTableRef(plugin, fullConfig, targetConnection.id, tableName, defaultSchema);
+  if (!dest.found) return null;
+
+  const src = await resolveTableRef(plugin, fullConfig, targetConnection.id, sourceTable, defaultSchema);
+  if (!src.found) return null;
+
+  // Columns of the RESOLVED destination, not of the name as written.
+  let destColumns = null;
+  try {
+    const res = dest.columns
+      ? { success: true, columns: dest.columns }
+      : await plugin.getColumns(fullConfig, targetConnection.id, dest.schema, dest.table);
+    if (res && res.success !== false && Array.isArray(res.columns) && res.columns.length) {
+      destColumns = res.columns.map((c) => c.name || String(c));
+    }
+  } catch (err) {
+    console.log(`[Output] Same-connection copy: could not read ${dest.table}:`, err.message || err);
+  }
+  if (!destColumns) return null;
+
+  // Both refs come from the resolver, which built them with the connector's own
+  // quoting around the names the engine really has.
+  const quotedDest = dest.quotedRef;
+  const quotedSource = src.quotedRef;
+  // Columns BARE — quoteIdentifier cannot tell a table from a column, and
+  // MySQL's would prepend the database, which is a syntax error in a column
+  // list. Same rule the streaming path's CREATE TABLE applies.
+  const quotedColumns = destColumns.map((c) => plugin.quoteIdentifier(c, null, null));
+  const columnList = quotedColumns.join(', ');
+
+  // How many rows are about to move. Also the empty-source answer, which has to
+  // be known BEFORE a truncate — emptying the destination and then writing
+  // nothing turns an empty source into data loss.
+  let rowCount;
+  try {
+    const counted = await plugin.runQuery(fullConfig, targetConnection.id, {
+      query: `SELECT COUNT(*) AS n FROM ${quotedSource}`,
+    });
+    if (!counted || counted.success === false) throw new Error(counted?.message || 'unknown error');
+    const row = (counted.rows || counted.data || [])[0] || {};
+    // Engines disagree about the case they hand a column alias back in.
+    const raw = Object.values(row)[0];
+    rowCount = Number(raw);
+    if (!Number.isFinite(rowCount)) throw new Error(`unreadable count: ${JSON.stringify(row)}`);
+  } catch (err) {
+    // Cannot tell how much there is, or cannot read the source at all. Fall
+    // back rather than guess — the streaming path reports the read failure
+    // properly.
+    console.log(`[Output] Same-connection copy: count of ${sourceTable} failed:`, err.message || err);
+    return null;
+  }
+
+  if (rowCount === 0) {
+    console.warn(`[Output] Source "${sourceName}" has no rows — ${tableName} left unchanged`);
+    return {
+      success: true,
+      warning: true,
+      message: `No rows to write: "${sourceName}" is empty, so ${tableName} was left unchanged.`,
+      rowsInserted: 0,
+      rowCount: 0,
+    };
+  }
+
+  if (writeMode === 'truncate') {
+    const cleared = await clearTable(plugin, fullConfig, targetConnection.id, quotedDest, dest.table);
+    if (!cleared.ok) {
+      return {
+        success: false,
+        message: `Could not truncate ${dest.table} before loading: ${cleared.error?.message || 'unknown error'}`,
+      };
+    }
+  }
+
+  // One statement, no rows through this process. A column the destination has
+  // and the source does not fails here with the engine's own message — the
+  // streaming path's shape check needs rows in hand and has nothing to offer.
+  const insertSql = `INSERT INTO ${quotedDest} (${columnList}) SELECT ${columnList} FROM ${quotedSource}`;
+  console.log(`[Output] Same-connection copy on ${targetConnection.dbType}: ${insertSql}`);
+  const result = await plugin.runQuery(fullConfig, targetConnection.id, { query: insertSql });
+  if (!result || result.success === false) {
+    return {
+      success: false,
+      message: `Could not copy ${src.table} into ${dest.table}: ${result?.message || 'unknown error'}`,
+    };
+  }
+
+  // Report the name the rows actually went to. Where the resolver had to fold
+  // the configured name to reach it, that differs from `tableName`, and the
+  // run log is the only place a user would ever see which one won.
+  return {
+    success: true,
+    message: `Successfully inserted ${rowCount} rows into ${dest.table}`,
+    rowsInserted: rowCount,
+    rowCount,
+  };
+}
+
+/**
+ * Insert data to database connection.
+ *
+ * Takes PAGES, not an array: a large load must not require the whole source to
+ * be resident, and the cap that used to make that safe is gone. The SQL and
+ * MongoDB branches consume the pages as they arrive; the vector and
+ * cloud-storage branches drain them first, because a vector upsert and an
+ * object PUT both need the whole set in hand.
+ *
+ * @param {AsyncIterable<object[]>} pages - Row pages from openSourcePages.
  * @param {string} connectionId - Target connection ID
  * @param {string} tableName - Target table/collection name
  * @param {Object} pluginManager - Plugin manager instance
  * @param {Function} getFullConfig - Function to get full config with credentials
- * @param {Function} getDb - Function to get NeDB database instance by collection name
+ * @param {Function} getDb - Function to get an app-metadata datastore by collection name
  * @returns {Promise<Object>} Result with success, message, documentsInserted/rowsInserted
  */
-async function insertToConnection(sourceData, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers = null) {
+async function insertToConnection(pages, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers = null, writeMode = 'append', { sourceName = 'the source' } = {}) {
   const connectionsDb = getDb('connections');
   const targetConnectionDocs = await connectionsDb.findAsync({});
   const targetConnection = targetConnectionDocs.find(c => c.id === connectionId);
@@ -812,12 +1274,31 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
   const isCloudStorage = plugin?.storageType === 'cloud-storage' || targetConnection.dbType === 'google-sheets';
   const isVector = plugin?.dbCategory === 'Vector' || targetConnection.dbType === 'pinecone' || targetConnection.dbType === 'lancedb';
 
+  /** Nothing came out of the source: leave the destination exactly as it is. */
+  const nothingToDo = () => {
+    const destination = tableName || 'the destination';
+    console.warn(`[Output] Source "${sourceName}" has no rows — ${destination} left unchanged`);
+    return {
+      success: true,
+      warning: true,
+      message: `No rows to write: "${sourceName}" is empty, so ${destination} was left unchanged.`,
+      rowsInserted: 0,
+      rowCount: 0,
+    };
+  };
+
   if (isVector) {
-    // Vector database - use vector-db-executor skill
-    return await insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers);
+    // Vector database - use vector-db-executor skill. Needs the whole set: the
+    // skill embeds and upserts one array.
+    const sourceData = await collectPages(pages);
+    if (sourceData.length === 0) return nothingToDo();
+    return await insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers, writeMode);
   }
 
   if (isCloudStorage) {
+    // One object, written whole — there is no append to a PUT.
+    const sourceData = await collectPages(pages);
+    if (sourceData.length === 0) return nothingToDo();
     // Upload data to cloud storage as JSON or CSV
     const fullConfig = await getFullConfig(targetConnection.id, targetConnection.dbConfig || {});
 
@@ -828,11 +1309,13 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
     let containerName, objectName, fileName;
 
     if (parts.length < 2) {
-      // For Google Sheets, if no "/" separator, use entire tableName as filename
+      // Google Sheets: "<spreadsheet>/<tab>" is what the picker records. A bare
+      // name is a spreadsheet with no tab named, which writes to (or creates)
+      // its first tab.
       if (targetConnection.dbType === 'google-sheets') {
-        containerName = 'root'; // Not used by Google Sheets, but required by interface
-        objectName = tableName;
-        fileName = tableName;
+        containerName = tableName;
+        objectName = 'Sheet1';
+        fileName = objectName;
       } else {
         return {
           success: false,
@@ -849,7 +1332,13 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
     let fileContent;
     let contentType;
 
-    if (fileName.endsWith('.json')) {
+    // Google Sheets takes ROWS, not a file: its uploadObject writes cells into
+    // a tab. The "file name" here is the tab, so its (absent, or incidental)
+    // extension must not decide the payload — always hand it JSON.
+    if (targetConnection.dbType === 'google-sheets') {
+      fileContent = Buffer.from(JSON.stringify(sourceData), 'utf-8');
+      contentType = 'application/json';
+    } else if (fileName.endsWith('.json')) {
       // Export as JSON
       fileContent = Buffer.from(JSON.stringify(sourceData, null, 2), 'utf-8');
       contentType = 'application/json';
@@ -865,14 +1354,21 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
       contentType = 'application/json';
     }
 
-    // Upload to cloud storage
+    // Upload to cloud storage.
+    //
+    // For an object store this REPLACES the object — dropping the old file and
+    // putting this one in its place — which is the only thing a file write can
+    // mean, so `writeMode` has nothing to change. Google Sheets is the
+    // exception in this branch: a tab holds rows across runs, so the mode is
+    // passed on and its connector either clears the tab first or appends.
     const result = await plugin.uploadObject(
       fullConfig,
       targetConnection.id,
       containerName,
       objectName,
       fileContent,
-      contentType
+      contentType,
+      { writeMode }
     );
 
     if (result.success) {
@@ -890,30 +1386,87 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
     }
   }
 
-  const isNoSQLTarget = ['mongodb', 'nedb'].includes(targetConnection.dbType);
+  const isNoSQLTarget = targetConnection.dbType === 'mongodb';
 
   if (isNoSQLTarget) {
-    // Insert to NoSQL database
-    if (targetConnection.dbType === 'nedb') {
-      return {
-        success: false,
-        message: 'NeDB connection output not yet implemented'
-      };
-    } else {
-      // MongoDB
+    // Insert to the MongoDB destination
+    {
       const fullConfig = await getFullConfig(targetConnection.id, targetConnection.dbConfig || {});
       const plugin = pluginManager.getConnector(targetConnection.dbType);
 
-      const result = await plugin.runQuery(fullConfig, targetConnection.id, {
-        operation: 'insertMany',
-        collection: tableName,
-        documents: sourceData
-      });
+      // Ask for the first page before touching the destination: an empty
+      // source must not reach the truncate below.
+      const { firstPage, rest } = await peekPages(pages);
+      if (!firstPage) return nothingToDo();
+
+      // Truncate: empty the collection, keeping the collection itself (and its
+      // indexes) so this is a load, not a re-create.
+      if (writeMode === 'truncate') {
+        const cleared = await plugin.runQuery(fullConfig, targetConnection.id, {
+          operation: 'deleteMany',
+          collection: tableName,
+          filter: {}
+        });
+        if (cleared && cleared.success === false) {
+          return { success: false, message: `Failed to truncate ${tableName}: ${cleared.message}` };
+        }
+        console.log(`[Output] Truncated collection ${tableName}`);
+      }
+
+      // One insertMany per page rather than one for the whole source: a ten
+      // million document array is not something to build, let alone hand to a
+      // driver in a single call.
+      let documentsInserted = 0;
+      for await (const page of rest) {
+        throwIfCancelled(
+          'inserting documents',
+          `${documentsInserted} documents already written to ${tableName}`,
+        );
+
+        // Drop `_id` before inserting. An `_id` identifies a document WITHIN
+        // its own collection, and these came out of a different one — carrying
+        // it over asks the destination to adopt another collection's identity
+        // for the row. The destination mints its own.
+        //
+        // Left in, the second write of any given source document fails the
+        // WHOLE batch with `E11000 duplicate key error ... index: _id_`: an
+        // append that re-sends a row it already sent, or a staging collection
+        // re-read across runs, becomes a hard error rather than the duplicate
+        // row that was asked for.
+        //
+        // Deleted IN PLACE rather than rebuilt with a rest-spread: these
+        // documents were just read for this insert and nothing else holds them,
+        // so rebuilding would allocate a second object per row for no gain. The
+        // pass is O(page) against an insertMany that already touches every
+        // document in it. Only `_id` goes; every other field, including one the
+        // source genuinely uses as a key, is untouched.
+        for (const doc of page) {
+          if (doc !== null && typeof doc === 'object' && '_id' in doc) delete doc._id;
+        }
+
+        // A failed operation comes back as { success: false } rather than
+        // throwing, so an unchecked call would report every document written
+        // when none were — and with writeMode 'truncate' the collection was
+        // just emptied, making a silent failure a data loss rather than a no-op.
+        const inserted = await plugin.runQuery(fullConfig, targetConnection.id, {
+          operation: 'insertMany',
+          collection: tableName,
+          documents: page
+        });
+        if (inserted && inserted.success === false) {
+          return {
+            success: false,
+            message: `Failed to insert into ${tableName} after ${documentsInserted} document(s): ${inserted.message}`,
+          };
+        }
+        documentsInserted += page.length;
+      }
 
       return {
         success: true,
-        message: `Successfully inserted ${sourceData.length} documents into ${tableName}`,
-        documentsInserted: sourceData.length
+        message: `Successfully ${writeMode === 'truncate' ? 'replaced' : 'inserted'} `
+          + `${documentsInserted} documents in ${tableName}`,
+        documentsInserted
       };
     }
   } else {
@@ -921,10 +1474,28 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
     const fullConfig = await getFullConfig(targetConnection.id, targetConnection.dbConfig || {});
     const plugin = pluginManager.getConnector(targetConnection.dbType);
 
-    // Infer columns and types from data
-    if (sourceData.length > 0) {
-      const columns = Object.keys(sourceData[0]);
-      const columnTypes = inferColumnTypes(sourceData, targetConnection.dbType);
+    // The first page decides the destination's shape, and answers "is there
+    // anything to write at all" — both before a single row is sent, and before
+    // the truncate below can empty a table for nothing.
+    const { firstPage, rest } = await peekPages(pages);
+
+    if (firstPage) {
+      const columns = Object.keys(firstPage[0]);
+      // Types are inferred from the FIRST PAGE rather than the whole source.
+      //
+      // Not a compromise forced by streaming — an improvement. The old code
+      // scanned every row it had, which on the capped path meant walking a
+      // million rows to pick a column type, and on an uncapped one would mean
+      // walking ten million. A page is the same sampling the file importer
+      // already does (see chunkedWriter's TYPE_SAMPLE_ROWS), and it is applied
+      // to the same rows the CREATE TABLE has to satisfy first.
+      //
+      // The trade is real and worth naming: a column that is integral for the
+      // first page and fractional later now gets the narrower type. That was
+      // already true past row 1,000,000; it is simply true sooner.
+      const columnTypes = inferColumnTypes(
+        firstPage, dialectFor(plugin, targetConnection.dbType),
+      );
       // Quote column identifiers so reserved words (e.g. a "timestamp" column on
       // SQL Server) don't break the CREATE TABLE. Without this the CREATE fails
       // with a syntax error that the try/catch below swallows, leaving the table
@@ -941,50 +1512,243 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
         ? (c) => plugin.quoteIdentifier(c, null, null)
         : (c) => c;
       const columnDefs = columns.map(col => `${quoteCol(col)} ${columnTypes[col]}`).join(', ');
-      console.log('tableName, schema, targetConnection.dbConfig: ', tableName, targetConnection.dbConfig)
-      // Quote the table name using the plugin's quoteIdentifier
-      // For BigQuery with dataset.table format, parse and quote properly
-      let quotedTableName = tableName;
-      if (plugin && plugin.quoteIdentifier) {
-        if (targetConnection.dbType === 'bigquery' && tableName.includes('.')) {
-          const parts = tableName.split('.');
-          if (parts.length === 2) {
-            const [schema, table] = parts;
-            quotedTableName = plugin.quoteIdentifier(table, schema, targetConnection.dbConfig);
+
+      // Pass NO schema when the destination carries its own qualifier —
+      // otherwise the connection's default ("public", the database name) would
+      // win over the schema the user actually named, and the lookup would check
+      // the wrong table. This is what stands between a wrong-shape load and a
+      // truncate, so it has to check the table the insert will really write to.
+      const lookupSchema = tableName.includes('.')
+        ? null
+        : (targetConnection.dbConfig?.schema || fullConfig?.schema || fullConfig?.database || null);
+
+      // WHICH object does the configured name name? Ask the connector before
+      // anything else, because every statement below has to agree about it.
+      //
+      // The name recorded on an output node comes from the user's prose or from
+      // an AI-generated config, not from the catalog, so its case need not
+      // match what the engine stored. Quoting it faithfully — which is all
+      // quoteIdentifier can do — asked Snowflake for "pg_txn_customers" while
+      // PG_TXN_CUSTOMERS sat beside it: the probe reported the table missing,
+      // the CREATE below made a second one, and 200 rows went into it without a
+      // single error. See lib/tableRef.resolveTableRef.
+      const resolved = await resolveTableRef(
+        plugin, fullConfig, targetConnection.id, tableName, lookupSchema,
+      );
+
+      // The name to WRITE with, and the bare name to hand batchInsert (which
+      // quotes internally).
+      //
+      // When the resolver found nothing these fall back to the configured name,
+      // unchanged from what this did before it could resolve anything: that is
+      // the first-ever run, and the CREATE below brings the table into
+      // existence under exactly that name. NO schema is passed on that path,
+      // deliberately — `lookupSchema` falls back to the DATABASE name when the
+      // connection records no schema, and on SQL Server that is never a schema
+      // (tables live in `dbo`), so qualifying the CREATE with it would build
+      // `[mydb].[orders]`. Splitting a qualified name is the connector's job.
+      const quotedTableName = resolved.found
+        ? resolved.quotedRef
+        : ((plugin && plugin.quoteIdentifier)
+          ? plugin.quoteIdentifier(tableName, null, targetConnection.dbConfig)
+          : tableName);
+      const writeTableName = resolved.table || tableName;
+
+      // Does the destination already exist? ASK, rather than issuing a CREATE
+      // and reading its failure as "yes".
+      //
+      // That older probe could not tell one failure from another: a permissions
+      // error, an unknown dataset or a bad column type all read as "the table is
+      // already there", after which the load continued and failed later with
+      // something unrelated to the real cause. It also made every re-run log a
+      // full error object (BigQuery's 409 dumps its whole HTTP response) for a
+      // condition that is entirely normal.
+      //
+      // Three outcomes, because "I could not tell" is not the same as "no":
+      // a connector without getColumns, or one whose lookup errors, leaves the
+      // answer UNKNOWN and we fall back to the create-and-see behaviour.
+      //
+      // Reads the RESOLVED identity, so the shape check and the truncate below
+      // are looking at the table the insert will really write to.
+      const readColumns = async (schema) => {
+        try {
+          const res = await plugin.getColumns(fullConfig, targetConnection.id, schema, writeTableName);
+          if (res && res.success !== false && Array.isArray(res.columns)) return res.columns;
+        } catch (err) {
+          console.log(`[Output] Could not read columns of ${writeTableName}:`, err.message || err);
+        }
+        return null; // couldn't tell
+      };
+
+      const probeTable = async () => {
+        if (typeof plugin.getColumns !== 'function') return { state: 'unknown', columns: null };
+
+        // The resolver already carries them where it reads columns itself.
+        if (resolved.found && Array.isArray(resolved.columns) && resolved.columns.length) {
+          return { state: 'exists', columns: resolved.columns };
+        }
+
+        const scoped = await readColumns(resolved.found ? resolved.schema : lookupSchema);
+        if (scoped && scoped.length > 0) return { state: 'exists', columns: scoped };
+
+        // An empty result from a SCOPED lookup is not proof of absence — the
+        // schema guessed above may not be one the engine uses. `lookupSchema`
+        // falls back to the DATABASE name when the connection records no
+        // schema, and on SQL Server that is never a schema (tables live in
+        // `dbo`), so a real table came back with zero columns and read as
+        // missing. Ask again unscoped and let the connector apply its own
+        // default before believing the table is not there.
+        if (lookupSchema) {
+          const bare = await readColumns(null);
+          if (bare && bare.length > 0) return { state: 'exists', columns: bare };
+          if (bare && scoped) return { state: 'missing', columns: null };
+          return { state: 'unknown', columns: null };
+        }
+
+        // Every table has at least one column, so a lookup that succeeded and
+        // returned none means there is no such table.
+        return scoped ? { state: 'missing', columns: null } : { state: 'unknown', columns: null };
+      };
+
+      let probe = await probeTable();
+      let tableIsNew = false;
+
+      if (probe.state !== 'exists') {
+        // A connector reports a failed statement by RETURNING { success: false },
+        // not by throwing — see the postgres/mysql/mssql runQuery, which catch
+        // the driver error themselves. Both shapes are handled so a connector
+        // that does throw still works.
+        const createTableSql = `CREATE TABLE ${quotedTableName} (${columnDefs})`;
+        console.log('[Output] Creating destination table:', createTableSql);
+        try {
+          const created = await plugin.runQuery(fullConfig, targetConnection.id, { query: createTableSql });
+          if (created && created.success === false) throw new Error(created.message);
+          tableIsNew = true;
+        } catch (err) {
+          // Ask again before deciding this is fatal: the table may have been
+          // created between the probe and here, or the probe may simply have
+          // looked somewhere the connector names differently.
+          const message = String(err?.message || err);
+          probe = await probeTable();
+          // The engine saying the object is already there outranks a lookup
+          // that failed to find it: whatever the probe was looking at, the
+          // table exists and the load can proceed. Without this, an engine
+          // whose schemas the probe cannot resolve turns a load that has
+          // always worked into a hard failure.
+          const saysExists = /already exists|already an object|duplicate/i.test(message);
+          if (probe.state === 'exists' || saysExists) {
+            console.log(`[Output] ${writeTableName} already exists; loading into it.`);
+          } else if (probe.state === 'missing') {
+            // It really is not there and the CREATE really did fail. Say so
+            // here, where the actual reason is still in hand.
+            return {
+              success: false,
+              message: `Could not create ${writeTableName}: ${message}`,
+            };
           } else {
-            quotedTableName = `\`${tableName}\``;
+            console.log('Table creation skipped (may already exist):', message);
           }
-        } 
-        else {
-          quotedTableName = plugin.quoteIdentifier(tableName, null, targetConnection.dbConfig);
         }
       }
 
-      // Try to create table - will fail silently if it already exists
-      const createTableSql = `CREATE TABLE ${quotedTableName} (${columnDefs})`;
-      console.log('createTableSql: ', createTableSql)
-      try {
-        await plugin.runQuery(fullConfig, targetConnection.id, {query: createTableSql});
-      } catch (err) {
-        // Table already exists, that's fine
-        console.log('Table creation skipped (may already exist):', err);
+      // The table was already there, so its shape is whatever some earlier run
+      // (or someone else entirely) left behind — nothing guarantees it matches
+      // what we are about to load. Check BEFORE the truncate below: the insert
+      // would catch a mismatch on its own, but only after the destination had
+      // been emptied, turning "wrong table" into lost data. Reported as a
+      // failure naming both column sets, which is what tells the user whether
+      // they meant a different table or need to drop this one.
+      //
+      // Advisory only: a connector without getColumns, or one that cannot read
+      // them, leaves the probe UNKNOWN and the load goes ahead rather than
+      // being blocked when it might well be fine.
+      //
+      // The columns come from the probe above — the lookup already happened
+      // there to decide whether to create, so asking again would be a second
+      // round trip for an answer we hold.
+      // `columns` is null when existence was established by the CREATE's own
+      // error rather than a lookup — there is nothing to compare then, so the
+      // check is skipped exactly as it is for an UNKNOWN probe.
+      if (!tableIsNew && probe.state === 'exists' && Array.isArray(probe.columns) && probe.columns.length > 0) {
+        const existing = probe.columns;
+        // Compare case-insensitively: the engines differ on identifier
+        // folding, and a case-only difference is not what this guards against.
+        const have = new Set(existing.map(c => String(c.name).toLowerCase()));
+        const missing = columns.filter(c => !have.has(String(c).toLowerCase()));
+        if (missing.length > 0) {
+          return {
+            success: false,
+            message: `Destination table ${writeTableName} does not have the column`
+              + `${missing.length === 1 ? '' : 's'} ${missing.join(', ')}. `
+              + `It has: ${existing.map(c => c.name).join(', ')}. `
+              + `The incoming data has: ${columns.join(', ')}. `
+              + `Nothing was written or removed — drop or rename ${writeTableName}, or point this `
+              + `output at a different table.`,
+          };
+        }
       }
 
-      // Insert data in chunks using plugin's batchInsert function
-      const CHUNK_SIZE = 1000;
+      // Truncate-and-insert: empty the table before loading, so a re-run
+      // REPLACES the previous load instead of stacking another copy on top.
+      // Skipped when the CREATE above just made the table — there is nothing in
+      // it, and an empty-table TRUNCATE is a needless round trip.
+      //
+      // TRUNCATE first because it is far cheaper than a row-by-row DELETE on
+      // every engine that has it; SQLite has no TRUNCATE at all and some
+      // engines refuse it on a table with inbound foreign keys, so DELETE is
+      // the fallback rather than the first choice. A failure of BOTH is
+      // reported instead of swallowed: silently appending to rows the user
+      // asked to have removed is the one outcome worth failing over.
+      if (writeMode === 'truncate' && !tableIsNew) {
+        const cleared = await clearTable(
+          plugin, fullConfig, targetConnection.id, quotedTableName, writeTableName,
+        );
+        if (!cleared.ok) {
+          return {
+            success: false,
+            message: `Could not truncate ${writeTableName} before loading: ${cleared.error?.message || 'unknown error'}`,
+          };
+        }
+      }
+
+      // Insert in chunks using the plugin's batchInsert, reading the source as
+      // we go — one chunk of rows is resident at a time, whatever the size of
+      // the table being loaded.
+      //
+      // The chunk size is the DESTINATION's, not the reader's: the connector
+      // chooses when it has a reason to — BigQuery turns each call into a load
+      // job and is rationing a daily job quota, not a statement length (see
+      // public/lib/batchChunkSize.js). So rows are buffered up to that size
+      // across page boundaries rather than one batchInsert per page, which
+      // would hand BigQuery whatever the reader happened to yield.
+      const CHUNK_SIZE = batchChunkSizeFor(plugin);
       let totalInserted = 0;
+      let buffer = [];
 
-      for (let chunkStart = 0; chunkStart < sourceData.length; chunkStart += CHUNK_SIZE) {
-        const chunk = sourceData.slice(chunkStart, chunkStart + CHUNK_SIZE);
-
+      const writeChunk = async (chunk) => {
         // Use plugin's batchInsert function if available, otherwise fallback to individual inserts
         if (plugin.batchInsert) {
-          // batchInsert expects unquoted table name (it handles quoting internally)
-          const result = await plugin.batchInsert(fullConfig, targetConnection.id, tableName, columns, chunk);
-          if (!result.success) {
-            throw new Error(result.message || 'Batch insert failed');
+          // Tell the tracer which records this call carries, so its line reads
+          // "records=50,001–100,000" instead of a fourth identical "rows=50000"
+          // — the only thing in the log that says how far a long load has got
+          // while it is still running. Purely descriptive; cleared afterwards so
+          // a later call in this node cannot inherit a stale offset.
+          setBatchWindow({ table: writeTableName, written: totalInserted });
+          try {
+            // batchInsert expects the table name UNQUOTED — it quotes
+            // internally — so this is the one place the RESOLVED bare name has
+            // to be used rather than the quoted ref. Handing it the configured
+            // `tableName` re-introduced the wrong case after everything above
+            // had resolved it correctly, and the rows went to a table nothing
+            // else in this function was looking at.
+            const result = await plugin.batchInsert(fullConfig, targetConnection.id, writeTableName, columns, chunk);
+            if (!result.success) {
+              throw new Error(result.message || 'Batch insert failed');
+            }
+            totalInserted += result.rowsInserted;
+          } finally {
+            setBatchWindow(null);
           }
-          totalInserted += result.rowsInserted;
         } else {
           // Fallback: individual INSERT statements (use quoted table name)
           const insertStatements = chunk.map(row => {
@@ -1000,22 +1764,57 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
           });
 
           const batchInsert = insertStatements.join('; ');
-          await plugin.runQuery(fullConfig, targetConnection.id, {query: batchInsert});
+          // Same convention as the CREATE above: a failed statement comes back
+          // as { success: false } rather than throwing. Counting the chunk
+          // without checking would report "Successfully inserted N rows" for a
+          // write that never landed.
+          const inserted = await plugin.runQuery(fullConfig, targetConnection.id, {query: batchInsert});
+          if (inserted && inserted.success === false) {
+            throw new Error(inserted.message || 'Insert failed');
+          }
           totalInserted += chunk.length;
         }
+      };
+
+      const flush = async () => {
+        if (buffer.length === 0) return;
+        const chunk = buffer;
+        buffer = [];
+        // A large load lives entirely inside this one loop — minutes of work in
+        // a single node — so the between-steps check in the runner would never
+        // come round. Checked before the batch, not after: the point is to not
+        // start another one. Rows already written stay written, which is why the
+        // count goes into the message.
+        //
+        // No "of N" any more: with the source streamed, the total is not known
+        // until it has all been read, and inventing one would be worse than
+        // reporting the number that is real.
+        throwIfCancelled(
+          'batch insert',
+          `${totalInserted} rows already written to ${writeTableName}`,
+        );
+        await writeChunk(chunk);
+      };
+
+      for await (const page of rest) {
+        for (const row of page) {
+          buffer.push(row);
+          if (buffer.length >= CHUNK_SIZE) await flush();
+        }
       }
+      await flush();
 
       return {
         success: true,
-        message: `Successfully inserted ${totalInserted} rows into ${tableName}`,
+        message: `Successfully ${writeMode === 'truncate' ? 'replaced' : 'inserted'} `
+          + `${totalInserted} rows in ${writeTableName}`,
         rowsInserted: totalInserted
       };
     }
 
-    return {
-      success: false,
-      message: 'No data to insert'
-    };
+    // The source yielded no pages at all: leave the destination alone rather
+    // than truncating it for nothing.
+    return nothingToDo();
   }
 }
 
@@ -1029,7 +1828,7 @@ async function insertToConnection(sourceData, connectionId, tableName, pluginMan
  * @param {Function} getFullConfig - Function to get full config with credentials
  * @returns {Promise<Object>} Result with success, message, vectorsInserted
  */
-async function insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers = null) {
+async function insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers = null, writeMode = 'append') {
   try {
     // Parse index name and namespace for Pinecone
     let indexName = tableName;
@@ -1050,12 +1849,20 @@ async function insertToVectorDatabase(sourceData, targetConnection, tableName, p
       };
     }
 
-    // Execute data-to-vector transfer using the skill
+    // Execute data-to-vector transfer using the skill.
+    //
+    // 'truncate' empties the target first. It matters more here than elsewhere:
+    // vectors are upserted by a CONTENT-derived id, so re-running an append
+    // against changed data leaves the old vectors in place beside the new ones
+    // and every similarity search keeps finding rows that no longer exist
+    // upstream. The skill drops the LanceDB table / clears the Pinecone
+    // namespace before writing.
     const result = await vectorSkill.executeDataToVector({
       sourceData,
       targetConnection,
       targetIndexName: indexName,
       targetNamespace: namespace,
+      writeMode,
       pluginManager,
       getFullConfig,
       helpers: skillHelpers
@@ -1064,7 +1871,10 @@ async function insertToVectorDatabase(sourceData, targetConnection, tableName, p
     if (result.success) {
       return {
         success: true,
-        message: result.message || `Successfully inserted ${result.vectorsInserted || sourceData.length} vectors into ${indexName}${namespace ? `/${namespace}` : ''}`,
+        message: result.message
+          || `Successfully ${writeMode === 'truncate' ? 'replaced' : 'inserted'} `
+            + `${result.vectorsInserted || sourceData.length} vectors in `
+            + `${indexName}${namespace ? `/${namespace}` : ''}`,
         vectorsInserted: result.vectorsInserted || sourceData.length
       };
     } else {
@@ -1074,6 +1884,11 @@ async function insertToVectorDatabase(sourceData, targetConnection, tableName, p
       };
     }
   } catch (error) {
+    // A stop must stay an exception on its way to the runner — see the note on
+    // executeOutput's catch above. This is the host-side wrapper around the
+    // vector skill, so it is the last place a stop raised while embedding or
+    // upserting could be flattened into a failed write.
+    if (isCancelledError(error)) throw error;
     console.error('Vector database insertion error:', error);
     return {
       success: false,
@@ -1087,9 +1902,11 @@ module.exports = {
   executeOutput,
   exportToLocalFile,
   insertToConnection,
+  trySameConnectionCopy,
   insertToVectorDatabase,
   inferColumnTypes,
   inferColumnType,
+  dialectFor,
   inferParquetSchema,
   inferAvroSchema
 };

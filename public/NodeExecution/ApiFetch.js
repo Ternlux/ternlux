@@ -6,7 +6,7 @@
  *   - apiFetchCode — a JavaScript async function expression string produced
  *     by the AI. It may contain `{{PLACEHOLDER}}` tokens from a fixed
  *     vocabulary, placed inside string literals or template literals.
- *   - nedbCollection + operationMode (what to name the rows and how to write them).
+ *   - targetCollection + operationMode (what to name the rows and how to write them).
  *
  * We merge the public config with keychain-decrypted credentials via the
  * injected `getFullConfig(connectionId, baseConfig)` (same helper Postgres /
@@ -112,9 +112,9 @@ function substituteCode(code, map) {
  *
  * @param {Object} params
  * @param {string} params.apiConnectionId
- * @param {Object} params.apiConnectionConfig - public config from the NeDB connection doc
+ * @param {Object} params.apiConnectionConfig - public config from the saved connection record
  * @param {string} params.apiFetchCode - async function expression (with placeholders)
- * @param {string} params.nedbCollection - target collection name
+ * @param {string} params.targetCollection - target collection name
  * @param {string} [params.operationMode='new_table'] - 'new_table' replaces, 'append' adds
  *
  * @returns {Promise<{success:boolean, rowCount?:number, collection?:string,
@@ -124,7 +124,7 @@ async function handleExecuteApiFetch({
   apiConnectionId,
   apiConnectionConfig = {},
   apiFetchCode,
-  nedbCollection,
+  targetCollection,
   operationMode = 'new_table',
   // Optional — writes the fetched rows as a table in the workflow's own
   // database instead of a standalone Parquet file.
@@ -138,8 +138,8 @@ async function handleExecuteApiFetch({
     if (!apiFetchCode || typeof apiFetchCode !== 'string') {
       return { success: false, error: 'Missing apiFetchCode' };
     }
-    if (!nedbCollection || typeof nedbCollection !== 'string') {
-      return { success: false, error: 'Missing nedbCollection' };
+    if (!targetCollection || typeof targetCollection !== 'string') {
+      return { success: false, error: 'Missing targetCollection' };
     }
 
     // 1. Merge public config with decrypted secrets (main-process only).
@@ -181,13 +181,13 @@ async function handleExecuteApiFetch({
     // Fetched rows are materialised as this node's output table in the
     // workflow's database — the same place a transformer or join writes — so
     // an API source is just another local table to everything downstream.
-    const localPath = resolveOutputPath(nedbCollection, { workflowId, nodeId });
+    const localPath = resolveOutputPath(targetCollection, { workflowId, nodeId });
 
     if (rows.length === 0) {
       return {
         success: true,
         rowCount: 0,
-        collection: nedbCollection,
+        collection: targetCollection,
         localPath,
         sampleRow: null,
         message: 'No rows returned by the API.',
@@ -197,7 +197,7 @@ async function handleExecuteApiFetch({
     try {
       await duck.withWorkflowLock(
         workflowId,
-        () => duck.ingestRowsToTable(rows, workflowId, nedbCollection),
+        () => duck.ingestRowsToTable(rows, workflowId, targetCollection),
       );
     } catch (err) {
       return { success: false, error: `Failed to write rows: ${err.message}` };
@@ -206,7 +206,7 @@ async function handleExecuteApiFetch({
     return {
       success: true,
       rowCount: rows.length,
-      collection: nedbCollection,
+      collection: targetCollection,
       localPath,
       sampleRow: rows[0],
     };
