@@ -1,7 +1,7 @@
 /**
  * DuckDB — the query engine for local files.
  *
- * Local files are no longer imported into SQLite/NeDB before they can be used.
+ * Local files are no longer imported into another store before they can be used.
  * They stay where the user put them and are queried in place: a CSV, JSON,
  * Parquet, Excel or Avro file is addressed by path and read straight off disk,
  * so opening a 5 GB file costs the same as opening a 5 MB one.
@@ -27,6 +27,7 @@ const path = require('path');
 const os = require('os');
 
 const { EXTENSION_FOR_FORMAT, ensureExtension, resetExtensions } = require('./extensions');
+const { throwIfCancelled } = require('../NodeExecution/executionCancel');
 const xlsxFile = require('./xlsx');
 
 // Formats DuckDB reads. csv / json / parquet are built in; xlsx and avro need
@@ -55,7 +56,43 @@ const NUMERIC_TYPES = /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALL
 // strings rather than silently losing their last digits.
 const INTEGER_TYPES = /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT)/i;
 
+let instancePromise = null;
 let connectionPromise = null;
+
+/**
+ * Bumped whenever the instance is thrown away and rebuilt.
+ *
+ * Everything catalog-level goes with the old instance — attachments, and the
+ * views connectors register over files — so anything that remembers "I already
+ * registered that" has to forget it. Callers hold this alongside their own
+ * cache key rather than being notified: a stale epoch simply misses, and the
+ * work is done again.
+ */
+let sessionGeneration = 0;
+const sessionEpoch = () => sessionGeneration;
+
+/**
+ * The shared instance. Held separately from the connection because a streaming
+ * read needs a connection of its OWN (see streamRows) while everything else
+ * keeps using the shared one — and both must be looking at the same catalog,
+ * or the aliases attachDb hands out would name nothing.
+ *
+ * ATTACH and CREATE VIEW here are catalog-level, not connection-local, so a
+ * second connection on this instance sees every attached database and every
+ * registered source without repeating the work.
+ */
+async function getInstance() {
+  if (!instancePromise) {
+    instancePromise = (async () => {
+      const { DuckDBInstance } = require('@duckdb/node-api');
+      return DuckDBInstance.create(':memory:');
+    })().catch((err) => {
+      instancePromise = null; // let a later call retry
+      throw err;
+    });
+  }
+  return instancePromise;
+}
 
 /**
  * The shared connection. Created on first use — an Electron main process that
@@ -64,8 +101,7 @@ let connectionPromise = null;
 async function getConnection() {
   if (!connectionPromise) {
     connectionPromise = (async () => {
-      const { DuckDBInstance } = require('@duckdb/node-api');
-      const instance = await DuckDBInstance.create(':memory:');
+      const instance = await getInstance();
       return instance.connect();
     })().catch((err) => {
       connectionPromise = null; // let a later call retry
@@ -106,7 +142,15 @@ const isFatalError = (err) => /^(INTERNAL|FATAL) Error/.test(String(err && err.m
  * saved.
  */
 function resetConnection() {
+  // Before anything else: whatever a connector remembers about this session's
+  // catalog stops being true the moment the instance goes.
+  sessionGeneration += 1;
   connectionPromise = null;
+  // The INSTANCE is what DuckDB invalidates, so it has to go too. It used to be
+  // created inline inside getConnection, which made dropping the connection
+  // enough; now that streamRows shares it, dropping only the connection would
+  // rebuild a connection onto the same poisoned instance.
+  instancePromise = null;
   attached.clear();
   // Extensions are loaded into an INSTANCE, so the new one starts without them.
   // Leaving the cache populated would have the next xlsx read skip the LOAD it
@@ -140,6 +184,17 @@ const detectFormat = (filePath) => FORMAT_BY_EXT[path.extname(String(filePath)).
 const isReadable = (filePath) => detectFormat(filePath) !== null;
 
 /**
+ * Is this path a DATABASE to attach, rather than a data file to read in place?
+ *
+ * The DuckDB connector draws the same line (its `isDatabase`), and the two must
+ * agree — a local source that the connector attaches but a workflow reader
+ * treats as a CSV fails with "no such format" on a file that browses fine.
+ * SQLite counts: DuckDB's sqlite extension makes a .sqlite/.db behave exactly
+ * like a .duckdb once attached.
+ */
+const isDatabaseFile = (filePath) => /\.(duckdb|sqlite|sqlite3|db)$/i.test(String(filePath || ''));
+
+/**
  * The FROM expression for a file — this is what makes a path behave like a
  * table. `union_by_name` keeps JSON files with varying keys readable.
  *
@@ -158,12 +213,11 @@ function sourceRef(filePath, format = null, { sheet = null, allVarchar = false }
     case 'csv':
       return `read_csv_auto(${literal})`;
     case 'json':
-      // `sample_size = -1` for the same reason the staged read uses it: the
-      // schema is inferred from a leading sample by default, and a field that
-      // first appears past it is dropped from the table with no error. A JSON
-      // file has to be parsed in full to be read at all, so full inference
-      // costs a fraction more (measured: 293ms → 314ms for a preview of a
-      // 19 MB file) rather than the extra pass it would cost a columnar format.
+      // `sample_size = -1` infers from the WHOLE file: correct whatever the
+      // data does, and the fallback `jsonRef` drops to when it cannot pin a
+      // schema of its own. It is NOT what the explorer registers a view with —
+      // see the note above jsonRef for why full inference is the wrong price to
+      // pay for a name in the sidebar.
       return `read_json_auto(${literal}, union_by_name = true, sample_size = -1)`;
     case 'parquet':
       return `read_parquet(${literal})`;
@@ -353,6 +407,146 @@ async function csvTypeOverrides(filePath) {
   return overrides;
 }
 
+// ── JSON schema pinning ────────────────────────────────────────────────────
+//
+// Reading JSON means inferring its schema, and DuckDB re-infers on every BIND —
+// not just on every read. A view over a JSON file is stored as its SQL text and
+// re-bound each time it is used, so `CREATE OR REPLACE VIEW`, `SELECT … LIMIT 0`
+// and every query behind them each pay inference again. With
+// `sample_size = -1` that is a full parse of the file: measured at 2,784 ms for
+// a 442 MB file, EVERY time, and the Data Explorer re-registers its views on
+// the schema tree, on each column load and on each run.
+//
+// So the schema is worked out once and then PINNED into the read as an explicit
+// `columns = {…}`, which takes binding to ~1 ms. What it costs to work out is
+// the whole design:
+//
+//   sampled types      78 ms   what the first JSON_SAMPLE_RECORDS records say
+//   empty-column probe 80 ms   which of those held no value at all
+//   full key set      263 ms   every key in the file, via read_json_objects
+//                              (raw JSON per record — no type inference)
+//
+// ~420 ms once per file version, against 2,784 ms per bind.
+//
+// A sample alone would be wrong in exactly the way full inference was chosen to
+// avoid, and in one more way besides:
+//
+//   a column that is null through the whole sample has no type to read off it.
+//     Sampling reports VARCHAR here, but only as its own fallback — so the rule
+//     is made explicit rather than borrowed: no non-null value in the sample
+//     means VARCHAR, which is unbounded in DuckDB and so holds any value the
+//     rest of the file turns out to have. Nothing is assumed to be empty just
+//     because the first records are.
+//
+//   a key that first appears PAST the sample is missing from the schema
+//     entirely, and its column would be dropped with no error. This is what the
+//     key-set scan is for: read_json_objects hands back each record as raw JSON
+//     without typing it, so `json_keys` over the whole file names every column
+//     for a fraction of what typing them costs. Keys found only there are
+//     VARCHAR for the same reason as above.
+//
+// Pinning also fixes a defect that plain sampling has on its own: a column the
+// sniffer typed from nothing comes back holding RAW JSON — the string
+// `value 260000` arrives as `"value 260000"`, quotes included. Pinned as
+// VARCHAR it is parsed properly.
+//
+// The residual limit, and it is a real one: `json_keys` reads TOP-LEVEL keys, so
+// a field that first appears past the sample INSIDE a struct is still dropped.
+// Full inference caught that. A file that needs it can still be read correctly —
+// jsonRef falls back to `sourceRef`, which is full inference — but nothing
+// detects the case automatically.
+
+// Records the type sample reads. DuckDB's own default is ~20k; this is higher
+// because the cost is per record read, not per byte of file, and a wider sample
+// leaves less for the key-set scan to have to repair.
+const JSON_SAMPLE_RECORDS = 50000;
+
+/** Types the sniffer reports when it had no value to go on. */
+const isUninformativeType = (type) => /^(JSON|NULL|SQLNULL)$/i.test(String(type || '').trim());
+
+// path@mtime → promise of the FROM expression to use for it.
+const jsonRefCache = new Map();
+
+/**
+ * `[{ name, type }]` to pin a JSON file's columns to, or null when the file is
+ * not records-with-keys and there is nothing to pin.
+ */
+async function jsonColumnSpec(filePath) {
+  const literal = quoteLiteral(filePath);
+  const sampled = `read_json_auto(${literal}, union_by_name = true, `
+    + `sample_size = ${JSON_SAMPLE_RECORDS})`;
+
+  const columns = await describe(sampled);
+  if (!columns.length) return null;
+
+  // Which sampled columns carried no value at all? Counted over the same
+  // records the types came from — a column that is empty there is a column the
+  // sample cannot speak for.
+  const probes = columns.map((c, i) => `count(${quoteIdentifier(c.name)}) AS c${i}`);
+  const { rows } = await query(
+    `SELECT ${probes.join(', ')} FROM `
+    + `(SELECT * FROM ${sampled} LIMIT ${JSON_SAMPLE_RECORDS})`,
+  );
+  const empty = new Set(
+    columns.filter((c, i) => Number(rows[0][`c${i}`] || 0) === 0).map((c) => c.name),
+  );
+
+  // Every top-level key in the file, typed by nobody.
+  const { rows: keyRows } = await query(
+    `SELECT DISTINCT unnest(json_keys(json)) AS k `
+    + `FROM read_json_objects(${literal}, format = 'auto')`,
+  );
+  const keys = keyRows.map((r) => r.k).filter((k) => typeof k === 'string' && k.length);
+  // No keys means the records are not objects — an array of scalars, say. There
+  // are no columns to pin, so the caller falls back.
+  if (!keys.length) return null;
+
+  const spec = columns.map((c) => ({
+    name: c.name,
+    type: (empty.has(c.name) || isUninformativeType(c.type)) ? 'VARCHAR' : c.type,
+  }));
+
+  // Keys the sample never saw, appended in the order the scan found them so the
+  // columns a user already knows keep their positions.
+  const sampledNames = new Set(spec.map((c) => c.name));
+  for (const key of keys) {
+    if (!sampledNames.has(key)) spec.push({ name: key, type: 'VARCHAR' });
+  }
+  return spec;
+}
+
+/**
+ * The FROM expression for a JSON file, with its schema pinned so that binding
+ * it is free. Cached per file version; falls back to full inference if the
+ * schema cannot be worked out, so the worst case is today's behaviour.
+ */
+function jsonRef(filePath) {
+  const key = cacheKeyFor(filePath);
+  if (!jsonRefCache.has(key)) {
+    const pending = (async () => {
+      const spec = await jsonColumnSpec(filePath);
+      if (!spec || !spec.length) return sourceRef(filePath, 'json');
+
+      const columns = spec
+        .map((c) => `${quoteLiteral(c.name)}: ${quoteLiteral(c.type)}`)
+        .join(', ');
+      return `read_json(${quoteLiteral(filePath)}, format = 'auto', columns = {${columns}})`;
+    })().catch((err) => {
+      // Inference is an optimisation, never a reason to fail a read. Drop the
+      // entry so a later call can try again, and hand back the expression that
+      // needs no inference of ours.
+      jsonRefCache.delete(key);
+      console.warn(
+        `[duckdb] ${path.basename(filePath)}: could not pin a JSON schema `
+        + `(${err.message}) — falling back to full inference`,
+      );
+      return sourceRef(filePath, 'json');
+    });
+    jsonRefCache.set(key, pending);
+  }
+  return jsonRefCache.get(key);
+}
+
 /**
  * The FROM expression to use for a file, with type corrections applied.
  *
@@ -366,6 +560,8 @@ async function tableRef(filePath, format = null, { sheet = null } = {}) {
     // A workbook's columns are typed by a sniffer that only sees the first
     // rows, so the expression it takes to read one is worked out per sheet.
     if (resolved === 'xlsx') return xlsxRef(filePath, sheet);
+    // JSON's schema is inferred on every bind unless it is pinned; see above.
+    if (resolved === 'json') return jsonRef(filePath);
     return sourceRef(filePath, resolved, { sheet });
   }
 
@@ -541,6 +737,130 @@ async function queryUpTo(sql, maxRows, { params = null } = {}) {
   });
 }
 
+/**
+ * Run a statement and yield its rows a chunk at a time, for as long as there
+ * are rows. No cap, and never more than one chunk in this process's heap.
+ *
+ * This is what `query` and `queryUpTo` cannot do: `query` materialises the
+ * whole result, and `queryUpTo` stops at a number. Reading a ten-million-row
+ * table to load it somewhere else needs neither — it needs every row, and it
+ * needs them a handful at a time.
+ *
+ * DuckDB hands back ~2048-row chunks and computes the next only when asked, so
+ * the peak here is one chunk regardless of the table's size.
+ *
+ * ON ITS OWN CONNECTION, deliberately. A streaming result stays open across
+ * every await the consumer makes — for a load that is minutes, while rows are
+ * written to some remote database — and any other statement issued on the same
+ * connection in that window would be interleaved with a read in flight. The
+ * shared connection is used by every other caller in this module, so a stream
+ * that borrowed it would make an unrelated node's query the thing that breaks
+ * this one. Connections are cheap; the catalog is shared at the instance.
+ *
+ * @param {string} sql
+ * @yields {object[]} One chunk of coerced row objects.
+ */
+async function* streamRows(sql, { params = null } = {}) {
+  const instance = await getInstance();
+
+  // The search path is SESSION state, and the callers of this function depend
+  // on it. Views are registered by bare name (registerAddressableViews, and
+  // the DuckDB connector's ensureViews) into whatever schema the SHARED
+  // connection currently points at, and the SQL then refers to them unqualified.
+  // A fresh connection starts at `main`, so without copying this across, a
+  // statement that resolves perfectly on the shared connection would fail here
+  // with "table does not exist" — for the join and transformer readers in
+  // particular, whose sources are exactly those bare-named views.
+  //
+  // Read before connecting so a failure to read it cannot leak the connection.
+  let searchPath = null;
+  try {
+    const { rows } = await query(`SELECT current_setting('search_path') AS p`);
+    searchPath = rows[0]?.p || null;
+  } catch (_) {
+    // Older builds may not expose it; `main` is then the right default anyway.
+  }
+
+  const connection = await instance.connect();
+  try {
+    if (searchPath) {
+      await connection.run(`SET search_path = ${quoteLiteral(searchPath)}`);
+    }
+
+    const result = params && params.length
+      ? await connection.stream(sql, params)
+      : await connection.stream(sql);
+
+    // `result` answers the same column questions a reader does, which is what
+    // lets coerceRows run per chunk — big integers keep the same treatment
+    // they get on the materialised path rather than silently differing.
+    for await (const page of result.yieldRowObjectJson()) {
+      if (page.length > 0) yield coerceRows(page, result);
+    }
+  } catch (err) {
+    if (isFatalError(err)) resetConnection();
+    throw err;
+  } finally {
+    // Runs on early exit too — a consumer that throws or stops reading (a
+    // cancelled run) must not leave the connection open.
+    try { connection.closeSync(); } catch (_) { /* already gone */ }
+  }
+}
+
+/**
+ * The `<alias>.<table>` expression for a table in a database addressed by PATH,
+ * attaching the database if it is not attached yet.
+ *
+ * Works for any database DuckDB can ATTACH — .duckdb natively, .sqlite/.db
+ * through the sqlite extension (ATTACH sniffs the file). Several readers build
+ * exactly this ref; sharing it keeps the quoting and sanitising in one place.
+ */
+async function attachedTableRef(dbPath, tableName) {
+  const alias = await attachDb(dbPath);
+  return `${quoteIdentifier(alias)}.${quoteIdentifier(sanitizeIdentifier(tableName))}`;
+}
+
+/**
+ * Every row of a table in a database addressed by PATH, streamed.
+ * The unbounded counterpart to readTableHeadAt.
+ */
+async function* streamTableRowsAt(dbPath, tableName) {
+  const ref = await attachedTableRef(dbPath, tableName);
+  yield* streamRows(`SELECT * FROM ${ref}`);
+}
+
+/**
+ * Every row of a data FILE (csv/json/parquet/xlsx), streamed.
+ * The unbounded counterpart to readHead.
+ */
+async function* streamFileRows(filePath, format = null, { sheet = null } = {}) {
+  const ref = await tableRef(filePath, format, { sheet });
+  yield* streamRows(`SELECT * FROM ${ref}`);
+}
+
+/**
+ * Every row of a LOCAL SOURCE, whichever of the two kinds of path it is.
+ *
+ * The distinction is the same one the DuckDB connector makes, and it has to be
+ * made the same way in both places or a local source reads correctly through
+ * the Data Explorer and fails in a workflow:
+ *
+ *   a DATABASE — .duckdb, and .sqlite/.sqlite3/.db through DuckDB's sqlite
+ *     extension — is ATTACHed, and its tables are real tables;
+ *   a DATA FILE — csv/json/parquet/xlsx/avro — is read in place.
+ *
+ * `.db` is a database here because that is what the connector means by it.
+ * Nothing else claims the extension any more, so it never has to
+ * carry the decision on its own.
+ */
+async function* streamLocalRows(filePath, tableName, { format = null, sheet = null } = {}) {
+  if (isDatabaseFile(filePath)) {
+    yield* streamTableRowsAt(filePath, tableName);
+    return;
+  }
+  yield* streamFileRows(filePath, format, { sheet });
+}
+
 /** Run a statement for its side effects. */
 async function exec(sql) {
   await withConnection((connection) => connection.run(sql));
@@ -610,6 +930,65 @@ async function statementType(sql, index = 0) {
       prepared.destroySync();
     }
   });
+}
+
+/**
+ * Run a script ONE STATEMENT AT A TIME, tolerating a statement that fails while
+ * a later one still succeeds.
+ *
+ * `exec` hands the whole script to the driver, which stops at the first error
+ * and reports it as the script's error. That is right for a script whose
+ * statements are all load-bearing, and wrong for the shape an in-place
+ * transform actually has: a structural change followed by the statement that
+ * uses it. On the SECOND run the structural change is already applied — the
+ * ALTER reports "column already exists" precisely because the first run
+ * worked — and failing the whole script there makes every in-place ALTER a
+ * one-shot node.
+ *
+ * So the LAST statement is the one that decides. Anything before it may fail
+ * and be recorded instead: those statements exist to make the last one
+ * possible, and the last one succeeding is proof enough that they did. A
+ * one-statement script has nothing to fall back on and is simply run.
+ *
+ * Statements are separated by DuckDB's own extractor, never by splitting the
+ * text on semicolons — a semicolon inside a string literal is not a boundary,
+ * and the parser is the only thing that knows the difference. Each is prepared
+ * only when its turn comes, so it binds against the catalog the statements in
+ * front of it have already changed.
+ *
+ * @returns {Promise<{tolerated: string[]}>} the errors that were tolerated, in
+ *   order. Empty means every statement ran.
+ */
+async function execScript(sql) {
+  const trimmed = trimStatement(sql);
+  const tolerated = [];
+  await withConnection(async (connection) => {
+    const extracted = await connection.extractStatements(trimmed);
+    const count = Number(extracted.count) || 0;
+    // Nothing to be tolerant WITH: one statement is the whole script, and an
+    // empty extraction means there is nothing to run at all.
+    if (count <= 1) {
+      await connection.run(trimmed);
+      return;
+    }
+    for (let index = 0; index < count; index += 1) {
+      try {
+        // Preparing binds, so a statement that cannot run as the catalog now
+        // stands throws here rather than at run(); both are the same failure
+        // from this loop's point of view.
+        const prepared = await extracted.prepare(index);
+        try {
+          await prepared.run();
+        } finally {
+          prepared.destroySync();
+        }
+      } catch (err) {
+        if (index === count - 1) throw err;
+        tolerated.push(err.message);
+      }
+    }
+  });
+  return { tolerated };
 }
 
 /**
@@ -842,6 +1221,13 @@ async function stageRowsAsNdjson(rows, { onProgress = null } = {}) {
       buffer += `${JSON.stringify(row)}\n`;
       count++;
       if (buffer.length > (1 << 20)) { await write(buffer); buffer = ''; }
+      // A remote table landing locally spends its whole time in this one loop,
+      // so a stop has to be able to reach it. Sampled rather than checked per
+      // row: this runs millions of times and the check is an AsyncLocalStorage
+      // lookup, while a thousand rows either way makes no difference to how
+      // responsive the button feels. The catch below removes the stage file, so
+      // stopping here leaves nothing behind.
+      if (count % 1000 === 0) throwIfCancelled('loading rows', `${count} rows staged so far`);
       if (onProgress && Date.now() - lastReport >= 250) {
         lastReport = Date.now();
         onProgress({ rows: count });
@@ -1083,6 +1469,25 @@ async function tablesAt(dbPath) {
   return rows.map((r) => r.table_name);
 }
 
+/**
+ * Detach a database addressed by PATH.
+ *
+ * The counterpart to attachDb, for when the thing behind the path is going
+ * away: a workflow's file being deleted, or a saved connection that pointed at
+ * a database being removed. Leaving it attached would keep the file open and
+ * keep its tables answering to a name whose owner no longer exists.
+ */
+async function detachDb(dbPath) {
+  const alias = aliasForDbPath(dbPath);
+  if (!attached.has(alias)) return;
+  attached.delete(alias);
+  try {
+    await exec(`DETACH ${quoteIdentifier(alias)}`);
+  } catch {
+    // Already gone, or never finished attaching. Nothing left to release.
+  }
+}
+
 /** Detach a workflow's database — used when its file is being replaced/removed. */
 async function detachWorkflow(workflowId) {
   const alias = workflowAlias(workflowId);
@@ -1178,10 +1583,13 @@ async function execInWorkflow(workflowId, sql) {
  * than by workflow id. Unqualified names resolve inside it, so a statement can
  * modify one of its tables directly — no copy, no write-back.
  */
-async function execInDb(dbPath, sql) {
+async function execInDb(dbPath, sql, run = exec) {
   const alias = await attachDb(dbPath);
-  return withCatalog(alias, () => exec(sql));
+  return withCatalog(alias, () => run(sql));
 }
+
+/** `execInDb`, statement by statement — see `execScript` for what that buys. */
+const execScriptInDb = (dbPath, sql) => execInDb(dbPath, sql, execScript);
 
 /** Row count of a table in the database at `dbPath`. */
 async function tableRowCountIn(dbPath, tableName) {
@@ -1318,17 +1726,20 @@ async function ingestRowsToStaging(rows, dbPath, tableName, { onProgress = null 
  * Run statements with the staging schema first on the search path, so an
  * unqualified name in the caller's SQL means its staging table.
  */
-async function execInStaging(dbPath, sql) {
+async function execInStaging(dbPath, sql, run = exec) {
   const alias = await ensureStagingSchema(dbPath);
   return withCatalog(alias, async () => {
     await exec(`SET search_path = ${quoteLiteral(`${STAGING_SCHEMA},main`)}`);
     try {
-      return await exec(sql);
+      return await run(sql);
     } finally {
       await exec("SET search_path = 'main'");
     }
   });
 }
+
+/** `execInStaging`, statement by statement — see `execScript`. */
+const execScriptInStaging = (dbPath, sql) => execInStaging(dbPath, sql, execScript);
 
 /** Drop staging tables once the operation that created them is done. */
 async function dropStaging(dbPath, tableNames) {
@@ -1374,6 +1785,13 @@ module.exports = {
   getConnection,
   query,
   queryUpTo,
+  // Unbounded streaming reads — see streamRows.
+  streamRows,
+  streamTableRowsAt,
+  streamFileRows,
+  streamLocalRows,
+  isDatabaseFile,
+  attachedTableRef,
   exec,
   statementCount,
   statementType,
@@ -1388,6 +1806,7 @@ module.exports = {
   ingestRows,
   sourceRef,
   tableRef,
+  sessionEpoch,
   detectFormat,
   isReadable,
   sheetFor,
@@ -1399,6 +1818,7 @@ module.exports = {
   quoteIdentifier,
   close,
   FORMAT_BY_EXT,
+  detachDb,
   // Workflow databases — a node output is a table in its workflow's own file.
   workflowDbPath,
   workflowAlias,
@@ -1415,6 +1835,8 @@ module.exports = {
   currentDatabase,
   execInWorkflow,
   execInDb,
+  execScript,
+  execScriptInDb,
   tableRowCountIn,
   queryIn,
   createTableAs,
@@ -1428,6 +1850,7 @@ module.exports = {
   ingestRowsToStaging,
   stagingRef,
   execInStaging,
+  execScriptInStaging,
   dropStaging,
   STAGING_SCHEMA,
   dropWorkflowDb,
