@@ -96,6 +96,17 @@ const Row = React.memo(function Row({
   // names its columns, and only those cells are tinted.
   const wholeRow = selected && !selectedColumns;
 
+  // The selection tint is translucent (C.aS is 10% blue), so it needs
+  // something opaque beneath it — laid down here as a gradient layer over a
+  // solid base rather than used as the background outright.
+  //
+  // The gutter is why this matters: it is sticky, so the row scrolls UNDERNEATH
+  // it, and a translucent background let the row's own cells slide visibly
+  // behind the row number. The cells need the same treatment for a quieter
+  // reason — a bare tint composites over the table's white, losing the zebra
+  // stripe, so a selected cell looked different on odd and even rows.
+  const tinted = (base) => `linear-gradient(${C.aS}, ${C.aS}), ${base}`;
+
   return (
     <tr onPointerEnter={() => onRowEnter(rowIndex)}>
       <td
@@ -104,7 +115,7 @@ const Row = React.memo(function Row({
         title="Click to select the whole row · double-click for row detail"
         style={{
           position: 'sticky', left: 0, zIndex: 1, width: GUTTER_W, height: ROW_H,
-          background: isOpen ? C.aD : selected ? C.aS : C.s2,
+          background: isOpen ? C.aD : selected ? tinted(C.s2) : C.s2,
           borderBottom: `1px solid ${C.border}`, borderRight: `2px solid ${C.border2}`,
           padding: '0 6px', textAlign: 'right', cursor: 'pointer',
           fontSize: 10, color: isOpen ? C.accent : selected ? C.accent : C.dim,
@@ -126,7 +137,7 @@ const Row = React.memo(function Row({
               borderBottom: `1px solid ${C.border}`, borderRight: `1px solid ${C.border}`,
               textAlign: col.numeric ? 'right' : 'left',
               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-              background: inSelection ? C.aS : zebra,
+              background: inSelection ? tinted(zebra) : zebra,
               boxShadow: focusColumn === col.name ? `inset 0 0 0 2px ${C.accent}` : 'none',
               cursor: 'cell',
             }}
@@ -140,7 +151,7 @@ const Row = React.memo(function Row({
         );
       })}
 
-      <td style={{ borderBottom: `1px solid ${C.border}`, background: wholeRow ? C.aS : zebra }} />
+      <td style={{ borderBottom: `1px solid ${C.border}`, background: wholeRow ? tinted(zebra) : zebra }} />
     </tr>
   );
 });
@@ -629,6 +640,46 @@ export const RowDetail = ({ result, index, onClose }) => {
     </div>
   );
 };
+
+// ── copying ────────────────────────────────────────────────────────────────
+
+/**
+ * ⌘C over a selection, as TSV — the format that pastes into a spreadsheet as
+ * cells. A cell range copies exactly the cells that are lit, bare; whole rows
+ * copy every column with a header line, because that is a record rather than a
+ * patch of values.
+ *
+ * Scoped to `hostRef` so it never steals ⌘C from an editor elsewhere on the
+ * page, and it stands in for the browser's copy-the-text-selection that the
+ * grid gives up by disabling text selection. Lives here rather than in either
+ * panel: a selection you cannot copy is half a feature, and both panels should
+ * mean the same thing by it.
+ */
+export function useCopySelection(hostRef, result, selection) {
+  useEffect(() => {
+    if (!selection || !selection.rows.size || !result) return undefined;
+    const onCopy = (e) => {
+      const host = hostRef.current;
+      if (!host || !host.contains(document.activeElement || e.target)) return;
+      const all = result.columns || [];
+      // Filtering `all` rather than mapping the names keeps the copy in grid
+      // order whichever way the range was dragged.
+      const cols = selection.columns
+        ? all.filter((c) => selection.columns.includes(c.name))
+        : all;
+      const picked = (result.rows || []).filter((_, i) => selection.rows.has(i));
+      if (!picked.length || !cols.length) return;
+      const cell = (v) => (v === null || v === undefined ? ''
+        : typeof v === 'object' ? JSON.stringify(v) : String(v));
+      const lines = picked.map((r) => cols.map((c) => cell(r[c.name])).join('\t'));
+      if (selection.mode === 'rows') lines.unshift(cols.map((c) => c.name).join('\t'));
+      e.clipboardData.setData('text/plain', lines.join('\n'));
+      e.preventDefault();
+    };
+    document.addEventListener('copy', onCopy);
+    return () => document.removeEventListener('copy', onCopy);
+  }, [hostRef, result, selection]);
+}
 
 // ── view selection ─────────────────────────────────────────────────────────
 

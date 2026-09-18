@@ -25,6 +25,7 @@ import QueryEditor from './QueryEditor';
 import ResultsPanel from './ResultsPanel';
 import { WorksheetTabs, Toolbar } from './WorksheetTabs';
 import { splitStatements, summarize } from './statements';
+import { collectTableRefs } from './completions';
 
 /**
  * Typing is kept off the React render path: Monaco owns the buffer, and the
@@ -130,7 +131,10 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
   const [dialect, setDialect] = useState(null);
   const [connectorMissing, setConnectorMissing] = useState(false);
   const [schemas, setSchemas] = useState([]);
-  const [schemaLoading, setSchemaLoading] = useState(false);
+  // Loading from the first paint, not from the first await: the fetch is
+  // kicked off by an effect, so starting at false shows "No objects found."
+  // for a frame before the panel has even asked the engine anything.
+  const [schemaLoading, setSchemaLoading] = useState(isElectron);
   const [schemaError, setSchemaError] = useState(null);
   const [activeSchema, setActiveSchema] = useState(null);
   const [selectedKey, setSelectedKey] = useState(null);
@@ -369,6 +373,23 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
 
     setColumnCache((prev) => ({ ...prev, [key]: res.success ? res.columns : [] }));
   }, [api, dbType, config, connectionId, isElectron, columnCache]);
+
+  // Warm the column cache as soon as the worksheet names a table, so the
+  // first `alias.` completes immediately instead of missing once. Debounced
+  // off the keystroke path; loadColumns already skips cached and in-flight
+  // tables, so re-runs are cheap.
+  useEffect(() => {
+    if (!activeSheet || !dialect || dialect.language === 'json') return undefined;
+    const sql = activeSheet.sql;
+    if (!sql || !sql.trim()) return undefined;
+
+    const timer = setTimeout(() => {
+      for (const ref of new Set(collectTableRefs(sql, dialect.sqlDialect).values())) {
+        if (!ref.cte && ref.table) loadColumns(ref.schema || activeSchema, ref.table);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [activeSheet, dialect, activeSchema, loadColumns]);
 
   // ── worksheet editing + persistence ──────────────────────────────────────
 
@@ -761,6 +782,7 @@ const DatabaseExplorer = ({ connection, onClose, onContextChange }) => {
             width={clampPanelWidth(panelWidth, bodyWidth)}
             dbType={dbType}
             containerLabel={dialect ? dialect.container : 'Schema'}
+            objectLabel={dialect ? dialect.objectLabel : 'Table'}
             schemas={schemas}
             loading={schemaLoading}
             error={schemaError}

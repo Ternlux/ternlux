@@ -69,6 +69,60 @@ const SectionHead = ({ label, count, open, onToggle, action }) => (
   </div>
 );
 
+/**
+ * The tree's names come from the engine, so on a remote connection this is a
+ * real wait. It gets a spinner and the noun the connector uses — "loading"
+ * on its own doesn't say what the panel is still missing.
+ */
+const Spinner = ({ size = 12, color = C.accent }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    style={{
+      animation: 'dbx-spin 0.7s linear infinite',
+      transformOrigin: 'center',
+      flexShrink: 0,
+    }}
+  >
+    <circle cx="12" cy="12" r="9" fill="none" stroke={C.s3} strokeWidth="3" />
+    <path d="M12 3a9 9 0 0 1 9 9" fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" />
+  </svg>
+);
+
+// Placeholder rows shaped like the tree they stand in for, so the panel keeps
+// its height and the list doesn't jump when the real names land.
+const SKELETON_ROWS = [
+  { depth: 0, width: 126 },
+  { depth: 2, width: 96 },
+  { depth: 2, width: 112 },
+  { depth: 2, width: 78 },
+  { depth: 2, width: 104 },
+];
+
+const TreeSkeleton = () => (
+  <div aria-hidden="true">
+    {SKELETON_ROWS.map((row, i) => {
+      const bar = {
+        background: C.s3, borderRadius: 4,
+        animation: `dbx-pulse 1.3s ease-in-out ${i * 0.11}s infinite`,
+      };
+      return (
+        <div
+          key={i}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 7, minHeight: 26,
+            padding: `4px 8px 4px ${8 + row.depth * 13}px`,
+          }}
+        >
+          <div style={{ ...bar, width: 12, height: 12, borderRadius: 3, flexShrink: 0 }} />
+          <div style={{ ...bar, width: row.width, height: 8, maxWidth: '100%' }} />
+        </div>
+      );
+    })}
+  </div>
+);
+
 const iconButton = (title, onClick, glyph) => (
   <button
     type="button"
@@ -90,6 +144,10 @@ const ObjectPanel = ({
   width = 274,
   dbType,
   containerLabel = 'Schema',
+  // What this engine calls the things in the tree — the connector's
+  // `objectLabel`. It is what the loading line names, so a document store says
+  // it is loading collection names rather than tables it doesn't have.
+  objectLabel = 'Table',
   schemas = [],
   loading = false,
   error = null,
@@ -130,6 +188,11 @@ const ObjectPanel = ({
   const [sections, setSections] = useState({ favorites: true, objects: true, worksheets: true });
 
   const needle = query.trim().toLowerCase();
+
+  // A refresh keeps the tree it already has and says so; only a cold load has
+  // nothing to show, and that is the one that gets the skeleton.
+  const objectNoun = (objectLabel || 'Table').toLowerCase();
+  const firstLoad = loading && schemas.length === 0;
 
   // Flat match list while the filter box has text — the tree is replaced by
   // results so a deep object is one click away.
@@ -215,6 +278,11 @@ const ObjectPanel = ({
       borderRight: `1px solid ${C.border}`, background: C.surface,
       display: 'flex', flexDirection: 'column',
     }}>
+      <style>{`
+        @keyframes dbx-spin { to { transform: rotate(360deg) } }
+        @keyframes dbx-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.42 } }
+      `}</style>
+
       {/* filter + actions */}
       <div style={{
         padding: '9px 10px', borderBottom: `1px solid ${C.border}`,
@@ -309,8 +377,21 @@ const ObjectPanel = ({
         )}
 
         {loading && (
-          <div style={{ padding: '18px 10px', textAlign: 'center', fontSize: 11, color: C.muted }}>
-            Loading schema…
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 7,
+              margin: '8px 4px 6px', padding: '7px 9px', borderRadius: 5,
+              background: C.aD, border: `1px solid ${C.aB}`,
+            }}
+          >
+            <Spinner />
+            <span style={{ fontSize: 11, color: C.accentDark, letterSpacing: '-0.01em' }}>
+              {schemas.length
+                ? `Refreshing ${objectNoun} names…`
+                : `Loading ${objectNoun} names…`}
+            </span>
           </div>
         )}
 
@@ -320,7 +401,7 @@ const ObjectPanel = ({
           </div>
         )}
 
-        {matches && (
+        {matches && !firstLoad && (
           <div style={{ paddingTop: 6 }}>
             <div style={{
               padding: '2px 6px 8px', fontSize: 9, fontFamily: MONO, fontWeight: 700,
@@ -347,6 +428,10 @@ const ObjectPanel = ({
             )}
           </div>
         )}
+
+        {/* Filtering before the names have arrived: the skeleton stands in for
+            the results rather than claiming nothing matches. */}
+        {matches && firstLoad && <TreeSkeleton />}
 
         {!matches && (
           <>
@@ -384,10 +469,11 @@ const ObjectPanel = ({
 
             <SectionHead
               label={`${containerLabel}s`}
-              count={schemas.length}
+              count={firstLoad ? null : schemas.length}
               open={sections.objects}
               onToggle={() => setSections((p) => ({ ...p, objects: !p.objects }))}
             />
+            {sections.objects && firstLoad && <TreeSkeleton />}
             {sections.objects && schemas.map((schema) => {
               const schemaOpen = openSchemas[schema.name];
               const total = OBJECT_KINDS.reduce(

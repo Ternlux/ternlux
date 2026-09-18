@@ -13,7 +13,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { C, MONO, SANS, Icon } from './theme';
 // The grid, the JSON cards and the Table/JSON switch are shared with the
 // workflow Data Preview — see ResultsView.js for the shape they read.
-import { Grid, JsonView, RowDetail, ViewToggle, autoViewFor, formatCell } from './ResultsView';
+import {
+  Grid, JsonView, RowDetail, ViewToggle, autoViewFor, formatCell, useCopySelection,
+} from './ResultsView';
 
 const toCsv = (columns, rows) => {
   const esc = (v) => {
@@ -240,35 +242,8 @@ const ResultsPanel = ({
     setOpenRow(null);
   }, [activeSheet.id, activeSheet.rev]);
 
-  // Copy the selection as TSV — the format that pastes into a spreadsheet as
-  // cells. A cell range copies exactly the cells that are lit, bare; whole
-  // rows copy every column with a header line, because that is a record rather
-  // than a patch of values. Scoped to this panel so it never steals Cmd-C from
-  // the editor, and it replaces the browser's copy-the-text-selection that the
-  // grid gives up by disabling text selection.
-  useEffect(() => {
-    if (!selection || !selection.rows.size || !shown) return undefined;
-    const onCopy = (e) => {
-      const host = panelRef.current;
-      if (!host || !host.contains(document.activeElement || e.target)) return;
-      const all = shown.columns || [];
-      // Filtering `all` rather than mapping the names keeps the copy in grid
-      // order whichever way the range was dragged.
-      const cols = selection.columns
-        ? all.filter((c) => selection.columns.includes(c.name))
-        : all;
-      const picked = (shown.rows || []).filter((_, i) => selection.rows.has(i));
-      if (!picked.length || !cols.length) return;
-      const cell = (v) => (v === null || v === undefined ? ''
-        : typeof v === 'object' ? JSON.stringify(v) : String(v));
-      const lines = picked.map((r) => cols.map((c) => cell(r[c.name])).join('\t'));
-      if (selection.mode === 'rows') lines.unshift(cols.map((c) => c.name).join('\t'));
-      e.clipboardData.setData('text/plain', lines.join('\n'));
-      e.preventDefault();
-    };
-    document.addEventListener('copy', onCopy);
-    return () => document.removeEventListener('copy', onCopy);
-  }, [selection, shown]);
+  // ⌘C copies the selection as TSV, scoped to this panel — see ResultsView.
+  useCopySelection(panelRef, shown, selection);
 
   // The focused cell drives the inspector in the stats bar; the Copy button
   // beside it only makes sense while that cell is the whole selection.
