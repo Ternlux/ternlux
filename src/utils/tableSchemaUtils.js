@@ -8,7 +8,7 @@
  * @param {Object} params.connection - Connection object { id, dbType, dbConfig, connectionType }
  * @param {string} params.tableName - Name of the table/collection
  * @param {string} params.tableSchema - Schema name (for SQL databases, optional)
- * @param {string} params.localPath - Path to local NeDB file (optional, for local MongoDB transformations)
+ * @param {string} params.localPath - Path to a local DuckDB/SQLite file (optional)
  * @param {string} params.sheetName - Sheet name (for Google Sheets, optional)
  * @param {number} params.limit - Number of sample rows to fetch (default: 5)
  * @returns {Promise<Object|null>} Schema object { tableName, columns, sampleData } or null on error
@@ -32,7 +32,7 @@ export const loadTableSchema = async ({
     console.log('connection: ', connection)
 
     // Handle vector databases (LanceDB, Pinecone) via the vector-db-executor skill.
-    // Must run before the localPath branch — LanceDB sets localPath but is not SQLite/NeDB.
+    // Must run before the localPath branch — LanceDB sets localPath but is not DuckDB/SQLite.
     if (isVectorDB) {
       if (!window.electronAPI?.skills?.queryVectorPreview) {
         console.error('Vector DB preview API not available');
@@ -75,14 +75,14 @@ export const loadTableSchema = async ({
       };
     }
 
-    // Handle local files (NeDB for MongoDB, SQLite for SQL transformations)
+    // Handle local files — every one of them is read as DuckDB or SQLite
     if (localPath && window.electronAPI?.db?.readLocalCollection) {
       // Determine storage type from connection dbType
-      const storageType = connection.dbType === 'sqlite' ? 'sqlite' : connection.dbType === 'duckdb' ? 'duckdb' : 'nedb';
+      const storageType = connection.dbType === 'sqlite' ? 'sqlite' : 'duckdb';
 
       // DuckDB reads the file in place and reports its own column types, so a
       // single read gives both the schema and the sample — no PRAGMA, and no
-      // guessing types from the first row the way the NeDB path has to.
+      // guessing types from the first row.
       if (storageType === 'duckdb') {
         const result = await window.electronAPI.db.readLocalCollection(localPath, limit, 'duckdb', null, tableName || null);
         if (!result.success || !result.rows) return null;
@@ -149,23 +149,6 @@ export const loadTableSchema = async ({
         }
 
         return null;
-      } else if (storageType === 'nedb') {
-        // For NeDB, read sample data and infer columns
-        const result = await window.electronAPI.db.readLocalCollection(localPath, limit, storageType, null, null);
-
-        if (result.success && result.rows) {
-          const rows = result.rows;
-          return {
-            tableName,
-            columns: rows.length > 0 ? Object.keys(rows[0]).map(name => ({
-              name,
-              type: 'unknown',
-              nullable: true,
-              isPrimary: name === '_id'
-            })) : [],
-            sampleData: rows.slice(0, limit)
-          };
-        }
       }
 
       return null;
