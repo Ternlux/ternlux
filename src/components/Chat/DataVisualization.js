@@ -32,7 +32,7 @@ import Editor from '@monaco-editor/react';
 import { Boxdataset } from '../ui_components/boxdataset';
 
 // Read-only Monaco JSON view for unstructured / document results, matching the
-// look DataPreview uses for NeDB/MongoDB data.
+// look DataPreview uses for document-shaped data.
 const defineTernluxLightTheme = (monaco) => {
     monaco.editor.defineTheme('ternlux-light', {
         base: 'vs',
