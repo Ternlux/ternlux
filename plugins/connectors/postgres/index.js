@@ -8,6 +8,11 @@ const { Pool } = require('pg');
 // Connection pool cache
 const connectionPools = new Map();
 
+// Most parameters a single statement can bind. The wire protocol writes the
+// count as an unsigned 16-bit integer, so this is a hard protocol ceiling, not
+// a tunable - going over it wraps the count rather than erroring cleanly.
+const PG_MAX_BIND_PARAMS = 65535;
+
 /**
  * Get or create connection pool
  */
@@ -33,12 +38,60 @@ function getPool(config, connectionId) {
   return connectionPools.get(key);
 }
 
+/**
+ * A driver failure, with the driver's own classification kept alongside the text.
+ *
+ * The message alone cannot be reasoned about — "Duplicate column name 'x'" is
+ * prose that moves with the server's version and locale. The CODE is the
+ * driver's own answer to what KIND of failure this is, and the transform
+ * executor uses it to tell a structural change that was ALREADY APPLIED (what
+ * the second run of an in-place ALTER looks like) from one that genuinely
+ * failed. Callers that only read `message` are unaffected.
+ */
+const queryError = (error) => ({
+  success: false,
+  message: error.message,
+  // pg reports the SQLSTATE itself as `code` — '42701' is duplicate_column.
+  // Repeated under sqlState so a caller can read it by either name.
+  code: error.code,
+  sqlState: error.code,
+});
+
+/**
+ * VARCHAR length for a column whose longest SAMPLED value is `maxLen`.
+ *
+ * Headroom, because the sample is the first page of a load and not the whole of
+ * it: half again as long, never under 255, never over this dialect's own limit.
+ * Each connector carries its own copy — the ceiling is a property of the engine
+ * (65535 here, 8000 for SQL Server's non-MAX NVARCHAR), and connectors do not
+ * reach outside their own folder.
+ */
+const varcharFor = (maxLen) => Math.ceil(Math.min(Math.max((maxLen || 0) * 1.5, 255), 65535));
+
 module.exports = {
   type: 'connector',
   id: 'postgres',
   name: 'PostgreSQL',
   icon: './icon.svg',
   dbCategory: 'SQL',
+
+  /**
+   * Column types for a CREATE TABLE this app generates. See the note on
+   * `types` in plugins/connectors/snowflake/index.js — the caller decides what
+   * a column HOLDS, this decides what it is called here.
+   */
+  types: {
+    NULL: () => 'TEXT',
+    DATE_ONLY: () => 'DATE',
+    TIMESTAMP: () => 'TIMESTAMP',
+    BOOLEAN: () => 'BOOLEAN',
+    INTEGER: () => 'INTEGER',
+    FLOAT: () => 'DOUBLE PRECISION',
+    OBJECT: () => 'TEXT',
+    // Past 255 characters an unbounded TEXT is cheaper to live with than a
+    // VARCHAR(n) guessed from a sample — Postgres stores them identically.
+    STRING: (maxLen) => (maxLen > 255 ? 'TEXT' : `VARCHAR(${varcharFor(maxLen)})`),
+  },
 
   /**
    * Test database connection
@@ -51,7 +104,7 @@ module.exports = {
       client.release();
       return { success: true, message: 'Connection successful' };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -80,7 +133,7 @@ module.exports = {
         }))
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -89,6 +142,25 @@ module.exports = {
    */
   getColumns: async (config, connectionId, schema, table) => {
     try {
+      // Callers disagree on how they name a table: the Data Explorer passes the
+      // schema separately with a bare table, while the output node passes a
+      // qualified "public.orders" and no schema. Taking the second shape
+      // literally searches for a table whose NAME contains a dot, which matches
+      // nothing — silently, since the caller that needs this treats a failed
+      // lookup as "cannot check". Accept both, and let an explicit `schema` win
+      // over the qualifier.
+      // A schema passed SEPARATELY settles it: `table` is then the table's whole
+      // name, dots included. A table really can be called "public.transactions",
+      // and taking the first segment off one looks up a DIFFERENT table — which
+      // fails silently, because the callers that need this read a failed lookup
+      // as "cannot check" rather than as an error.
+      // Only a name arriving with no schema beside it may have a qualifier read
+      // out of it, and even there a genuinely dotted name cannot be told apart
+      // from a qualified one — so that split is a last resort, not the default.
+      const parts = String(table || '').split('.');
+      if (!schema && parts.length === 2) {
+        [schema, table] = parts;
+      }
       const pool = getPool(config, connectionId);
       const result = await pool.query(`
       SELECT c.column_name AS name, c.data_type AS type,
@@ -119,7 +191,7 @@ ORDER BY c.ordinal_position
         }))
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -156,7 +228,7 @@ ORDER BY c.ordinal_position
           rowCount: result.rowCount
         };
       } catch (error) {
-        return { success: false, message: error.message };
+        return queryError(error);
       }
     }
 
@@ -165,7 +237,7 @@ ORDER BY c.ordinal_position
     try {
       client = await pool.connect();
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
 
     return new Promise((resolve) => {
@@ -174,14 +246,14 @@ ORDER BY c.ordinal_position
         cursor = client.query(new Cursor(sqlQuery));
       } catch (error) {
         client.release();
-        resolve({ success: false, message: error.message });
+        resolve(queryError(error));
         return;
       }
       // One past the cap, so "is there more?" is observed rather than assumed.
       cursor.read(maxRows + 1, (err, rows, result) => {
         cursor.close(() => client.release());
         if (err) {
-          resolve({ success: false, message: err.message });
+          resolve(queryError(err));
           return;
         }
         const all = rows || [];
@@ -255,7 +327,7 @@ ORDER BY c.ordinal_position
         readBatch();
       });
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -275,25 +347,57 @@ ORDER BY c.ordinal_position
         // Start transaction
         await client.query('BEGIN');
 
-        // Build parameterized multi-row INSERT
-        const valuePlaceholders = rows.map((_, rowIndex) => {
-          const rowPlaceholders = columns.map((_, colIndex) => `$${rowIndex * columns.length + colIndex + 1}`);
-          return `(${rowPlaceholders.join(', ')})`;
-        });
+        // One INSERT per slice of rows, not one for the whole call: the
+        // protocol's Bind message counts parameters in a 16-bit field, so a
+        // statement can carry at most PG_MAX_BIND_PARAMS of them. The caller
+        // sizes its chunk for memory (tens of thousands of rows), which for
+        // anything but a one-column table is far past that ceiling — and the
+        // overflow does not surface as "too many parameters" but as the count
+        // WRAPPED, e.g. 50,000 rows x 7 columns reported back as "bind message
+        // has 22320 parameter formats but 0 parameters". Slicing by the actual
+        // column count keeps every statement under the real limit; they all run
+        // inside the one transaction, so the call as a whole still lands or
+        // rolls back together.
+        const rowsPerStatement = Math.floor(PG_MAX_BIND_PARAMS / columns.length);
+        if (rowsPerStatement < 1) {
+          // A single row already exceeds the ceiling - no slicing can help.
+          throw new Error(
+            `Cannot insert into ${tableName}: ${columns.length} columns exceeds `
+            + `PostgreSQL's limit of ${PG_MAX_BIND_PARAMS} parameters per statement.`
+          );
+        }
 
-        const insertSql = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+        for (let start = 0; start < rows.length; start += rowsPerStatement) {
+          const slice = rows.slice(start, start + rowsPerStatement);
 
-        // Flatten all values into a single array
-        const allValues = rows.flatMap(row =>
-          columns.map(col => {
-            const val = row[col];
-            if (val instanceof Date) return val;
-            if (typeof val === 'object' && val !== null) return JSON.stringify(val);
-            return val;
-          })
-        );
+          // Build parameterized multi-row INSERT
+          const valuePlaceholders = slice.map((_, rowIndex) => {
+            const rowPlaceholders = columns.map((_, colIndex) => `$${rowIndex * columns.length + colIndex + 1}`);
+            return `(${rowPlaceholders.join(', ')})`;
+          });
 
-        await client.query(insertSql, allValues);
+          // batchInsert is given the table name UNQUOTED and quotes it here —
+          // the contract every other connector already keeps. Interpolating it
+          // bare made this the one INSERT in the codebase that could not reach
+          // a table whose name carries a capital: a join's `CREATE TABLE
+          // "temp_dataSource_x"` preserved the S, this asked for
+          // temp_datasource_x, and the load failed with `relation does not
+          // exist` after reading every row of the source.
+          const insertSql = `INSERT INTO ${module.exports.quoteIdentifier(tableName)} `
+            + `(${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+
+          // Flatten all values into a single array
+          const allValues = slice.flatMap(row =>
+            columns.map(col => {
+              const val = row[col];
+              if (val instanceof Date) return val;
+              if (typeof val === 'object' && val !== null) return JSON.stringify(val);
+              return val;
+            })
+          );
+
+          await client.query(insertSql, allValues);
+        }
 
         // Commit transaction
         await client.query('COMMIT');
@@ -310,7 +414,7 @@ ORDER BY c.ordinal_position
         throw error;
       }
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -407,60 +511,80 @@ ORDER BY c.ordinal_position
     - Database type: PostgreSQL
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
-    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local SQLite'}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
+    - Column names: PostgreSQL folds an UNQUOTED identifier to LOWER CASE, so a
+      column whose stored name contains any upper-case letter is reachable only
+      in double quotes. The column names listed in the source schema above are
+      the EXACT stored names: wherever one is not already all lower-case, write
+      it as "ThatName" every time it appears — in SELECT lists, WHERE clauses,
+      SET clauses, CASE expressions and ALTER TABLE alike. An ALIAS you invent
+      is your own new name and needs no quoting.
+    - Source table name: the source schema above gives the name to read FROM
+      already qualified and quoted. Use that, and nothing else — never re-derive
+      it from the bare table name.
+    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local DuckDB'}
 
     ${settings.storageLocation === 'database'
       ? `**Instructions for Database Storage**:
-    Generate transformation SQL that:
-    1. Creates a new table in PostgreSQL with the transformed structure
-    2. Populates it with transformed data using INSERT INTO ... SELECT
+
+    The target is TRUNCATED AND LOADED on every run: the executor drops it
+    before your ddl runs, so your ddl always creates it fresh and your sql
+    always loads it from empty. Nothing survives a run. So do not write
+    IF NOT EXISTS, do not check for or delete prior rows, and do not try to
+    merge, upsert, or de-duplicate against what was there last time — write the
+    plain CREATE and the plain load.
+
+    You return TWO separate statements, and the executor runs them in order:
+
+      1. \`ddl\`  — a plain CREATE TABLE that declares the columns and types.
+      2. \`sql\`  — an INSERT INTO ... SELECT that loads those columns.
+
+    Do NOT combine them. A CREATE TABLE ... AS SELECT (or SELECT ... INTO) is not
+    accepted here: the two fields are executed as separate statements, so putting
+    the SELECT in \`ddl\` leaves \`sql\` with nothing to do.
+
+    **\`sql\` MUST NOT BE EMPTY.** It is the only statement that puts rows in the
+    table. Leave it empty and the run creates an empty table and loads nothing —
+    the node reports success having produced no data. If you find yourself with
+    nothing to put in \`sql\`, you have written the SELECT into \`ddl\` by
+    mistake: split it back out into a CREATE plus an INSERT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "CREATE TABLE statement",
-      "sql": "INSERT INTO statement with SELECT query",
+      "ddl": "CREATE TABLE statement (columns + types) — creates the table, inserts nothing",
+      "sql": "INSERT INTO <target> (cols...) SELECT ... — REQUIRED, this is what loads the rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
       "previewSql": "SELECT query to preview the transformed data (LIMIT 100)"
     }`
-      : `**Instructions for Local SQLite Storage**:
-    Generate SQL to fetch data from PostgreSQL and save it locally to SQLite.
+      : `**Instructions for Local Storage**:
+    The rows are fetched from PostgreSQL and written into a table in THIS
+    workflow's own local DuckDB database. Nothing is written back to PostgreSQL.
 
-    **You must provide THREE separate SQL statements**:
-    1. **DDL**: SQLite CREATE TABLE statement with appropriate SQLite data types
-       - Use SQLite types: INTEGER, REAL, TEXT, BLOB
-       - Column names must match the SELECT query output
-    2. **SQL (SELECT)**: PostgreSQL SELECT query to fetch and transform data from the source
-       - This will be executed on PostgreSQL database
-       - Include all transformations (filtering, calculations, etc.)
-    3. **INSERT**: SQLite INSERT statement to insert the fetched data
-       - Use parameterized query with ? placeholders
-       - Column order must match the SELECT query output exactly
-
-    **SQLite Data Type Mapping**:
-    - INTEGER: for whole numbers (int, bigint, serial, etc.)
-    - REAL: for floating point numbers (float, double, decimal, numeric)
-    - TEXT: for strings (varchar, char, text, date, timestamp)
-    - BLOB: for binary data
+    You provide ONE statement: the PostgreSQL SELECT that produces the rows you
+    want. That is the only thing that runs. Its result is streamed straight into
+    the local table, which is replaced on every run with the column types
+    inferred from the data — so there is no CREATE TABLE to write, no INSERT,
+    and no type mapping to choose. Do NOT emit "ddl" or "insertSql": nothing
+    reads them, and inventing them only risks contradicting the SELECT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "SQLite CREATE TABLE ${fullTableName.split('.').pop()} (...columns...)",
-      "sql": "PostgreSQL SELECT query to fetch transformed data",
-      "insertSql": "SQLite table INSERT INTO ${fullTableName.split('.').pop()} (...columns...) VALUES (?, ?, ...)",
+      "sql": "PostgreSQL SELECT query producing the transformed rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
-      "previewSql": "SQLite table SELECT * FROM ${fullTableName.split('.').pop()} LIMIT 100"
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"   // reads the LOCAL table, so this one is DuckDB SQL
     }
 
     **Example**:
     {
       "explanation": "Fetch active customers with calculated total spending",
-      "ddl": "CREATE TABLE customers_transformed (customer_id INTEGER, name TEXT, email TEXT, total_spending REAL)",
-      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) as total_spending FROM public.customers WHERE status = 'active'",
-      "insertSql": "INSERT INTO customers_transformed (customer_id, name, email, total_spending) VALUES (?, ?, ?, ?)",
-      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, {"name": "email", "type": "TEXT"}, {"name": "total_spending", "type": "REAL"}],
-      "previewSql": "SELECT * FROM customers_transformed LIMIT 100"
+      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) AS total_spending FROM customers WHERE status = 'active'",
+      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "VARCHAR"}, {"name": "email", "type": "VARCHAR"}, {"name": "total_spending", "type": "DOUBLE"}],
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"
     }`}
 
     Be specific and provide working SQL. Use PostgreSQL-specific features where appropriate (e.g., SERIAL, JSONB, array operations).`,
@@ -477,6 +601,20 @@ ORDER BY c.ordinal_position
     - Database type: PostgreSQL
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
+    - Column names: PostgreSQL folds an UNQUOTED identifier to LOWER CASE, so a
+      column whose stored name contains any upper-case letter is reachable only
+      in double quotes. The column names listed in the source schema above are
+      the EXACT stored names: wherever one is not already all lower-case, write
+      it as "ThatName" every time it appears — in SELECT lists, WHERE clauses,
+      SET clauses, CASE expressions and ALTER TABLE alike. An ALIAS you invent
+      is your own new name and needs no quoting.
+    - Source table name: the source schema above gives the name to read FROM
+      already qualified and quoted. Use that, and nothing else — never re-derive
+      it from the bare table name.
 
     Analyze the request and determine what operations are needed:
 
@@ -502,7 +640,19 @@ ORDER BY c.ordinal_position
     - In-place mode only supports database storage (cannot store locally while modifying remote source).
     - Ensure string literals are properly escaped for PostgreSQL.
     - For explanations text to bolden key points use **text** and to break lines use \\n
-    - If both ddl and sql are provided, ddl will execute first, then sql
+    - **Exactly ONE statement per field.** The "ddl" field is sent to the driver
+      as a single statement, and so is "sql". No semicolon-separated scripts, no
+      dynamic or guarded DDL, no procedure bodies — the driver runs one
+      statement per field and rejects everything after the first. Several
+      structural changes have to fit inside that one statement; if they cannot,
+      the transformation needs more than one node.
+    - ddl executes first, then sql. When BOTH are present, a failing ddl does
+      NOT fail the node — only a failing sql does, and the ddl's error is
+      reported alongside the result. That is what lets the node be rerun: on the
+      second run the structural change fails because the first run already
+      applied it, the DML behind it still runs, and the node succeeds. Write the
+      plain statement and let a rerun report it. When ddl is the ONLY field, its
+      failure IS the node's failure.
 
     Return your response in this JSON format:
     {
@@ -577,14 +727,38 @@ ORDER BY c.ordinal_position
    */
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
-
-    const quotedIdentifier = `"${identifier}"`;
-
-    if (schema) {
-      return `"${schema}".${quotedIdentifier}`;
+    // Already quoted — hand it back untouched. Callers pass identifiers that
+    // another layer has sometimes quoted already, and quoting a second time
+    // produces ONE identifier whose text is the quoted string, which resolves
+    // to nothing: a read of "PUBLIC"."public.transactions" came back as
+    // `Object 'TERNLUX.PUBLIC.""PUBLIC"."public.transactions""' does not exist`.
+    // The SQL Server connector has always done this; the rest now agree.
+    if (typeof identifier === 'string'
+        && identifier.startsWith('"') && identifier.endsWith('"') && identifier.length > 1) {
+      return identifier;
     }
 
-    return quotedIdentifier;
+
+    const quote = (part) => `"${String(part).replace(/"/g, '""')}"`;
+
+    if (schema) {
+      return `${quote(schema)}.${quote(identifier)}`;
+    }
+
+    // A dotted name passed as a single string ("public.product_vectors") with
+    // no explicit schema is a multi-part schema.table name, and EACH part is
+    // quoted → "public"."product_vectors". Quoting the whole string instead
+    // asks for a table whose NAME contains a dot: CREATE TABLE made
+    // "public.product_vectors" in the default schema, while the unquoted
+    // `INSERT INTO public.product_vectors` resolved schema public / table
+    // product_vectors — so the load failed with "relation does not exist"
+    // against a table the CREATE had just reported as already existing.
+    // Same rule, and the same reason, as the SQL Server connector's.
+    if (typeof identifier === 'string' && identifier.includes('.')) {
+      return identifier.split('.').map(quote).join('.');
+    }
+
+    return quote(identifier);
   },
 
   /**
