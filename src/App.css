@@ -39,6 +39,18 @@ body.chat-pinned .ant-image-preview-mask {
   right: var(--chat-rail-w);
 }
 
+/* MUI does the same thing, and needs the same treatment: its Modal root and
+   Backdrop are both `position: fixed` with `right: 0`, so a Dialog — the
+   full-screen code editor above all — stretches the whole viewport width and
+   runs on underneath the rail. Only Dialog is listed, deliberately. MUI's
+   Menu and Popover share the same Modal root, but they position their paper
+   from an anchor's bounding box, and one anchored inside the rail itself would
+   be clipped rather than moved by this. */
+body.chat-pinned .MuiDialog-root,
+body.chat-pinned .MuiDialog-root .MuiBackdrop-root {
+  right: var(--chat-rail-w);
+}
+
 /* Toasts are laid out as a full-width centering strip, so they need the width
    released before `right` can move them. */
 body.chat-pinned .ant-message {
