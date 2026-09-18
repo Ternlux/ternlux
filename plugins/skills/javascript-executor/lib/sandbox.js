@@ -31,7 +31,7 @@ function buildContext(helpers, secrets = null) {
     embeddingProviders: helpers.embeddingProviders || [],
 
     // Unified connection / file access. `connection` is either the saved
-    // connection's name/id or a local dbType ('nedb' | 'sqlite' | 'lancedb');
+    // connection's name/id or a local dbType ('duckdb' | 'sqlite' | 'lancedb');
     // when `dbPath` is provided the call routes to the local lib.
     runQuery:    (connection, query, dbPath = null)             => helpers.runQuery(connection, query, dbPath),
     getTables:   (connection, dbPath = null)                    => helpers.getTables(connection, dbPath),

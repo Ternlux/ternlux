@@ -4,9 +4,9 @@
  * Two-stage flow inside buildSkillPrompt:
  *
  *   Stage 1 — planning (internal AI call via params.helpers.callAI):
- *     The AI decides one of:
- *       • answer_directly     — user asked a question; no transformation
- *       • ask_questions       — request is ambiguous; clarify in plain language
+ *     The AI decides one of (exactly two — it either builds or it asks):
+ *       • ask_questions       — request is ambiguous, informational, or cannot
+ *                               be done; clarify in plain language
  *       • plan_complete       — return the connections + tables it will need,
  *                               which AI/embedding provider to use, and the
  *                               output destination (duckdb | lancedb)
@@ -14,8 +14,8 @@
  *   Stage 2 — function generation (renderer's AI call via the returned prompt):
  *     For plan_complete the skill fetches the planned tables' columns +
  *     sample data and includes that context in the function prompt.
- *     For answer_directly / ask_questions the skill returns a small "echo"
- *     prompt so processSkillResponse just passes the planner's answer back.
+ *     For ask_questions the skill returns a small "echo" prompt so
+ *     processSkillResponse just passes the planner's question back.
  *
  * Helpers (callAI, runQuery, getTables, getColumns, vectorize, axios, ...)
  * all come from
@@ -128,10 +128,10 @@ When this skill fits, return:
       );
     }
     console.log('plan: ', String(plan))
-    // Stage 1 short-circuit: planner returned a direct answer or follow-up
-    // questions. No second AI call needed; return the validated result so the
+    // Stage 1 short-circuit: planner asked for more information instead of
+    // planning. No second AI call needed; return the validated result so the
     // renderer can render it without going through processSkillResponse.
-    if (plan.action === 'answer_directly' || plan.action === 'ask_questions') {
+    if (plan.action === 'ask_questions') {
       return preResolved(validateResult(plan), { stage: 'short_circuit', plan });
     }
 
@@ -217,7 +217,14 @@ When this skill fits, return:
       sourceConnectionName,
       sourceConnectionType,
       userRequest,
-      targetLocalPath
+      targetLocalPath,
+      // The table the BUILDER named for this node — see the note where it is
+      // used. The workflow executor sends it as `targetTable`; an ad-hoc run
+      // from the node chat does not.
+      targetTable = null,
+      // 'new_table' | 'in_place'. Only the workflow executor sends it; an
+      // ad-hoc run leaves it undefined and keeps the append behaviour.
+      operationMode = null
     } = params;
 
     if (!helpers) {
@@ -251,15 +258,29 @@ When this skill fits, return:
       const output = scrubSecrets(Array.isArray(result) ? result : [result], secrets);
 
       // 3. Write to the workflow's DuckDB database, or LanceDB.
-      const targetTableName = (nodeId || `js_${Date.now()}`).replace(/-/g, '_').toLowerCase();
+      //
+      // The name the BUILDER chose wins. It is what the node records as
+      // `targetTableName`, what its preview SQL selects from, and what every
+      // downstream node reads — so deriving a different one here (from the node
+      // id) wrote the rows somewhere nothing else knew to look. The node-id
+      // name remains the fallback for an ad-hoc run with no target settled yet.
+      const targetTableName = (typeof targetTable === 'string' && targetTable.trim())
+        ? targetTable.trim()
+        : (nodeId || `js_${Date.now()}`).replace(/-/g, '_').toLowerCase();
       let savedConfig;
       let localPath;
 
       if (outputType === 'lancedb') {
         const dbPath = targetLocalPath || path.join(app.getPath('userData'), 'data', 'lancedb');
         const prepared = output.map((row) => {
-          const v = row.vector || row.values || row.embedding;
-          if (!Array.isArray(v)) {
+          // A vector reaches here as a plain array from generated code, or as a
+          // Float32Array when the function passed a LanceDB row straight
+          // through. Both are vectors; only the first survives Array.isArray,
+          // so normalise rather than reject.
+          const v = toNumericVector(row.vector)
+            || toNumericVector(row.values)
+            || toNumericVector(row.embedding);
+          if (!v) {
             throw new Error('LanceDB output requires each record to include a numeric `vector` array');
           }
           const clean = { ...row, vector: v };
@@ -269,7 +290,17 @@ When this skill fits, return:
         });
         const lanceResult = await helpers.runQuery(
           'lancedb',
-          { operation: 'upsert', tableName: targetTableName, data: prepared },
+          {
+            operation: 'upsert',
+            tableName: targetTableName,
+            data: prepared,
+            // A "new table" node produces its table afresh each run, so replace
+            // it rather than appending — the same rule vector-db-executor
+            // applies, and what the DuckDB branch below does with mode
+            // 'replace'. Appending re-ran rows in on top of the last run's and
+            // fails outright when the batch's shape has changed since.
+            overwrite: operationMode === 'new_table',
+          },
           dbPath
         );
         if (lanceResult && lanceResult.success === false) {
@@ -354,8 +385,7 @@ function validateResult(parsed) {
     };
   }
 
-  if (parsed.action === 'answer_directly') return parsed;
-  if (parsed.action === 'ask_questions')   return parsed;
+  if (parsed.action === 'ask_questions') return parsed;
 
   if (parsed.action === 'execute') {
     if (!parsed.transformFunction || !parsed.transformFunction.includes('function transform')) {
@@ -430,16 +460,10 @@ Embedding providers configured: ${embeddingProviders.join(', ') || 'none'}
 
 Decide ONE of:
 
-1. **answer_directly** — User is asking a question that doesn't require code (e.g., what columns exist, explain prior work).
-2. **ask_questions** — Request is ambiguous; ask plain-language clarifying questions.
-3. **plan_complete** — Ready to write a transformation. List the OTHER connections + tables the function will need (do NOT list the source — it's loaded automatically), and pick providers + output destination.
+1. **ask_questions** — Request is ambiguous, informational (what columns exist, explain prior work), or something you cannot do. Ask plain-language clarifying questions; answer what they asked inside the question if they asked something. You are a builder, not a chat partner — this is the ONLY way to reply without writing code.
+2. **plan_complete** — Ready to write a transformation. List the OTHER connections + tables the function will need (do NOT list the source — it's loaded automatically), and pick providers + output destination.
 
 Return JSON in EXACTLY one of these shapes (no markdown, no commentary):
-
-{
-  "action": "answer_directly",
-  "directAnswer": "your answer"
-}
 
 {
   "action": "ask_questions",
@@ -452,14 +476,20 @@ Return JSON in EXACTLY one of these shapes (no markdown, no commentary):
     { "connection": "<connection name>", "tables": ["table1"] }
   ],
   "aiProvider": "openai" | "claude" | "gemini" | null,
-  "embeddingProvider": "openai" | "huggingface" | null,
+  "embeddingProvider": "openai" | null,
   "outputType": "duckdb" | "lancedb",
   "summary": "Brief description of the planned transformation"
 }
 
 connectionsNeeded must be [] if no extra connections are required.
 Choose providers ONLY from the configured lists; null if not needed.
-outputType is "lancedb" only when the function will produce records with a numeric vector field; otherwise "duckdb".`;
+outputType is "lancedb" only when the function will produce records with a numeric vector field; otherwise "duckdb".
+
+WHERE THE RESULT IS WRITTEN IS ALREADY DECIDED — never ask about it. Your
+function RETURNS rows; this skill persists them to the workflow's own database
+by itself. There is no destination, path, folder, filename or file format for
+you to choose or confirm, so a question about one cannot be answered and only
+costs a round. Plan the transformation and nothing else.`;
 }
 
 async function fetchSchemaContext({ connectionsNeeded, helpers }) {
@@ -560,6 +590,13 @@ Write ONE async function with this exact signature:
 \`records\` is the source data already loaded as an array of objects. Return
 an array of objects to write downstream. Keep the function small — every
 ctx helper is a single async call so you almost never need to wrap or guard them.
+${isVectorSource(sourceConnection) ? `
+This source is a VECTOR store, read as plain rows: each record is its \`id\`
+plus its metadata fields promoted to top level, with the vector itself dropped.
+When the task is a search rather than a pass over these rows — "the N most
+similar to X" — ignore \`records\` and query the store through ctx.runQuery,
+embedding the probe text with ctx.vectorize first.
+` : ''}
 
 # ctx helpers (all simple, single-call)
 
@@ -569,6 +606,10 @@ ctx helper is a single async call so you almost never need to wrap or guard them
     Saved connection (dbPath omitted):
       SQL:    ctx.runQuery('warehouse', 'SELECT id, email FROM users')
       NoSQL:  ctx.runQuery('mongo-prod', { collection: 'users', filter: {}, limit: 100 })
+      Vector: ctx.runQuery('pinecone', { operation: 'queryVectors', indexName: 'products-index',
+                                         namespace: 'products', queryVector: v, topK: 5 })
+              Matches come back as { id, score, values, metadata, namespace } —
+              \`values\` is the stored vector, \`metadata\` the record's own fields.
     Returns an array of rows.
 - await ctx.getTables(connection, dbPath?)
 - await ctx.getColumns(connection, table, schema?, dbPath?)
@@ -599,7 +640,16 @@ that API expects them — a query parameter, a header, or a body field:
   });
 
 Index \`params\` with the exact key name as saved — including spaces and case.
+That name identifies the value; it is not where the value goes. Which header,
+query parameter or body field carries it is the API's contract, not the
+connection's — take it from the endpoint you are calling. A saved name is free
+text and may be something no header or parameter would accept.
+
 Never log, return, or embed a credential value in your output rows.
+
+Let a failed call throw. Catching an error to return a row of nulls or a status
+field reports success for a call that did not work, and every reader downstream
+believes it.
 ${includeLocalNote ? `
 
 # Local data (duckdb / lancedb)
@@ -629,7 +679,10 @@ no filter-object form.
 
 "${outputType}":
 ${outputType === 'lancedb'
-  ? '- Each output record MUST include a numeric `vector` array.'
+  ? `- Each output record MUST include a numeric \`vector\` array. Either carry one
+  you already have — a vector search returns the stored vector as \`values\` —
+  or embed the text yourself with \`await ctx.vectorize([...])\`. A record
+  without one fails the write.`
   : `- Plain JSON records, no vector field required. They are written as a
   DuckDB table, so give every record the same keys — a key that appears on
   only some records becomes a column that is NULL for the rest.`}
@@ -662,13 +715,123 @@ If still unclear (rare at this stage):
 Keep the function concise. Use only the ctx helpers listed above.`;
 }
 
+/** A vector store, whichever way the connection records it. */
+const VECTOR_DB_TYPES = new Set(['lancedb', 'pinecone']);
+const isVectorSource = (conn) =>
+  !!conn && (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType));
+
+/**
+ * A vector as a plain numeric array, or null when the value is not one.
+ *
+ * Generated code produces a real array. A function that passed a row straight
+ * through produces whatever the read yielded: a Float32Array, or — for a
+ * LanceDB source — an Apache Arrow `Vector`, which is neither an array nor a
+ * typed array and whose dimensions are not index-accessible (`v[0]` is
+ * undefined). Both are vectors; convert rather than reject.
+ *
+ * An empty array is rejected here rather than sent on to fail inside the Arrow
+ * writer with a less obvious message.
+ */
+function toNumericVector(value) {
+  if (value == null || typeof value === 'string') return null;
+  const v = (!Array.isArray(value) && !ArrayBuffer.isView(value) && typeof value.toArray === 'function')
+    ? value.toArray()
+    : value;
+  if (Array.isArray(v)) return v.length > 0 ? v : null;
+  if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
+    return v.length > 0 ? Array.from(v, Number) : null;
+  }
+  if (typeof v[Symbol.iterator] === 'function') {
+    const arr = Array.from(v, Number);
+    return arr.length > 0 ? arr : null;
+  }
+  return null;
+}
+
+/**
+ * Rows from a vector source (LanceDB or Pinecone).
+ *
+ * A vector store answers neither of the two shapes below: it has no SQL and no
+ * Mongo-style collection query. Without this branch a Pinecone source fell
+ * through to the SQL form and reached the connector as
+ * `{ query: 'SELECT * FROM products-index' }` — no `indexName`, no `operation`
+ * — which comes back as "Index name is required", so the node died before the
+ * transform function ever ran. LanceDB failed the same way with `dbType` set
+ * but no `localPath` reaching the reader.
+ *
+ * The pull itself is vector-db-executor's `fetchVectorSourceRecords` — the same
+ * function the JOIN executor uses (NodeExecution.pullJoinSourceRows), so a
+ * vector source reads identically whether it feeds a join or a transformer.
+ * It flattens id + metadata to top-level columns and drops the vector, which is
+ * the row shape `transform(records, ctx)` expects.
+ */
+async function loadVectorSourceRecords({ sourceConnection, sourceTableSchema, helpers }) {
+  const pm = helpers.pluginManager;
+  const skill = pm && pm.hasSkill && pm.hasSkill('vector-db-executor')
+    ? pm.getSkill('vector-db-executor')
+    : null;
+  if (!skill || typeof skill.fetchVectorSourceRecords !== 'function') {
+    throw new Error('vector-db-executor skill not available; cannot read from a vector source');
+  }
+
+  // Index coordinates live in different places depending on whether the node
+  // was authored by the AI builder or wired from a saved connection. Same
+  // fallback order as pullJoinSourceRows, for the same reason.
+  const tableName = sourceTableSchema?.tableName
+    || sourceConnection.dbConfig?.tableName
+    || sourceConnection.indexName;
+  if (!tableName) {
+    throw new Error('Vector source: no tableName/indexName on the schema or the connection');
+  }
+  const indexName = sourceTableSchema?.indexName
+    || sourceConnection.indexName
+    || sourceConnection.dbConfig?.indexName
+    || tableName;
+  const namespace = sourceTableSchema?.namespace
+    || sourceTableSchema?.schema
+    || sourceConnection.namespace
+    || sourceConnection.dbConfig?.namespace
+    || '';
+
+  return skill.fetchVectorSourceRecords({
+    sourceConnection: {
+      ...sourceConnection,
+      localPath: sourceConnection.localPath
+        || sourceConnection.dbConfig?.dbPath
+        || sourceTableSchema?.localPath
+        || null,
+    },
+    // Merged, not `||`: the resolved coordinates must survive a source that
+    // already has a schema, which is every source in a built workflow.
+    sourceTableSchema: { ...(sourceTableSchema || {}), tableName, indexName, namespace },
+    // No search text — a transformer reads its source, it does not search it.
+    // Similarity search belongs inside the function, via ctx.runQuery.
+    vectorFetchOperation: { useEmbeddingSearch: false, filter: sourceConnection.dbType === 'pinecone' ? {} : '', topK: 10000 },
+    // This is a full read of the source, not a join key lookup: the function
+    // is free to pass the vector through to a new vector table, and several
+    // do. The join default drops the dimensions, which left the generated
+    // function with no `vector` field to preserve and the LanceDB write below
+    // rejecting every row it produced.
+    includeVector: true,
+    pluginManager: pm,
+    getFullConfig: helpers.getFullConfig,
+    helpers,
+  });
+}
+
 /**
  * Load source data using the same pattern as handleTransformSQL/NoSQL.
  * Local files are read directly; remote connections go through the connector
- * via helpers.runQuery.
+ * via helpers.runQuery; vector stores go through vector-db-executor.
  */
 async function loadSourceRecords({ sourceConnection, sourceTableSchema, helpers }) {
   if (!sourceConnection) return [];
+
+  // Before the local/remote split: a LanceDB source is local and a Pinecone one
+  // is remote, but neither is readable by the query forms below.
+  if (isVectorSource(sourceConnection)) {
+    return loadVectorSourceRecords({ sourceConnection, sourceTableSchema, helpers });
+  }
 
   const isLocal = !!sourceConnection.localPath;
 
@@ -688,10 +851,6 @@ async function loadSourceRecords({ sourceConnection, sourceTableSchema, helpers 
     return helpers.runQuery('duckdb', { query: `SELECT * FROM "${tableName}"` }, localPath);
   }
 
-  if (isLocal && sourceConnection.dbType === 'nedb') {
-    return helpers.runQuery('nedb', { filter: {}, limit: 1000000 }, sourceConnection.localPath);
-  }
-
   if (isLocal && sourceConnection.dbType === 'sqlite') {
     const tableName = sourceTableSchema.originalTableName || sourceTableSchema.tableName;
     return helpers.runQuery('sqlite', { query: `SELECT * FROM ${tableName}` }, sourceConnection.localPath);
@@ -699,26 +858,29 @@ async function loadSourceRecords({ sourceConnection, sourceTableSchema, helpers 
 
   // Remote connection — dispatch via helpers.runQuery (no need to look up
   // connectors or credentials in the skill).
-  const isNoSQL = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
+  const isNoSQL = sourceConnection.dbType === 'mongodb';
   const tableName = isNoSQL
     ? (sourceTableSchema.originalTableName || sourceTableSchema.tableName)
     : sourceTableSchema.tableName;
 
-  // NoSQL connectors (MongoDB) expect a structured { collection, filter, limit }
+  // NoSQL connectors (MongoDB) expect a structured { collection, filter }
   // query and JSON.parse any `query` string they receive — so never hand them a
   // SQL string. SQL connectors get the SELECT form.
+  //
+  // No `limit`. The transform function is handed its source as one array and
+  // that is not changing, but it must be the WHOLE source: a million-row cap
+  // here meant a transform over a larger table quietly ran on part of it and
+  // returned an answer that looked complete.
   const queryObj = isNoSQL
     ? {
         collection: tableName,
-        filter: {},
-        limit: 1000000
+        filter: {}
       }
     : {
         query: `SELECT * FROM ${sourceTableSchema.tableName}`,
         tableName,
         schema: sourceTableSchema.schema || sourceConnection.dbConfig?.schema,
-        sheetName: sourceTableSchema.sheetName,
-        limit: 1000000
+        sheetName: sourceTableSchema.sheetName
       };
   return helpers.runQuery(sourceConnection.name || sourceConnection.id, queryObj);
 }
