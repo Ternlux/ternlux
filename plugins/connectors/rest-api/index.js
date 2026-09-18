@@ -111,7 +111,7 @@ module.exports = {
 
   /**
    * Synthetic single "table" representing an API response. The real
-   * table/collection is materialised into NeDB at DataSource node use time.
+   * table/collection is materialised into DuckDB at DataSource node use time.
    */
   async getTables(/* config, connectionId */) {
     return {
@@ -122,7 +122,7 @@ module.exports = {
 
   /**
    * Columns are unknown until a request is authored. Return empty; the chat
-   * flow infers them from the materialised NeDB collection.
+   * flow infers them from the materialised table.
    */
   async getColumns(/* config, connectionId, schema, table */) {
     return { success: true, columns: [] };
