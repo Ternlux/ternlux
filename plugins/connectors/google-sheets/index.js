@@ -7,6 +7,8 @@ const { OAuth2Client } = require('google-auth-library');
 const { sheets: sheetsApi } = require('@googleapis/sheets');
 const { drive: driveApi } = require('@googleapis/drive');
 const axios = require('axios');
+const { Parser } = require('@json2csv/plainjs');
+const Papa = require('papaparse');
 
 // OAuth client cache
 const oauthClients = new Map();
@@ -85,12 +87,76 @@ function registerTokenRefreshCallback(connectionId, callback) {
   tokenRefreshCallbacks.set(connectionId, callback);
 }
 
+/** A Google file id: opaque, no spaces, and long. A spreadsheet TITLE is not one. */
+const looksLikeFileId = (v) => /^[A-Za-z0-9_-]{20,}$/.test(String(v || '').trim());
+
+/**
+ * The spreadsheet a container reference names.
+ *
+ * The picker records a file id, but a hand-written config (or an older one)
+ * may carry the spreadsheet's title instead. A title is looked up, and — for a
+ * write — created when nothing matches, which is what makes "output to an
+ * existing sheet, or a new one if it isn't there" work from one field.
+ */
+async function resolveSpreadsheetId(drive, sheets, ref, { createIfMissing = false } = {}) {
+  const name = String(ref || '').trim();
+  if (!name) throw new Error('No spreadsheet was selected');
+  if (looksLikeFileId(name)) return name;
+
+  const escaped = name.replace(/'/g, "\\'");
+  const found = await drive.files.list({
+    q: `name = '${escaped}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`,
+    fields: 'files(id, name)',
+    pageSize: 1,
+  });
+  const hit = found.data.files?.[0];
+  if (hit) return hit.id;
+
+  if (!createIfMissing) {
+    throw new Error(`Google Sheets spreadsheet "${name}" not found`);
+  }
+  const created = await sheets.spreadsheets.create({
+    requestBody: { properties: { title: name } },
+    fields: 'spreadsheetId',
+  });
+  return created.data.spreadsheetId;
+}
+
+/** A tab name as the user meant it — the picker appends a file extension. */
+const tabNameOf = (objectName) => String(objectName || '')
+  .split('/').pop()
+  .replace(/\.(csv|json|xlsx?|tsv)$/i, '')
+  .trim();
+
+/**
+ * Rows out of whatever the output node serialised.
+ *
+ * insertToConnection sends this connector JSON, but a config whose tab name
+ * ends in .csv would have produced CSV, so both are accepted rather than
+ * throwing on a leading `"S"`.
+ */
+function rowsFromPayload(data) {
+  const text = Buffer.isBuffer(data) ? data.toString('utf-8') : (typeof data === 'string' ? data : null);
+  if (text === null) return Array.isArray(data) ? data : [data];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch (_) {
+    const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+    return parsed.data || [];
+  }
+}
+
 module.exports = {
   type: 'connector',
   id: 'google-sheets',
   name: 'Google Sheets',
   icon: './icon.svg',
-  dbCategory: 'API',
+  // A spreadsheet is browsed and written like cloud storage — pick the file,
+  // then the tab inside it — not queried like an API. `storageType` is what
+  // routes it to the cloud picker and the cloud output path.
+  storageType: 'cloud-storage',
+  dbCategory: 'CloudStorage',
   authType: 'oauth2',
 
   /**
@@ -104,9 +170,16 @@ module.exports = {
         config.redirectUri || 'http://localhost:3000/oauth/callback'
       );
 
+      // Deliberately NO Drive listing scope. `drive.metadata.readonly` and
+      // `drive.readonly` are both RESTRICTED by Google — publishing an app
+      // that asks for either means annual third-party security assessment —
+      // and neither is needed: the user picks a spreadsheet in Google's own
+      // Picker, which grants this app access to that one file under
+      // `drive.file`. Everything after the pick (tabs, values, writes) runs on
+      // the `spreadsheets` scope, which is merely sensitive.
       const scopes = [
-        'https://www.googleapis.com/auth/spreadsheets', // Full read/write access to spreadsheets
-        'https://www.googleapis.com/auth/drive.file'     // Access to files created/opened by the app
+        'https://www.googleapis.com/auth/spreadsheets', // Read/write cell values (sensitive)
+        'https://www.googleapis.com/auth/drive.file'    // Files this app creates or the user picks (non-sensitive)
       ];
 
       const authUrl = oauth2Client.generateAuthUrl({
@@ -612,85 +685,308 @@ module.exports = {
    * Upload object (create new spreadsheet and write data)
    * This makes Google Sheets compatible with cloud storage output interface
    */
-  uploadObject: async (config, connectionId, containerName, fileName, data, contentType) => {
+  /**
+   * Containers = the spreadsheets this app can already see.
+   *
+   * Under `drive.file` that is only what the app created or the user has
+   * picked before — deliberately, since listing everything in a person's Drive
+   * needs a RESTRICTED scope. Discovery happens in Google's Picker instead
+   * (GoogleSheetsPicker), which hands back a spreadsheet id this connector can
+   * then work with; this method stays because the cloud-storage contract
+   * requires it, and because a previously-picked sheet is worth offering.
+   */
+  getContainers: async (config, connectionId = null) => {
     try {
       const oauth2Client = getOAuthClient(config, connectionId);
       await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
 
-      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
-
-      // Parse data from Buffer if needed
-      let jsonData;
-      if (Buffer.isBuffer(data)) {
-        const dataString = data.toString('utf-8');
-        jsonData = JSON.parse(dataString);
-      } else if (typeof data === 'string') {
-        jsonData = JSON.parse(data);
-      } else {
-        jsonData = data;
-      }
-
-      if (!Array.isArray(jsonData) || jsonData.length === 0) {
-        return {
-          success: false,
-          message: 'Data must be a non-empty array of objects'
-        };
-      }
-
-      // Remove file extension from spreadsheet name
-      const spreadsheetName = fileName.replace(/\.(json|csv)$/, '');
-      const sheetTitle = 'Sheet1';
-
-      // Create new spreadsheet
-      const createResponse = await sheets.spreadsheets.create({
-        requestBody: {
-          properties: {
-            title: spreadsheetName
-          },
-          sheets: [
-            {
-              properties: {
-                title: sheetTitle
-              }
-            }
-          ]
-        }
-      });
-
-      const spreadsheetId = createResponse.data.spreadsheetId;
-
-      // Extract headers from first object
-      const headers = Object.keys(jsonData[0]);
-      const rows = jsonData.map(row => headers.map(header => {
-        const value = row[header];
-        // Convert values to strings for Google Sheets
-        return value !== null && value !== undefined ? String(value) : '';
-      }));
-
-      // Combine headers and rows
-      const values = [headers, ...rows];
-
-      // Write data to the spreadsheet
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: spreadsheetId,
-        range: `${sheetTitle}!A1`,
-        valueInputOption: 'RAW',
-        requestBody: {
-          values
-        }
+      const response = await drive.files.list({
+        q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed = false",
+        fields: 'files(id, name, modifiedTime)',
+        pageSize: 200,
+        orderBy: 'modifiedTime desc',
       });
 
       return {
         success: true,
-        message: `Successfully created spreadsheet "${spreadsheetName}" with ${jsonData.length} rows`,
-        spreadsheetId: spreadsheetId,
-        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`
+        containers: (response.data.files || []).map((f) => ({
+          name: f.name,
+          id: f.id,
+          description: 'Spreadsheet',
+          lastModified: f.modifiedTime,
+        })),
       };
     } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Credentials for Google's own file Picker.
+   *
+   * The Picker is what makes `drive.file` enough: a file the user selects there
+   * becomes accessible to this app without any account-wide Drive scope.
+   */
+  getPickerCredentials: async (config, connectionId) => {
+    try {
+      const oauth2Client = getOAuthClient(config, connectionId);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
       return {
-        success: false,
-        message: error.message
+        success: true,
+        accessToken: oauth2Client.credentials?.access_token,
+        apiKey: config.apiKey || null, // optional when using OAuth
+        clientId: config.clientId,
       };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Objects = the tabs of one spreadsheet.
+   *
+   * Named with a .csv suffix because that is what they become on the way out:
+   * downloadObject serialises the tab as CSV, the file is saved locally, and
+   * DuckDB reads it in place like any other cloud file. No SQLite import, and
+   * a workflow run refreshes it through the same cloudSource path as S3.
+   */
+  listObjects: async (config, connectionId, containerName, prefix = '', pageSize = 1000, continuationToken = null, searchTerm = '') => {
+    try {
+      const oauth2Client = getOAuthClient(config, connectionId);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
+
+      const spreadsheetId = await resolveSpreadsheetId(drive, sheets, containerName);
+      const metadata = await sheets.spreadsheets.get({
+        spreadsheetId,
+        fields: 'properties(title),sheets(properties(title,gridProperties(rowCount,columnCount)))',
+      });
+
+      const term = String(searchTerm || '').toLowerCase();
+      const objects = (metadata.data.sheets || [])
+        .map((sheet) => {
+          const title = sheet.properties?.title || '';
+          const grid = sheet.properties?.gridProperties || {};
+          return {
+            name: `${title}.csv`,
+            objectKey: title,
+            isFolder: false,
+            size: 0,
+            rowCount: grid.rowCount || 0,
+            columnCount: grid.columnCount || 0,
+            lastModified: null,
+          };
+        })
+        .filter((o) => !term || o.objectKey.toLowerCase().includes(term));
+
+      return {
+        success: true,
+        objects,
+        // The spreadsheet's own name, so a caller that only had an id (someone
+        // pasting a link) can show WHAT it just opened.
+        containerName: metadata.data.properties?.title || spreadsheetId,
+        spreadsheetId,
+        isTruncated: false,
+        nextContinuationToken: null,
+        totalCount: objects.length,
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * One tab, as CSV bytes.
+   *
+   * Returning a file rather than rows is what lets Sheets reuse the whole
+   * cloud-storage pipeline: saved to disk, read in place by DuckDB, and
+   * re-downloaded on every run.
+   */
+  downloadObject: async (config, connectionId, containerName, objectName) => {
+    try {
+      const oauth2Client = getOAuthClient(config, connectionId);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
+
+      const spreadsheetId = await resolveSpreadsheetId(drive, sheets, containerName);
+      const tab = tabNameOf(objectName);
+      if (!tab) return { success: false, message: 'No sheet tab was selected' };
+
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `'${tab.replace(/'/g, "''")}'!A1:ZZ`,
+      });
+
+      const values = response.data.values || [];
+      if (values.length === 0) {
+        return { success: true, data: Buffer.from('', 'utf-8'), contentType: 'text/csv', name: `${tab}.csv` };
+      }
+
+      // A blank or repeated header cell would otherwise collapse two columns
+      // into one, so every column gets a distinct name before it becomes CSV.
+      const seen = new Map();
+      const headers = (values[0] || []).map((h, i) => {
+        const base = String(h ?? '').trim() || `Column_${i + 1}`;
+        const count = (seen.get(base) || 0) + 1;
+        seen.set(base, count);
+        return count === 1 ? base : `${base}_${count}`;
+      });
+
+      const rows = values.slice(1).map((row) => {
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = row[i] ?? ''; });
+        return obj;
+      });
+
+      const csv = new Parser({ fields: headers }).parse(rows);
+      return {
+        success: true,
+        data: Buffer.from(csv, 'utf-8'),
+        contentType: 'text/csv',
+        contentLength: Buffer.byteLength(csv),
+        name: `${tab}.csv`,
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Write rows into a tab of an existing spreadsheet.
+   *
+   * `containerName` is the spreadsheet (id, or a title to find/create) and
+   * `objectName` is the TAB. A missing tab is added rather than failing, and a
+   * missing spreadsheet is created — so "put this in the sheet I picked" and
+   * "make me a new one" are the same call.
+   *
+   * An empty tab gets a header row and the data. A tab that already holds rows
+   * is APPENDED to, with each row lined up under the header that is already
+   * there — matching how an output node behaves against a database table, and
+   * never silently discarding what a person has in the sheet.
+   */
+  uploadObject: async (config, connectionId, containerName, objectName, data, contentType, options = {}) => {
+    try {
+      const oauth2Client = getOAuthClient(config, connectionId);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
+
+      const rows = rowsFromPayload(data);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return { success: false, message: 'Data must be a non-empty array of objects' };
+      }
+
+      const spreadsheetId = await resolveSpreadsheetId(drive, sheets, containerName, { createIfMissing: true });
+      const tab = tabNameOf(objectName) || 'Sheet1';
+      const quoted = `'${tab.replace(/'/g, "''")}'`;
+
+      // Add the tab when the spreadsheet does not have it yet.
+      const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: 'properties(title),sheets(properties(title))' });
+      const existingTabs = (metadata.data.sheets || []).map((sh) => sh.properties?.title);
+      if (!existingTabs.includes(tab)) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: { requests: [{ addSheet: { properties: { title: tab } } }] },
+        });
+      }
+
+      // Truncate: wipe the tab's contents so the rows below are all it holds.
+      // The TAB survives (formatting, its position in the workbook, anything
+      // pointing at it by name) — only the values go.
+      if (options.writeMode === 'truncate') {
+        await sheets.spreadsheets.values.clear({ spreadsheetId, range: quoted, requestBody: {} });
+        console.log(`[Google Sheets] Cleared tab "${tab}" before loading`);
+      }
+
+      // What is already in the tab decides header-and-write vs append. After a
+      // truncate there is nothing, so it always takes the header-and-write path.
+      const current = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${quoted}!A1:ZZ1` });
+      const existingHeaders = current.data.values?.[0] || [];
+      const asCell = (v) => (v === null || v === undefined ? '' : String(v));
+
+      if (existingHeaders.length === 0) {
+        const headers = Object.keys(rows[0]);
+        const values = [headers, ...rows.map((r) => headers.map((h) => asCell(r[h])))];
+        await sheets.spreadsheets.values.update({
+          spreadsheetId,
+          range: `${quoted}!A1`,
+          valueInputOption: 'RAW',
+          requestBody: { values },
+        });
+        return {
+          success: true,
+          message: `${options.writeMode === 'truncate' ? 'Replaced' : 'Wrote'} ${rows.length} row(s) `
+            + `in "${tab}" of "${metadata.data.properties?.title || spreadsheetId}"`,
+          spreadsheetId,
+          sheetName: tab,
+          spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`,
+        };
+      }
+
+      // Existing header wins: a column the sheet does not have is left out
+      // rather than shifting every later value into the wrong column.
+      const values = rows.map((r) => existingHeaders.map((h) => asCell(r[h])));
+      const missing = Object.keys(rows[0]).filter((k) => !existingHeaders.includes(k));
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `${quoted}!A1`,
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values },
+      });
+
+      return {
+        success: true,
+        message: `Appended ${rows.length} row(s) to "${tab}" in "${metadata.data.properties?.title || spreadsheetId}"`
+          + (missing.length ? ` (columns not in the sheet were skipped: ${missing.join(', ')})` : ''),
+        spreadsheetId,
+        sheetName: tab,
+        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}`,
+      };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Delete a tab from a spreadsheet.
+   *
+   * Part of the cloud-storage contract (pluginManager.validateConnectorPlugin
+   * requires it, and without it this connector was never registered at all —
+   * every call came back "Storage connector not found"). Deleting an "object"
+   * here means removing the tab, never the spreadsheet: a file the user picked
+   * is not something a workflow should be able to destroy by name.
+   */
+  deleteObject: async (config, connectionId, containerName, objectName) => {
+    try {
+      const oauth2Client = getOAuthClient(config, connectionId);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
+
+      const spreadsheetId = await resolveSpreadsheetId(drive, sheets, containerName);
+      const tab = tabNameOf(objectName);
+      if (!tab) return { success: false, message: 'No sheet tab was named' };
+
+      const metadata = await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets(properties(sheetId,title))' });
+      const all = metadata.data.sheets || [];
+      const target = all.find((sh) => sh.properties?.title === tab);
+      if (!target) return { success: false, message: `Sheet tab "${tab}" not found` };
+      if (all.length === 1) {
+        return { success: false, message: `"${tab}" is the only tab in this spreadsheet and cannot be deleted` };
+      }
+
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests: [{ deleteSheet: { sheetId: target.properties.sheetId } }] },
+      });
+
+      return { success: true, message: `Deleted sheet tab "${tab}"` };
+    } catch (error) {
+      return { success: false, message: error.message };
     }
   },
 
