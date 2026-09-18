@@ -5,50 +5,258 @@
 
 const snowflake = require('snowflake-sdk');
 
-// Connection cache
-const connections = new Map();
+/**
+ * How long one connect attempt may take before we report a failure.
+ *
+ * The SDK will not do this for us. Its `retryTimeout` floors at 300s
+ * (connection_config.js applies `Math.max(300, yours)`), and a login request
+ * that fails for a network reason — an account identifier that does not
+ * resolve, a blocked host — is retried silently with exponential backoff, so
+ * `connect()` can sit for five minutes without a word to the caller.
+ */
+const CONNECT_TIMEOUT_MS = 30000;
 
 /**
- * Get or create Snowflake connection
+ * Login retries within that window. The SDK's default of 7 exists to ride out
+ * transient blips, but a wrong account or an unreachable host fails the same
+ * way every time; a couple of attempts is enough to tell those apart.
  */
-function getConnection(config, connectionId) {
-  const key = connectionId || JSON.stringify(config);
+const MAX_LOGIN_RETRIES = 2;
 
-  if (!connections.has(key)) {
-    const connection = snowflake.createConnection({
-      account: config.account,
-      username: config.username,
-      password: config.password,
-      warehouse: config.warehouse,
-      database: config.database,
-      schema: config.schema || 'PUBLIC',
-      role: config.role,
-    });
+/** Teardown is best-effort — never let it hold up the caller's answer. */
+const DESTROY_TIMEOUT_MS = 5000;
 
-    connections.set(key, { connection, connected: false });
-  }
+// Connection cache: key -> { connection, connected, connecting }
+const connections = new Map();
 
-  return connections.get(key);
+function cacheKey(config, connectionId) {
+  return connectionId || JSON.stringify(config);
+}
+
+function createConnection(config) {
+  return snowflake.createConnection({
+    account: config.account,
+    username: config.username,
+    password: config.password,
+    warehouse: config.warehouse,
+    database: config.database,
+    schema: config.schema || 'PUBLIC',
+    role: config.role,
+    sfRetryMaxLoginRetries: MAX_LOGIN_RETRIES,
+  });
 }
 
 /**
- * Connect to Snowflake if not already connected (async wrapper)
+ * Log out and forget a connection. Teardown is bounded because `destroy()` on a
+ * connection that is still mid-connect is queued behind that connect.
  */
-async function ensureConnected(connectionObj) {
-  if (connectionObj.connected) {
-    return connectionObj.connection;
+function closeQuietly(connection) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, DESTROY_TIMEOUT_MS);
+    try {
+      // Errors here are expected and uninteresting: destroying a connection
+      // that never came up reports "not connected", which is what we want.
+      connection.destroy(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+}
+
+function dropConnection(key) {
+  const entry = connections.get(key);
+  if (!entry) return;
+  connections.delete(key);
+  closeQuietly(entry.connection);
+}
+
+/**
+ * Run one bounded connect attempt against a fresh connection object.
+ *
+ * A connection may only be connected once — the SDK object is a state machine,
+ * and a failed or timed-out attempt leaves it in a terminal state where every
+ * later `connect()` answers "Connection already terminated. Cannot connect
+ * again." Callers must therefore throw the object away on rejection.
+ */
+function connectOnce(connection) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(connection);
+    };
+
+    const timer = setTimeout(() => {
+      finish(new Error(
+        `Timed out after ${CONNECT_TIMEOUT_MS / 1000}s connecting to Snowflake. ` +
+        'Check the account identifier, network access, and the warehouse/role.'
+      ));
+    }, CONNECT_TIMEOUT_MS);
+
+    try {
+      connection.connect((err) => finish(err));
+    } catch (err) {
+      finish(err);
+    }
+  });
+}
+
+/**
+ * Resolve to a live connection for this config, connecting on first use.
+ *
+ * Concurrent callers share one in-flight attempt: calling `connect()` twice on
+ * the same object is itself an error ("Connection already in progress"). A
+ * failed attempt evicts the entry so the next call starts from a fresh object
+ * rather than replaying the terminal-state error forever.
+ */
+async function acquire(config, connectionId) {
+  const key = cacheKey(config, connectionId);
+  const cached = connections.get(key);
+
+  // A connection whose session has since gone down cannot be revived, only
+  // replaced.
+  if (cached && cached.connected && !cached.connection.isUp()) {
+    dropConnection(key);
   }
 
-  return new Promise((resolve, reject) => {
-    connectionObj.connection.connect((err, conn) => {
-      if (err) {
-        reject(err);
-      } else {
-        connectionObj.connected = true;
-        resolve(conn);
-      }
+  if (!connections.has(key)) {
+    connections.set(key, { connection: createConnection(config), connected: false, connecting: null });
+  }
+
+  const entry = connections.get(key);
+  if (entry.connected) return entry.connection;
+  if (entry.connecting) return entry.connecting;
+
+  entry.connecting = connectOnce(entry.connection)
+    .then((connection) => {
+      entry.connected = true;
+      entry.connecting = null;
+      return connection;
+    })
+    .catch((err) => {
+      entry.connecting = null;
+      dropConnection(key);
+      throw err;
     });
-  });
+
+  return entry.connecting;
+}
+
+/**
+ * SDK codes meaning "this connection object is finished — build a new one".
+ * All carry SQL state 08003 (connection does not exist).
+ */
+const TERMINAL_CONNECTION_CODES = new Set([
+  405503, // ERR_CONN_CONNECT_STATUS_DISCONNECTED — connect() on a dead object
+  407001, // ERR_CONN_REQUEST_STATUS_PRISTINE     — request before connecting
+  407002, // ERR_CONN_REQUEST_STATUS_DISCONNECTED — request on a dead object
+]);
+
+function isDeadConnectionError(error) {
+  if (!error) return false;
+  return TERMINAL_CONNECTION_CODES.has(Number(error.code)) || error.sqlState === '08003';
+}
+
+/** Forget a connection the SDK has terminated. Safe to call with any error. */
+function evictIfDead(config, connectionId, error) {
+  if (isDeadConnectionError(error)) dropConnection(cacheKey(config, connectionId));
+}
+
+/**
+ * Run a READ against a live connection, replacing the connection once if it
+ * turns out to have been terminated.
+ *
+ * `acquire` checks isUp() before handing a connection over, but a session can
+ * be terminated by the server at any moment — an idle timeout, an admin, a
+ * dropped network — including between that check and the request going out.
+ * The SDK then answers every later call on that object with "Unable to perform
+ * operation using terminated connection" (407002), and because the object is a
+ * one-shot state machine it can never recover: the cached connection is dead
+ * for good, and the caller sees a bare 08003 with nothing to act on.
+ *
+ * Evicting and retrying ONCE turns that into a reconnect nobody has to notice.
+ *
+ * READS ONLY. Re-running an arbitrary statement to work around a dead
+ * connection is how an INSERT ends up applied twice, so the write paths call
+ * evictIfDead instead — the next call gets a fresh connection, but this one is
+ * reported as the failure it was.
+ */
+async function withReadRetry(config, connectionId, run) {
+  const connection = await acquire(config, connectionId);
+  try {
+    return await run(connection);
+  } catch (err) {
+    if (!isDeadConnectionError(err)) throw err;
+    dropConnection(cacheKey(config, connectionId));
+    return run(await acquire(config, connectionId));
+  }
+}
+
+/**
+ * Turn a driver error into something a user can act on.
+ *
+ * The SDK collapses every login failure into "Request to Snowflake failed.",
+ * which names neither the cause nor the field to correct. What it does carry is
+ * a socket code (NetworkError, under `cause`) or the HTTP response
+ * (RequestFailedError) — enough to tell an unreachable host from an account
+ * identifier that the Snowflake edge does not recognise.
+ */
+function describeError(error) {
+  const message = (error && error.message) || String(error);
+  const code = (error && error.cause && error.cause.code) || (error && error.code);
+  const status = error && error.response && error.response.status;
+
+  const accountHint = 'Check the Account field — it must include the region for a legacy ' +
+    'locator ("xy12345.us-east-1") or use the "myorg-myaccount" form.';
+
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+    return `${message} — the Snowflake host could not be resolved. ${accountHint}`;
+  }
+  if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET') {
+    return `${message} — could not reach the Snowflake host. Check network access and any proxy or firewall.`;
+  }
+  if (status === 404) {
+    return `${message} — Snowflake returned 404 for this account's login endpoint, so no such ` +
+      `account exists at that host. ${accountHint}`;
+  }
+  if (status === 403) {
+    return `${message} — Snowflake returned 403. The account may have a network policy that ` +
+      'blocks this IP address.';
+  }
+  if (status) {
+    return `${message} (HTTP ${status})`;
+  }
+  return message;
+}
+
+/**
+ * Quote one identifier for Snowflake.
+ *
+ * Quoting is all-or-nothing on this engine and cannot be treated as cosmetic.
+ * Snowflake folds an UNQUOTED identifier to UPPER CASE, so a table created as
+ * `"transactions"` — quoted, and therefore genuinely lower case — is a
+ * different object from the `TRANSACTIONS` that a bare
+ * `INSERT INTO transactions` resolves to. Every statement this connector
+ * builds must quote, or none of them can.
+ */
+function quote(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
+/**
+ * Quote a possibly schema-qualified name ("PUBLIC.transactions"), part by part.
+ * Quoting it whole would ask for one object whose name contains a dot.
+ */
+function quoteQualified(name) {
+  return String(name).split('.').map(quote).join('.');
 }
 
 /**
@@ -70,6 +278,23 @@ function executeAsync(connection, sqlText, binds = []) {
   });
 }
 
+/**
+ * A driver failure, with the driver's own classification kept alongside the text.
+ *
+ * The message alone cannot be reasoned about — "Duplicate column name 'x'" is
+ * prose that moves with the server's version and locale. The CODE is the
+ * driver's own answer to what KIND of failure this is, and the transform
+ * executor uses it to tell a structural change that was ALREADY APPLIED (what
+ * the second run of an in-place ALTER looks like) from one that genuinely
+ * failed. Callers that only read `message` are unaffected.
+ */
+const queryError = (error) => ({
+  success: false,
+  message: describeError(error),
+  code: error && error.code,
+  sqlState: error && error.sqlState,
+});
+
 module.exports = {
   type: 'connector',
   id: 'snowflake',
@@ -78,16 +303,124 @@ module.exports = {
   dbCategory: 'SQL',
 
   /**
-   * Test database connection
+   * Column types for a CREATE TABLE this app generates.
+   *
+   * public/NodeExecution/outputExecutionHelpers.js decides WHAT a column holds
+   * — all integers, has a time component, nested objects — and this says what
+   * that is CALLED here. It used to be a hardcoded table in that file with no
+   * snowflake entry, so an output node fell through to SQLite's names and
+   * created `("total_amount" REAL, "transaction_date" TEXT)`. That only worked
+   * because REAL and TEXT happen to be aliases on this engine; a boolean column
+   * would have landed as INTEGER and a timestamp as a string.
    */
-  testConnection: async (config, connectionId = null) => {
+  types: {
+    NULL: () => 'VARCHAR',
+    DATE_ONLY: () => 'DATE',
+    // NTZ rather than plain TIMESTAMP: the app writes wall-clock strings with
+    // no offset ("2025-12-04 15:50:05"), and TIMESTAMP maps to whichever of the
+    // three variants TIMESTAMP_TYPE_MAPPING is set to on the account — TZ on
+    // some, which would attach the session's zone to a value that never had one.
+    TIMESTAMP: () => 'TIMESTAMP_NTZ',
+    BOOLEAN: () => 'BOOLEAN',
+    // Snowflake has one numeric type; INTEGER is an alias for NUMBER(38,0).
+    INTEGER: () => 'NUMBER(38,0)',
+    FLOAT: () => 'FLOAT',
+    OBJECT: () => 'VARIANT',
+    // VARCHAR with no length is the full 16MB here, so there is nothing to size.
+    STRING: () => 'VARCHAR',
+  },
+
+  /**
+   * Resolve a table name to the object this account really has.
+   *
+   * Snowflake's rule is exactly two candidates: a QUOTED reference means the
+   * literal string, an UNQUOTED one means the upper-cased string. So a name the
+   * app holds as `pg_txn_customers` may be either the table literally called
+   * that (created quoted) or PG_TXN_CUSTOMERS (created bare) — and BOTH can
+   * exist side by side as different objects, which is the state an unquoted
+   * CREATE followed by a quoted one leaves behind.
+   *
+   * Asked as an IN list rather than `UPPER(table_name) = UPPER(?)` precisely
+   * because of that: a case-insensitive match returns both tables, and the
+   * caller reading a flat column list would see one five-column table as having
+   * ten. Two named candidates stay distinguishable by table_name.
+   */
+  resolveTableRef: async (config, connectionId, name, schema = null) => {
     try {
-      const connectionObj = getConnection(config, connectionId);
-      const connection = await ensureConnected(connectionObj);
+      // Same split rule as getColumns: only a name arriving with NO schema
+      // beside it may have a qualifier read out of it, because a table really
+      // can be called "public.orders".
+      const parts = String(name || '').split('.');
+      if (!schema && parts.length === 2) {
+        [schema, name] = parts;
+      }
+
+      const database = config.database;
+      const targetSchema = schema || config.schema || 'PUBLIC';
+      const literal = String(name || '');
+      const folded = literal.toUpperCase();
+
+      const { rows } = await withReadRetry(config, connectionId, (connection) => executeAsync(connection, `
+        SELECT DISTINCT table_name AS name
+        FROM "${database}".INFORMATION_SCHEMA.TABLES
+        WHERE table_schema = ? AND table_name IN (?, ?)
+      `, [targetSchema, literal, folded]));
+
+      const names = rows.map(row => row.NAME);
+      const hit = names.includes(literal) ? literal
+        : names.includes(folded) ? folded
+          : null;
+
+      if (!hit) {
+        return { found: false, schema: targetSchema, table: null, quotedRef: null, ambiguous: [] };
+      }
+
+      // Both forms exist as distinct objects. Prefer the literal — it is what
+      // the caller asked for — and NAME the other, so a load that lands
+      // somewhere unexpected says so now rather than being found weeks later
+      // when the row counts stop adding up.
+      const ambiguous = names.length > 1 ? names : [];
+      if (ambiguous.length) {
+        console.warn(
+          `[snowflake] "${literal}" in ${targetSchema} matches ${names.join(' and ')} — using ${hit}. `
+          + 'These are different tables; one is probably left over from an unquoted CREATE TABLE.',
+        );
+      }
+
+      return {
+        found: true,
+        schema: targetSchema,
+        table: hit,
+        quotedRef: `${quote(targetSchema)}.${quote(hit)}`,
+        ambiguous,
+      };
+    } catch (error) {
+      // Cannot tell. Reported as not-found with the reason logged, so callers
+      // fall back to their own behaviour rather than treating a lookup failure
+      // as proof the table is absent.
+      console.log('[snowflake] resolveTableRef failed:', error.message || error);
+      return { found: false, schema: schema || config.schema || null, table: null, quotedRef: null, ambiguous: [] };
+    }
+  },
+
+  /**
+   * Test database connection.
+   *
+   * Deliberately outside the connection cache. A test runs against credentials
+   * the user is still editing, so a cached result — success or the terminal
+   * "Connection already terminated" left behind by a failure — would report on
+   * a previous attempt rather than on what is currently on screen.
+   */
+  testConnection: async (config) => {
+    const connection = createConnection(config);
+    try {
+      await connectOnce(connection);
       await executeAsync(connection, 'SELECT 1');
       return { success: true, message: 'Connection successful' };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
+    } finally {
+      await closeQuietly(connection);
     }
   },
 
@@ -96,19 +429,16 @@ module.exports = {
    */
   getTables: async (config, connectionId = null) => {
     try {
-      const connectionObj = getConnection(config, connectionId);
-      const connection = await ensureConnected(connectionObj);
       const database = config.database;
-      const schema = config.schema || 'PUBLIC';
 
-      const { rows } = await executeAsync(connection, `
+      const { rows } = await withReadRetry(config, connectionId, (connection) => executeAsync(connection, `
         SELECT
           table_schema as schema,
           table_name as name,
           table_type as type
         FROM "${database}".INFORMATION_SCHEMA.TABLES
         ORDER BY table_schema, table_name
-      `, []);
+      `, []));
 
       return {
         success: true,
@@ -120,7 +450,7 @@ module.exports = {
       };
     } catch (error) {
       console.log('getTables_error: ', error)
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -129,13 +459,27 @@ module.exports = {
    */
   getColumns: async (config, connectionId, schema, table) => {
     try {
-      const connectionObj = getConnection(config, connectionId);
-      const connection = await ensureConnected(connectionObj);
+      // Accept a qualified "PUBLIC.transactions" as well as a bare table with
+      // the schema passed separately — the same two shapes quoteIdentifier
+      // handles. Split BEFORE the default below, or the qualifier is lost and
+      // the lookup searches PUBLIC for a table whose NAME contains a dot.
+      // A schema passed SEPARATELY settles it: `table` is then the table's whole
+      // name, dots included. A table really can be called "public.transactions",
+      // and taking the first segment off one looks up a DIFFERENT table — which
+      // fails silently, because the callers that need this read a failed lookup
+      // as "cannot check" rather than as an error.
+      // Only a name arriving with no schema beside it may have a qualifier read
+      // out of it, and even there a genuinely dotted name cannot be told apart
+      // from a qualified one — so that split is a last resort, not the default.
+      const parts = String(table || '').split('.');
+      if (!schema && parts.length === 2) {
+        [schema, table] = parts;
+      }
 
       const database = config.database;
       const targetSchema = schema || config.schema || 'PUBLIC';
 
-      const { rows } = await executeAsync(connection, `
+      const { rows } = await withReadRetry(config, connectionId, (connection) => executeAsync(connection, `
         SELECT
           column_name AS name,
           data_type AS type,
@@ -144,7 +488,7 @@ module.exports = {
         FROM "${database}".INFORMATION_SCHEMA.COLUMNS
         WHERE table_schema = ? AND table_name = ?
         ORDER BY ordinal_position
-      `, [targetSchema, table]);
+      `, [targetSchema, table]));
 
       return {
         success: true,
@@ -157,7 +501,7 @@ module.exports = {
         }))
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -182,8 +526,7 @@ module.exports = {
     const sqlQuery = queryObj.query;
 
     try {
-      const connectionObj = getConnection(config, connectionId);
-      const connection = await ensureConnected(connectionObj);
+      const connection = await acquire(config, connectionId);
 
       if (!(maxRows > 0)) {
         const { stmt, rows } = await executeAsync(connection, sqlQuery);
@@ -201,7 +544,7 @@ module.exports = {
           streamResult: true,
           complete: (err, stmt) => {
             if (err) {
-              resolve({ success: false, message: err.message });
+              resolve(queryError(err));
               return;
             }
             const columns = stmt.getColumns().map(col => col.getName());
@@ -210,7 +553,7 @@ module.exports = {
             // assumed. `end` is inclusive and zero-based.
             const stream = stmt.streamRows({ start: 0, end: maxRows });
             stream.on('data', (row) => rows.push(row));
-            stream.on('error', (streamErr) => resolve({ success: false, message: streamErr.message }));
+            stream.on('error', (streamErr) => resolve(queryError(streamErr)));
             stream.on('end', () => resolve({
               success: true,
               rows: rows.slice(0, maxRows),
@@ -222,7 +565,11 @@ module.exports = {
         });
       });
     } catch (error) {
-      return { success: false, message: error.message };
+      // Writes and arbitrary SQL never retry — re-running a statement to work
+      // around a dead connection is how an INSERT gets applied twice. Forget the
+      // terminated connection so the NEXT call reconnects, and report this one.
+      evictIfDead(config, connectionId, error);
+      return queryError(error);
     }
   },
 
@@ -232,8 +579,7 @@ module.exports = {
    */
   streamQuery: async (config, connectionId, query, onBatch, batchSize = 1000) => {
     try {
-      const connectionObj = getConnection(config, connectionId);
-      const connection = await ensureConnected(connectionObj);
+      const connection = await acquire(config, connectionId);
 
       return new Promise((resolve, reject) => {
         let columns = null;
@@ -293,12 +639,22 @@ module.exports = {
         });
       });
     } catch (error) {
-      return { success: false, message: error.message };
+      // Writes and arbitrary SQL never retry — re-running a statement to work
+      // around a dead connection is how an INSERT gets applied twice. Forget the
+      // terminated connection so the NEXT call reconnects, and report this one.
+      evictIfDead(config, connectionId, error);
+      return queryError(error);
     }
   },
 
   /**
    * Batch insert rows into a table (uses multi-row INSERT with transaction)
+   *
+   * `tableName` and `columns` arrive UNQUOTED — quoting them is this function's
+   * job, and it must quote them the same way the caller's CREATE TABLE did.
+   * Leaving them bare let Snowflake fold them to upper case, so a load into a
+   * table created as `"transactions"` failed with "Table 'TRANSACTIONS' does
+   * not exist" — after the truncate had already emptied it.
    */
   batchInsert: async (config, connectionId, tableName, columns, rows) => {
     try {
@@ -306,8 +662,7 @@ module.exports = {
         return { success: true, rowsInserted: 0 };
       }
 
-      const connectionObj = getConnection(config, connectionId);
-      const connection = await ensureConnected(connectionObj);
+      const connection = await acquire(config, connectionId);
 
       // Start transaction
       await executeAsync(connection, 'BEGIN TRANSACTION');
@@ -327,7 +682,8 @@ module.exports = {
         });
 
         // Use multi-row INSERT syntax
-        const insertSql = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES ${valueRows.join(', ')}`;
+        const insertSql = `INSERT INTO ${quoteQualified(tableName)} `
+          + `(${columns.map(quote).join(', ')}) VALUES ${valueRows.join(', ')}`;
         await executeAsync(connection, insertSql);
 
         // Commit transaction
@@ -343,7 +699,11 @@ module.exports = {
         throw error;
       }
     } catch (error) {
-      return { success: false, message: error.message };
+      // Writes and arbitrary SQL never retry — re-running a statement to work
+      // around a dead connection is how an INSERT gets applied twice. Forget the
+      // terminated connection so the NEXT call reconnects, and report this one.
+      evictIfDead(config, connectionId, error);
+      return queryError(error);
     }
   },
 
@@ -351,15 +711,7 @@ module.exports = {
    * Close connection
    */
   closeConnection: async (connectionId) => {
-    if (connections.has(connectionId)) {
-      const connectionObj = connections.get(connectionId);
-      return new Promise((resolve) => {
-        connectionObj.connection.destroy((err) => {
-          connections.delete(connectionId);
-          resolve();
-        });
-      });
-    }
+    dropConnection(connectionId);
   },
 
   /**
@@ -443,16 +795,50 @@ module.exports = {
     - Database type: Snowflake
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
-    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local SQLite'}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
+    - Column names: Snowflake folds an UNQUOTED identifier to UPPER CASE, so a
+      column whose stored name is lower-case or mixed-case is reachable only in
+      double quotes. The column names listed in the source schema above are the
+      EXACT stored names: wherever one is not already all upper-case, write it
+      as "that_name" every time it appears — in SELECT lists, WHERE clauses,
+      SET clauses, CASE expressions and ALTER TABLE alike. An ALIAS you invent
+      is your own new name and needs no quoting.
+    - Source table name: the source schema above gives the name to read FROM
+      already qualified and quoted. Use that, and nothing else — never re-derive
+      it from the bare table name.
+    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local DuckDB'}
 
     ${settings.storageLocation === 'database'
       ? `**Instructions for Database Storage**:
-    Generate transformation SQL that:
-    1. Creates a new table in Snowflake with the transformed structure
-    2. Populates it with transformed data using CREATE OR REPLACE TABLE ... AS SELECT
+
+    The target is TRUNCATED AND LOADED on every run: the executor drops it
+    before your ddl runs, so your ddl always creates it fresh and your sql
+    always loads it from empty. Nothing survives a run. So do not write
+    IF NOT EXISTS, do not check for or delete prior rows, and do not try to
+    merge, upsert, or de-duplicate against what was there last time — write the
+    plain CREATE and the plain load.
+
+    You return TWO separate statements, and the executor runs them in order:
+
+      1. \`ddl\`  — a plain CREATE TABLE that declares the columns and types.
+      2. \`sql\`  — an INSERT INTO ... SELECT that loads those columns.
+
+    Do NOT combine them. A CREATE TABLE ... AS SELECT is not accepted here: the
+    two fields are executed as separate statements, so a CTAS in \`ddl\` leaves
+    \`sql\` with nothing to do.
+
+    **\`sql\` MUST NOT BE EMPTY.** It is the only statement that puts rows in the
+    table. Leave it empty and the run creates an empty table and loads nothing —
+    the node reports success having produced no data. If you find yourself with
+    nothing to put in \`sql\`, you have written the SELECT into \`ddl\` by
+    mistake: split it back out into a CREATE plus an INSERT.
 
     **Snowflake-Specific Considerations**:
     - Use clustering keys for frequently filtered columns (CLUSTER BY)
+    - Clustering keys belong on the CREATE TABLE in \`ddl\`
     - Consider table types (TRANSIENT, TEMPORARY) for staging
     - Snowflake supports VARIANT for semi-structured data (JSON, AVRO, PARQUET)
     - Use appropriate data types (NUMBER, FLOAT, VARCHAR, BOOLEAN, DATE, TIMESTAMP_NTZ, etc.)
@@ -461,49 +847,36 @@ module.exports = {
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "CREATE OR REPLACE TABLE statement with Snowflake optimizations",
-      "sql": "The SELECT query is part of the CREATE TABLE AS SELECT statement in ddl field (leave sql as empty string)",
+      "ddl": "CREATE TABLE statement (columns + types, plus any CLUSTER BY) — creates the table, inserts nothing",
+      "sql": "INSERT INTO <target> (cols...) SELECT ... — REQUIRED, this is what loads the rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
       "previewSql": "SELECT query to preview the transformed data (LIMIT 100)"
     }`
-      : `**Instructions for Local SQLite Storage**:
-    Generate SQL to fetch data from Snowflake and save it locally to SQLite.
+      : `**Instructions for Local Storage**:
+    The rows are fetched from Snowflake and written into a table in THIS
+    workflow's own local DuckDB database. Nothing is written back to Snowflake.
 
-    **You must provide THREE separate SQL statements**:
-    1. **DDL**: SQLite CREATE TABLE statement with appropriate SQLite data types
-       - Use SQLite types: INTEGER, REAL, TEXT, BLOB
-       - Column names must match the SELECT query output
-    2. **SQL (SELECT)**: Snowflake SELECT query to fetch and transform data from the source
-       - This will be executed on Snowflake database
-       - Include all transformations (filtering, calculations, etc.)
-    3. **INSERT**: SQLite INSERT statement to insert the fetched data
-       - Use parameterized query with ? placeholders
-       - Column order must match the SELECT query output exactly
-
-    **SQLite Data Type Mapping**:
-    - INTEGER: for whole numbers (NUMBER with 0 decimal places, BOOLEAN as 0/1)
-    - REAL: for floating point numbers (NUMBER, FLOAT, DOUBLE)
-    - TEXT: for strings (VARCHAR, CHAR, STRING, DATE, TIMESTAMP, TIME)
-    - BLOB: for binary data (BINARY, VARBINARY)
+    You provide ONE statement: the Snowflake SELECT that produces the rows you
+    want. That is the only thing that runs. Its result is streamed straight into
+    the local table, which is replaced on every run with the column types
+    inferred from the data — so there is no CREATE TABLE to write, no INSERT,
+    and no type mapping to choose. Do NOT emit "ddl" or "insertSql": nothing
+    reads them, and inventing them only risks contradicting the SELECT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "SQLite CREATE TABLE ${fullTableName.split('.').pop()} (...columns...)",
-      "sql": "Snowflake SELECT query to fetch transformed data",
-      "insertSql": "SQLite INSERT INTO ${fullTableName.split('.').pop()} (...columns...) VALUES (?, ?, ...)",
+      "sql": "Snowflake SELECT query producing the transformed rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
-      "previewSql": "SQLite SELECT * FROM ${fullTableName.split('.').pop()} LIMIT 100"
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"   // reads the LOCAL table, so this one is DuckDB SQL
     }
 
     **Example**:
     {
       "explanation": "Fetch active customers with calculated total spending",
-      "ddl": "CREATE TABLE customers_transformed (customer_id INTEGER, name TEXT, email TEXT, total_spending REAL)",
-      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) as total_spending FROM PUBLIC.CUSTOMERS WHERE status = 'active'",
-      "insertSql": "INSERT INTO customers_transformed (customer_id, name, email, total_spending) VALUES (?, ?, ?, ?)",
-      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, {"name": "email", "type": "TEXT"}, {"name": "total_spending", "type": "REAL"}],
-      "previewSql": "SELECT * FROM customers_transformed LIMIT 100"
+      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) AS total_spending FROM customers WHERE status = 'active'",
+      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "VARCHAR"}, {"name": "email", "type": "VARCHAR"}, {"name": "total_spending", "type": "DOUBLE"}],
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"
     }`}
 
     Be specific and provide working SQL. Use Snowflake-specific features where appropriate (e.g., VARIANT, semi-structured data functions).`,
@@ -520,6 +893,20 @@ module.exports = {
     - Database type: Snowflake
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
+    - Column names: Snowflake folds an UNQUOTED identifier to UPPER CASE, so a
+      column whose stored name is lower-case or mixed-case is reachable only in
+      double quotes. The column names listed in the source schema above are the
+      EXACT stored names: wherever one is not already all upper-case, write it
+      as "that_name" every time it appears — in SELECT lists, WHERE clauses,
+      SET clauses, CASE expressions and ALTER TABLE alike. An ALIAS you invent
+      is your own new name and needs no quoting.
+    - Source table name: the source schema above gives the name to read FROM
+      already qualified and quoted. Use that, and nothing else — never re-derive
+      it from the bare table name.
 
     Analyze the request and determine what operations are needed:
 
@@ -548,7 +935,19 @@ module.exports = {
     - Use double quotes for case-sensitive identifiers
     - String literals use single quotes
     - For explanations text to bolden key points use **text** and to break lines use \\n
-    - If both ddl and sql are provided, ddl will execute first, then sql
+    - **Exactly ONE statement per field.** The "ddl" field is sent to the driver
+      as a single statement, and so is "sql". No semicolon-separated scripts, no
+      dynamic or guarded DDL, no procedure bodies — the driver runs one
+      statement per field and rejects everything after the first. Several
+      structural changes have to fit inside that one statement; if they cannot,
+      the transformation needs more than one node.
+    - ddl executes first, then sql. When BOTH are present, a failing ddl does
+      NOT fail the node — only a failing sql does, and the ddl's error is
+      reported alongside the result. That is what lets the node be rerun: on the
+      second run the structural change fails because the first run already
+      applied it, the DML behind it still runs, and the node succeeds. Write the
+      plain statement and let a rerun report it. When ddl is the ONLY field, its
+      failure IS the node's failure.
 
     Return your response in this JSON format:
     {
@@ -623,14 +1022,28 @@ module.exports = {
    */
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
-
-    const quotedIdentifier = `"${identifier}"`;
-
-    if (schema) {
-      return `"${schema}".${quotedIdentifier}`;
+    // Already quoted — hand it back untouched. Callers pass identifiers that
+    // another layer has sometimes quoted already, and quoting a second time
+    // produces ONE identifier whose text is the quoted string, which resolves
+    // to nothing: a read of "PUBLIC"."public.transactions" came back as
+    // `Object 'TERNLUX.PUBLIC.""PUBLIC"."public.transactions""' does not exist`.
+    // The SQL Server connector has always done this; the rest now agree.
+    if (typeof identifier === 'string'
+        && identifier.startsWith('"') && identifier.endsWith('"') && identifier.length > 1) {
+      return identifier;
     }
 
-    return quotedIdentifier;
+
+    if (schema) {
+      return `${quote(schema)}.${quote(identifier)}`;
+    }
+
+    // A dotted name given as one string ("PUBLIC.transactions") is a
+    // schema.table name — quoteQualified splits it so the parts qualify each
+    // other instead of naming one object with a dot in it. This is the same
+    // form batchInsert builds, which is what keeps CREATE and INSERT pointed at
+    // the same table.
+    return quoteQualified(identifier);
   },
 
   /**
@@ -657,6 +1070,9 @@ module.exports = {
     container: 'Schema',
     objectLabel: 'Table',
     quote: '"',
+    // Unquoted identifiers fold to UPPERCASE, so anything not already
+    // uppercase must be quoted or Snowflake won't resolve it.
+    fold: 'upper',
     keywords: [
       'QUALIFY', 'ILIKE', 'LATERAL FLATTEN', 'PIVOT', 'UNPIVOT', 'SAMPLE',
       'CLONE', 'WAREHOUSE', 'STAGE', 'FILE FORMAT', 'COPY INTO', 'MERGE',
