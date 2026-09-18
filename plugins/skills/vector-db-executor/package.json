@@ -1,7 +1,7 @@
 {
   "name": "@ternlux/skill-vector-db-executor",
   "version": "1.0.0",
-  "description": "Vector database executor skill for Ternlux - supports LanceDB and Pinecone with OpenAI/HuggingFace embeddings",
+  "description": "Vector database executor skill for Ternlux - supports LanceDB and Pinecone with OpenAI embeddings",
   "main": "index.js",
   "ternlux": {
     "type": "skill",
@@ -21,14 +21,12 @@
     "embeddings",
     "lancedb",
     "pinecone",
-    "openai",
-    "huggingface"
+    "openai"
   ],
   "author": "Ternlux",
   "license": "MIT",
   "dependencies": {
     "openai": "^4.28.0",
-    "@huggingface/inference": "^2.6.0",
     "@seald-io/nedb": "^4.0.2"
   },
   "devDependencies": {},

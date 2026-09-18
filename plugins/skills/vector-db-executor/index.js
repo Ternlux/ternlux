@@ -4,11 +4,14 @@
  */
 
 const path = require('path');
+const crypto = require('crypto');
 const { app } = require('electron');
 const { generateId, prepareVectorRecords, formatVectorResults, sanitizeTableName } = require('./lib/utils');
 const joinHandler = require('./joinHandler');
 
 // Load source data helpers (similar to python-executor)
+// The app's own connections metadata store (see loadConnection below) — not
+// user data, which lives in DuckDB.
 const Datastore = require('@seald-io/nedb');
 const fs = require('fs');
 
@@ -18,12 +21,33 @@ const fs = require('fs');
 let generateEmbeddings, estimateOpenAICost, getEmbeddingDimension;
 let executeLanceDBOperation, listLanceTables, getLanceDBConnection;
 
+// Cooperative stop, injected by the host alongside the vector libs above (see
+// buildSkillHelpers in public/electron.js). `throwIfCancelled` raises when the
+// user has stopped the run this skill is executing inside; `isCancelledError`
+// is how the best-effort catches below tell that raise apart from a real
+// failure they are meant to swallow.
+//
+// Defaulted to no-ops rather than required: a host that predates them, or a
+// direct test of this skill, still runs — it just cannot be stopped part-way.
+let throwIfCancelled = () => {};
+let isCancelledError = () => false;
+
+// The host's unified local/remote data access. Bound the same way as the libs
+// above so internal call sites can write a local DuckDB table without every
+// signature having to carry `helpers` down to them.
+let runLocalQuery = null;
+
 function bindLibs(helpers) {
   if (!helpers || !helpers.embeddings || !helpers.lancedb) {
     throw new Error('vector-db-executor requires helpers.embeddings and helpers.lancedb (electron must inject helpers).');
   }
   ({ generateEmbeddings, estimateOpenAICost, getEmbeddingDimension } = helpers.embeddings);
   ({ executeLanceDBOperation, listTables: listLanceTables, getLanceDBConnection } = helpers.lancedb);
+  ({
+    throwIfCancelled = () => {},
+    isCancelledError = () => false,
+  } = helpers.cancel || {});
+  runLocalQuery = typeof helpers.runQuery === 'function' ? helpers.runQuery : null;
 }
 
 // Normalize a vector value into a PLAIN number array. Vectors read back from
@@ -40,6 +64,325 @@ const toVectorArray = (v) => {
   if (ArrayBuffer.isView(v) || typeof v.length === 'number') return Array.from(v); // TypedArray / array-like
   return [v]; // genuine scalar
 };
+
+/**
+ * Stable id for a row, so the same record keeps the same id across runs.
+ *
+ * This is what makes `skipExisting` possible at all: with a random id per run
+ * an upsert can never match an existing vector, so it appends instead of
+ * replacing and the index grows on every execution.
+ *
+ * Order: an explicit id column, then the row's own id, then a hash of the text
+ * being embedded (so re-embedding identical text is idempotent even with no
+ * key at all), and only then a random id.
+ */
+function resolveRecordId(row, { idColumn = null, columnToEmbed = null } = {}) {
+  const usable = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+
+  if (idColumn && usable(row?.[idColumn])) return String(row[idColumn]);
+  if (usable(row?.id)) return String(row.id);
+  if (usable(row?._id)) return String(row._id);
+
+  const text = columnToEmbed ? row?.[columnToEmbed] : null;
+  if (usable(text)) return `txt_${contentHashOf(text)}`;
+  return generateId();
+}
+
+/**
+ * Fingerprint of the text that was actually embedded.
+ *
+ * Identity and freshness are separate questions. `idColumn` answers "which row
+ * is this" — it stays put when the row is edited, which is the whole point of a
+ * key. This answers "is the stored vector still the right one for this text",
+ * which is what `skipExisting` actually needs to decide.
+ *
+ * It also removes any need for the caller to understand HOW the embedded value
+ * was produced. A concatenation, a CASE expression or a rewritten column all
+ * arrive as one resolved string on the row, and the hash covers that string —
+ * so a derived value is tracked exactly as accurately as a plain column.
+ */
+function contentHashOf(text) {
+  return crypto.createHash('sha1').update(String(text ?? '')).digest('hex').slice(0, 24);
+}
+
+// Metadata key holding the fingerprint. Written alongside every vector and read
+// back during the existence check; kept out of the user-facing target columns.
+const CONTENT_HASH_FIELD = '_content_hash';
+const META_HASH_FIELD = '_meta_hash';
+
+// Fields that describe the embedding rather than the row, so they never count
+// as a metadata change.
+const INTERNAL_FIELDS = new Set([
+  'vector', 'values', 'embedding', 'id', '_id',
+  CONTENT_HASH_FIELD, META_HASH_FIELD,
+  '_embedded_column', '_embedding_provider', '_embedding_model', '_embedded_at'
+]);
+
+/**
+ * Fingerprint of everything stored ALONGSIDE the vector.
+ *
+ * Separate from the content hash because the two imply different work: changed
+ * text needs a new embedding, changed metadata does not. A price edit should
+ * refresh the stored price without paying to re-embed a name that never moved.
+ */
+function metadataHashOf(row) {
+  const parts = Object.keys(row || {})
+    .filter((k) => !INTERNAL_FIELDS.has(k))
+    .sort()
+    .map((k) => {
+      const v = row[k];
+      return `${k}=${v === null || v === undefined ? '' : String(v)}`;
+    });
+  return crypto.createHash('sha1').update(parts.join('\u0000')).digest('hex').slice(0, 24);
+}
+
+/**
+ * The columns an embed-and-upsert writes on TOP of the ones the model named.
+ *
+ * They used to be left out of the declared target columns as "not user-facing",
+ * which made the node advertise an output shape narrower than what it actually
+ * wrote. The next node then read the REAL table, recorded all of them as its
+ * input, and the two records disagreed from that moment on — enough for the
+ * build executor's schema gate to rebuild a downstream node on every later
+ * plan, unasked.
+ *
+ * WHICH ones depends on the store, because the two write paths differ:
+ *   - LanceDB gets the whole embedded record, so the four provenance fields
+ *     that generateEmbeddings stamps on (public/lib/embeddings.js) land in the
+ *     table as columns.
+ *   - Pinecone and the other cloud stores take { id, vector, metadata }, and
+ *     the metadata is built by DELETING those same four fields (see the upsert
+ *     in execute()). Declaring them there would advertise columns that will
+ *     never exist, and a downstream node configured from this list would
+ *     reference them.
+ * Both keep `id` and the two fingerprints this skill reads back for change
+ * detection.
+ */
+const VECTOR_RECORD_COLUMNS = [
+  { name: 'id', type: 'TEXT' },
+  { name: CONTENT_HASH_FIELD, type: 'TEXT' },
+  { name: META_HASH_FIELD, type: 'TEXT' },
+];
+const EMBEDDING_PROVENANCE_COLUMNS = [
+  { name: '_embedded_column', type: 'TEXT' },
+  { name: '_embedding_provider', type: 'TEXT' },
+  { name: '_embedding_model', type: 'TEXT' },
+  { name: '_embedded_at', type: 'TEXT' },
+];
+
+const writtenVectorColumns = (vectorDbType) => (
+  String(vectorDbType || '').toLowerCase() === 'lancedb'
+    ? [...VECTOR_RECORD_COLUMNS, ...EMBEDDING_PROVENANCE_COLUMNS]
+    : VECTOR_RECORD_COLUMNS
+);
+
+/**
+ * Declared columns plus the ones an upsert to THIS store always adds, without
+ * duplicating anything the model already named. "*" means "the source's
+ * columns pass through unchanged" and stays as it is — the builder resolves it
+ * against the real source schema, and appending to it would turn a wildcard
+ * into a partial list.
+ */
+function withWrittenVectorColumns(targetColumns, vectorDbType) {
+  if (!Array.isArray(targetColumns)) return targetColumns;
+  if (targetColumns.some((c) => c === '*' || c?.name === '*')) return targetColumns;
+  const have = new Set(
+    targetColumns.map((c) => String(typeof c === 'string' ? c : c?.name || '').toLowerCase()),
+  );
+  return [
+    ...targetColumns,
+    ...writtenVectorColumns(vectorDbType).filter((c) => !have.has(c.name.toLowerCase())),
+  ];
+}
+
+/** Metadata payload for a row: everything except the vector and the internals. */
+function metadataPayload(row) {
+  const meta = { ...row };
+  ['vector', 'values', 'embedding', '_embedded_column', '_embedding_provider',
+   '_embedding_model', '_embedded_at'].forEach((k) => delete meta[k]);
+  return meta;
+}
+
+/**
+ * Rewrite metadata for records whose vector is still correct. Returns how many
+ * were updated. Never calls the embedding API — that is the entire point.
+ */
+async function applyMetadataUpdates({
+  rows,
+  vectorDbType,
+  targetTable,
+  indexName,
+  namespace = '',
+  targetLocalPath = null,
+  targetConnectionId = null,
+  pluginManager = null,
+  getFullConfig = null
+}) {
+  if (!Array.isArray(rows) || rows.length === 0) return 0;
+
+  try {
+    if (vectorDbType === 'lancedb') {
+      // LanceDB updates by delete+add, so the row has to be written back whole.
+      // Read the stored vectors and reuse them rather than regenerating.
+      const dbPath = targetLocalPath || path.join(app.getPath('userData'), 'data', 'lancedb');
+      const db = await getLanceDBConnection({ dbPath });
+      const table = await db.openTable(targetTable);
+
+      const quoted = rows.map((r) => `'${String(r.id).replace(/'/g, "''")}'`).join(', ');
+      const stored = await table.query().where(`id IN (${quoted})`).toArray();
+      const vectorById = new Map(stored.map((r) => [String(r.id), toVectorArray(r.vector)]));
+
+      const updates = rows
+        .filter((r) => vectorById.has(String(r.id)))
+        .map((r) => ({ ...metadataPayload(r), id: String(r.id), vector: vectorById.get(String(r.id)) }));
+
+      if (updates.length === 0) return 0;
+
+      await executeLanceDBOperation({
+        operation: 'update',
+        config: {
+          dbPath,
+          tableName: targetTable,
+          filter: `id IN (${updates.map((u) => `'${u.id.replace(/'/g, "''")}'`).join(', ')})`,
+          updates
+        }
+      });
+      return updates.length;
+    }
+
+    if (!pluginManager || !getFullConfig || !targetConnectionId) return 0;
+    const connector = pluginManager.getConnector(vectorDbType);
+    if (!connector || typeof connector.executeVectorOperation !== 'function') return 0;
+    const fullConfig = await getFullConfig(targetConnectionId);
+    if (!fullConfig) return 0;
+
+    // Pinecone updates metadata in place, one record per call — there is no
+    // bulk metadata endpoint.
+    let updated = 0;
+    for (const row of rows) {
+      // One network call per row, so this loop is unbounded in time on a large
+      // refresh and has to be stoppable.
+      throwIfCancelled('refreshing vector metadata', `${updated} of ${rows.length} updated`);
+
+      const res = await connector.executeVectorOperation(fullConfig, targetConnectionId, {
+        operation: 'update',
+        indexName,
+        namespace,
+        id: String(row.id),
+        metadata: metadataPayload(row)
+      });
+      if (res && res.success !== false) updated += 1;
+    }
+    return updated;
+  } catch (error) {
+    // A stop is not a failed refresh. This catch exists to swallow provider
+    // errors so a best-effort step cannot fail the node — swallowing a stop
+    // here instead would let the run carry on to the next step as if the user
+    // had never pressed anything.
+    if (isCancelledError(error)) throw error;
+    // Metadata refresh is best-effort: the vectors themselves are already
+    // correct, so a failure here must not fail the node.
+    console.warn(`[vector] metadata refresh failed: ${error.message}`);
+    return 0;
+  }
+}
+
+/**
+ * Which of `ids` are already stored, mapped to the fingerprints each was written
+ * with ({content, meta}; null entries when the record predates fingerprinting).
+ * An empty Map
+ * means "insert everything", which is also what a missing table/index yields,
+ * so a first run behaves normally.
+ */
+async function findExistingRecords({
+  vectorDbType,
+  ids,
+  targetTable,
+  indexName,
+  namespace = '',
+  targetLocalPath = null,
+  targetConnectionId = null,
+  pluginManager = null,
+  getFullConfig = null
+}) {
+  const found = new Map();
+  if (!Array.isArray(ids) || ids.length === 0) return found;
+
+  try {
+    if (vectorDbType === 'lancedb') {
+      const dbPath = targetLocalPath || path.join(app.getPath('userData'), 'data', 'lancedb');
+      const db = await getLanceDBConnection({ dbPath });
+      const tables = await db.tableNames();
+      if (!tables.includes(targetTable)) return found;
+
+      const table = await db.openTable(targetTable);
+      // The fingerprint column only exists on tables written since it was
+      // introduced; ask for it, and fall back to ids alone if it isn't there.
+      const cols = ['id', CONTENT_HASH_FIELD, META_HASH_FIELD];
+      // Quote ids for the SQL-ish filter LanceDB accepts, chunked so the
+      // expression stays a sane length on large batches.
+      for (let i = 0; i < ids.length; i += 500) {
+        throwIfCancelled('checking which vectors already exist', `${i} of ${ids.length} checked`);
+
+        const chunk = ids.slice(i, i + 500)
+          .map((id) => `'${String(id).replace(/'/g, "''")}'`)
+          .join(', ');
+        let rows;
+        try {
+          rows = await table.query().where(`id IN (${chunk})`).select(cols).toArray();
+        } catch {
+          rows = await table.query().where(`id IN (${chunk})`).select(['id']).toArray();
+        }
+        rows.forEach((r) => found.set(String(r.id), {
+          content: r[CONTENT_HASH_FIELD] || null,
+          meta: r[META_HASH_FIELD] || null
+        }));
+      }
+      return found;
+    }
+
+    // Cloud stores: fetch by id through the connector.
+    if (!pluginManager || !getFullConfig || !targetConnectionId) return found;
+    const connector = pluginManager.getConnector(vectorDbType);
+    if (!connector || typeof connector.executeVectorOperation !== 'function') return found;
+
+    const fullConfig = await getFullConfig(targetConnectionId);
+    if (!fullConfig) return found;
+
+    // Pinecone caps ids per fetch; batch well under it.
+    for (let i = 0; i < ids.length; i += 100) {
+      // 100 ids per round-trip, so a 100k-row upsert probes a thousand times
+      // before it embeds anything.
+      throwIfCancelled('checking which vectors already exist', `${i} of ${ids.length} checked`);
+
+      const batch = ids.slice(i, i + 100);
+      const res = await connector.executeVectorOperation(fullConfig, targetConnectionId, {
+        operation: 'fetch',
+        indexName,
+        namespace,
+        ids: batch
+      });
+      if (res && res.success !== false) {
+        (res.rows || []).forEach((r) => {
+          if (r?.id != null) found.set(String(r.id), {
+            content: r.metadata?.[CONTENT_HASH_FIELD] || null,
+            meta: r.metadata?.[META_HASH_FIELD] || null
+          });
+        });
+      }
+    }
+    return found;
+  } catch (error) {
+    // A stop must not be read as a failed probe. The fallback below is "insert
+    // everything", so swallowing a stop here would do the opposite of what the
+    // user asked: it would go on to embed and write the whole source.
+    if (isCancelledError(error)) throw error;
+    // A failed existence probe must not block the write — fall back to
+    // inserting everything rather than silently dropping the user's data.
+    console.warn(`[vector] existence check failed, inserting all records: ${error.message}`);
+    return new Map();
+  }
+}
 
 const replaceNulls = (value) => {
   if (value === null) return '';
@@ -75,8 +418,8 @@ module.exports = {
     name: 'Vector Database Executor',
     description: 'Perform embedding or vector operations with automatic embedding generation',
     capabilities: [
-      'Generate embeddings using OpenAI or HuggingFace',
-      'Embed column using OpenAI or HuggingFace',
+      'Generate embeddings using OpenAI',
+      'Embed column using OpenAI',
       'Upsert vectors to LanceDB (local) or Pinecone (cloud)',
       'Query similar vectors with semantic search',
       'Delete vectors by ID or filter',
@@ -87,12 +430,11 @@ module.exports = {
     outputFormat: 'Array of vector records with metadata and similarity scores',
     executionEnvironment: 'local with external API calls for embeddings',
     providers: {
-      embedding: ['OpenAI', 'HuggingFace'],
+      embedding: ['OpenAI'],
       vectorDB: ['LanceDB (local)', 'Pinecone (cloud)']
     },
     models: {
-      openai: ['text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002'],
-      huggingface: ['sentence-transformers/all-MiniLM-L6-v2', 'BAAI/bge-small-en-v1.5']
+      openai: ['text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002']
     }
   }),
 
@@ -124,7 +466,6 @@ module.exports = {
 
         **Embedding Providers:**
         - OpenAI: text-embedding-3-small (1536 dim), text-embedding-3-large (3072 dim)
-        - HuggingFace: sentence-transformers/all-MiniLM-L6-v2 (384 dim)
       `,
 
       responseFormat: `
@@ -135,7 +476,7 @@ module.exports = {
           "skillParams": {
             "vectorDbType": "lancedb" | "pinecone",
             "operation": "upsert" | "query" | "delete" | "update",
-            "embeddingProvider": "openai" | "huggingface",
+            "embeddingProvider": "openai",
             "embeddingModel": "text-embedding-3-small",
             "columnToEmbed": "column_name",
             "targetTable": "table_name"
@@ -181,10 +522,8 @@ module.exports = {
 
     // Check if we have any embedding API keys
     // OpenAI embeddings use the 'chatgpt' key (same as ChatGPT API)
-    // HuggingFace has its own key
     const hasOpenAI = apiKeys && apiKeys.chatgpt;
-    const hasHuggingFace = apiKeys && apiKeys.huggingface;
-    const hasAnyEmbeddingKey = hasOpenAI || hasHuggingFace;
+    const hasAnyEmbeddingKey = hasOpenAI;
 
     // If no embedding keys, return error
     if (!hasAnyEmbeddingKey) {
@@ -193,7 +532,6 @@ module.exports = {
 
 To use vector operations, you need to set up an embedding provider API key:
 - OpenAI API key (for OpenAI embeddings)
-- HuggingFace API key (for HuggingFace embeddings)
 
 Please configure an embedding API key in settings before proceeding.`,
         context: { error: true, missingKeys: true }
@@ -210,17 +548,6 @@ Please configure an embedding API key in settings before proceeding.`,
           'text-embedding-3-small (1536 dim, $0.02/1M tokens)',
           'text-embedding-3-large (3072 dim, $0.13/1M tokens)',
           'text-embedding-ada-002 (1536 dim, $0.10/1M tokens)'
-        ]
-      });
-    }
-    if (hasHuggingFace) {
-      availableProviders.push({
-        name: 'HuggingFace',
-        id: 'huggingface',
-        models: [
-          'sentence-transformers/all-MiniLM-L6-v2 (384 dim)',
-          'BAAI/bge-small-en-v1.5 (384 dim)',
-          'BAAI/bge-base-en-v1.5 (768 dim)'
         ]
       });
     }
@@ -301,7 +628,7 @@ Please configure an embedding API key in settings before proceeding.`,
       }
     }
 
-    // If source is vector DB, this is a transformation operation (like NeDB)
+    // If source is vector DB, this is a transformation operation
     // If source is regular data, this is an embedding+insert operation
     const prompt = isSourceVector ? `
 You are a ${sourceVectorDbType} expert helping transform vectors in-place.
@@ -366,13 +693,12 @@ ${sourceVectorDbType === 'pinecone' ? `  - record.metadata (all metadata fields 
 
 **Response Format:**
 
-**For Questions** (user asking about the data):
-{
-  "action": "answer_directly",
-  "directAnswer": "Your answer to their question"
-}
+There are exactly TWO ways this ends — you either execute, or you ask. You are a
+builder, not a chat partner: a question about the data, and anything you cannot
+do, are both "ask_questions". Answer what they asked inside the question text,
+then say what you still need.
 
-**For Clarification** (need more info):
+**For Clarification** (need more info, user asked something, or you cannot proceed):
 IMPORTANT: Ask SIMPLE, user-friendly questions. DO NOT use technical terms like "embedding search", "metadata filter", "useEmbeddingSearch", etc.
 Instead, ask about WHAT the user wants to accomplish in plain language.
 {
@@ -397,10 +723,12 @@ Instead, ask about WHAT the user wants to accomplish in plain language.
 
 **Examples:**
 
-Answer a question:
+Answer a question (still "ask_questions" — the answer goes in the question text):
 {
-  "action": "answer_directly",
-  "directAnswer": "This vector database contains ${sourceTableSchema?.sampleData?.length || 0} vectors with metadata fields: ${columnsList}. Each vector represents embedded content from your documents."
+  "action": "ask_questions",
+  "questionsNeeded": {
+    "data": "This vector database contains ${sourceTableSchema?.sampleData?.length || 0} vectors with metadata fields: ${columnsList}. What would you like done with them?"
+  }
 }
 
 Ask for clarification (simple user-friendly questions):
@@ -510,16 +838,13 @@ Determine the configuration for embedding this data based on chat history and us
 
 **Response Format:**
 
-**Action Type**: Determine what to do:
-- "answer_directly": User is asking a question that doesn't require embedding/transformation
+**Action Type**: Determine what to do. There are exactly TWO, and every request
+ends in one of them — you either execute, or you ask. You are a builder, not a
+chat partner: a question that needs no embedding/transformation, and anything you
+cannot do, are both "ask_questions" — answer what was asked inside the question
+text, then say what you still need.
 - "ask_questions": Need to ask clarifying questions before proceeding
 - "execute": Ready to execute the embedding operation
-
-If answering directly:
-{
-  "action": "answer_directly",
-  "directAnswer": "Your answer to the user's question"
-}
 
 If you need to ask questions:
 {
@@ -546,9 +871,33 @@ If ready to execute:
   "targetConnectionName": "connection_name",  // REQUIRED for cloud vector DBs, omit for LanceDB
   "indexName": "index_name",  // For databases that use indexes (Pinecone, etc.)
   "namespace": "optional_namespace",  // For databases that use namespaces
+  "skipExisting": true,   // default true — see below
+  "idColumn": "column_name",  // the column that identifies a row (e.g. product_id); omit if there isn't one
   "targetColumns": [{"name": "field", "type": "TYPE"}],   // every field written alongside the vector (the source columns carried over, plus anything added). Downstream nodes are configured from this; "*" if the source's columns are written through unchanged
   "explanation": "Explanation of what will happen"
 }
+
+RE-EMBEDDING EXISTING RECORDS ("skipExisting"):
+- Default to true. Records already in the target are left alone and never
+  re-embedded, so re-running a workflow costs nothing extra and does not stack
+  duplicate copies of the same row into the index.
+- Set it to false ONLY when the user asks for something that needs the vectors
+  rewritten — changing the embedding model or the embedded column, refreshing
+  text that has since been edited, or an explicit "re-embed everything".
+- "idColumn" identifies the ROW, not the embedded value — it is normally a
+  DIFFERENT column from "columnToEmbed". Use the source's key column when the
+  schema has one (product_id, order_id, sku). Two rows can legitimately share
+  the same embedded text, and a real key keeps them as separate records.
+- Only name a column you can see in the schema and that plausibly identifies a
+  row. If nothing qualifies, OMIT idColumn — identity then falls back to a hash
+  of the embedded text, which is correct but merges rows with identical text.
+- You do not need to reason about how the embedded value was produced. Whether
+  it is a plain column or something an upstream node derived, freshness is
+  tracked from a fingerprint of the text computed at run time: changed text is
+  re-embedded and replaced in place, changed metadata is rewritten WITHOUT
+  re-embedding, and untouched rows cost nothing.
+- Do not ask the user about either of these. Infer idColumn from the schema and
+  leave skipExisting at its default unless the request clearly implies a rewrite.
 
 IMPORTANT:
 - For LanceDB: Do NOT include "targetConnectionName", "indexName", or "namespace"
@@ -587,9 +936,12 @@ IMPORTANT:
         if (jsonMatch) {
           parsed = JSON.parse(jsonMatch[1] || jsonMatch[0]);
         } else {
+          // No JSON envelope came back. That is not an answer to hand the
+          // user as though the node were built — ask, carrying whatever the
+          // model did say so the question is not empty.
           return {
-            action: 'answer_directly',
-            message: aiResponse
+            action: 'ask_questions',
+            questionsNeeded: { request: aiResponse }
           };
         }
       } else {
@@ -709,6 +1061,13 @@ IMPORTANT:
           }
         }
 
+        // Declare what this node will really write. Only for an upsert that
+        // embeds: a vector-source transformation (in-place maintenance, a
+        // search) writes through its own function and adds nothing.
+        if (!isSourceVector && parsed.operation === 'upsert') {
+          parsed.targetColumns = withWrittenVectorColumns(parsed.targetColumns, parsed.vectorDbType);
+        }
+
         return {
           action: 'execute',
           skillParams: parsed,
@@ -727,8 +1086,8 @@ IMPORTANT:
     } catch (error) {
       console.error('Failed to process skill response:', error);
       return {
-        action: 'answer_directly',
-        message: `I need more information to proceed. ${error.message}`
+        action: 'ask_questions',
+        questionsNeeded: { request: `I need more information to proceed. ${error.message}` }
       };
     }
   },
@@ -751,6 +1110,11 @@ IMPORTANT:
         embeddingModel,
         embeddingApiKey,
         columnToEmbed,
+        // Default ON: check the target first and embed only what isn't there.
+        // Embedding is the expensive step, so this both saves cost and stops
+        // re-runs from piling duplicate vectors into the index.
+        skipExisting = true,
+        idColumn = null,
         targetTable,
         targetConnectionId,
         pineconeConfig,
@@ -769,7 +1133,6 @@ IMPORTANT:
         pluginManager,
         getFullConfig,
         appSqliteDbPath,
-        sqlitePool,
         targetLocalPath, // Path for local LanceDB storage
         storageLocation,
         operationMode
@@ -798,7 +1161,6 @@ IMPORTANT:
           pluginManager,
           getFullConfig,
           appSqliteDbPath,
-          sqlitePool,
           nodeId,
           sourceNodeId,
           startTime,
@@ -814,6 +1176,10 @@ IMPORTANT:
 
       let sourceData = [];
       let embeddedData = [];
+      // Outcome of the skipExisting pass, reported on the final result.
+      let skippedExisting = 0;
+      let refreshedStale = 0;
+      let metadataUpdated = 0;
       let result;
 
       // Step 1: Load source data (for upsert/update operations)
@@ -825,7 +1191,6 @@ IMPORTANT:
           operationType,
           pluginManager,
           getFullConfig,
-          sqlitePool,
           appSqliteDbPath
         });
 
@@ -838,7 +1203,98 @@ IMPORTANT:
           };
         }
 
-        // Step 2: Generate embeddings
+        // Step 2: Give every row a stable id, then (by default) drop the ones
+        // already stored. Both happen BEFORE embedding — skipping after the
+        // embed call would avoid the duplicate but still pay for the tokens.
+        const idOpts = { idColumn, columnToEmbed };
+        sourceData = sourceData.map((row) => ({
+          ...row,
+          id: resolveRecordId(row, idOpts),
+          [CONTENT_HASH_FIELD]: contentHashOf(columnToEmbed ? row?.[columnToEmbed] : ''),
+          [META_HASH_FIELD]: metadataHashOf(row)
+        }));
+
+        let metadataOnly = [];
+        if (skipExisting && operation === 'upsert') {
+          const existing = await findExistingRecords({
+            vectorDbType,
+            ids: sourceData.map((row) => row.id),
+            targetTable: targetTable || sanitizeTableName(sourceTableSchema?.tableName || 'vectors'),
+            indexName: params.indexName || targetTable || sourceTableSchema?.tableName,
+            namespace: params.namespace || '',
+            targetLocalPath,
+            targetConnectionId,
+            pluginManager,
+            getFullConfig
+          });
+
+          if (existing.size > 0) {
+            const before = sourceData.length;
+            sourceData = sourceData.filter((row) => {
+              const stored = existing.get(row.id);
+              if (!stored) return true;                          // new record
+
+              // Embedded text changed — re-embed so the vector matches the row.
+              // The id is stable, so this REPLACES the old vector rather than
+              // adding a second one. A record with no stored fingerprint
+              // predates this check and can't be verified, so it is refreshed
+              // once and then settles.
+              if (stored.content !== row[CONTENT_HASH_FIELD]) {
+                refreshedStale += 1;
+                return true;
+              }
+
+              // Vector is still correct but the columns stored beside it moved
+              // (a price edit, say). Rewrite the metadata in place — no
+              // embedding call, so no tokens spent on an unchanged vector.
+              if (stored.meta !== row[META_HASH_FIELD]) {
+                metadataOnly.push(row);
+                return false;
+              }
+
+              return false;                                      // unchanged — skip
+            });
+            skippedExisting = before - sourceData.length - metadataOnly.length;
+            console.log(
+              `Skipping ${skippedExisting} unchanged record(s); ` +
+              `embedding ${sourceData.length} (${refreshedStale} with changed text); ` +
+              `${metadataOnly.length} metadata-only update(s).`
+            );
+          }
+
+          const metaTarget = {
+            vectorDbType,
+            targetTable: targetTable || sanitizeTableName(sourceTableSchema?.tableName || 'vectors'),
+            indexName: params.indexName || targetTable || sourceTableSchema?.tableName,
+            namespace: params.namespace || '',
+            targetLocalPath,
+            targetConnectionId,
+            pluginManager,
+            getFullConfig
+          };
+
+          if (sourceData.length === 0) {
+            // Nothing to embed, but metadata may still need refreshing — do it
+            // before returning rather than dropping the change on the floor.
+            const updated = await applyMetadataUpdates({ rows: metadataOnly, ...metaTarget });
+            return {
+              success: true,
+              message: updated > 0
+                ? `No re-embedding needed; refreshed metadata on ${updated} record(s).`
+                : `All ${skippedExisting} record(s) are already in the database and unchanged — nothing to embed.`,
+              recordCount: 0,
+              skippedExisting,
+              metadataUpdated: updated,
+              executionTime: Date.now() - startTime
+            };
+          }
+
+          // Rows that only need metadata are applied here so the embed path
+          // below deals purely with rows that need a vector.
+          metadataUpdated = await applyMetadataUpdates({ rows: metadataOnly, ...metaTarget });
+        }
+
+        // Step 2b: Generate embeddings
         console.log(`Generating embeddings for column: ${columnToEmbed}...`);
 
         // Estimate cost for OpenAI
@@ -862,54 +1318,8 @@ IMPORTANT:
 
         console.log(`Generated ${embeddedData.length} embeddings`);
 
-        // Step 2.5: Check for duplicates before inserting (upsert operation only)
-        if (operation === 'upsert') {
-          console.log('Checking for existing records to avoid duplicates...');
-          // let newRecords;
-
-          // if (vectorDbType === 'lancedb') {
-          //   // Use LanceDB's filterDuplicates function
-          //   newRecords = await filterDuplicatesLanceDB({
-          //     embeddedData,
-          //     targetTable: targetTable || sanitizeTableName(sourceTableSchema?.tableName || 'vectors')
-          //   });
-          // } else {
-          //   // Use connector's filterDuplicates method
-          //   const fullConfig = await getFullConfig(targetConnectionId);
-          //   const connector = pluginManager.getConnector(vectorDbType);
-
-          //   if (connector && typeof connector.filterDuplicates === 'function') {
-          //     newRecords = await connector.filterDuplicates(
-          //       fullConfig,
-          //       targetConnectionId,
-          //       {
-          //         embeddedData,
-          //         indexName: params.indexName || targetTable || sourceTableSchema?.tableName,
-          //         namespace: params.namespace || ''
-          //       }
-          //     );
-          //   } else {
-          //     console.warn(`${vectorDbType} does not support duplicate filtering, proceeding with all records`);
-          //     newRecords = embeddedData;
-          //   }
-          // }
-
-          // const duplicateCount = embeddedData.length - newRecords.length;
-          // if (duplicateCount > 0) {
-          //   console.log(`Filtered out ${duplicateCount} duplicate records`);
-          // }
-
-          // embeddedData = newRecords;
-
-          if (embeddedData.length === 0) {
-            return {
-              success: true,
-              message: 'All records already exist in the database (duplicates filtered)',
-              recordCount: 0,
-              duplicatesFiltered: duplicateCount
-            };
-          }
-        }
+        // Duplicate filtering now happens before embedding (Step 2 above), so
+        // skipped rows never cost embedding tokens.
       }
 
       // Step 3: Execute vector operation
@@ -1014,7 +1424,6 @@ IMPORTANT:
         sourceConnection,
         sourceTableSchema,
         appSqliteDbPath,
-        sqlitePool,
         targetConnectionId,
         namespace: params.namespace || '',
         indexName: params.indexName || targetTable || sourceTableSchema?.tableName,
@@ -1034,12 +1443,19 @@ IMPORTANT:
         success: true,
         data: result.data || [],
         recordCount: result.recordCount || 0,
+        skippedExisting,
+        refreshedStale,
+        metadataUpdated,
         config: savedConfig,
         message: result.message,
         executionTime
       };
 
     } catch (error) {
+      // A stop leaves as an exception — see the note on executeDataToVector's
+      // catch. This is the path that embeds, so it is the one most likely to be
+      // stopped part-way.
+      if (isCancelledError(error)) throw error;
       console.error('Vector DB execution failed:', error);
 
       return {
@@ -1066,8 +1482,17 @@ IMPORTANT:
         connectionId,
         pluginManager,
         getFullConfig,
-        targetLocalPath
+        targetLocalPath,
+        // Pinecone addresses an INDEX, not a table. A node writing to Pinecone
+        // records both `indexName` and a `targetTableName`, and they are not the
+        // same string — so substituting the table name here asked for an index
+        // that was never created under that name.
+        indexName: paramIndexName = null
       } = params;
+      // LanceDB genuinely has tables, so `tableName` remains right for it. For
+      // Pinecone the index name wins, falling back to the table name only when
+      // nothing better was recorded (older nodes).
+      const pineconeIndex = paramIndexName || dbConfig?.indexName || tableName;
 
       // console.log(`Querying ${vectorDbType} for preview: ${tableName}`);
       // console.log('queryVectorPreview: ', params)
@@ -1134,8 +1559,8 @@ IMPORTANT:
           fullConfig,  // fullConfig is now { apiKey: 'key' } directly
           connectionId,
           {
-            indexName: tableName,
-            namespace: namespace,
+            indexName: pineconeIndex,
+            namespace: namespace || dbConfig?.namespace || '',
             filter: {},
             includeValues: true,
             includeMetadata: true,
@@ -1161,7 +1586,12 @@ IMPORTANT:
           data: formattedResults,
           recordCount: formattedResults.length,
           isJson: true,
-          storageType: 'Pinecone'
+          storageType: 'Pinecone',
+          // Carried through so the renderer can show which index/namespace was
+          // actually read and what the index reports holding.
+          queriedIndex: pineconeIndex,
+          queriedNamespace: namespace || dbConfig?.namespace || '',
+          indexStats: result.indexStats
         };
       }
 
@@ -1192,6 +1622,14 @@ IMPORTANT:
       targetConnection,
       targetIndexName,
       targetNamespace = '',
+      idColumn = null,
+      columnToEmbed = null,
+      // 'truncate' clears the target before writing; 'append' upserts into
+      // whatever is already there (the default). Vectors are keyed by a
+      // content-derived id, so an append against changed data leaves the old
+      // vectors alongside the new ones and every search keeps returning rows
+      // that no longer exist upstream — which is what truncate is for.
+      writeMode = 'append',
       pluginManager,
       getFullConfig
     } = params;
@@ -1227,7 +1665,9 @@ IMPORTANT:
       // Prepare vector records
       const vectorRecords = sourceData.map((row, idx) => {
         const vector = row.vector || row.values || row.embedding;
-        const id = row.id || row._id || generateId();
+        // Same stable-id rule as the transformer path, so an Output node
+        // re-running against a vector target replaces rather than appends.
+        const id = resolveRecordId(row, { idColumn, columnToEmbed });
 
         if (dbType === 'pinecone') {
           // Pinecone: metadata structure
@@ -1293,11 +1733,18 @@ IMPORTANT:
           };
         }
 
+        // executeLanceDBOperation reads BOTH of these off `config` — passing
+        // them at the top level left it connecting to an undefined path.
         const result = await executeLanceDBOperation({
           operation: 'upsert',
           data: vectorRecords,
-          dbPath,
-          tableName: targetIndexName
+          config: {
+            dbPath,
+            tableName: targetIndexName,
+            // The library's own truncate: it drops the table before writing,
+            // which also lets the new batch define the schema.
+            overwrite: writeMode === 'truncate',
+          },
         });
 
         if (result.success) {
@@ -1333,6 +1780,70 @@ IMPORTANT:
           };
         }
 
+        // Truncate: empty the namespace being written to, keeping the index
+        // itself (and every other namespace in it) untouched.
+        if (writeMode === 'truncate') {
+          if (typeof connector.runQuery !== 'function') {
+            return { success: false, message: `${dbType} connector cannot truncate before loading` };
+          }
+
+          // Is the index even there? A first run writes to an index that does
+          // not exist yet — the upsert below creates it — and asking a service
+          // to empty something absent is an error, not a truncate. Pinecone
+          // answers with a bare "HTTP status 404" that names no index and reads
+          // like a real failure, which failed the whole node one step before
+          // the index would have been created.
+          //
+          // Unknown (no getTables, or a lookup that errors) falls through to
+          // attempting the clear, so no connector loses behaviour it had.
+          let indexExists = null;
+          if (typeof connector.getTables === 'function') {
+            try {
+              const listed = await connector.getTables(fullConfig, targetConnection.id);
+              const tables = Array.isArray(listed) ? listed : (listed && listed.tables);
+              if ((!listed || listed.success !== false) && Array.isArray(tables)) {
+                // Compare like with like: a store that rewrites names to suit
+                // its own rules (Pinecone maps "a_b" to "a-b") lists the name
+                // it really holds, which is never the one configured here.
+                const wanted = String(
+                  typeof connector.normalizeTableName === 'function'
+                    ? connector.normalizeTableName(targetIndexName)
+                    : targetIndexName,
+                ).toLowerCase();
+                indexExists = tables.some((t) => {
+                  const name = typeof t === 'string' ? t : (t && t.name);
+                  return String(name || '').toLowerCase() === wanted;
+                });
+              }
+            } catch (err) {
+              console.log(`[Vector Output] Could not list indexes on ${dbType}:`, err.message || err);
+            }
+          }
+
+          if (indexExists === false) {
+            console.log(
+              `[Vector Output] ${targetIndexName} does not exist yet — nothing to clear; `
+              + 'the write below creates it.',
+            );
+          } else {
+            const cleared = await connector.runQuery(fullConfig, targetConnection.id, {
+              operation: 'delete',
+              indexName: targetIndexName,
+              namespace: targetNamespace,
+              deleteAll: true,
+            });
+            // An index or namespace that holds nothing yet reports failure on
+            // some services; nothing to clear is not a failure to clear. A
+            // namespace absent from an index that DOES exist lands here, which
+            // is why the 404 wording is tolerated as well.
+            const benign = /not found|does not exist|empty|404/i;
+            if (cleared && cleared.success === false && !benign.test(cleared.message || '')) {
+              return { success: false, message: `Failed to truncate ${targetIndexName}: ${cleared.message}` };
+            }
+            console.log(`[Vector Output] Cleared ${targetIndexName}${targetNamespace ? '/' + targetNamespace : ''}`);
+          }
+        }
+
         // Use executeVectorOperation which handles index creation and upsert
         const result = await connector.executeVectorOperation(
           fullConfig,
@@ -1361,6 +1872,11 @@ IMPORTANT:
       }
 
     } catch (error) {
+      // A stop must leave this skill as an exception. Flattened to
+      // { success: false } it reaches the runner indistinguishable from a
+      // broken write, and the run is recorded as FAILED — see
+      // public/NodeExecution/executionCancel.js.
+      if (isCancelledError(error)) throw error;
       console.error('[Vector Output] Error:', error);
       return {
         success: false,
@@ -1376,7 +1892,7 @@ IMPORTANT:
    */
   exportToLanceDB: async (params) => {
     bindLibs(params.helpers);
-    const { sourceData, savePath } = params;
+    const { sourceData, savePath, tableName: requestedTable } = params;
 
     try {
       const startTime = Date.now();
@@ -1396,20 +1912,35 @@ IMPORTANT:
 
       const path = require('path');
 
-      // Parse directory and table name from savePath
-      // Expected format: /path/to/lancedb-dir or /path/to/lancedb-dir/tablename
-      let dbPath, tableName;
-
-      if (savePath.endsWith('.lance')) {
-        // User selected a .lance directory
-        dbPath = path.dirname(savePath);
-        tableName = path.basename(savePath, '.lance');
-      } else {
-        // Assume the last segment is the table name, rest is directory
-        const parts = savePath.split(path.sep);
-        tableName = parts.pop() || 'data';
-        dbPath = parts.join(path.sep);
-      }
+      // The export produces a self-contained LanceDB DATABASE at savePath: a
+      // directory holding one `<table>.lance` dataset.
+      //
+      // It used to treat savePath's last segment as the table name and its
+      // PARENT as the database, so saving to "~/Downloads/products.lancedb"
+      // wrote the dataset "~/Downloads/products.lancedb.lance" with ~/Downloads
+      // as the database. The returned path then named the dataset, and a
+      // connection built on it listed zero tables — `connect()` on a dataset
+      // succeeds and finds no `.lance` children, so it reads as an empty
+      // database rather than an error. Pointing the connection at the parent
+      // instead is no fix: that makes every unrelated `.lance` in ~/Downloads a
+      // table of this connection.
+      //
+      // A trailing `.lance` names a dataset, not a database, so strip it before
+      // using savePath as the directory.
+      const dbPath = savePath.replace(/\.lance$/i, '');
+      // The caller names the table when it has one to name — a LanceDB database
+      // holds many, so "a LanceDB at <dir> called <name>" is an ordinary request
+      // and the directory cannot express it.
+      //
+      // Falling back to the folder's own name (minus a `.lancedb` suffix, which
+      // describes the database rather than the table) keeps every node saved
+      // before the name was passed through writing exactly where it always did.
+      const sanitizeTable = (name) => String(name || '').trim()
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/^_+|_+$/g, '');
+      const tableName = sanitizeTable(requestedTable)
+        || sanitizeTable(path.basename(dbPath).replace(/\.lancedb$/i, ''))
+        || 'data';
 
       // Ensure directory exists
       const fs = require('fs');
@@ -1424,7 +1955,7 @@ IMPORTANT:
         record.vector = toVectorArray(vector);
         delete record.values;
         delete record.embedding;
-        delete record._id; // Remove NeDB/MongoDB internal ID
+        delete record._id; // Remove the document store's internal ID
 
         // Flatten metadata object if it exists (from Pinecone source)
         if (record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)) {
@@ -1474,7 +2005,11 @@ IMPORTANT:
         return {
           success: true,
           message: `Successfully exported ${sourceData.length} vectors to LanceDB (${tableName})`,
-          filePath: path.join(dbPath, `${tableName}.lance`),
+          // The DATABASE directory, which is what a LanceDB connection has to
+          // point at. Returning the `${tableName}.lance` dataset inside it is
+          // what produced connections that listed no tables.
+          filePath: dbPath,
+          tableName,
           recordCount: sourceData.length,
           executionTime: Date.now() - startTime
         };
@@ -1551,7 +2086,7 @@ IMPORTANT:
 
   metadata: {
     displayName: 'Vector Database Executor',
-    description: 'Generate embeddings and run vector operations on LanceDB or Pinecone — embed columns, upsert vectors, and run semantic search via OpenAI or HuggingFace.',
+    description: 'Generate embeddings and run vector operations on LanceDB or Pinecone — embed columns, upsert vectors, and run semantic search via OpenAI.',
     version: '1.0.0',
     author: 'Ternlux'
   }
@@ -1635,7 +2170,7 @@ async function fetchVectorSampleData({
 
 /**
  * Execute JavaScript transformation on vector source data
- * Similar to NeDB transformations but for vector databases
+ * Similar to a document-store transformation but for vector databases
  */
 async function executeVectorSourceTransformation({
   sourceConnection,
@@ -1651,7 +2186,6 @@ async function executeVectorSourceTransformation({
   pluginManager,
   getFullConfig,
   appSqliteDbPath,
-  sqlitePool,
   nodeId,
   sourceNodeId,
   startTime,
@@ -1897,9 +2431,9 @@ async function executeVectorSourceTransformation({
 
           let unchangedRecords = [];
           if (excludeFilter) {
-            unchangedRecords = await freshTable.query().where(excludeFilter).limit(1000000).toArray();
+            unchangedRecords = await freshTable.query().where(excludeFilter).toArray();
           } else {
-            unchangedRecords = await freshTable.query().limit(1000000).toArray();
+            unchangedRecords = await freshTable.query().toArray();
           }
 
           // Combine unchanged + updated records (excluding deleted ones)
@@ -2074,17 +2608,9 @@ async function loadSourceData({
   operationType,
   pluginManager,
   getFullConfig,
-  sqlitePool,
   appSqliteDbPath
 }) {
   const tableName = sourceTableSchema.tableName;
-
-  // Local NeDB
-  if (sourceConnection.dbType === 'nedb' || operationType === 'nosql') {
-    if (sourceConnection.localPath) {
-      return await loadFromNeDB(sourceConnection.localPath);
-    }
-  }
 
   // Local SQLite
   if (sourceConnection.dbType === 'sqlite') {
@@ -2097,7 +2623,7 @@ async function loadSourceData({
       || sourceConnection.dbConfig?.path
       || sourceConnection.dbConfig?.database;
 
-    return await loadFromSQLite(tableName, sqlitePool, { path: dbPath });
+    return await loadFromSQLite(tableName, { path: dbPath });
   }
 
   // Remote database via plugin
@@ -2108,17 +2634,15 @@ async function loadSourceData({
     if (connector) {
       // Different connectors expect different query shapes — runQuery is
       // intentionally polymorphic. SQL connectors take a SQL string;
-      // MongoDB takes a JSON object with collection / filter / limit;
-      // NeDB takes a similar JSON shape. Build the right shape per
-      // dbType so we don't hand a SQL string to a doc store (which
+      // MongoDB takes a JSON object with collection / filter / limit.
+      // Build the right shape per dbType so we don't hand a SQL string
+      // to a doc store (which
       // would JSON.parse-throw inside the connector and return success:
       // false, surfacing here as "Unable to load data from source").
       const dbType = String(sourceConnection.dbType || '').toLowerCase();
       let queryPayload;
       if (dbType === 'mongodb') {
         queryPayload = { collection: tableName, filter: {}, limit: 10000 };
-      } else if (dbType === 'nedb') {
-        queryPayload = { operation: 'find', filter: {}, limit: 10000 };
       } else {
         // SQL-shaped connectors (Postgres, MySQL, MSSQL, Snowflake,
         // BigQuery, Redshift, …): keep the SELECT * the previous code
@@ -2159,55 +2683,25 @@ async function loadSourceData({
 }
 
 /**
- * Load data from NeDB file
+ * Load data from a local SQLite FILE.
+ *
+ * Reads the file by path with its own connection. It used to borrow a
+ * connection from the app's shared SQLite pool, which is gone — nothing writes
+ * to that database any more — and the pool could only ever open one file
+ * anyway, so a source pointing at the user's own .sqlite was read from the
+ * wrong place.
  */
-function loadFromNeDB(localPath) {
-  return new Promise((resolve, reject) => {
-    if (!fs.existsSync(localPath)) {
-      reject(new Error(`NeDB file not found: ${localPath}`));
-      return;
-    }
+function loadFromSQLite(tableName, dbConfig) {
+  const dbPath = dbConfig?.path || dbConfig?.database;
 
-    const db = new Datastore({ filename: localPath });
-    db.loadDatabase((err) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-
-      db.find({}, (findErr, docs) => {
-        if (findErr) {
-          reject(findErr);
-        } else {
-          resolve(docs);
-        }
-      });
-    });
-  });
-}
-
-/**
- * Load data from SQLite
- */
-function loadFromSQLite(tableName, sqlitePool, dbConfig) {
-  return new Promise((resolve, reject) => {
-    const dbPath = dbConfig?.path || dbConfig?.database;
-
-    if (!dbPath || !fs.existsSync(dbPath)) {
-      reject(new Error(`SQLite database not found: ${dbPath}`));
-      return;
-    }
-
-    const db = sqlitePool.getConnection(dbPath);
-
-    db.all(`SELECT * FROM ${tableName} LIMIT 10000`, [], (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(rows || []);
-      }
-    });
-  });
+  if (!dbPath || !fs.existsSync(dbPath)) {
+    return Promise.reject(new Error(`SQLite database not found: ${dbPath}`));
+  }
+  if (!runLocalQuery) {
+    return Promise.reject(new Error('vector-db-executor cannot read SQLite: helpers.runQuery was not injected.'));
+  }
+  return runLocalQuery('sqlite', { query: `SELECT * FROM ${tableName} LIMIT 10000` }, dbPath)
+    .then((rows) => rows || []);
 }
 
 /**
@@ -2498,7 +2992,6 @@ async function saveVectorResults({
   sourceConnection,
   sourceTableSchema,
   appSqliteDbPath,
-  sqlitePool,
   targetConnectionId = null,
   namespace = '',
   indexName = null,
@@ -2509,12 +3002,15 @@ async function saveVectorResults({
   columnToEmbed = null,
   embeddedData = null
 }) {
-  // For query results, save to local NeDB
+  // Query results land in a local DuckDB database, like every other local
+  // result in the app. `${targetTable}_query_results` is the table inside it,
+  // so re-running the node replaces that table and leaves anything else in the
+  // file alone.
   if (operation === 'query' && result.data && result.data.length > 0) {
     const localDbPath = path.join(
       require('electron').app.getPath('userData'),
       'local-collections',
-      `${targetTable}_query_results.db`
+      `${targetTable}_query_results.duckdb`
     );
 
     const localDbDir = path.dirname(localDbPath);
@@ -2522,15 +3018,19 @@ async function saveVectorResults({
       fs.mkdirSync(localDbDir, { recursive: true });
     }
 
-    // Save query results to NeDB
-    const db = new Datastore({ filename: localDbPath, autoload: true });
-
-    await new Promise((resolve, reject) => {
-      db.insert(result.data, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+    if (!runLocalQuery) {
+      throw new Error('vector-db-executor cannot save query results: helpers.runQuery was not injected.');
+    }
+    await runLocalQuery(
+      'duckdb',
+      {
+        operation: 'insert',
+        docs: result.data,
+        tableName: `${targetTable}_query_results`,
+        mode: 'replace',
+      },
+      localDbPath,
+    );
 
     return {
       nodeType: 'transformer',
@@ -2538,7 +3038,7 @@ async function saveVectorResults({
       sourceConnectionId: sourceConnection?.id,
       sourceTableName: sourceTableSchema?.tableName,
       targetConnectionId: 'local',
-      targetDbType: 'nedb',
+      targetDbType: 'duckdb',
       targetTableName: `${targetTable}_query_results`,
       targetLocalPath: localDbPath,
       skillExecution: {
