@@ -21,7 +21,7 @@ Every connection has:
 | Type | What it points at | Examples |
 | --- | --- | --- |
 | Database | Plugin-driven database connection | PostgreSQL, MySQL, MongoDB, Pinecone, LanceDB |
-| File | Local file imported into the workspace | CSV, Excel, Parquet, Avro, JSON, SQLite, NeDB |
+| File | Local file read in place by DuckDB | CSV, Excel, Parquet, Avro, JSON, DuckDB, SQLite |
 | API | REST API base URL plus your own key/value credentials | Auth headers, API keys, tenant ids, query parameters |
 | Cloud storage | Bucket-style storage with object pickers | S3, Google Cloud Storage, Azure Blob, Google Drive, SharePoint, OneDrive, Dropbox |
 
