@@ -1,5 +1,11 @@
 # Amazon Redshift connector
 
+> **Disabled.** Redshift is turned off for now: the plugin still ships under
+> `plugins/connectors/redshift/`, but it is listed in `DISABLED_CONNECTORS` in
+> `public/pluginManager.js` so it never registers, and it is commented out of
+> the connector picker. This page describes the connector as it behaves once
+> re-enabled.
+
 AWS data warehouse. PostgreSQL-compatible at the wire level, so most
 SQL idioms carry over, but the metadata catalog is Redshift-specific.
 

@@ -28,9 +28,14 @@ identifier quoting, preview syntax, and supported types.
 | [PostgreSQL](postgres.md) | Multi-schema, SSL support, system schemas hidden |
 | [MySQL](mysql.md) | Standard pooling, dialect-specific batch inserts |
 | [MSSQL (SQL Server)](mssql.md) | Named instances, default `dbo` schema |
-| [BigQuery](bigquery.md) | Google data warehouse, dataset.table naming, partitioning |
+| [BigQuery](bigquery.md) | Google data warehouse, OAuth, dataset.table naming, partitioning |
 | [Snowflake](snowflake.md) | Cloud warehouse, account identifier, warehouse + role context |
+
+<!-- Redshift is disabled for now — the plugin still ships but is not loaded
+     (see DISABLED_CONNECTORS in public/pluginManager.js). Restore this row
+     when it is re-enabled:
 | [Redshift](redshift.md) | AWS warehouse, JDBC URL parsing |
+-->
 
 ### Document databases
 
@@ -42,8 +47,8 @@ deletes, aggregation, or custom JavaScript.
 | --- | --- |
 | [MongoDB](mongodb.md) | Aggregation pipelines, batched JS transformations |
 
-The local document store (NeDB) is also available for any workflow
-that imports JSON or generates documents — see
+A local JSON file is read as a table by DuckDB like any other local
+file — there is no separate local document store — see
 [Connections](../../connections/README.md).
 
 ### Vector databases
@@ -66,7 +71,7 @@ File picker UX and bucket / object listing screens. See
 | Connector | Notes |
 | --- | --- |
 | [Amazon S3](cloud-storage/s3.md) | AWS keys, S3-compatible endpoints (MinIO, etc.) |
-| [Google Cloud Storage](cloud-storage/gcs.md) | Service account JSON or key file |
+| [Google Cloud Storage](cloud-storage/gcs.md) | OAuth, project-scoped bucket listing |
 | [Azure Blob Storage](cloud-storage/azure-blob.md) | Connection string or account key |
 | [Google Drive](cloud-storage/google-drive.md) | OAuth, file IDs, format export |
 | [OneDrive](cloud-storage/onedrive.md) | OAuth, Microsoft Graph, multi-tenant |
@@ -87,7 +92,6 @@ File picker UX and bucket / object listing screens. See
 
 ### Local file formats
 
-These don't need a connector — they're imported into the local
-workspace by the Data Source node. Supported formats: CSV, Excel,
-Parquet, Avro, JSON (into a local document store), SQLite, NeDB,
-LanceDB.
+These don't need a connector — the Data Source node records the file
+and DuckDB reads it where it lies. Supported formats: CSV, Excel,
+Parquet, Avro, JSON, DuckDB, SQLite, LanceDB.
