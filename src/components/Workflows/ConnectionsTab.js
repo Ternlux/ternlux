@@ -7,6 +7,8 @@ import ConnectionTypeSelector from './ConnectionTypeSelector';
 
 import DynamicConnectionForm from './connections/DynamicConnectionForm';
 import LocalFileConnectionForm from './connections/LocalFileConnectionForm';
+import { isDuplicateConnectionName } from './connections/connectionNameRule';
+import { connectorVisual, ConnectorLogo } from './connections/connectorCatalog';
 
 import DatabaseExplorer from '../DatabaseExplorer/DatabaseExplorer';
 
@@ -72,7 +74,13 @@ const typeCfgFor = (subType) =>
 // Plugin dbCategory values that have no useful Explore/Preview action.
 const NO_MIDDLE_ACTION_CATEGORIES = new Set(['Vector', 'CloudStorage', 'API']);
 
+// Saved connections wear the same provider logo the connector picker shows.
+// An unrecognised type (a custom plugin, a legacy record) keeps the generic
+// file/database glyph tinted by its category.
 const ConnIcon = ({ conn }) => {
+  const visual = connectorVisual(subTypeOf(conn));
+  if (visual) return <ConnectorLogo c={visual} size={32} imgSize={20} letterSize={9} />;
+
   const isFile = conn.connectionType === 'file';
   const isDb   = conn.connectionType === 'database';
   const isApi  = conn.connectionType === 'api';
@@ -292,6 +300,7 @@ const FilterBar = ({ filters, setFilters, categories, types }) => {
           }}>Type</span>
           {types.map(t => {
             const cfg = typeCfgFor(t);
+            const visual = connectorVisual(t);
             const active = filters.types.includes(t);
             return (
               <button key={t} type="button" onClick={() => toggleType(t)}
@@ -302,7 +311,14 @@ const FilterBar = ({ filters, setFilters, categories, types }) => {
                   color: active ? cfg.color : C.muted,
                   fontSize: 11, fontWeight: active ? 600 : 500, fontFamily: SANS,
                   cursor: 'pointer', transition: 'all 0.15s', whiteSpace: 'nowrap',
+                  display: 'flex', alignItems: 'center', gap: 5,
                 }}>
+                {visual && (
+                  <ConnectorLogo
+                    c={visual} size={14} imgSize={12} letterSize={7}
+                    style={{ background: 'transparent', border: 'none' }}
+                  />
+                )}
                 {cfg.label}
               </button>
             );
@@ -527,6 +543,14 @@ const ConnectionsTab = ({
     const connectionId = editingConnection?.id || editingConnection?._id;
     const isEditing = Boolean(connectionId);
     const isFileConnection = connectionData.connectionType === 'file';
+
+    // The forms validate this too, but a dropped-file batch derives its names
+    // from filenames without the user ever seeing the field — so re-check here
+    // before anything is written.
+    if (isDuplicateConnectionName(connectionData.name, connections, editingConnection)) {
+      message.error(`A connection named "${connectionData.name}" already exists.`);
+      return;
+    }
 
     // if (!isLoggedIn() || isFileConnection) {
       try {
@@ -815,6 +839,7 @@ const ConnectionsTab = ({
           onSave={handleSaveDbConnection}
           onCancel={() => { cancelledRef.current = true; setActiveDbType(null); setEditingConnection(null); setDroppedFile(null); setFileQueue([]); }}
           editingConnection={editingConnection}
+          existingConnections={connections}
         />
       );
     }
@@ -827,6 +852,7 @@ const ConnectionsTab = ({
           onCancel={() => { setActiveDbType(null); setEditingConnection(null); }}
           onTest={handleTestConnection}
           editingConnection={editingConnection}
+          existingConnections={connections}
         />
       );
     }

@@ -89,7 +89,7 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
   const initialConfig = resetKey > 0 ? null : (node.data?.config || null);
   // console.log('resetKey: ', resetKey)
   // ─────────────────────────────────────────────────────────────────────────
-  // Shared Helper: Get source local path for NeDB
+  // Shared Helper: Get source local path for a local-file source
   // ─────────────────────────────────────────────────────────────────────────
 
   const getSourceLocalPath = (targetNode) => {
@@ -140,7 +140,7 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
     onSuccess = null,
     onError = null
   }) => {
-    const isNoSQL = connectionConfig.dbType === 'mongodb' || connectionConfig.dbType === 'nedb';
+    const isNoSQL = connectionConfig.dbType === 'mongodb';
 
     if (isNoSQL && operationType) {
       // NoSQL transformation
@@ -166,7 +166,7 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
           storageLocation,
           operationMode,
           targetLocalPath,
-          // Scopes the local NeDB file to this workflow + node.
+          // Scopes the local output table to this workflow + node.
           { workflowId: workflowScopeId || currentWorkflowId, nodeId: node.id }
         );
 
@@ -383,16 +383,17 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
 
     const finalChat = [...chat, summaryMsg];
 
+    const saved = { ...config, chat: finalChat };
+
     // A transformer/join/output that was just (re)configured describes an output
     // it has not produced: its target table is a name in this config and nothing
-    // more until the node runs. `executed` is what readers — the Data Preview
-    // above all — check before querying that table; executeNode sets it true.
-    const saved = { ...config, chat: finalChat };
-    if (node.type === 'transformer' || node.type === 'join' || node.type === 'output') {
-      saved.executed = false;
-    }
-
-    onConfigUpdate(node.id, saved);
+    // more until the node runs. `resetExecuted` tells the editor to record that
+    // on the workflow's executedNodes map, which readers — the Data Preview
+    // above all — check before querying that table; a run sets it true.
+    // It is deliberately NOT written into the config: a flag on the node makes
+    // every run an edit to the workflow, dirtying the canvas and adding a
+    // version to the history. See utils/executedNodes.js.
+    onConfigUpdate(node.id, saved, { resetExecuted: true });
 
     // Also update the selectedNode so DataPreview can show the new data
     onPreviewConfigUpdate(node.id, saved);
@@ -410,6 +411,37 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
     if (!node.data?.config) return;
 
     const config = node.data.config;
+
+    // An output node runs through the workflow runner rather than by calling
+    // its destination directly, so the run is recorded and can be watched and
+    // stopped in the ExecutionMonitor — which for a write of several hundred
+    // thousand rows is the difference between a mistake you can call off and
+    // one you have to wait out.
+    //
+    // It runs the SAVED node: the runner reads the graph, not the open form, so
+    // the button is disabled while there are unsaved changes (see the header).
+    if (node.type === 'output') {
+      setExecuting(true);
+      try {
+        const result = await runNode();
+        if (result?.cancelled) {
+          antMessage.warning(result.message || 'Output stopped.');
+        } else if (result?.success) {
+          // Succeeded, but an empty source means it wrote nothing — reporting
+          // that as a plain success hides the one thing worth knowing.
+          if (result.warning) antMessage.warning(result.message || 'Output ran, but there was no data to write.');
+          else antMessage.success(result.message || 'Output complete.');
+          if (onDataPreviewRefresh) onDataPreviewRefresh();
+        } else {
+          antMessage.error(result?.message || 'Output failed');
+        }
+      } catch (err) {
+        antMessage.error(err?.message || 'Failed to run the output');
+      } finally {
+        setExecuting(false);
+      }
+      return;
+    }
 
     // Handle join nodes differently
     if (node.type === 'join') {
@@ -499,13 +531,12 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
     }
 
     // Handle transformer nodes
-    const isNoSQL = config.dbType === 'mongodb' || config.dbType === 'nedb';
-    const isNeDB = config.dbType === 'nedb';
+    const isNoSQL = config.dbType === 'mongodb';
     const isLocalStorage = config.transformationSettings?.storageLocation === 'local';
     const isInPlace = config.transformationSettings?.operationMode === 'in_place';
 
-    // Get source local path if needed (for NeDB or local SQLite operations)
-    const sourceLocalPath = (isNeDB || isLocalStorage || isInPlace) ? getSourceLocalPath(node) : null;
+    // Get source local path if needed (for local file operations)
+    const sourceLocalPath = (isLocalStorage || isInPlace) ? getSourceLocalPath(node) : null;
 
     const result = await executeTransformation({
       connectionConfig: {
@@ -541,7 +572,34 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
     }
   };
 
+  // Kept for the node chats still commented out below, which drive the panel's
+  // running state themselves.
+  // eslint-disable-next-line no-unused-vars
   const executingInd = async (execute) => setExecuting(execute)
+
+  /**
+   * Run THIS node through the workflow runner — the same path the chat
+   * assistant's "Run this node" uses, and therefore recorded as an execution
+   * that the ExecutionMonitor can show and stop.
+   *
+   * It goes through WorkflowEditor rather than straight to the IPC because the
+   * editor owns the graph: it sanitizes the live nodes for IPC, marks the node
+   * executed on success, and refreshes the data preview. Duplicating that here
+   * would mean a run from this panel behaved differently from the same run
+   * started in the chat.
+   *
+   * CustomEvent dispatch is synchronous, so `handled` is a reliable witness
+   * that a listener took it: without the check, a panel open with no editor
+   * mounted would leave the caller awaiting a promise nothing will settle, and
+   * the Run button spinning for ever.
+   */
+  const runNode = () => new Promise((resolve) => {
+    const detail = { nodeId: node.id, resolve, handled: false };
+    window.dispatchEvent(new CustomEvent('ternlux:execute-node', { detail }));
+    if (!detail.handled) {
+      resolve({ success: false, message: 'The workflow editor is not available to run this node.' });
+    }
+  });
 
   /**
    * Execute Join Operation
@@ -595,6 +653,10 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
   /**
    * Execute Output Operation
    * Handles exporting data to local files or database connections
+   *
+   * No longer the output panel's Run path — that goes through `runNode` so the
+   * run is recorded and can be stopped from the execution monitor. Kept for
+   * callers that still address a destination directly.
    */
   const executeOutput = async ({
     sourceConnection,
@@ -763,8 +825,6 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
             onSave={handleSave}
             onCancel={onClose}
             onDirtyChange={setFormDirty}
-            executeOutput={executeOutput}
-            executingInd={executingInd}
             executing={executing}
           />
         );
@@ -853,22 +913,41 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
           </span>
         )}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          {/* Show run button for dataSource, transformer, and join nodes with SQL/DDL */}
+          {/* Show run button for dataSource, transformer, and join nodes with
+              SQL/DDL, and for a saved output node.
+
+              An output node's Run sits HERE rather than in the form footer,
+              beside the unsaved marker, because the two belong together: the
+              marker is exactly the condition that disables the button. Saving
+              and running are separate acts, and the header is where the state
+              that decides whether you may run is already shown. */}
           {(
             (node.type === 'dataSource' && node.data?.config?.sql && node.data?.config?.ddl && node.data?.config?.connectionType === 'database') ||
             (node.type === 'transformer' && node.data?.config?.targetSql || node.data?.config?.targetDdl || node.data?.config?.transformFunction || node.data?.config?.nosqlOperation) ||
-            (node.type === 'join' && node.data?.config?.targetConnectionType)
+            (node.type === 'join' && node.data?.config?.targetConnectionType) ||
+            // Saved settings are validated settings — the output form refuses to
+            // save an incomplete one — so their presence is the whole test for
+            // "is there something here to run".
+            (node.type === 'output' && node.data?.config?.outputSettings)
           ) && (
             <Button
               type="text"
               icon={executing ? <LoadingOutlined /> : <CaretRightOutlined />}
               onClick={handleHeaderExecute}
               size="small"
-              title="Execute SQL"
-              disabled={executing}
+              title={node.type === 'output'
+                ? (executing
+                  ? 'Running — stop it from the execution monitor'
+                  : formDirty
+                    ? 'Save your changes first — Run uses the saved configuration'
+                    : 'Run this output')
+                : 'Execute SQL'}
+              // Unsaved edits are not part of the run: the runner reads the
+              // saved node, so running now would quietly use the old settings.
+              disabled={executing || (node.type === 'output' && formDirty)}
               style={{ color: nodeColor, fontSize: 11 }}
             >
-              {executing && 'Running'}
+              {executing ? 'Running' : node.type === 'output' ? 'Run' : null}
             </Button>
           )}
           <Button

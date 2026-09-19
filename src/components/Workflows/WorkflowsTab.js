@@ -1,9 +1,14 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Modal, message, Spin } from 'antd';
 import WorkflowEditor from './WorkflowEditor';
-import axios from 'axios';
+// No axios import: every remote workflow endpoint returns 403 for logged-in
+// tokens, so this tab reads and writes the local store and runs workflows over
+// IPC. The commented-out calls below are kept as a record of what the server
+// path was; re-enabling one means restoring the import with it.
 import moment from 'moment';
-import { workflowsDb, connectionsDb } from '../../utils/localDb';
+import { workflowsDb, connectionsDb, workflowHistoryDb } from '../../utils/localDb';
+import { resolveExecutionSteps } from '../../utils/workflowUtils';
+import { refreshExecutions } from '../../utils/executionMonitorStore';
 import {
   C, MONO, Btn, Tag, MetaItem, MoreMenu, PageHeader, fullscreenModalProps,
 } from './_designShared';
@@ -89,6 +94,11 @@ const WorkflowsTab = ({
   const [isDragOver, setIsDragOver] = useState(false);
   const workflowCloseHandlerRef = useRef(null);
   const importInputRef = useRef(null);
+  // Ids currently executing from this list. A run resolves only when the whole
+  // workflow is done, so without this a second click starts a second run over
+  // the same DuckDB tables. A ref, not state: nothing renders from it, and it
+  // must be current inside the async handler.
+  const runningIdsRef = useRef(new Set());
 
   const handleAuthError = (error) => {
     if (error.response?.status === 401 || error.response?.status === 204 ||
@@ -151,25 +161,30 @@ const WorkflowsTab = ({
   // path. A modify build opens the saved workflow so its existing nodes are
   // there to be glowed and rewired.
   //
-  // An editor already open on some OTHER workflow is left alone: the user is
-  // looking at it, and the finished build opens itself when it lands.
+  // The build TAKES OVER the editor, even when it is open on another workflow.
+  // The user asked for this build; watching it write itself is the point, and
+  // leaving the old canvas up meant a workflow was being created behind a
+  // screen showing something unrelated. Nothing is lost by the swap: every path
+  // into a build goes through the save gate first (requestWorkflowSaveGate in
+  // ChatAssistant), so an open workflow with unsaved edits has already been
+  // saved — or the build was cancelled and never reached here. An editor
+  // already showing THIS build's canvas is left alone.
   const liveBuildId = liveBuild?.workflowId || null;
   const liveBuildPhase = liveBuild?.phase || null;
-  // Whether the open editor (if any) is the one this build belongs to.
+  // Whether the open editor (if any) is the one this build belongs to. This is
+  // now the ONLY thing the takeover checks — a previous build's placeholder and
+  // a workflow the user opened are both simply "not this build", and both get
+  // re-pointed. (There used to be a separate `staleLiveCanvas` for the former,
+  // back when the latter was left alone.)
   const editorOwnsBuild = isEditorOpen
     && (editingWorkflow?.id || editingWorkflow?._id || editingWorkflow?.liveBuildId) === liveBuildId;
-  // A canvas opened for an earlier build that this one has moved on from. It
-  // shows nothing but stale placeholders, so it is ours to re-point.
-  const staleLiveCanvas = isEditorOpen
-    && !!editingWorkflow?.liveBuildId
-    && editingWorkflow.liveBuildId !== liveBuildId;
   useEffect(() => {
-    // Nothing to do when the editor is already open on something real: it is
-    // either this build's own canvas (which `editorOwnsBuild` feeds the
-    // progress stream to) or a workflow the user opened, which we don't take
-    // away from them.
+    // The only case with nothing to do is the editor already being on this
+    // build's canvas — `editorOwnsBuild` is what feeds it the progress stream.
+    // Anything else (closed, another workflow, a previous build's placeholder)
+    // gets re-pointed at this build.
     if (!liveBuildId || liveBuildPhase !== 'building') return undefined;
-    if (isEditorOpen && !staleLiveCanvas) return undefined;
+    if (editorOwnsBuild) return undefined;
     let cancelled = false;
     (async () => {
       if (liveBuild.mode === 'modify' && await refreshAndOpen(liveBuildId, () => cancelled)) return;
@@ -186,16 +201,20 @@ const WorkflowsTab = ({
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveBuildId, liveBuildPhase, isEditorOpen, staleLiveCanvas]);
+  }, [liveBuildId, liveBuildPhase, editorOwnsBuild]);
 
   // The build finished — swap the preview for the real thing. This does NOT
   // wait for ChatAssistant's post-build review to hand the workflow over: the
   // review can take a while, and a failed one never hands it over at all,
   // which would leave the canvas showing placeholders for a workflow that is
   // already saved and openable.
+  //
+  // No "is the editor showing something else?" guard: the 'building' effect
+  // above has already pointed it at this build, and if that never arrived (a
+  // build too fast to render a progress frame, a reload mid-build) opening the
+  // finished workflow is still the right end state.
   useEffect(() => {
     if (!liveBuildId || liveBuildPhase !== 'done') return undefined;
-    if (isEditorOpen && !editorOwnsBuild) return undefined;
     let cancelled = false;
     refreshAndOpen(liveBuildId, () => cancelled).catch(() => {});
     return () => { cancelled = true; };
@@ -381,6 +400,13 @@ const WorkflowsTab = ({
           //   }
           // } else {
           await workflowsDb.delete(workflowId);
+          // The version history goes with the workflow — there is nothing left
+          // to revert into, and leaving it behind would hand its versions to
+          // the next workflow that happened to reuse the id. The main process
+          // does this too when it sees a workflows removal (see db:remove in
+          // electron.js); doing it here as well covers the browser fallback,
+          // and removing an already-removed document is a no-op.
+          await workflowHistoryDb.deleteByWorkflowId(workflowId);
           setWorkflows(prev => prev.filter(w => w.id !== workflowId));
           message.success('Workflow deleted locally');
           // }
@@ -393,23 +419,95 @@ const WorkflowsTab = ({
     });
   };
 
+  // Run a saved workflow from the list, without opening the editor.
+  //
+  // This runs through the SAME path the editor's Execute button uses
+  // (doExecuteWorkflow → workflow:execute over IPC), because that is the only
+  // path that exists: the remote POST /executions this used to call is part of
+  // the same backend whose workflow endpoints all return 403 for logged-in
+  // tokens — see fetchWorkflows / saveWorkflowData / handleDeleteWorkflow, which
+  // moved to the local store for exactly that reason. It was the last caller
+  // still pointed at the server.
+  //
+  // The editor runs the LIVE canvas; here there is no canvas, so the saved
+  // record is the input. handleSave writes nodes/edges/executionSteps into it,
+  // so a saved workflow carries everything workflow:execute needs.
   const handleRunWorkflow = async (workflowId) => {
+    if (runningIdsRef.current.has(workflowId)) {
+      message.warning('That workflow is already running.');
+      return;
+    }
+    if (!window.electronAPI?.workflow?.executeWorkflow) {
+      message.error('Workflow execution not available');
+      return;
+    }
+
+    let hideRunning = null;
     try {
-      const response = await axios.post('/executions', {
-        workflowId, trigger: { type: 'manual' },
-      }, { headers: { 'auth-token': localStorage.getItem('auth-token') } });
-      if (response.data.success) {
-        message.success('Workflow execution started');
-        fetchWorkflows();
+      const wf = await workflowsDb.getById(workflowId);
+      if (!wf) {
+        message.error('Workflow not found');
+        return;
       }
+
+      const nodes = wf.nodes || [];
+      const edges = wf.edges || [];
+      if (nodes.length === 0) {
+        message.warning('No nodes to execute');
+        return;
+      }
+      // Same rule the editor and the steps editor use: saved order is honoured
+      // while it still covers every node, otherwise it is rebuilt from the graph.
+      const executionSteps = resolveExecutionSteps(wf.executionSteps, nodes, edges);
+
+      runningIdsRef.current.add(workflowId);
+      // executeWorkflow resolves only when the whole run is over, so the run is
+      // reported live by the execution monitor. Kick the poller now rather than
+      // waiting for its next tick.
+      setTimeout(refreshExecutions, 150);
+      hideRunning = message.loading(`Running "${wf.name || 'workflow'}"…`, 0);
+
+      const result = await window.electronAPI.workflow.executeWorkflow({
+        workflowId: wf.id,
+        workflowName: wf.name || 'Untitled Workflow',
+        // No sanitization pass here: these came back out of the local store, so
+        // they have already survived a structured clone. The editor needs
+        // toCloneable because its nodes are live canvas state carrying Arrow
+        // vectors and circular refs.
+        nodes,
+        edges,
+        executionSteps,
+      });
+
+      if (result?.success) {
+        message.success(`Workflow executed successfully! Execution ID: ${result.executionId}`);
+      } else if (result?.cancelled) {
+        // Stopped from the execution monitor — not a failure, so it does not
+        // get the red toast.
+        message.warning(result.message || 'Workflow run stopped.');
+      } else {
+        message.error(`Workflow execution failed: ${result?.message || 'Unknown error'}`);
+      }
+      // Either way, re-read the store: markNodeExecuted writes each finished
+      // node into the workflow's `executedNodes` map, and opening the editor
+      // from a stale list would show a workflow that has never run.
+      fetchWorkflows();
+      refreshExecutions();
     } catch (error) {
-      if (handleAuthError(error)) return;
       console.error('Error running workflow:', error);
-      message.error('Failed to start workflow execution');
+      message.error(`Execution error: ${error.message}`);
+    } finally {
+      if (hideRunning) hideRunning();
+      runningIdsRef.current.delete(workflowId);
     }
   };
 
   const saveWorkflowData = async (workflowData, workflowId) => {
+    // `__history*` are instructions for the version history, not workflow
+    // fields — peel them off so they never reach the stored document.
+    const { __historySource: historySource, __historyLabel: historyLabel, ...persisted } = workflowData;
+    workflowData = persisted;
+
     const nameConflict = workflows.some(w => {
       if (workflowId && w.id === workflowId) return false;
       return w.name?.trim().toLowerCase() === workflowData.name?.trim().toLowerCase();
@@ -442,17 +540,33 @@ const WorkflowsTab = ({
     //   }
     // } else {
     console.log("workflowId, workflowData: ", workflowId, workflowData)
+    let savedId;
     if (workflowId) {
       await workflowsDb.update(workflowId, workflowData);
-      return workflowId;
+      savedId = workflowId;
     } else {
       const newWorkflow = {
         ...workflowData,
         ...(uploadedDataSource && { connectionId: uploadedDataSource.connectionId }),
       };
       const saved = await workflowsDb.save(newWorkflow);
-      return saved.id;
+      savedId = saved.id;
     }
+
+    // Every write to a workflow passes through here, so this is the one place
+    // the history has to be recorded from. It is deliberately best-effort: a
+    // failure to record a version must not fail the save that produced it.
+    // `record` is a no-op when nothing actually changed.
+    try {
+      await workflowHistoryDb.record(savedId, workflowData, {
+        source: historySource || 'save',
+        label: historyLabel || null,
+      });
+    } catch (err) {
+      console.warn('[workflowHistory] could not record version:', err);
+    }
+
+    return savedId;
     // }
   };
 
@@ -599,6 +713,10 @@ const WorkflowsTab = ({
           onAutoSave={handleAutoSave}
           onCancel={handleWorkflowClose}
           onCloseRequest={registerWorkflowCloseHandler}
+          // The editor owns the chat's focus while it is open: it is the only
+          // place that knows the workflow's live name and id, including for a
+          // new workflow that has neither yet.
+          onContextChange={onContextChange}
         />
       </Modal>
     </div>

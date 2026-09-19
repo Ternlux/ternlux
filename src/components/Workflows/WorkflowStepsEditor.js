@@ -36,7 +36,12 @@ import { CSS } from '@dnd-kit/utilities';
 import axios from 'axios';
 import Editor from '@monaco-editor/react';
 import CodeEditorPopup from '../Chat/CodeEditorPopup';
-import { getNodeExecutionOrder, generateStepsFromNodes } from '../../utils/workflowUtils';
+import {
+  generateStepsFromNodes,
+  hydrateSteps,
+  sanitizeExecutionSteps,
+  stepDescriptionOf,
+} from '../../utils/workflowUtils';
 import { nodeDisplayName } from './nodes/nodeCardShared';
 
 const { Title, Text } = Typography;
@@ -61,7 +66,13 @@ const NODE_TYPE_NAMES = {
   output: 'Output',
 };
 
-// Draggable step item component
+// Draggable step item component.
+//
+// `step` is hydrated (see hydrateSteps): `{ nodeId, order, node }`. A saved step
+// is only `{ nodeId, order }`, so everything drawn here — icon, name, summary —
+// comes from the live node. That is also why a renamed or rebuilt node shows up
+// correctly the moment this list opens; it used to draw a snapshot taken when
+// the step was written.
 const DraggableStepItem = ({ step, index }) => {
   const {
     attributes,
@@ -69,26 +80,25 @@ const DraggableStepItem = ({ step, index }) => {
     setNodeRef,
     transform,
     transition,
-  } = useSortable({ id: step.id });
+  } = useSortable({ id: step.nodeId });
 
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
   };
 
+  const nodeType = step.node?.type;
+
   const getStepIcon = () => {
-    return NODE_TYPE_ICONS[step.nodeType] || <SettingOutlined />;
+    return NODE_TYPE_ICONS[nodeType] || <SettingOutlined />;
   };
 
-  // Same naming rule as the canvas card (nodeDisplayName): an explicit name,
-  // else a label that isn't just the node type, else what the config says the
-  // node reads/writes. `nodeLabel` is the snapshot taken when the step was
-  // created, so it goes in as the label and loses to the config when it is
-  // nothing but the type name — which is why steps used to read "Transformer".
+  // The same naming rule as the canvas card — one function, so the step list
+  // and the node it stands for can never disagree.
   const getStepTitle = () => nodeDisplayName(
-    step.nodeType,
-    { label: step.nodeLabel, config: step.config },
-    `${NODE_TYPE_NAMES[step.nodeType] || 'Unknown'} - Unnamed`,
+    nodeType,
+    step.node?.data,
+    `${NODE_TYPE_NAMES[nodeType] || 'Unknown'} - Unnamed`,
   );
 
   return (
@@ -131,25 +141,38 @@ const DraggableStepItem = ({ step, index }) => {
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap'
           }}>
-            {step.description || 'No description provided'}
+            {stepDescriptionOf(step.node) || 'No description provided'}
           </div>
         </div>
-        
+
         <div style={{ color: '#8c8c8c', fontSize: '12px' }}>
-          {NODE_TYPE_NAMES[step.nodeType]}
+          {NODE_TYPE_NAMES[nodeType]}
         </div>
       </Card>
     </div>
   );
 };
 
-const WorkflowStepsEditor = ({ 
-  open, 
-  onClose, 
-  onSave, 
-  workflow,
+/**
+ * Everything this dialog shows comes from the editor's live state, passed in
+ * piece by piece — never from a saved workflow record. A record read when the
+ * editor opened does not know about saves made since, and seeding from one made
+ * this dialog reopen on the order the user had already replaced.
+ *
+ * `savedExecutionSteps` is the order as last saved/verified, `nodes`/`edges` the
+ * canvas as it stands now, and `workflowId` is set only once the workflow exists
+ * in the database (which is what authoring a validation function requires).
+ */
+const WorkflowStepsEditor = ({
+  open,
+  onClose,
+  onSave,
+  executionSteps: savedExecutionSteps,
+  outputValidation: savedOutputValidation,
+  workflowId,
+  workflowName,
   nodes,
-  edges 
+  edges
 }) => {
   const [steps, setSteps] = useState([]);
   const [activeId, setActiveId] = useState(null);
@@ -176,86 +199,6 @@ const WorkflowStepsEditor = ({
     })
   );
 
-  // Merge existing execution steps with current workflow nodes
-  const mergeStepsWithNodes = (existingSteps, workflowNodes, workflowEdges) => {
-    if (!workflowNodes || workflowNodes.length === 0) return existingSteps;
-
-    // Get current node IDs from workflow
-    const currentNodeIds = new Set(workflowNodes.map(node => node.id));
-    
-    // Get node IDs that are already in execution steps
-    const existingNodeIds = new Set(existingSteps.map(step => step.nodeId));
-    
-    // Find missing nodes that need to be added
-    const missingNodeIds = [...currentNodeIds].filter(nodeId => !existingNodeIds.has(nodeId));
-    // console.log('missingNodeIds: ', missingNodeIds, existingNodeIds)
-    
-    // Generate the correct execution order using DFS
-    const startNode = workflowNodes.find(node => node.type === 'start');
-    if (!startNode) return existingSteps;
-
-    const correctOrder = getNodeExecutionOrder(workflowNodes, workflowEdges, startNode.id);
-    // console.log('correctOrder: ', correctOrder, 'workflowNodes length:', workflowNodes.length)
-    // Create a new merged steps array
-    const mergedSteps = [];
-    
-    correctOrder.forEach((nodeId, index) => {
-      // Check if this node already has an execution step
-      const existingStep = existingSteps.find(step => step.nodeId === nodeId);
-      
-      if (existingStep) {
-        // Use existing step but update the order
-        mergedSteps.push({
-          ...existingStep,
-          order: index
-        });
-      } else {
-        // Create new step for missing node
-        const node = workflowNodes.find(n => n.id === nodeId);
-        if (node) {
-          const nodeLabel = nodeDisplayName(node.type, node.data, 'Unnamed');
-          
-          let description = '';
-          if (node.type === 'transformer') {
-            description = node.data?.config?.transformationRequest || '';
-          } else if (node.type === 'join') {
-            description = node.data?.config?.joinDescription || '';
-          } else {
-            description = node.data?.config?.description || '';
-          }
-          mergedSteps.push({
-            id: `step-${node.id}`,
-            nodeId: node.id,
-            node_name: node.node_name,
-            nodeType: node.type,
-            nodeLabel: nodeLabel,
-            customName: '',
-            description: description,
-            order: index,
-            config: node.data?.config || {}
-          });
-        }
-      }
-    });
-    // console.log('mergedSteps: ', mergedSteps)
-
-    // Ensure the start node is first. Output nodes keep whatever position the
-    // graph order gave them — there can be more than one, and none of them is
-    // required to be last.
-    const startIndex = mergedSteps.findIndex(step => step.nodeType === 'start');
-
-    if (startIndex > 0) {
-      const startStep = mergedSteps.splice(startIndex, 1)[0];
-      mergedSteps.unshift(startStep);
-    }
-
-    // Update order property after reordering
-    return mergedSteps.map((step, index) => ({
-      ...step,
-      order: index
-    }));
-  };
-
   // Check if all nodes are covered by existing execution steps
   const areAllNodesInExecutionSteps = (existingSteps, workflowNodes) => {
     if (!existingSteps || !workflowNodes) return false;
@@ -278,26 +221,32 @@ const WorkflowStepsEditor = ({
     return true;
   };
 
-  // Initialize steps from workflow or derive from nodes
+  // Seed the list when the dialog opens, from the order the editor holds —
+  // which includes whatever was saved from this dialog a moment ago.
   useEffect(() => {
     if (open) {
-      const ov = workflow?.outputValidation || null;
+      const ov = savedOutputValidation || null;
       setOutputValidation(ov);
       setValidationEnabled(Boolean(ov?.enabled));
-      if (workflow?.executionSteps && workflow.executionSteps.length > 0) {
-        const existingSteps = [...workflow.executionSteps];
-        
+      if (savedExecutionSteps && savedExecutionSteps.length > 0) {
+        // Steps whose node has been deleted are dropped before anything else
+        // looks at the list. The coverage check below only asks whether the
+        // CURRENT nodes all have a step, which a leftover step never breaks —
+        // so without this the editor (and the save behind it) kept listing
+        // sources and outputs that are no longer on the canvas.
+        const existingSteps = sanitizeExecutionSteps(savedExecutionSteps, nodes);
+
         // Check if all current nodes are already in execution steps
         if (areAllNodesInExecutionSteps(existingSteps, nodes)) {
           // All nodes are covered, keep existing execution steps as-is
           console.log('Using existing execution steps - all nodes are covered, keeping current order');
-          setSteps(existingSteps);
+          setSteps(hydrateSteps(existingSteps, nodes));
           setHasModifiedOrder(true);
           setAutoGeneratedSteps([]);
         } else {
           // New node detected - do a full rebuild of steps
           console.log('New node detected - doing full rebuild of execution steps');
-          const generatedSteps = generateStepsFromNodes(nodes, edges);
+          const generatedSteps = hydrateSteps(generateStepsFromNodes(nodes, edges), nodes);
           setSteps(generatedSteps);
           setAutoGeneratedSteps([...generatedSteps]);
           setHasModifiedOrder(false);
@@ -305,7 +254,7 @@ const WorkflowStepsEditor = ({
       } else if (nodes && nodes.length > 0) {
         // Auto-generate steps from workflow nodes
         console.log('Auto-generating execution steps from nodes');
-        const generatedSteps = generateStepsFromNodes(nodes, edges);
+        const generatedSteps = hydrateSteps(generateStepsFromNodes(nodes, edges), nodes);
         setSteps(generatedSteps);
         setAutoGeneratedSteps([...generatedSteps]); // Keep track of original auto-generated order
         setHasModifiedOrder(false);
@@ -315,7 +264,7 @@ const WorkflowStepsEditor = ({
         setHasModifiedOrder(false);
       }
     }
-  }, [open, workflow, nodes, edges]);
+  }, [open, savedExecutionSteps, savedOutputValidation, nodes, edges]);
 
 
   const handleDragStart = (event) => {
@@ -328,19 +277,21 @@ const WorkflowStepsEditor = ({
 
     if (over && active.id !== over.id) {
       setSteps((prevSteps) => {
-        const draggedStep = prevSteps.find(step => step.id === active.id);
+        // The sortable id IS the node id — a step has nothing else to be
+        // identified by, and the node it names is unique in the workflow.
+        const draggedStep = prevSteps.find(step => step.nodeId === active.id);
 
         // Start is the only pinned step — it has to run first. Output nodes are
         // ordinary steps: a workflow can have several, and the user decides
         // where each one runs (mid-pipeline exports are legitimate).
-        if (draggedStep?.nodeType === 'start') {
+        if (draggedStep?.node?.type === 'start') {
           message.warning('The Start node must stay first.');
           return prevSteps;
         }
 
-        const oldIndex = prevSteps.findIndex(step => step.id === active.id);
-        const newIndex = prevSteps.findIndex(step => step.id === over.id);
-        const startIndex = prevSteps.findIndex(step => step.nodeType === 'start');
+        const oldIndex = prevSteps.findIndex(step => step.nodeId === active.id);
+        const newIndex = prevSteps.findIndex(step => step.nodeId === over.id);
+        const startIndex = prevSteps.findIndex(step => step.node?.type === 'start');
 
         if (startIndex !== -1 && newIndex <= startIndex) {
           message.warning('Nodes cannot be placed before the Start node.');
@@ -398,14 +349,14 @@ const WorkflowStepsEditor = ({
   };
 
   const handleGenerateValidation = async () => {
-    if (!workflow?.id) {
+    if (!workflowId) {
       message.warning('Save the workflow first, then generate its validation.');
       return;
     }
     setGeneratingValidation(true);
     setValidationResume(null);
     try {
-      applyValidationResult(await window.electronAPI.workflow.generateValidation({ workflowId: workflow.id }));
+      applyValidationResult(await window.electronAPI.workflow.generateValidation({ workflowId }));
     } catch (err) {
       message.error(err.message || 'Failed to generate validation function');
     } finally {
@@ -428,16 +379,12 @@ const WorkflowStepsEditor = ({
   };
 
   const handleSave = () => {
-    // Prepare execution steps for saving
-    const executionSteps = steps.map(step => ({
-      id: step.id,
+    // What gets persisted is the ORDER and nothing else: which node, and where
+    // in the run it sits. Everything this list draws comes from the node, so
+    // there is nothing else worth writing down.
+    const executionSteps = steps.map((step, index) => ({
       nodeId: step.nodeId,
-      nodeType: step.nodeType,
-      nodeLabel: step.nodeLabel,
-      customName: step.customName,
-      description: step.description,
-      order: step.order,
-      config: step.config
+      order: index,
     }));
 
     // Resolve the outputValidation to persist. Passing null means "no change" —
@@ -457,7 +404,7 @@ const WorkflowStepsEditor = ({
     onClose();
   };
 
-  const draggedStep = activeId ? steps.find(step => step.id === activeId) : null;
+  const draggedStep = activeId ? steps.find(step => step.nodeId === activeId) : null;
 
   return (
     <Modal
@@ -465,8 +412,8 @@ const WorkflowStepsEditor = ({
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <SettingOutlined />
           <span>Edit Execution Steps</span>
-          {workflow?.name && (
-            <Text type="secondary">- {workflow.name}</Text>
+          {workflowName && (
+            <Text type="secondary">- {workflowName}</Text>
           )}
         </div>
       }
@@ -503,14 +450,14 @@ const WorkflowStepsEditor = ({
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
           >
-            <SortableContext 
-              items={steps.map(step => step.id)}
+            <SortableContext
+              items={steps.map(step => step.nodeId)}
               strategy={verticalListSortingStrategy}
             >
               {steps.map((step, index) => (
-                <DraggableStepItem 
-                  key={step.id} 
-                  step={step} 
+                <DraggableStepItem
+                  key={step.nodeId}
+                  step={step}
                   index={index}
                 />
               ))}
@@ -518,9 +465,9 @@ const WorkflowStepsEditor = ({
 
             <DragOverlay>
               {draggedStep && (
-                <DraggableStepItem 
-                  step={draggedStep} 
-                  index={steps.findIndex(s => s.id === draggedStep.id)}
+                <DraggableStepItem
+                  step={draggedStep}
+                  index={steps.findIndex(s => s.nodeId === draggedStep.nodeId)}
                 />
               )}
             </DragOverlay>
@@ -556,11 +503,11 @@ const WorkflowStepsEditor = ({
                   icon={<SafetyCertificateOutlined />}
                   loading={generatingValidation}
                   onClick={handleGenerateValidation}
-                  disabled={!workflow?.id}
+                  disabled={!workflowId}
                 >
                   {outputValidation?.validationFunction ? 'Regenerate validation' : 'Generate validation'}
                 </Button>
-                {!workflow?.id && (
+                {!workflowId && (
                   <Text type="secondary" style={{ fontSize: 12 }}>
                     Save the workflow first to generate a validation function.
                   </Text>

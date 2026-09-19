@@ -46,6 +46,7 @@ const FilterBar = ({ filters, setFilters, workflows, users }) => {
     <div style={{
       background: '#fff', border: `1px solid ${C.border}`, borderRadius: 6,
       padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 10,
+      flexShrink: 0,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <div style={{ position: 'relative', flex: 1 }}>
@@ -199,6 +200,82 @@ const ExecutionRow = ({ ex, onSelect, selectedId }) => {
   );
 };
 
+// ── One log line ────────────────────────────────────────────────────
+//
+// A line is the message, plus whatever structured `detail` the execution
+// tracer attached to it (see NodeExecution/executionLog.js). `sql` gets its own
+// block because it is the thing you came here to read — a statement folded into
+// the message line is unreadable the moment it wraps — and the rest is rendered
+// as a compact meta row so a slow connector call shows its duration without
+// anyone having to expand anything further.
+//
+// Everything is optional: entries written before this existed, and the plain
+// orchestrator lines, carry no `detail` at all and render exactly as they did.
+const LOG_COLORS = {
+  error: { level: '#f87171', text: '#fca5a5' },
+  warn:  { level: '#fbbf24', text: '#fde68a' },
+  // Output validation writes 'warning' where the executor writes 'warn'. The
+  // monitor already treats them alike (logColor there); this view did not, so a
+  // failed validation rendered in the same grey as an ordinary info line.
+  warning: { level: '#fbbf24', text: '#fde68a' },
+  info:  { level: '#64748b', text: '#e2e8f0' },
+};
+
+// Rendered in this order, and only these — `detail` also carries routing fields
+// that would be noise on every line. The third entry is the label to print when
+// the key itself would not read as one: `rowRange` is a span of RECORDS, and
+// "rowRange=50,001–100,000" next to "rows=50000 rows" reads like two counts.
+const META_FIELDS = [
+  ['connector', ''], ['skillId', ''], ['phase', ''], ['table', ''],
+  ['rowCount', ' rows'], ['rows', ' rows'], ['rowRange', '', 'records'],
+  ['durationMs', 'ms'],
+];
+
+// Values that are their own label — a connector name, a phase — print bare.
+const UNLABELLED_META = new Set(['connector', 'skillId', 'phase']);
+
+const LogLine = ({ l }) => {
+  const c = LOG_COLORS[l.level] || LOG_COLORS.info;
+  const d = l.detail || null;
+  const meta = d
+    ? META_FIELDS
+        .filter(([k]) => d[k] != null && d[k] !== '')
+        .map(([k, suffix, label]) => `${UNLABELLED_META.has(k) ? '' : `${label || k}=`}${d[k]}${suffix}`)
+    : [];
+
+  return (
+    <div style={{ marginBottom: d ? 6 : 0 }}>
+      <div style={{ display: 'flex', gap: 10, whiteSpace: 'nowrap' }}>
+        <span style={{ color: '#475569', flexShrink: 0 }}>
+          [{l.timestamp ? moment(l.timestamp).format('HH:mm:ss') : (l.t || '')}]
+        </span>
+        <span style={{ color: c.level, flexShrink: 0, minWidth: 32 }}>
+          {(l.level || 'info').toUpperCase()}
+        </span>
+        <span style={{ color: c.text, whiteSpace: 'pre-wrap' }}>{l.message || l.msg}</span>
+      </div>
+      {meta.length > 0 && (
+        <div style={{ marginLeft: 92, color: '#64748b', fontSize: 10.5 }}>
+          {meta.join('  ·  ')}
+        </div>
+      )}
+      {d?.sql && (
+        <pre style={{
+          margin: '4px 0 0 92px', padding: '6px 8px', background: '#1e293b',
+          border: '1px solid #334155', borderRadius: 4, color: '#cbd5e1',
+          fontFamily: MONO, fontSize: 10.5, lineHeight: 1.5,
+          whiteSpace: 'pre', overflowX: 'auto', maxHeight: 220,
+        }}>{d.sql}</pre>
+      )}
+      {d?.error && !d.sql && (
+        <div style={{ marginLeft: 92, color: '#fca5a5', fontSize: 10.5, whiteSpace: 'pre-wrap' }}>
+          {d.error}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Node Row (collapsible logs per node) ────────────────────────────
 const NodeRow = ({ n, index, logs }) => {
   const [expanded, setExpanded] = useState(false);
@@ -254,21 +331,7 @@ const NodeRow = ({ n, index, logs }) => {
           background: '#0f172a', padding: '10px 14px', fontFamily: MONO, fontSize: 11,
           lineHeight: 1.7, overflowX: 'auto', borderTop: `1px solid ${C.border}`,
         }}>
-          {logs.map((l, i) => (
-            <div key={i} style={{ display: 'flex', gap: 10, whiteSpace: 'nowrap' }}>
-              <span style={{ color: '#475569', flexShrink: 0 }}>
-                [{l.timestamp ? moment(l.timestamp).format('HH:mm:ss') : (l.t || '')}]
-              </span>
-              <span style={{
-                color: l.level === 'error' ? '#f87171' : l.level === 'warn' ? '#fbbf24' : '#64748b',
-                flexShrink: 0, minWidth: 32,
-              }}>{(l.level || 'info').toUpperCase()}</span>
-              <span style={{
-                color: l.level === 'error' ? '#fca5a5' : l.level === 'warn' ? '#fde68a' : '#e2e8f0',
-                whiteSpace: 'pre-wrap',
-              }}>{l.message || l.msg}</span>
-            </div>
-          ))}
+          {logs.map((l, i) => <LogLine key={i} l={l} />)}
         </div>
       )}
     </div>
@@ -474,21 +537,7 @@ const DetailPanel = ({ ex, onClose }) => {
                 background: '#0f172a', padding: '10px 14px', fontFamily: MONO, fontSize: 11,
                 lineHeight: 1.7, overflowX: 'auto', borderRadius: 5,
               }}>
-                {logsByNode.get('__global__').map((l, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 10, whiteSpace: 'nowrap' }}>
-                    <span style={{ color: '#475569', flexShrink: 0 }}>
-                      [{l.timestamp ? moment(l.timestamp).format('HH:mm:ss') : (l.t || '')}]
-                    </span>
-                    <span style={{
-                      color: l.level === 'error' ? '#f87171' : l.level === 'warn' ? '#fbbf24' : '#64748b',
-                      flexShrink: 0, minWidth: 32,
-                    }}>{(l.level || 'info').toUpperCase()}</span>
-                    <span style={{
-                      color: l.level === 'error' ? '#fca5a5' : l.level === 'warn' ? '#fde68a' : '#e2e8f0',
-                      whiteSpace: 'pre-wrap',
-                    }}>{l.message || l.msg}</span>
-                  </div>
-                ))}
+                {logsByNode.get('__global__').map((l, i) => <LogLine key={i} l={l} />)}
               </div>
             </div>
           )}
@@ -568,7 +617,7 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
             ...prev, page, total: result.total, hasMore: result.hasMore,
           }));
         } catch (localError) {
-          console.error('Error fetching from local NeDB:', localError);
+          console.error('Error fetching from the local store:', localError);
           message.error('Failed to load executions');
           setExecutions([]);
         }
@@ -648,7 +697,7 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
           if (execution) { setSelectedExecution(execution); reportSelected(execution); }
           else message.error('Execution not found');
         } catch (localError) {
-          console.error('Error fetching execution from local NeDB:', localError);
+          console.error('Error fetching execution from the local store:', localError);
           message.error('Failed to load execution details');
         }
       } else {
@@ -742,8 +791,10 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
           <Btn key="r" icon="reload" onClick={handleRefresh} disabled={loading}>Refresh</Btn>,
         ]}
       />
+      {/* Column flex scroller: children need flexShrink: 0 or they compress to
+          fit instead of overflowing, and nothing scrolls. */}
       <div style={{ flex: 1, overflow: 'auto', padding: 24, display: 'flex', flexDirection: 'column', gap: 16 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12, flexShrink: 0 }}>
           <StatCard label="Total Executions" value={String(computedStats.total)} sub="all time" />
           <StatCard label="Completed" value={String(computedStats.completed)}
             sub={computedStats.successRate != null ? `${computedStats.successRate.toFixed(1)}% success` : undefined}
@@ -757,7 +808,7 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
         <FilterBar filters={filters} setFilters={setFilters}
           workflows={workflowOptions} users={userOptions} />
 
-        <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden' }}>
+        <div style={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden', flexShrink: 0 }}>
           <div style={{
             display: 'grid', gridTemplateColumns: '1fr 120px 130px 90px 100px 110px 90px',
             gap: 12, padding: '9px 16px', background: C.surface, borderBottom: `1px solid ${C.border}`,
@@ -790,7 +841,7 @@ const ExecutionTab = ({ onContextChange = () => {} }) => {
         </div>
 
         {filtered.length > 0 && (
-          <div style={{ fontSize: 11, color: C.dim, fontFamily: MONO, textAlign: 'right' }}>
+          <div style={{ fontSize: 11, color: C.dim, fontFamily: MONO, textAlign: 'right', flexShrink: 0 }}>
             {filtered.length} of {executions.length} executions
           </div>
         )}

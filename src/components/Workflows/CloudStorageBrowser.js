@@ -72,21 +72,29 @@ const CloudStorageBrowser = ({
   // Determine default output format based on source database type
   const getDefaultFormat = () => {
     if (!sourceDbType) return 'csv';
-    const noSqlTypes = ['mongodb', 'nedb'];
+    const noSqlTypes = ['mongodb'];
     return noSqlTypes.includes(sourceDbType.toLowerCase()) ? 'json' : 'csv';
   };
 
   const [outputFormat, setOutputFormat] = useState(getDefaultFormat());
 
+  // Stores addressed by ID rather than by name. S3 / Azure Blob / GCS name a
+  // bucket and walk it by path; these three hand out opaque ids and have no
+  // path syntax at all — Google Drive included, whose containers list as
+  // { name: 'My Drive', id: 'root' }. Recording the NAME is what sent
+  // "My Drive" to the API as a folder id and came back `File not found`.
+  const ID_ADDRESSED = ['onedrive', 'sharepoint', 'google-drive', 'google-sheets'];
+  const isIdAddressed = () => ID_ADDRESSED.includes(connection.dbType);
+
+  // Google Sheets browses as spreadsheet (container) → tab (object). A tab is
+  // not a file: it has no format and no extension, and the output side names
+  // one to write into rather than inventing a filename.
+  const isSheets = connection?.dbType === 'google-sheets';
+
   // Helper function to get the correct container identifier based on dbType
-  const getContainerIdentifier = (container) => {
-    // OneDrive and SharePoint require ID first (drive ID/site ID)
-    // Other cloud storage (S3, Azure Blob, GCS) use name first
-    if (connection.dbType === 'onedrive' || connection.dbType === 'sharepoint') {
-      return container.id || container.name;
-    }
-    return container.name || container.id;
-  };
+  const getContainerIdentifier = (container) => (
+    isIdAddressed() ? (container.id || container.name) : (container.name || container.id)
+  );
 
   // Helper function to get the correct folder path/ID based on dbType
   const getFolderPrefix = (pathArray) => {
@@ -94,8 +102,8 @@ const CloudStorageBrowser = ({
       return '';
     }
 
-    // OneDrive and SharePoint use item IDs for folder navigation
-    if (connection.dbType === 'onedrive' || connection.dbType === 'sharepoint') {
+    // OneDrive, SharePoint and Google Drive use item IDs for folder navigation
+    if (isIdAddressed()) {
       // Return the ID of the last folder in the path
       const lastFolder = pathArray[pathArray.length - 1];
       return lastFolder.id || lastFolder.objectKey || '';
@@ -250,8 +258,13 @@ const CloudStorageBrowser = ({
       if (checkFileType(object)) {
         setSelectedFile(object);
       }
+    } else if (isSheets) {
+      // Output mode: clicking a tab targets it, which is how an EXISTING tab is
+      // chosen. Typing a name that is not in the list creates that tab instead.
+      setOutputFileName(object.objectKey || object.name);
     }
-    // In output mode, clicking files does nothing - user navigates to folders and enters filename
+    // For other stores in output mode, clicking files does nothing — the user
+    // navigates to a folder and types a filename.
   };
 
   const handleBreadcrumbClick = (index) => {
@@ -281,7 +294,7 @@ const CloudStorageBrowser = ({
 
   const isSupportedFileType = (fileName) => {
     const name = fileName.toLowerCase();
-    const supportedTypes = ['.csv', '.xlsx', '.xls', '.json', '.sqlite', '.db', '.parquet', '.avro', '.nedb'];
+    const supportedTypes = ['.csv', '.xlsx', '.xls', '.json', '.sqlite', '.db', '.parquet', '.avro'];
     return supportedTypes.some(ext => name.endsWith(ext));
   };
 
@@ -289,7 +302,7 @@ const CloudStorageBrowser = ({
     const isSupported = isSupportedFileType(file.name);
 
     if (!isSupported) {
-      message.warning('This file type is not supported. Please select CSV, Excel, JSON, SQLite, Parquet, Avro, or NeDB files.');
+      message.warning('This file type is not supported. Please select CSV, Excel, JSON, SQLite, Parquet, or Avro files.');
       setSelectedFile(null); // Don't allow selection of unsupported files
       return false;
     }
@@ -301,7 +314,7 @@ const CloudStorageBrowser = ({
     if (name.endsWith('.csv')) return <FileTextOutlined style={{ fontSize: 24, color: '#52c41a' }} />;
     if (name.endsWith('.xlsx') || name.endsWith('.xls')) return <FileExcelOutlined style={{ fontSize: 24, color: '#1890ff' }} />;
     if (name.endsWith('.json')) return <FileTextOutlined style={{ fontSize: 24, color: '#fa8c16' }} />;
-    if (name.endsWith('.sqlite') || name.endsWith('.db') || name.endsWith('.nedb')) return <DatabaseOutlined style={{ fontSize: 24, color: '#722ed1' }} />;
+    if (name.endsWith('.sqlite') || name.endsWith('.db')) return <DatabaseOutlined style={{ fontSize: 24, color: '#722ed1' }} />;
     if (name.endsWith('.parquet')) return <DatabaseOutlined style={{ fontSize: 24, color: '#eb2f96' }} />;
     if (name.endsWith('.avro')) return <DatabaseOutlined style={{ fontSize: 24, color: '#13c2c2' }} />;
     if (name.endsWith('.pdf')) return <FilePdfOutlined style={{ fontSize: 24, color: '#f5222d' }} />;
@@ -315,7 +328,6 @@ const CloudStorageBrowser = ({
     if (name.endsWith('.xlsx') || name.endsWith('.xls')) return <Tag color="blue">Excel</Tag>;
     if (name.endsWith('.json')) return <Tag color="orange">JSON</Tag>;
     if (name.endsWith('.sqlite') || name.endsWith('.db')) return <Tag color="purple">SQLite</Tag>;
-    if (name.endsWith('.nedb')) return <Tag color="purple">NeDB</Tag>;
     if (name.endsWith('.parquet')) return <Tag color="magenta">Parquet</Tag>;
     if (name.endsWith('.avro')) return <Tag color="cyan">Avro</Tag>;
     return <Tag color="default">File</Tag>;
@@ -389,13 +401,13 @@ const CloudStorageBrowser = ({
    */
   const saveFileLocally = async (fileData, fileName) => {
     try {
-      if (!window.electronAPI?.saveFileDialog || !window.electronAPI?.cloudStorage?.saveAndRegister) {
+      if (!window.electronAPI?.selectSavePath || !window.electronAPI?.cloudStorage?.saveAndRegister) {
         message.error('Saving cloud files is not available');
         return;
       }
 
       const extension = fileName.includes('.') ? fileName.split('.').pop().toLowerCase() : '';
-      const chosen = await window.electronAPI.saveFileDialog(fileName, extension);
+      const chosen = await window.electronAPI.selectSavePath(fileName, extension);
       if (chosen.canceled || !chosen.filePath) return;
 
       setProcessingFile(true);
@@ -457,7 +469,6 @@ const CloudStorageBrowser = ({
     if (name.endsWith('.csv') || name.endsWith('.xlsx') || name.endsWith('.xls')) return 'spreadsheet';
     if (name.endsWith('.json')) return 'json';
     if (name.endsWith('.sqlite') || name.endsWith('.db')) return 'sqlite';
-    if (name.endsWith('.nedb')) return 'nedb';
     if (name.endsWith('.parquet')) return 'parquet';
     if (name.endsWith('.avro')) return 'avro';
     return null;
@@ -474,17 +485,26 @@ const CloudStorageBrowser = ({
       return;
     }
 
-    // Automatically append the extension based on selected format
+    // Automatically append the extension based on selected format. A Sheets
+    // tab takes the name as typed — "Results.csv" would become a tab called
+    // exactly that.
     const extension = `.${outputFormat}`;
-    const fileNameWithExtension = outputFileName.endsWith(extension)
-      ? outputFileName
-      : `${outputFileName}${extension}`;
+    const fileNameWithExtension = isSheets
+      ? outputFileName.trim()
+      : (outputFileName.endsWith(extension) ? outputFileName : `${outputFileName}${extension}`);
     console.log('currentContainer: ', currentContainer)
-    // Build the full path
-    const folderPath = currentPath.map(p => p.name).join('/');
+    // Build the full path.
+    //
+    // OneDrive/SharePoint upload to `<driveId>:/folder/file.ext`, so the folders
+    // travel in the object path by NAME. Google Drive has no such syntax — a
+    // file is created under a parent id — so the folder the user browsed to
+    // becomes the container and the object is just the file.
+    const drivesByFolderId = connection.dbType === 'google-drive';
+    const folderPath = drivesByFolderId ? '' : currentPath.map(p => p.name).join('/');
     const objectPath = folderPath ? `${folderPath}/${fileNameWithExtension}` : fileNameWithExtension;
     // Use getContainerIdentifier to get the correct identifier based on dbType
-    const containerName = getContainerIdentifier(currentContainer);
+    const containerName = (drivesByFolderId && getFolderPrefix(currentPath))
+      || getContainerIdentifier(currentContainer);
 
     onFileSelect({
       containerName,
@@ -864,15 +884,20 @@ const CloudStorageBrowser = ({
 
                   <Divider style={{ margin: '8px 0' }} />
 
-                  <div>
-                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>Folder Path</Text>
-                    <Text style={{ fontSize: 14 }}>
-                      {currentPath.length > 0 ? currentPath.map(p => p.name).join(' / ') : '/ (root)'}
-                    </Text>
-                  </div>
+                  {!isSheets && (
+                    <>
+                      <div>
+                        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>Folder Path</Text>
+                        <Text style={{ fontSize: 14 }}>
+                          {currentPath.length > 0 ? currentPath.map(p => p.name).join(' / ') : '/ (root)'}
+                        </Text>
+                      </div>
 
-                  <Divider style={{ margin: '8px 0' }} />
+                      <Divider style={{ margin: '8px 0' }} />
+                    </>
+                  )}
 
+                  {!isSheets && (
                   <div>
                     <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>Output Format *</Text>
                     <Select
@@ -884,43 +909,56 @@ const CloudStorageBrowser = ({
                       <Option value="json">
                         <Space>
                           <Tag color="orange">JSON</Tag>
-                          <Text>JSON Format {sourceDbType && ['mongodb', 'nedb'].includes(sourceDbType.toLowerCase()) && '(Recommended for NoSQL)'}</Text>
+                          <Text>JSON Format {sourceDbType && sourceDbType.toLowerCase() === 'mongodb' && '(Recommended for NoSQL)'}</Text>
                         </Space>
                       </Option>
                       <Option value="csv">
                         <Space>
                           <Tag color="success">CSV</Tag>
-                          <Text>CSV Format {sourceDbType && !['mongodb', 'nedb'].includes(sourceDbType.toLowerCase()) && '(Recommended for SQL)'}</Text>
+                          <Text>CSV Format {sourceDbType && sourceDbType.toLowerCase() !== 'mongodb' && '(Recommended for SQL)'}</Text>
                         </Space>
                       </Option>
                     </Select>
                   </div>
+                  )}
 
-                  <Divider style={{ margin: '8px 0' }} />
+                  {!isSheets && <Divider style={{ margin: '8px 0' }} />}
 
                   <div>
-                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>Output Filename *</Text>
+                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+                      {isSheets ? 'Sheet tab *' : 'Output Filename *'}
+                    </Text>
                     <Input
-                      placeholder="output (extension will be added automatically)"
+                      placeholder={isSheets
+                        ? 'Tab name (click one above, or type a new one)'
+                        : 'output (extension will be added automatically)'}
                       value={outputFileName}
                       onChange={(e) => setOutputFileName(e.target.value)}
                       onPressEnter={handleSelectOutputPath}
                       size="large"
-                      suffix={
-                        outputFormat === 'json' ? <Tag color="orange">.json</Tag> : <Tag color="success">.csv</Tag>
-                      }
+                      suffix={isSheets
+                        ? null
+                        : (outputFormat === 'json' ? <Tag color="orange">.json</Tag> : <Tag color="success">.csv</Tag>)}
                     />
                     <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
-                      Extension (.{outputFormat}) will be added automatically
+                      {isSheets
+                        ? 'Rows are appended when the tab already has a header row; a tab that does not exist is created.'
+                        : `Extension (.${outputFormat}) will be added automatically`}
                     </Text>
                   </div>
 
                   <Divider style={{ margin: '8px 0' }} />
 
                   <div>
-                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>Full Path Preview</Text>
+                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
+                      {isSheets ? 'Writes to' : 'Full Path Preview'}
+                    </Text>
                     <Text code style={{ fontSize: 12, display: 'block', wordBreak: 'break-all', padding: '8px', background: '#f5f5f5', borderRadius: 4 }}>
                       {(() => {
+                        if (isSheets) {
+                          const container = currentContainer.name || currentContainer.id;
+                          return `${container} → ${outputFileName.trim() || 'tab name'}`;
+                        }
                         const extension = `.${outputFormat}`;
                         const fileNameWithExt = outputFileName ? (outputFileName.endsWith(extension) ? outputFileName : `${outputFileName}${extension}`) : `filename${extension}`;
                         return currentPath.length > 0
@@ -944,7 +982,9 @@ const CloudStorageBrowser = ({
               </Button>
 
               <Text type="secondary" style={{ display: 'block', textAlign: 'center', marginTop: 12, fontSize: 12 }}>
-                Navigate to folders above and enter a filename
+                {isSheets
+                  ? 'Pick an existing tab above, or type a name to create one'
+                  : 'Navigate to folders above and enter a filename'}
               </Text>
             </div>
           )}
