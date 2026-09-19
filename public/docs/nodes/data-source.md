@@ -17,7 +17,7 @@ the node behaves:
   tables are read directly from the file. For Pinecone, you can
   enumerate indexes / namespaces from the picker.
 - **Local file connection** — the node references a file you've
-  added as local files (CSV, Excel, Parquet, Avro, JSON, SQLite, NeDB,
+  added as local files (CSV, Excel, Parquet, Avro, JSON, DuckDB, SQLite,
   LanceDB). At execution time the file is re-imported into the local
   workspace so downstream nodes see fresh data.
 - **Cloud storage connection** — the node references a specific object

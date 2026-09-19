@@ -30,11 +30,12 @@ supports eight formats:
 - **JSON** — plain JSON array.
 - **CSV** — comma-separated values.
 - **Excel** — single-sheet workbook.
-- **NeDB** — local document database file you can re-open later as a
-  source.
-- **SQLite** — Ternlux infers the right column types per dialect from
-  a sample of the data, drops any pre-existing table named the same
-  in the file, creates the table, and inserts the rows in a single
+- **DuckDB** — local database file. You name the table it writes; an
+  existing file keeps its other tables and only that one is replaced,
+  so several output nodes can build up one file.
+- **SQLite** — same table-per-node rule as DuckDB. Ternlux infers the
+  right column types from a sample of the data, drops any pre-existing
+  table of that name, creates it, and inserts the rows in a single
   transaction.
 - **Parquet** — columnar format with a schema inferred from the data.
 - **Avro** — record format with a schema inferred from the data.

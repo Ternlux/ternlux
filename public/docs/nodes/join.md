@@ -11,13 +11,43 @@ Before generating the join, the assistant insists on:
 - **The exact column relationships between every pair of tables.**
   Even if two columns are obviously named the same, the assistant
   asks for confirmation.
-- **The join type for every pair** — inner, left, or full outer.
+- **The join type for every pair** — inner, left, right, or full outer.
 - **The columns to keep** in the final result.
+- **A target table or collection name**, always — a join creates the
+  table it writes.
 
-For new-table mode, the assistant also requires a target table or
-collection name. The assistant asks one question at a time, building
-on what you've already said. It only proceeds to generate when it's
-one hundred percent certain from your explicit statements.
+The assistant asks one question at a time, building on what you've
+already said. It only proceeds to generate when it's one hundred
+percent certain from your explicit statements.
+
+## A join always replaces its target
+
+Every destination route rebuilds the target from this run's rows:
+a SQL destination drops it, runs the generated `CREATE TABLE`, then
+inserts; local DuckDB does `CREATE OR REPLACE TABLE AS`; a document
+store drops the collection first.
+
+So a join has **no write mode**. It cannot append to, merge into, or
+preserve what its target already held, and "new table" is the only
+operation mode — the executor only creates a destination in that mode,
+so any other mode yields a join that cannot make the table it inserts
+into.
+
+**To add rows to a table that must keep what earlier runs put there**,
+the join writes a staging table and an Output node appends from it:
+
+    sources → join → staging table → output (append) → real destination
+
+Put the staging table on the **destination's own connection** (not
+local DuckDB) unless you want the work done locally: a source that
+already lives on that connection is then read in place instead of
+being pulled across the network and pushed back. The Output node is
+the only node type with a write mode.
+
+Appending only rows that aren't already there is a separate problem —
+an append matches no keys. Read the destination table as its own data
+source, feed it into the join, and anti-join against it (LEFT join on
+the identity column, keep the rows with no match).
 
 ## Picking the destination
 
@@ -33,18 +63,6 @@ you never see the same connection twice. One local option is always
 offered alongside your saved connections: **Local file**, which writes
 the joined rows to a table in the workflow's own DuckDB database.
 
-The mode options shown depend on the destination type:
-
-- **Relational destination** — both "new table" and "merge into
-  existing table" are available. For "merge into existing", the chat
-  loads the list of existing tables in that destination so you can
-  pick one (or type a custom name when nothing matches).
-- **Document destination (MongoDB)** — only "new table" is
-  available. Document stores don't support upsert semantics for
-  arbitrary documents, so Ternlux always creates a fresh collection.
-- **Vector destination** — always "new table" (the upsert into the
-  index is what the vector skill does for you).
-
 ## Destination types
 
 The flow of a join depends entirely on what kind of destination you
@@ -52,25 +70,28 @@ chose:
 
 ### Relational destination
 
-Ternlux makes the destination database the venue of the join. For
-each source that lives outside the destination database, Ternlux
-creates a temporary table inside the destination, loads the source's
-rows into it (in batches, with chunked inserts), and then runs the
-AI-generated join SQL against the temp tables and any tables already
-living in the destination. After the join completes, the temp tables
-are dropped.
+Ternlux makes the destination database the venue of the join. A source
+that already lives on the destination connection is read **in place** —
+no copy, no staging. For every source that doesn't, Ternlux creates a
+temporary table inside the destination, loads that source's rows into
+it (in batches, with chunked inserts), and then runs the AI-generated
+join SQL against the temp tables and the tables already living there.
+The temp tables are dropped when the join finishes.
 
-Temp table names are generated to be unique per node and per source
-position so two joins running concurrently never collide.
+Each temp table is named after its source NODE, lower-cased, and is
+written into the DDL and the join SQL already quoted for the
+destination's dialect — so the table the `CREATE` makes and the table
+the load writes to are the same object on every engine.
 
 ### Local file destination
 
-The workflow's own DuckDB database is the venue. It reads each source
-directly — Parquet, CSV or JSON files in place, upstream node tables in
-the same database, rows pulled across from remote connections — runs
-the generated join SQL over them, and writes the result as this node's
-table. No temporary tables are created, and nothing is staged in a
-database shared with other workflows.
+The workflow's own DuckDB database is the venue. Local files are read
+where they lie — Parquet, CSV or JSON in place — and an upstream node's
+output is already a table in that database. Only genuinely remote
+sources are pulled across, and those are staged as tables in the same
+database. The generated join SQL runs over all of them, its result
+becomes this node's table, and the staging tables and views are dropped
+afterwards whether the join succeeded or not.
 
 ### Document destination
 
@@ -112,35 +133,40 @@ distinct intents:
   output is then routed to the destination using the appropriate
   destination flow above.
 
-The vector skill is hidden from the explicit "use a skill" picker
-for joins because the skill's join behaviour is invoked automatically
-by the join engine when needed — there's no need to choose it
-manually.
+The vector skill is excluded from the skill list the join builder can
+route through: the join engine invokes that behaviour itself when the
+request needs it, so there is nothing to pick.
 
 ## Limit and offset handling
 
-For relational destinations, the SQL fetched from each external SQL
-source is automatically wrapped with the destination database's
-preferred pagination syntax (LIMIT/OFFSET, TOP, FETCH, etc.) so
-large sources can be loaded in chunks without rewriting the query
-for each dialect.
+Each external SQL source is read in chunks. The generated read carries
+a `{LIMIT_OFFSET_HERE}` marker that the executor fills with the
+pagination the SOURCE engine speaks — `OFFSET … FETCH NEXT` for SQL
+Server, `LIMIT … OFFSET` elsewhere — so a large source loads a page at
+a time without the query being rewritten per dialect. Local DuckDB
+sources are streamed instead of paged, which is linear rather than
+quadratic over a big table.
 
-## Execution plan and confirmation
+## When a source moves out from under the join
 
-Before running, the chat shows you the full plan: which sources will
-be loaded into temp tables, what the join SQL or function looks like,
-and what gets inserted at the end. You confirm before anything is
-written.
+A join step records the connection, the table, the read SQL, the temp
+table and its DDL — all generated together, for one specific source.
+If that source node is later rebuilt onto a **different table or
+connection**, Ternlux re-points the step at the new object but leaves
+its SQL and DDL alone, because those describe the old one.
 
-## Error recovery
+The node is then marked and **the join refuses to run**, naming what
+moved. Only rebuilding the join clears it: nothing else regenerates
+the statements, and a run allowed through would read the wrong table
+where the names happen to line up, or write a `CREATE TABLE` shaped
+for columns that no longer exist.
 
-If a join fails at execution time, the chat surfaces an "Ask AI to
-fix the error" affordance so you can describe the fix in plain
-language and let the assistant regenerate the relevant piece —
-without losing the context of what you've already configured.
+A source whose **columns** changed but whose table is the same is
+refreshed silently — the step still reads what it names.
 
 ## Persistence across reopens
 
-The chat saves the full join configuration (destination, mode,
-target name, per-source temp table names, join SQL, JS function) so
-reopening the node restores everything you've decided.
+The chat saves the full join configuration — destination, target name,
+per-source temp table names, join SQL, JS function — and the
+conversation that produced it, so reopening the node restores
+everything you've decided.
