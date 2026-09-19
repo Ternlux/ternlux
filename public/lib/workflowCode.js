@@ -202,11 +202,21 @@ function externalizeConfig(config, nodeDir, workflowDir, baseDir) {
   return out || config;
 }
 
-// Externalize code across a workflow doc's nodes[] and executionSteps[]. The
-// directory is named after the workflow name (falling back to its id) and each
-// node after a unique, non-default label (falling back to its id). Never mutates
-// the input; returns a copy with sentinels in place. `workflowName` overrides
-// doc.name (needed on the update path where the name lives outside the doc).
+// Externalize code across a workflow doc's nodes[]. The directory is named
+// after the workflow name (falling back to its id) and each node after a
+// unique, non-default label (falling back to its id). Never mutates the input;
+// returns a copy with sentinels in place. `workflowName` overrides doc.name
+// (needed on the update path where the name lives outside the doc).
+//
+// executionSteps hold no code: a step is `{ nodeId, order }`. They used to carry
+// a snapshot of their node's config, with the same field names as the live node,
+// and externalizing both against one node directory made them fight over a
+// single file — `<wfDir>/<nodeDir>/sourcePreviewSql.sql` written by the node and
+// then OVERWRITTEN by the step, whose older code the next load inlined back onto
+// the node. (That is how a data source repointed from DuckDB to BigQuery kept
+// answering with `SELECT * FROM "wf_output_output_1"."earliest_transactions"`.)
+// With no config on a step there is nothing to externalize; inlining still reads
+// whatever path a sentinel names, so old documents keep resolving.
 function externalizeWorkflowCode(doc, workflowId, baseDir, workflowName) {
   if (!doc || typeof doc !== 'object' || !workflowId) return doc;
   const out = { ...doc };
@@ -223,44 +233,26 @@ function externalizeWorkflowCode(doc, workflowId, baseDir, workflowName) {
       return { ...node, data: { ...node.data, config: newCfg } };
     });
   }
-  if (Array.isArray(out.executionSteps)) {
-    out.executionSteps = out.executionSteps.map((step) => {
-      const nodeId = step && step.nodeId;
-      if (!nodeId || !step.config) return step;
-      const nodeDir = nodeDirs.get(nodeId) || String(nodeId);
-      const newCfg = externalizeConfig(step.config, nodeDir, wfDir, baseDir);
-      if (newCfg === step.config) return step;
-      return { ...step, config: newCfg };
-    });
-  }
   return out;
 }
 
-// Externalize code inside a NeDB update modifier. Only handles whole-array
-// replacements of nodes / executionSteps under $set (the only shape the app
-// uses). `workflowName` is the workflow's current name (the caller resolves it,
+// Externalize code inside a NeDB update modifier. Only handles a whole-array
+// replacement of nodes under $set (the only shape the app uses that carries
+// code). `workflowName` is the workflow's current name (the caller resolves it,
 // since modify updates may not carry it). Returns a copy of `update` with code
 // externalized, or `update` as-is.
 function externalizeUpdateCode(query, update, baseDir, workflowName) {
   if (!update || typeof update !== 'object') return update;
   const set = update.$set;
-  if (!set || (!Array.isArray(set.nodes) && !Array.isArray(set.executionSteps))) return update;
+  if (!set || !Array.isArray(set.nodes)) return update;
   const workflowId = extractWorkflowId(query);
   if (!workflowId) {
     console.warn('[workflowCode] update with no resolvable workflowId; code left inline');
     return update;
   }
   const name = set.name !== undefined ? set.name : workflowName;
-  const pseudo = externalizeWorkflowCode(
-    { nodes: set.nodes, executionSteps: set.executionSteps },
-    workflowId,
-    baseDir,
-    name,
-  );
-  const newSet = { ...set };
-  if (Array.isArray(set.nodes)) newSet.nodes = pseudo.nodes;
-  if (Array.isArray(set.executionSteps)) newSet.executionSteps = pseudo.executionSteps;
-  return { ...update, $set: newSet };
+  const pseudo = externalizeWorkflowCode({ nodes: set.nodes }, workflowId, baseDir, name);
+  return { ...update, $set: { ...set, nodes: pseudo.nodes } };
 }
 
 // ── Inline (read) ───────────────────────────────────────────────────────────
@@ -328,6 +320,10 @@ function inlineWorkflowCode(doc, baseDir) {
       return { ...node, data: { ...node.data, config: newCfg } };
     });
   }
+  // Steps written before they became `{ nodeId, order }` still carry a config
+  // snapshot full of sentinels. Nothing reads that snapshot any more and the
+  // next save drops it, but a sentinel must never reach a caller as an object
+  // where a string belongs.
   if (Array.isArray(out.executionSteps)) {
     out.executionSteps = out.executionSteps.map((step) => {
       if (!step || !step.config) return step;

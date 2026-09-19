@@ -1,8 +1,10 @@
 const pluginManager = require('../pluginManager');
-const { transformNeDB, saveToLocalNeDB } = require('../transfomers/NeDB');
-const Sqlite = require('../transfomers/Sqlite');
 const DuckDB = require('../transfomers/DuckDB');
-const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, executeLocalSQLiteJoin, executeLocalDuckDBJoin } = require('../joins/joinExecutionHelpers');
+const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, executeLocalDuckDBJoin } = require('../joins/joinExecutionHelpers');
+const localSqlite = require('../lib/sqlite');
+const { batchChunkSizeFor, DEFAULT_BATCH_CHUNK_SIZE } = require('../lib/batchChunkSize');
+const { logStep, traceCall } = require('./executionLog');
+const { isCancelledError } = require('./executionCancel');
 
 const VECTOR_DB_TYPES_SET = new Set(['lancedb', 'pinecone']);
 const isVectorConnection = (conn) =>
@@ -11,16 +13,14 @@ const isVectorConnection = (conn) =>
 // These will be set by the initialize function
 let appSqliteDbPath = null;
 let getFullConfig = null;
-let sqlitePool = null;
 let buildSkillHelpers = null;
 
 /**
  * Initialize the module with required dependencies
  */
-function initialize(sqliteDbPath, configGetter, connectionPool, skillHelpersBuilder = null) {
+function initialize(sqliteDbPath, configGetter, skillHelpersBuilder = null) {
   appSqliteDbPath = sqliteDbPath;
   getFullConfig = configGetter;
-  sqlitePool = connectionPool;
   buildSkillHelpers = skillHelpersBuilder;
 }
 
@@ -77,7 +77,19 @@ async function pullJoinSourceRows(sourceConnection, sourceConfig) {
   const helpers = buildSkillHelpers ? await buildSkillHelpers() : {};
   return await skill.fetchVectorSourceRecords({
     sourceConnection,
-    sourceTableSchema: sourceConfig.sourceTableSchema || { tableName, indexName, namespace },
+    // MERGED, not `sourceConfig.sourceTableSchema || {…}`. The skill reads the
+    // index coordinates off this object (joinHandler: `sourceTableSchema.indexName
+    // || sourceConnection.indexName`), so the `||` meant that any source with a
+    // real schema — i.e. every source in a built workflow — silently discarded
+    // the indexName and namespace resolved just above, and Pinecone failed with
+    // "Index name is required". The fallback only ever fired for a source that
+    // had no schema at all.
+    sourceTableSchema: {
+      ...(sourceConfig.sourceTableSchema || {}),
+      tableName: sourceConfig.sourceTableSchema?.tableName || tableName,
+      indexName,
+      namespace,
+    },
     vectorFetchOperation: sourceConfig.vectorFetchOperation || {},
     pluginManager,
     getFullConfig,
@@ -102,7 +114,7 @@ function buildJoinCtx(helpers) {
     })),
     aiProviders: helpers.aiProviders || [],
     embeddingProviders: helpers.embeddingProviders || [],
-    // Unified data access: pass `dbPath` to hit a local nedb/sqlite/lancedb
+    // Unified data access: pass `dbPath` to hit a local duckdb/sqlite/lancedb
     // file; leave it null for saved connections.
     runQuery:    (connection, query, dbPath = null)             => helpers.runQuery(connection, query, dbPath),
     getTables:   (connection, dbPath = null)                    => helpers.getTables(connection, dbPath),
@@ -133,6 +145,32 @@ function quoteTableIdentifier(dbType, tableName, schema, config) {
   return schema ? `${schema}.${tableName}` : tableName;
 }
 
+/**
+ * Run one statement on a join's DESTINATION and fail if it did not run.
+ *
+ * A connector reports a failed statement by RETURNING { success: false, message }
+ * rather than by throwing — the mysql/postgres/mssql runQuery all catch the
+ * driver error themselves. An unchecked call therefore carries on as though the
+ * statement had worked, and the real error is discarded. Both ways that went
+ * wrong were reported as something else entirely, several steps later:
+ *
+ *   - a failed CREATE TABLE surfaced as "Table 'database.temp_x' doesn't exist"
+ *     from the INSERT after it, hiding the DDL error that actually happened
+ *     (MySQL rejecting a bare VARCHAR, which requires a length);
+ *   - a failed join INSERT…SELECT returned "Join completed successfully.
+ *     0 rows inserted", because rowsAffected simply defaulted to 0.
+ *
+ * The statement's own message is the only thing that names the problem, so it
+ * travels with the failure.
+ */
+async function runDestStatement(plugin, fullConfig, connectionId, query, what) {
+  const result = await plugin.runQuery(fullConfig, connectionId, { query });
+  if (result && result.success === false) {
+    throw new Error(`${what} failed: ${result.message || 'unknown error'}`);
+  }
+  return result;
+}
+
 // SQL transformation handler implementation
 async function handleTransformSQL({
     dbType,
@@ -146,6 +184,13 @@ async function handleTransformSQL({
     targetSchema,
     targetTableName,
     sourceLocalPath = null,
+    // What the source is CALLED. Passed explicitly by the caller, like every
+    // other field here — it used to be dug out of `config`, which is the target
+    // DATABASE config (credentials, dbPath) and has never carried it. That read
+    // silently produced null on every run, and the DuckDB path then fell back to
+    // the target table name and had the node read its own unwritten output.
+    sourceTableName = null,
+    sourceConnectionName = null,
     insertSql = null,
     targetLocalPath = null,
     sourceFormat = null,
@@ -173,6 +218,19 @@ async function handleTransformSQL({
       // The source is read where it lies (a file, or an upstream node's table
       // in the same database). `in_place` runs the model's ALTER/UPDATE/DELETE
       // against the table; anything else replaces it from the SELECT.
+      // Which branch a transform takes is the first thing worth knowing when it
+      // writes to somewhere unexpected — the routing rules below are subtle
+      // (see isSqlSourceToLocal in workflowExecutionHelpers), and until now the
+      // decision existed only as a console.log in the main process.
+      logStep('info', `SQL transform routing: dbType=${dbType}, mode=${operationMode || 'replace'}`, {
+        kind: 'transform',
+        dbType,
+        operationMode: operationMode || null,
+        storageLocation: storageLocation || null,
+        targetTable: targetTableName || null,
+        sourceTable: sourceTableName || null,
+      });
+
       if (dbType === 'duckdb') {
         const params = {
           sourceLocalPath,
@@ -181,29 +239,42 @@ async function handleTransformSQL({
           targetLocalPath,
           // What the source is called when it is another node's output — the
           // name the model's `FROM …` refers to.
-          sourceTableName: config?.sourceTableName || config?.sourceTableSchema?.tableName || null,
+          sourceTableName,
           sourceFormat,
           // The source is ALSO registered under this connection's own schema,
           // so `FROM <connection>.<table>` — the form the Data Explorer's tree
           // displays — resolves at run time as well as the bare name.
-          connectionName: config?.sourceConnectionName || null,
+          connectionName: sourceConnectionName,
           workflowId,
           nodeId,
         };
-        return operationMode === 'in_place'
-          ? DuckDB.inPlaceLocalUpdate(params)
-          : DuckDB.createLocalTable(params);
+        const duckLabel = operationMode === 'in_place'
+          ? 'duckdb.inPlaceLocalUpdate'
+          : 'duckdb.createLocalTable';
+        return traceCall(
+          { kind: 'duckdb', label: duckLabel, sql, detail: { targetTable: targetTableName } },
+          () => (operationMode === 'in_place'
+            ? DuckDB.inPlaceLocalUpdate(params)
+            : DuckDB.createLocalTable(params)),
+        );
       }
 
-      // LOCAL SQL (legacy SQLite imports)
-      if(dbType === 'sqlite'){
-        if (operationMode === 'in_place') {
-          // For SQLite in-place operations, execute DDL (ALTER TABLE) and/or UPDATE/DELETE on the app database
-          return Sqlite.inPlaceLocalUpdate(appSqliteDbPath, ddl, sql, targetTableName, sqlitePool)
-        } else {
-          // For SQLite new table operations, create table and execute INSERT
-          return Sqlite.createLocalTable(appSqliteDbPath, ddl, sql, targetTableName, sqlitePool)
-        }
+      // A transform whose TARGET is SQLite is a node saved before local results
+      // moved to DuckDB: it wrote into the app's shared SQLite database, a store
+      // nothing writes to any more. Rebuilding the node repoints it at DuckDB,
+      // which is a one-step fix — so say that rather than failing later with a
+      // missing table.
+      if (dbType === 'sqlite') {
+        logStep('error', 'Transform target is the retired local SQLite store', {
+          kind: 'transform', targetTable: targetTableName || null,
+        });
+        return {
+          success: false,
+          message:
+            `This transform writes to "${targetTableName || 'a local SQLite table'}" in the app's `
+            + 'shared SQLite database, which is no longer written to — local results are DuckDB now. '
+            + 'Open the node and regenerate it to repoint it at local DuckDB storage.',
+        };
       } else {
         // DATABASE TYPES
         if (operationMode === 'in_place') {
@@ -218,39 +289,88 @@ async function handleTransformSQL({
           }
   
           const plugin = pluginManager.getConnector(dbType);
-          let ddlRowCount = 0;
           let sqlRowCount = 0;
-          let messages = [];
-          // Execute DDL first if it exists (ALTER TABLE operations)
+          const messages = [];
+
+          // The DDL runs first, and whether ITS failure fails the node depends
+          // on whether there is DML behind it.
+          //
+          // DDL ALONE is the whole node. Nothing else was going to happen, so a
+          // failure there is the node's failure and is reported as it stands.
+          //
+          // DDL + DML is the "add a column, then populate it" pair, and there a
+          // failing DDL is routine rather than fatal: the SECOND run of an
+          // ADD COLUMN reports "column already exists" precisely because the
+          // first run worked. Failing the node on that would make every
+          // in-place ALTER a one-shot — MySQL, SQL Server and Redshift have no
+          // `ADD COLUMN IF NOT EXISTS` to write instead, so the statement
+          // cannot be made rerunnable in SQL. So the DML decides the verdict:
+          // it succeeds and the node succeeded, with the DDL's error carried on
+          // the result rather than swallowed; it fails and both errors are
+          // reported together, since the DDL's is usually the one that explains
+          // the DML's ("no such column" behind "could not add column").
+          let ddlError = null;
           if (ddl) {
+            logStep('info', `Running DDL on ${dbType}`, { kind: 'transform', phase: 'ddl', sql: ddl });
             const ddlResult = await plugin.runQuery(fullConfig, connectionId, { query: ddl });
-            if (!ddlResult.success) {
+            if (ddlResult.success) {
+              messages.push('DDL executed successfully');
+              logStep('info', 'DDL executed successfully', { kind: 'transform', phase: 'ddl' });
+            } else if (!sql) {
+              // DDL alone was the whole node, so its failure is the node's.
+              logStep('error', `DDL execution failed: ${ddlResult.message}`, {
+                kind: 'transform', phase: 'ddl', sql: ddl,
+              });
               return {
                 success: false,
                 message: `DDL execution failed: ${ddlResult.message}`
               };
+            } else {
+              ddlError = ddlResult.message;
+              // Not fatal — see the note above on why a failing ADD COLUMN is
+              // routine on a rerun — but it is the thing a user hunting a
+              // missing column needs to see, and until now it reached them only
+              // as a clause tacked onto the node's success message.
+              logStep('warn', `DDL did not apply: ${ddlResult.message}. Continuing — the DML behind it decides this node.`, {
+                kind: 'transform', phase: 'ddl', sql: ddl,
+              });
             }
-            ddlRowCount = ddlResult.rowCount || 0;
-            messages.push(`DDL executed successfully`);
           }
 
           // Execute SQL (UPDATE/DELETE) if it exists
           if (sql) {
+            logStep('info', `Running DML on ${dbType}`, { kind: 'transform', phase: 'dml', sql });
             const sqlResult = await plugin.runQuery(fullConfig, connectionId, { query: sql });
             console.log('sqlResult: ', sqlResult)
             if (!sqlResult.success) {
+              logStep('error', `SQL execution failed: ${sqlResult.message}`, {
+                kind: 'transform', phase: 'dml', sql,
+                ...(ddlError ? { precedingDdlError: ddlError } : {}),
+              });
               return {
                 success: false,
-                message: `SQL execution failed: ${sqlResult.message}`
+                message: ddlError
+                  ? `SQL execution failed: ${sqlResult.message}. The DDL before it also failed: ${ddlError}`
+                  : `SQL execution failed: ${sqlResult.message}`
               };
             }
             sqlRowCount = sqlResult.rowCount || 0;
             messages.push(`${sqlRowCount} rows modified`);
+            logStep('info', `${sqlRowCount} rows modified`, {
+              kind: 'transform', phase: 'dml', rowCount: sqlRowCount,
+            });
           }
-  
+
           return {
             success: true,
-            message: messages.length > 0 ? messages.join('. ') : 'Operation completed successfully',
+            // A DDL that failed while the DML went through is not a failure, but
+            // it is not nothing either — a rerun's duplicate column and a real
+            // schema problem look identical from here. Flagged so the run shows
+            // amber and the message says what was skipped.
+            warning: !!ddlError,
+            message: ddlError
+              ? `${messages.join('. ') || 'Operation completed'}. DDL did not apply: ${ddlError}`
+              : (messages.length > 0 ? messages.join('. ') : 'Operation completed successfully'),
             rowCount: sqlRowCount // For UPDATE/DELETE row count
           };
         }else if(storageLocation === 'database'){
@@ -276,9 +396,16 @@ async function handleTransformSQL({
           }
           // console.log("ddl: ", ddl)
           // Execute DDL
+          //
+          // Fatal here, unlike the in-place branch above. A new table's DDL is
+          // the CREATE that the DROP immediately before it just made necessary,
+          // so a failure means the target does not exist — and letting the
+          // INSERT run anyway would either fail for a second reason or, worse,
+          // succeed against a stale table left over from an earlier shape and
+          // report rows written into the wrong place.
           let ddlResult = {};
           if(ddl){
-            
+
             ddlResult = await plugin.runQuery(fullConfig, connectionId, { query: ddl });
             console.log('ddlResult: ', ddlResult)
 
@@ -304,10 +431,21 @@ async function handleTransformSQL({
           }
 
   
-          // Success - return result
+          // Success - return result.
+          //
+          // A DDL-only node reaching here is one saved BEFORE the connector
+          // prompts required a separate INSERT: its ddl is a CREATE ... AS
+          // SELECT, which fills the table in the same statement, so there is no
+          // row count to report. Saying "0 rows inserted" reads as a node that
+          // did nothing, which is the opposite of what happened. New builds
+          // always carry both statements — see the completeness gate in
+          // workflowBuilder.assembleTransformerConfig.
+          const ranInsert = !!(sql && String(sql).trim());
           return {
             success: true,
-            message: `Table created and ${sqlResult.rowCount || 0} rows inserted`,
+            message: ranInsert
+              ? `Table created and ${sqlResult.rowCount || 0} rows inserted`
+              : 'Table created and populated in a single statement',
             rowCount: sqlResult.rowCount || 0
           };
   
@@ -349,6 +487,8 @@ async function handleTransformSQL({
   
   
     } catch (error) {
+      // A stop must reach the runner as an exception — see executeOutput.
+      if (isCancelledError(error)) throw error;
       console.error('[dbconn:transform-sql]', error);
       return {
         success: false,
@@ -373,7 +513,7 @@ async function handleTransformNoSQL({
     transformFunction,
     storageLocation,
     operationMode,
-    // Optional scope for the local NeDB fallback path (see saveToLocalNeDB).
+    // Optional scope for the local DuckDB table the aggregated docs land in.
     workflowId = null,
     nodeId = null
   }) {
@@ -388,22 +528,10 @@ async function handleTransformNoSQL({
     //   operationMode
     // }));
     try {
-      // NoSQL now means a remote document store. Local files — JSON included —
-      // are read as SQL by DuckDB and go through handleTransformSQL, so a
-      // local target arriving here is a stale config from before the switch.
-      if (dbType === 'nedb') {
-        console.warn('[handleTransformNoSQL] nedb target is legacy; local transforms now run on DuckDB');
-        return await transformNeDB({
-          sourceLocalPath,
-          targetCollection,
-          targetLocalPath,
-          operationType,
-          nosqlOperation,
-          transformFunction,
-          operationMode
-        });
-
-      } else if (pluginManager.hasConnector(dbType)) {
+      // NoSQL means a remote document store. Local files — JSON included —
+      // are read as SQL by DuckDB and go through handleTransformSQL, so nothing
+      // local arrives here at all.
+      if (pluginManager.hasConnector(dbType)) {
         // Use NoSQL plugin for transformation (MongoDB, etc.)
         const fullConfig = await getFullConfig(connectionId, config);
   
@@ -427,7 +555,7 @@ async function handleTransformNoSQL({
   
         // The plugin aggregated remotely and handed back documents to land
         // locally. They go where every other node output goes: a table in this
-        // workflow's own DuckDB database. They used to become a NeDB file,
+        // workflow's own DuckDB database. They used to become a local file
         // which nothing downstream reads any more — the preview, joins and
         // output nodes all address a node's result as a DuckDB table.
         if (result.needsLocalStorage && result.transformedDocs) {
@@ -440,7 +568,7 @@ async function handleTransformNoSQL({
 
           const duck = require('../duckdb');
           const table = targetCollection || `transform_${String(nodeId || Date.now()).replace(/[^A-Za-z0-9_]/g, '_')}`;
-          // `mode` mirrors what the NeDB path meant by operationMode: a new
+          // `mode` mirrors what the old local path meant by operationMode: a new
           // table replaces, anything else adds to what is already there.
           const mode = operationMode === 'new_table' ? 'replace' : 'append';
 
@@ -464,11 +592,14 @@ async function handleTransformNoSQL({
       } else {
         return {
           success: false,
-          message: `Unsupported database type: ${dbType}. Only 'mongodb' and 'nedb' are supported.`
+          message: `Unsupported database type: ${dbType}. Only 'mongodb' is supported.`
         };
       }
   
     } catch (error) {
+      // A stop must reach the runner as an exception rather than a failed
+      // transform — see executeOutput's catch in outputExecutionHelpers.
+      if (isCancelledError(error)) throw error;
       return {
         success: false,
         message: `Transformation failed: ${error.message}`,
@@ -485,13 +616,18 @@ async function handleExecuteJoin({
     destinationConnection,
     joinConfig,
     operationMode = 'new_table',
-    // Optional — used only to place a local NeDB result under
-    // local-collections/<workflowId>/<nodeId>.db. Absent for ad-hoc runs.
+    // Optional — used only to scope a local result to this run's own workflow
+    // database. Absent for ad-hoc runs.
     workflowId = null,
     nodeId = null
   }) {
     try {
-      const CHUNK_SIZE = 1000;
+      // Rows per source read AND per temp-table batchInsert on the remote-join
+      // path below. It was 1000, which made staging a large source thousands of
+      // LIMIT/OFFSET round trips and thousands of inserts — the round trips,
+      // not the rows, were the minutes. Shared default with the output node so
+      // the two write paths do not drift; see public/lib/batchChunkSize.js.
+      const CHUNK_SIZE = DEFAULT_BATCH_CHUNK_SIZE;
       const isVectorDestination = isVectorConnection(destinationConnection);
       // NoSQL means a remote document store. A local destination is DuckDB and
       // takes the SQL path, whatever the shape of the data.
@@ -618,6 +754,52 @@ async function handleExecuteJoin({
           const fullConfig = await getFullConfig(destinationConnection.id, destinationConnection.dbConfig || {});
           const plugin = pluginManager.getConnector(destinationConnection.dbType);
   
+          // A join function is user- or AI-authored and may return anything.
+          const documents = Array.isArray(joinedResults) ? joinedResults : [];
+
+          // Strip `_id` for the same reason the output node does (see
+          // outputExecutionHelpers): it names a document within its OWN
+          // collection. A join function that returns source documents rather
+          // than freshly-built objects would write another collection's ids
+          // into the target — and two Mongo sources contributing rows can
+          // collide with EACH OTHER on `_id` even in a brand-new collection,
+          // failing the whole batch with E11000.
+          //
+          // In place, no rebuild: these objects were produced by the join
+          // function for this insert and nothing else holds them. Most join
+          // functions build fresh objects with no `_id` at all, in which case
+          // the `in` check is all this costs.
+          for (const doc of documents) {
+            if (doc !== null && typeof doc === 'object' && '_id' in doc) delete doc._id;
+          }
+
+          // A join that matched nothing is not a failure of this node. What it
+          // MEANS for the destination depends on the mode, and the two answers
+          // are opposites:
+          //
+          //  · 'new_table' REPLACES the target every run. Replacing it with
+          //    nothing means the target ends up EMPTY. Leaving last run's rows
+          //    in place is not caution, it is staleness — a staging collection
+          //    that the join reported as "no new records" still handed the
+          //    downstream output node the PREVIOUS run's rows, which it then
+          //    re-appended to the destination.
+          //  · any other mode adds to what is there, so an empty result adds
+          //    nothing and the target is correctly left alone.
+          //
+          // Either way insertMany is skipped rather than called with [] — the
+          // driver rejects an empty batch outright.
+          const isEmpty = documents.length === 0;
+
+          if (isEmpty && operationMode !== 'new_table') {
+            console.warn(`[NoSQL Join] Join matched no records — ${targetTableName} left unchanged`);
+            return {
+              success: true,
+              warning: true,
+              message: `No rows to write: the join matched no records, so ${targetTableName} was left unchanged.`,
+              documentsInserted: 0,
+            };
+          }
+
           if (operationMode === 'new_table') {
             // Drop existing collection
             try {
@@ -629,18 +811,49 @@ async function handleExecuteJoin({
               // Collection might not exist
             }
           }
-  
+
+          if (isEmpty) {
+            // 'new_table' with nothing to write: the drop above already made the
+            // target reflect this run. Downstream reads an empty collection,
+            // which is the honest answer, rather than last run's rows.
+            console.warn(`[NoSQL Join] Join matched no records — ${targetTableName} replaced with an empty collection`);
+            return {
+              success: true,
+              warning: true,
+              message: `No rows to write: the join matched no records, so ${targetTableName} is now empty.`,
+              documentsInserted: 0,
+            };
+          }
+
           // Insert documents
           const insertResult = await plugin.runQuery(fullConfig, destinationConnection.id, {
             operation: 'insertMany',
             collection: targetTableName,
-            documents: joinedResults
+            documents
           });
   
+          // A connector reports a failed statement by RETURNING
+          // { success: false }, not by throwing — the MongoDB runQuery catches
+          // the driver error itself. This result used to be assigned and then
+          // discarded, so a write that never landed was reported as a
+          // successful load of however many rows we had HOPED to write, and
+          // the whole run went green on top of it.
+          if (!insertResult || insertResult.success === false) {
+            return {
+              success: false,
+              message: `Could not write to ${targetTableName}: ${insertResult?.message || 'unknown error'}`,
+            };
+          }
+
+          // What the destination says it took, not what it was handed.
+          const inserted = insertResult.insertedCount
+            ?? insertResult.rowCount
+            ?? documents.length;
+
           return {
             success: true,
-            message: `Successfully inserted ${joinedResults.length} documents into ${targetTableName}`,
-            documentsInserted: joinedResults.length
+            message: `Successfully inserted ${inserted} documents into ${targetTableName}`,
+            documentsInserted: inserted
           };
         }
   
@@ -692,7 +905,14 @@ async function handleExecuteJoin({
   
         const destFullConfig = await getFullConfig(destinationConnection.id, destinationConnection.dbConfig || {});
         const destPlugin = pluginManager.getConnector(destinationConnection.dbType);
-  
+
+        // On the streaming path below, the SOURCE read size decides the
+        // destination write size: every batch pulled from the source becomes
+        // one batchInsert. So a destination that rations calls rather than
+        // statement size — BigQuery spends a daily load-job quota — has to be
+        // able to widen the read. See public/lib/batchChunkSize.js.
+        const LOAD_CHUNK_SIZE = batchChunkSizeFor(destPlugin, CHUNK_SIZE);
+
   
         // Step 1: Create temp tables and load source data
         for (let i = 0; i < sourcesConfig.length; i++) {
@@ -706,26 +926,47 @@ async function handleExecuteJoin({
           console.log(`SOURCE_CONFIG: `, sourceConfig);
   
           const tempTableName = sourceConfig.tempTableName;
-          tempTablesToCleanup.push(tempTableName);
-  
-          console.log(`TEMP_TABLE: ${tempTableName}`);
-  
+
+          // One quoted form for every statement built HERE — the DROP below and
+          // the cleanup at the end — so both name the same table that
+          // `sourceConfig.ddl` creates. Quoted, because that DDL is: PostgreSQL
+          // keeps a capital in a quoted name and folds it away in a bare one,
+          // and the two forms are then different tables. (The load in between
+          // goes through batchInsert, which takes the name UNQUOTED and quotes
+          // it itself — see outputExecutionHelpers' note at its own call.)
+          //
+          // No schema, because the DDL is unqualified: the table lands wherever
+          // the connection's own search path (or default database/dataset) puts
+          // it, and naming a schema here could point somewhere else. The
+          // connector's quoteIdentifier still qualifies where a bare name would
+          // otherwise be ambiguous to it — MySQL with the connection's
+          // database, BigQuery with its dataset.
+          const quotedTempTableName = quoteTableIdentifier(
+            destinationConnection.dbType, tempTableName, null, destFullConfig,
+          );
+          tempTablesToCleanup.push(quotedTempTableName);
+
+          console.log(`TEMP_TABLE: ${tempTableName} -> ${quotedTempTableName}`);
+
           // Drop temp table if exists (from previous failed runs)
           try {
-            const schema = joinConfig.targetSchema || destFullConfig?.dbConfig?.schema || null;
-            const quotedTempTableName = quoteTableIdentifier(destinationConnection.dbType, tempTableName, schema, destFullConfig);
             await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${quotedTempTableName}`});
           } catch (err) {
             // Ignore errors if table doesn't exist
             console.log(`Ignoring drop table error for ${tempTableName}: ${err.message}`);
           }
   
-          // Create temp table
-          await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: sourceConfig.ddl});
+          // Create temp table. Checked: a DDL that fails here leaves nothing for
+          // the load below to write into, and the "table doesn't exist" it then
+          // raises names neither the statement nor the reason.
+          await runDestStatement(
+            destPlugin, destFullConfig, destinationConnection.id,
+            sourceConfig.ddl, `Creating temp table ${tempTableName}`,
+          );
   
           // Load data from source
           const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
-          const isNoSQLSource = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
+          const isNoSQLSource = sourceConnection.dbType === 'mongodb';
           const isVectorSource = isVectorConnection(sourceConnection);
 
           // Get selectedColumns from sourceConfig
@@ -748,7 +989,7 @@ async function handleExecuteJoin({
               tempTableName,
               selectedColumns,
               sourceData,
-              CHUNK_SIZE
+              LOAD_CHUNK_SIZE
             );
   
             console.log(`SQL_LOADED: ${totalInserted}/${sourceData.length}`);
@@ -760,7 +1001,7 @@ async function handleExecuteJoin({
             totalInserted = await loadSQLSourceInChunks(
               sourceConnection,
               sourceConfig.sql,
-              CHUNK_SIZE,
+              LOAD_CHUNK_SIZE,
               pluginManager,
               getFullConfig,
               async (rows) => {
@@ -799,21 +1040,30 @@ async function handleExecuteJoin({
             // Ignore errors if table doesn't exist
           }
   
-          await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: targetDdl});
+          await runDestStatement(
+            destPlugin, destFullConfig, destinationConnection.id,
+            targetDdl, `Creating target table ${targetTableName}`,
+          );
         }
   
         // Step 3: Execute join query
         console.log(`join_execute_main_query: `, joinSql);
-        const joinResult = await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: joinSql});
+        // Checked: rowsAffected falls back to 0, so an unchecked failure here
+        // was reported as "Join completed successfully. 0 rows inserted" — a
+        // node that wrote nothing, and said so as though that were the answer.
+        const joinResult = await runDestStatement(
+          destPlugin, destFullConfig, destinationConnection.id, joinSql, 'Join query',
+        );
         const rowsAffected = joinResult.rowCount || joinResult.affectedRows || 0;
   
         // Step 4: Clean up temp tables
         console.log(`join_drop_temp_table: `, tempTablesToCleanup);
+        // Already quoted when the table was named, by the same call the CREATE
+        // and the load went through — re-quoting it here would only be the
+        // idempotent guard handing it back.
         for (const tempTable of tempTablesToCleanup) {
           try {
-            const schema = joinConfig.targetSchema || destFullConfig?.dbConfig?.schema || null;
-            const quotedTempTable = quoteTableIdentifier(destinationConnection.dbType, tempTable, schema, destFullConfig);
-            await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${quotedTempTable}`});
+            await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${tempTable}`});
           } catch (err) {
             console.error(`Failed to cleanup ${tempTable}:`, err);
           }
@@ -828,6 +1078,13 @@ async function handleExecuteJoin({
       }
   
     } catch (error) {
+      // A stop must reach the runner as an exception — see executeOutput.
+      //
+      // Note the temp tables: the cleanup above is on the success path only, so
+      // a stop leaves them behind exactly as a failure already does. They are
+      // reclaimed by the DROP TABLE IF EXISTS the next run issues before
+      // recreating each one, so this leaks nothing permanently.
+      if (isCancelledError(error)) throw error;
       console.error('Join execution error:', error);
       return {
         success: false,
@@ -903,15 +1160,23 @@ async function handleExecuteBranch({
       try {
         const dbType = sourceConnection.dbType;
         if (dbType === 'sqlite') {
-          // Local SQLite: run against the app sqlite DB via the pool.
-          if (!sqlitePool) {
-            throw new Error('Local SQLite pool is not initialized');
+          // A SQLite source is a FILE, read by path. This used to go through the
+          // app's shared SQLite pool, which could only ever reach app-data.db —
+          // so a step against a .sqlite the user picked themselves silently ran
+          // against the wrong database. Same lib and same path resolution the
+          // join reader uses.
+          const dbPath = sourceConnection.fileInfo?.filePath
+            || sourceConnection.localPath
+            || sourceConnection.dbConfig?.dbPath
+            || null;
+          if (!dbPath) {
+            throw new Error(`No local SQLite path for source ${sourceConnection.id || '(unknown)'}`);
           }
           const rawSql = (step.sql || '').replace('{LIMIT_OFFSET_HERE}', '');
           if (!rawSql.trim()) {
             throw new Error('SQLite step requires a "sql" query');
           }
-          rows = await sqlitePool.all(rawSql, []);
+          rows = await localSqlite.runQuery({ dbPath, query: rawSql });
         } else {
           rows = await loadSourceData(
             sourceConnection,

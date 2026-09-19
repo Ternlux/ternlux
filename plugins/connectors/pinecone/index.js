@@ -30,6 +30,24 @@ async function getConnection(config, connectionId) {
   return connections.get(key);
 }
 
+/**
+ * The real Pinecone name for an index the caller asked for.
+ *
+ * Pinecone only accepts lowercase letters, digits and hyphens, so a name like
+ * "product_values" cannot exist as written: the upsert path has always mapped
+ * it to "product-values" when creating the index. Every OTHER path used the
+ * raw string, so a write went to one index and a read, a delete or a truncate
+ * went looking for another — which comes back as a bare 404 that names no
+ * index. Applying the same mapping everywhere is what keeps them addressing
+ * one index; it can never point at a different real index, because the
+ * unmapped form is not a name Pinecone can hold.
+ */
+const sanitizeIndexName = (name) => String(name || '')
+  .toLowerCase()                 // Convert to lowercase
+  .replace(/[^a-z0-9-]/g, '-')   // Replace invalid chars with hyphens
+  .replace(/--+/g, '-')          // Replace multiple hyphens with single
+  .replace(/^-|-$/g, '');        // Remove leading/trailing hyphens
+
 module.exports = {
   type: 'connector',
   id: 'pinecone',
@@ -161,7 +179,7 @@ module.exports = {
   getColumns: async (config, connectionId, schema, indexName) => {
     try {
       const pinecone = await getConnection(config, connectionId);
-      const index = pinecone.index(indexName);
+      const index = pinecone.index(sanitizeIndexName(indexName));
 
       // Get index stats to find namespaces
       const stats = await index.describeIndexStats();
@@ -241,7 +259,7 @@ module.exports = {
         };
       }
 
-      const index = pinecone.index(indexName);
+      const index = pinecone.index(sanitizeIndexName(indexName));
       // console.log('index: ', pinecone, index, indexName)
       const ns = namespace ? index.namespace(namespace) : index;
 
@@ -249,21 +267,33 @@ module.exports = {
       let rows = [];
 
       switch (operation) {
-        case 'query':
-          // Similarity search
-          if (!params.vector || !Array.isArray(params.vector)) {
+        case 'query': {
+          // Similarity search. The prompts (and LanceDB) call the search vector
+          // `queryVector`; Pinecone's own SDK calls it `vector`. Accept either so
+          // one generated function works against both stores.
+          const queryVector = params.vector || params.queryVector;
+
+          if (!queryVector || !Array.isArray(queryVector)) {
             return {
               success: false,
               message: 'Query vector is required for similarity search'
             };
           }
 
+          // Pinecone rejects an empty `filter` object outright ("must enter a
+          // filter object with at least one key-value pair") rather than
+          // treating it as "no filter". Generated code routinely passes `{}` to
+          // mean "match everything", so drop the key when there is nothing in it.
+          const hasFilter = params.filter
+            && typeof params.filter === 'object'
+            && Object.keys(params.filter).length > 0;
+
           result = await ns.query({
-            vector: params.vector,
+            vector: queryVector,
             topK: params.topK || 10,
             includeMetadata: params.includeMetadata !== false,
             includeValues: params.includeValues !== false,
-            filter: params.filter || {}
+            ...(hasFilter ? { filter: params.filter } : {})
           });
 
           rows = (result.matches || []).map(match => ({
@@ -280,6 +310,7 @@ module.exports = {
             columns: ['id', 'score', 'values', 'metadata', 'namespace'],
             rowCount: rows.length
           };
+        }
 
         case 'fetch':
           // Fetch by IDs
@@ -398,7 +429,7 @@ module.exports = {
 
   /**
    * Fetch ALL vectors from index for local transformations
-   * Similar to NeDB's find() pattern - enables bulk data extraction
+   * Similar to a document store's find() pattern - enables bulk data extraction
    * @param {Object} config - Connection config
    * @param {String} connectionId - Connection ID
    * @param {Object} params - Parameters:
@@ -443,14 +474,20 @@ module.exports = {
         };
       }
 
-      const index = pinecone.index(indexName);
+      const index = pinecone.index(sanitizeIndexName(indexName));
       const ns = namespace ? index.namespace(namespace) : index;
 
       // Get index stats to determine total vectors
       const stats = await index.describeIndexStats();
-      const totalVectors = namespace && stats.namespaces?.[namespace]?.vectorCount
-        ? stats.namespaces[namespace].vectorCount
-        : stats.totalVectorCount || 0;
+      // SDK v3 reports `recordCount` / `totalRecordCount`; older ones used
+      // `vectorCount` / `totalVectorCount`. Reading only the old spelling made
+      // this report 0 for a populated index.
+      const nsStats = namespace ? stats.namespaces?.[namespace] : null;
+      const nsCount = nsStats?.recordCount ?? nsStats?.vectorCount;
+      const totalVectors = nsCount
+        ?? stats.totalRecordCount
+        ?? stats.totalVectorCount
+        ?? 0;
 
       console.log(`Fetching vectors from index '${indexName}' (namespace: '${namespace || 'default'}')`);
       console.log(`Total vectors in namespace: ${totalVectors}`);
@@ -459,9 +496,15 @@ module.exports = {
       // Strategy: Use listPaginated if available in newer SDK, otherwise use query with pagination
       const allRecords = [];
 
+      // SDK v3 names this `listPaginated`; other versions expose `list`. Probing
+      // only for `list` sent every v3 install down the query fallback below,
+      // which cannot enumerate an index (see the zero-vector note there).
+      const listFn = typeof ns.listPaginated === 'function'
+        ? ns.listPaginated.bind(ns)
+        : (typeof ns.list === 'function' ? ns.list.bind(ns) : null);
+
       try {
-        // Try to use list() method if available (newer Pinecone SDK)
-        if (typeof ns.list === 'function') {
+        if (listFn) {
           let paginationToken = null;
           let fetchedCount = 0;
 
@@ -471,7 +514,7 @@ module.exports = {
               ...(paginationToken && { paginationToken })
             };
 
-            const listResult = await ns.list(listParams);
+            const listResult = await listFn(listParams);
 
             if (listResult.vectors && listResult.vectors.length > 0) {
               // Fetch full vector data for the IDs
@@ -502,9 +545,14 @@ module.exports = {
           // Fallback: Use query with dummy vector for pagination
           console.log('Using query-based pagination (older SDK)');
 
-          // Create a zero vector for querying
+          // A zero vector cannot rank against anything on a cosine index — its
+          // magnitude is 0, so similarity is undefined and Pinecone returns no
+          // matches. Use a random unit vector instead: the ordering is arbitrary
+          // either way (this path only exists to enumerate), but it returns rows.
           const dimension = stats.dimension || 1536;
-          const dummyVector = Array(dimension).fill(0);
+          const dummyVector = Array.from({ length: dimension }, () => Math.random() - 0.5);
+          const magnitude = Math.sqrt(dummyVector.reduce((sum, v) => sum + v * v, 0)) || 1;
+          for (let i = 0; i < dimension; i++) dummyVector[i] /= magnitude;
 
           let paginationToken = null;
           let fetchedCount = 0;
@@ -555,6 +603,15 @@ module.exports = {
         columns: ['id', 'values', 'metadata', 'namespace'],
         rowCount: allRecords.length,
         totalVectors: totalVectors,
+        // Raw stats, so an empty fetch can be told apart from a fetch against
+        // the wrong namespace. `totalVectors` above reads `vectorCount` /
+        // `totalVectorCount`, which newer SDKs renamed to `recordCount` /
+        // `totalRecordCount` — it reports 0 for a populated index on those.
+        indexStats: {
+          requestedNamespace: namespace || '(default)',
+          usedListApi: Boolean(listFn),
+          raw: stats
+        },
         message: `Fetched ${allRecords.length} vectors from ${indexName}`
       };
 
@@ -578,6 +635,15 @@ module.exports = {
     }
     return { success: false, message: 'Connection not found' };
   },
+
+  /**
+   * The real index name for one the caller asked for — see sanitizeIndexName.
+   *
+   * Exposed because a caller comparing a configured name against `getTables`
+   * (which reports the names Pinecone actually holds) has to compare like with
+   * like: "product_values" never appears in that list, only "product-values".
+   */
+  normalizeTableName: (name) => sanitizeIndexName(name),
 
   /**
    * Execute vector operation with automatic index creation
@@ -628,14 +694,6 @@ module.exports = {
 
       // Sanitize index name for Pinecone requirements
       // Pinecone requires: lowercase alphanumeric characters or '-'
-      const sanitizeIndexName = (name) => {
-        return name
-          .toLowerCase()                    // Convert to lowercase
-          .replace(/[^a-z0-9-]/g, '-')     // Replace invalid chars with hyphens
-          .replace(/--+/g, '-')             // Replace multiple hyphens with single
-          .replace(/^-|-$/g, '');           // Remove leading/trailing hyphens
-      };
-
       const originalIndexName = indexName;
       indexName = sanitizeIndexName(indexName);
 
@@ -750,6 +808,10 @@ module.exports = {
         queryObj.includeMetadata = true;
         queryObj.includeValues = true;
         queryObj.filter = filter;
+      } else if (operation === 'fetch') {
+        // Used by the existence check before embedding — without this the ids
+        // never reached runQuery and every fetch failed as "IDs array required".
+        queryObj.ids = params.ids;
       } else if (operation === 'delete') {
         if (params.ids) {
           queryObj.ids = params.ids;
@@ -892,7 +954,7 @@ module.exports = {
       }
 
       const pinecone = await getConnection(config, connectionId);
-      const index = pinecone.index(indexName);
+      const index = pinecone.index(sanitizeIndexName(indexName));
       const ns = namespace ? index.namespace(namespace) : index;
 
       let vectors = [];
@@ -981,7 +1043,7 @@ module.exports = {
       const { indexName, namespace = '', toUpdate = [], toDelete = [] } = params;
 
       const pinecone = await getConnection(config, connectionId);
-      const index = pinecone.index(indexName);
+      const index = pinecone.index(sanitizeIndexName(indexName));
       const ns = namespace ? index.namespace(namespace) : index;
 
       let updatedCount = 0;

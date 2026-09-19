@@ -29,7 +29,7 @@ export const categorizeConnection = (conn) => {
 
 // The one local destination: the join result is written as a Parquet file the
 // node owns and read back through DuckDB. Tabular and document data alike —
-// there is no local NeDB/SQLite destination any more.
+// there is no local SQLite destination any more.
 export const LOCAL_FILE_DESTINATION = {
   id: 'local-duckdb',
   label: 'Local file',

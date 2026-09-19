@@ -1,7 +1,7 @@
 # PostgreSQL connector
 
 Representative relational connector. The other relational connectors
-(MySQL, MSSQL, BigQuery, Snowflake, Redshift) follow the same overall
+(MySQL, MSSQL, BigQuery, Snowflake) follow the same overall
 behaviour with dialect-specific differences in identifier quoting,
 preview syntax, and supported types.
 

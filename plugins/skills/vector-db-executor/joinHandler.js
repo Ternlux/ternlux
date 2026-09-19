@@ -19,12 +19,47 @@ const isVectorConn = (conn) =>
   !!conn && (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType));
 
 /**
- * Flatten a vector record into a row-shaped object. Metadata fields are
- * promoted to top-level keys; vector dimensions are dropped (not useful as
- * join keys). Pinecone records are normalised to look like LanceDB ones so
- * the join executor can treat them uniformly.
+ * A vector as a plain numeric array, or null when the value is not one.
+ *
+ * Normalise at the boundary, because a vector arrives in three shapes and only
+ * the first survives an `Array.isArray` check downstream or a spread in
+ * AI-written code:
+ *
+ *   - a plain array (Pinecone `values`, generated code)
+ *   - a Float32Array (`Vector.toArray()`, embedding helpers)
+ *   - an Apache Arrow `Vector` — what a LanceDB read actually yields. It is
+ *     none of the above and is not even index-accessible (`v[0]` is
+ *     undefined), so anything that reaches for a dimension sees nothing.
  */
-function flattenVectorRecord(record) {
+function toPlainVector(value) {
+  if (value == null || typeof value === 'string') return null;
+  const v = (!Array.isArray(value) && !ArrayBuffer.isView(value) && typeof value.toArray === 'function')
+    ? value.toArray()
+    : value;
+  if (Array.isArray(v)) return v.length > 0 ? v : null;
+  // Every typed array iterates as numbers; a DataView does not, and would
+  // flatten to an empty array that reads like a vector but is not one.
+  if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
+    return v.length > 0 ? Array.from(v, Number) : null;
+  }
+  if (typeof v[Symbol.iterator] === 'function') {
+    const arr = Array.from(v, Number);
+    return arr.length > 0 ? arr : null;
+  }
+  return null;
+}
+
+/**
+ * Flatten a vector record into a row-shaped object. Metadata fields are
+ * promoted to top-level keys. Pinecone records are normalised to look like
+ * LanceDB ones so the join executor can treat them uniformly.
+ *
+ * Vector dimensions are dropped by default — they are not useful as join keys,
+ * which is what this was written for. A caller doing a full READ of the source
+ * (javascript-executor, whose function may pass the vector straight through to
+ * a new vector table) asks for them back with `includeVector`.
+ */
+function flattenVectorRecord(record, { includeVector = false } = {}) {
   if (!record || typeof record !== 'object') return record;
   const flat = { id: record.id };
   if (record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)) {
@@ -33,6 +68,12 @@ function flattenVectorRecord(record) {
   for (const [key, value] of Object.entries(record)) {
     if (key === 'metadata' || key === 'vector' || key === 'values' || key === '_distance') continue;
     if (flat[key] === undefined) flat[key] = value;
+  }
+  if (includeVector) {
+    // Pinecone calls it `values`, LanceDB `vector`; callers only ever see the
+    // latter, matching the field name every write path expects.
+    const vector = toPlainVector(record.vector) || toPlainVector(record.values);
+    if (vector) flat.vector = vector;
   }
   return flat;
 }
@@ -48,6 +89,12 @@ function flattenVectorRecord(record) {
  *     topK: number (default 10000),
  *     embeddingProvider?, embeddingModel?  // only if useEmbeddingSearch=true
  *   }
+ *
+ * `includeVector` keeps each record's vector on the returned row (as a plain
+ * numeric array). Off by default: a join has no use for the dimensions and
+ * they would bloat every row it carries. A caller reading the source in full
+ * — javascript-executor, whose function may hand the vector straight to a new
+ * vector table — turns it on.
  */
 async function fetchVectorSourceRecords({
   sourceConnection,
@@ -55,7 +102,8 @@ async function fetchVectorSourceRecords({
   vectorFetchOperation,
   pluginManager,
   getFullConfig,
-  helpers
+  helpers,
+  includeVector = false
 }) {
   const dbType = sourceConnection.dbType;
   const tableName = sourceTableSchema.tableName;
@@ -71,9 +119,12 @@ async function fetchVectorSourceRecords({
   // Embed the search text if requested.
   let queryVector = null;
   if (useEmbeddingSearch && searchQuery && op.embeddingProvider && op.embeddingModel) {
+    // OpenAI is the only embedding provider; its key is stored under 'chatgpt'.
+    // Anything else has no key to resolve and fails in generateEmbeddings,
+    // naming the provider rather than silently embedding with the wrong one.
     const apiKey = op.embeddingProvider === 'openai'
       ? helpers?.apiKeys?.chatgpt
-      : helpers?.apiKeys?.huggingface;
+      : null;
     const embedded = await helpers.embeddings.generateEmbeddings({
       data: [{ query: searchQuery }],
       columnToEmbed: 'query',
@@ -113,14 +164,16 @@ async function fetchVectorSourceRecords({
       queryVector,
       filter: filter || {},
       topK,
-      includeValues: false,
+      // Cloud stores only send the dimensions back when asked, so the flag has
+      // to reach the query as well as the flattening below.
+      includeValues: includeVector,
       includeMetadata: true
     });
     if (!result.success) throw new Error(`Failed to query vectors: ${result.message}`);
     vectors = result.rows || [];
   }
 
-  return vectors.map(flattenVectorRecord);
+  return vectors.map((record) => flattenVectorRecord(record, { includeVector }));
 }
 
 /**
@@ -133,7 +186,7 @@ async function fetchVectorSourceRecords({
  *   columnToEmbed      - field name to embed
  *   vectorDbType       - 'lancedb' | 'pinecone' | …
  *   targetTable        - table/index name
- *   embeddingProvider  - 'openai' | 'huggingface'
+ *   embeddingProvider  - 'openai'
  *   embeddingModel     - provider-specific model id
  *
  * For cloud vector DBs (non-lancedb), also: targetConnectionId, indexName,
@@ -166,7 +219,7 @@ async function embedAndUpsertJoinedRows({
   }
 
   const apiKey = embeddingApiKey
-    || (embeddingProvider === 'openai' ? helpers?.apiKeys?.chatgpt : helpers?.apiKeys?.huggingface);
+    || (embeddingProvider === 'openai' ? helpers?.apiKeys?.chatgpt : null);
   if (!apiKey) {
     throw new Error(`No API key configured for embedding provider: ${embeddingProvider}`);
   }

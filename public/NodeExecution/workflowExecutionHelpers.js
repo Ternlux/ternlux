@@ -8,14 +8,14 @@ const fs = require('fs');
 const { handleTransformNoSQL, handleTransformSQL, handleExecuteJoin, handleExecuteBranch } = require('./NodeExecution');
 const { handleExecuteApiFetch } = require('./ApiFetch');
 const { executeOutput } = require('./outputExecutionHelpers');
-const { importParquetToSqlite, importAvroToSqlite, importSpreadsheetToSqlite, importCsvToSqlite } = require('../imports/importHelpers');
+const { isCancelledError } = require('./executionCancel');
 
 /**
  * Node types that MATERIALISE something when they run — a table, a collection,
  * a file. Their config names an output (targetTableName / targetPreviewSql /
  * outputSettings) from the moment they are built, but nothing is behind that
- * name until the node has actually executed. `config.executed` is what tells
- * the two apart, and only these types carry it.
+ * name until the node has actually executed. The workflow's `executedNodes`
+ * map is what tells the two apart, and only these types appear in it.
  */
 const MATERIALIZING_NODE_TYPES = new Set(['transformer', 'join', 'output']);
 
@@ -23,10 +23,18 @@ const MATERIALIZING_NODE_TYPES = new Set(['transformer', 'join', 'output']);
  * Record in the saved workflow that this node's output now exists.
  *
  * Every way a workflow runs — the Execute button, a chat "run this node", a
- * CRON schedule, a file watcher — comes through executeNode, so writing the
- * flag here covers all of them at once. The stored workflow is the only place
- * it can live: a triggered run has no canvas to tell, and the node object we
- * were handed is a copy that is thrown away when the run ends.
+ * CRON schedule, a file watcher — comes through executeNode, so writing this
+ * here covers all of them at once. The stored workflow is the only place it can
+ * live: a triggered run has no canvas to tell, and the node object we were
+ * handed is a copy that is thrown away when the run ends.
+ *
+ * It goes in `workflow.executedNodes`, keyed by node id, and NOT on the node —
+ * a flag inside a node's config made a run indistinguishable from an edit, so
+ * the open canvas went dirty, auto-saved, and the version history recorded a
+ * "node changed" entry whose entire content was this flag. Writing beside the
+ * nodes also means a run never touches the `nodes` array, so it cannot race a
+ * concurrent save into clobbering a node's config.
+ * (Renderer-side counterpart: src/utils/executedNodes.js.)
  *
  * Never throws. A run that produced real data must not be reported as failed
  * because a bookkeeping write did.
@@ -35,18 +43,14 @@ async function markNodeExecuted(node, helpers) {
   try {
     const workflowId = helpers?.workflowId;
     const getDb = helpers?.getDb;
-    if (!workflowId || typeof getDb !== 'function') return;
+    if (!workflowId || !node?.id || typeof getDb !== 'function') return;
 
     const db = getDb('workflows');
     const workflow = await db.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
-    if (!workflow || !Array.isArray(workflow.nodes)) return;
+    if (!workflow) return;
 
-    const nodes = workflow.nodes.map((n) => (
-      n.id === node.id
-        ? { ...n, data: { ...(n.data || {}), config: { ...(n.data?.config || {}), executed: true } } }
-        : n
-    ));
-    await db.updateAsync({ _id: workflow._id }, { $set: { nodes } }, {});
+    const executedNodes = { ...(workflow.executedNodes || {}), [node.id]: true };
+    await db.updateAsync({ _id: workflow._id }, { $set: { executedNodes } }, {});
   } catch (err) {
     console.warn(`[Workflow Execution] could not flag node ${node?.id} as executed:`, err.message);
   }
@@ -124,7 +128,7 @@ async function addExecutionLog(executionsDb, executionId, level, message, nodeId
 }
 
 /**
- * Get source local path for NeDB or local SQLite operations
+ * Get source local path for local file operations
  */
 function getSourceLocalPath(targetNode, nodeMap, edges) {
   const sourceEdge = edges.find(e => e.target === targetNode.id);
@@ -141,7 +145,7 @@ function getSourceLocalPath(targetNode, nodeMap, edges) {
   /**
    * Helper function to get original file path from connection
    * @param {String} sourceConnectionId - Connection ID
-   * @param {String} dbType - Database type (sqlite or nedb)
+   * @param {String} dbType - Database type (duckdb or sqlite)
    * @returns {Promise<String|null>} Original file path or null
    */
   const getOriginalFilePath = async (sourceConnectionId, dbType, getDb) => {
@@ -150,7 +154,7 @@ function getSourceLocalPath(targetNode, nodeMap, edges) {
     }
 
     // Only applicable for local file types
-    if (!['duckdb', 'sqlite', 'nedb'].includes(dbType)) {
+    if (!['duckdb', 'sqlite'].includes(dbType)) {
       return null;
     }
 
@@ -187,7 +191,7 @@ function getSourceLocalPath(targetNode, nodeMap, edges) {
  * Imports local files or Google Sheets
  */
 async function executeDataSourceNode(node, helpers) {
-  const { pluginManager, getFullConfig, getDb, appSqliteDbPath, sqlitePool } = helpers;
+  const { pluginManager, getFullConfig, getDb, appSqliteDbPath } = helpers;
 
   console.log(`[Workflow Execution] Executing Data Source node: ${node.id}`);
 
@@ -207,7 +211,7 @@ async function executeDataSourceNode(node, helpers) {
   const sourceConnectionId = config.sourceConnectionId;
   console.log('config: ', config)
   // REST API source: re-execute the saved fetch function and re-populate the
-  // local NeDB collection the downstream nodes already point at.
+  // local table the downstream nodes already point at.
   if (config.sourceConnectionType === 'api' && config.apiFetchCode) {
     try {
       console.log('[Workflow Execution] REST API source — re-running fetch function');
@@ -219,7 +223,7 @@ async function executeDataSourceNode(node, helpers) {
         apiConnectionId: config.sourceApiConnectionId,
         apiConnectionConfig: config.apiConnectionPublicConfig || {},
         apiFetchCode: config.apiFetchCode,
-        nedbCollection: collection,
+        targetCollection: collection,
         operationMode: 'new_table',
         workflowId: helpers?.workflowId || null,
         nodeId: node.id,
@@ -239,6 +243,8 @@ async function executeDataSourceNode(node, helpers) {
         recordsProcessed: fetchResult.rowCount || 0,
       };
     } catch (err) {
+      // A stop stays an exception all the way to the runner — see executeOutputNode.
+      if (isCancelledError(err)) throw err;
       console.error('[Workflow Execution] REST API source error:', err);
       return { success: false, message: err.message || 'REST API source failed', recordsProcessed: 0 };
     }
@@ -312,167 +318,24 @@ async function executeDataSourceNode(node, helpers) {
         };
       }
 
-      const fileExt = path.extname(objectName).toLowerCase();
+      // No saved path on this node means it was recorded before cloud files were
+      // kept on disk and read in place. Such a node used to re-import the object
+      // into the app's SQLite database, or — for JSON — into a local document
+      // store. Both of those are gone: every local file is DuckDB
+      // now, read where it lies. There is nothing to fall back to, so say what
+      // to do rather than failing further down with a missing-table error.
+      return {
+        success: false,
+        message:
+          `"${objectName}" was added before cloud files were saved to disk, so this node has `
+          + 'no local path to refresh. Open the data source, pick a save location for the file, '
+          + 'and re-select it — the object is then kept on disk and read in place by DuckDB.',
+        recordsProcessed: 0,
+      };
 
-      let fileType;
-      if (['.csv'].includes(fileExt)) {
-        fileType = 'spreadsheet';
-      } else if (['.xlsx', '.xls'].includes(fileExt)) {
-        fileType = 'spreadsheet';
-      } else if (['.json'].includes(fileExt)) {
-        fileType = 'json';
-      } else if (['.parquet'].includes(fileExt)) {
-        fileType = 'parquet';
-      } else if (['.avro'].includes(fileExt)) {
-        fileType = 'avro';
-      }
-
-      if (!fileType) {
-        return {
-          success: false,
-          message: `Unsupported file type: ${fileExt}`,
-          recordsProcessed: 0
-        };
-      }
-
-      // Import the file to local storage
-      const tableName = config.sourceTableName || config.sourceCollection || config.sourceTableSchema?.tableName;
-      
-      if (fileType === 'spreadsheet' || fileType === 'parquet' || fileType === 'avro') {
-        // Import to SQLite
-        if (!sqlitePool) {
-          throw new Error('SQLite connection pool not available');
-        }
-
-        // Prepare sheets array for Excel files
-        // If sheetName is specified in cloudSource, only import that sheet
-        const sheets = sheetName ? [sheetName] : [];
-
-        const importResult = await sqlitePool.executeWrite(async (db) => {
-          if (fileType === 'parquet') {
-            // Save buffer to temp file for parquet parser
-            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
-            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
-            const result = await importParquetToSqlite(tempPath, tableName, db, appSqliteDbPath);
-            fs.unlinkSync(tempPath);
-            return result;
-          } else if (fileType === 'avro') {
-            // Save buffer to temp file for avro parser
-            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
-            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
-            const result = await importAvroToSqlite(tempPath, tableName, db, appSqliteDbPath);
-            fs.unlinkSync(tempPath);
-            return result;
-          } else if (['.xlsx', '.xls'].includes(fileExt)) {
-            // Save buffer to temp file for spreadsheet parser
-            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
-            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
-            const connectionName = sheetName ? tableName.replace(`_${sheetName}`, '') : tableName;
-            console.log('tableName, sheets: ', connectionName, tableName, sheets)
-            // Pass sheets array: empty = import all sheets, specific = import only those
-            const result = await importSpreadsheetToSqlite(tempPath, connectionName, db, appSqliteDbPath, sheets);
-            fs.unlinkSync(tempPath);
-            return result;
-          } else if (fileExt === '.csv') {
-            // Save buffer to temp file for CSV parser
-            const tempPath = path.join(require('electron').app.getPath('temp'), objectName);
-            fs.writeFileSync(tempPath, Buffer.from(downloadResult.data));
-            const result = await importCsvToSqlite(tempPath, tableName, db, appSqliteDbPath);
-            fs.unlinkSync(tempPath);
-            return result;
-          }
-        });
-
-        if (importResult.success) {
-          return {
-            success: true,
-            message: `Successfully imported ${importResult.rowCount || 0} rows from cloud storage`,
-            recordsProcessed: importResult.rowCount || 0
-          };
-        } else {
-          return {
-            success: false,
-            message: importResult.message || 'Cloud storage import failed',
-            recordsProcessed: 0
-          };
-        }
-      } else if (fileType === 'json') {
-        // Import to NeDB
-        const collectionName = config.sourceCollection || config.sourceTableSchema?.tableName;
-        const dbPath = config.sourceLocalPath;
-
-        // Parse JSON
-        const jsonContent = Buffer.from(downloadResult.data).toString('utf8');
-        let documents;
-        try {
-          const parsed = JSON.parse(jsonContent);
-          documents = Array.isArray(parsed) ? parsed : [parsed];
-        } catch (parseErr) {
-          return {
-            success: false,
-            message: `Invalid JSON format: ${parseErr.message}`,
-            recordsProcessed: 0
-          };
-        }
-
-        if (documents.length === 0) {
-          return {
-            success: false,
-            message: 'No documents found in JSON file',
-            recordsProcessed: 0
-          };
-        }
-
-        // Create NeDB datastore
-        const Datastore = require('@seald-io/nedb');
-        const db = new Datastore({ filename: dbPath, autoload: true });
-
-        // Remove all existing documents first
-        await new Promise((resolve) => {
-          db.remove({}, { multi: true }, (err, numRemoved) => {
-            if (err) {
-              console.warn(`[Workflow Execution] Could not clear NeDB collection:`, err);
-            } else {
-              console.log(`[Workflow Execution] Cleared ${numRemoved} existing documents from collection`);
-            }
-            resolve();
-          });
-        });
-
-        db.persistence.compactDatafile();
-
-        // Insert documents
-        const insertResult = await new Promise((resolve) => {
-          db.insert(documents, (err, newDocs) => {
-            if (err) {
-              resolve({
-                success: false,
-                message: `Failed to insert documents: ${err.message}`
-              });
-            } else {
-              resolve({
-                success: true,
-                docCount: newDocs.length
-              });
-            }
-          });
-        });
-
-        if (insertResult.success) {
-          return {
-            success: true,
-            message: `Successfully imported ${insertResult.docCount} documents from cloud storage`,
-            recordsProcessed: insertResult.docCount
-          };
-        } else {
-          return {
-            success: false,
-            message: insertResult.message,
-            recordsProcessed: 0
-          };
-        }
-      }
     } catch (error) {
+      // A stop stays an exception all the way to the runner — see executeOutputNode.
+      if (isCancelledError(error)) throw error;
       console.error('[Workflow Execution] Cloud storage import error:', error);
       return {
         success: false,
@@ -486,7 +349,7 @@ async function executeDataSourceNode(node, helpers) {
   console.log("sourceFilePath: ", filePath)
 
   // A local file source has nothing to execute. It used to be re-imported into
-  // SQLite or NeDB on every run — reading the whole file and rewriting a copy
+  // SQLite on every run — reading the whole file and rewriting a copy
   // of it before the workflow could touch a single row. DuckDB reads the file
   // in place when a downstream node queries it, so this step only has to
   // confirm the file is still there and report how big it is.
@@ -504,9 +367,14 @@ async function executeDataSourceNode(node, helpers) {
     }
     try {
       const duck = require('../duckdb');
-      // A workflow database holds the source as a TABLE (an upstream node's
-      // output); a data file is counted where it lies.
-      const isDb = /\.duckdb$/i.test(localPath);
+      // A DATABASE holds the source as a TABLE — a workflow's .duckdb (an
+      // upstream node's output) or a .sqlite/.db the user imported, both of
+      // which DuckDB ATTACHes; a data file is counted where it lies. Same
+      // predicate the connector and the transform use (duck.isDatabaseFile), so
+      // a source the Data Explorer browses cannot fail here: matching only
+      // `.duckdb` sent .sqlite down the data-file path, where tableRef threw
+      // "supported formats are csv, json, parquet, xlsx and avro".
+      const isDb = duck.isDatabaseFile(localPath);
       const sourceTable = config.sourceTableName || config.sourceTableSchema?.tableName;
       if (isDb && !sourceTable) {
         return { success: false, message: 'No table recorded for this data source', recordsProcessed: 0 };
@@ -534,72 +402,16 @@ async function executeDataSourceNode(node, helpers) {
     }
   }
 
-  // Check if it's a Google Sheets import
-  if (config.dbType === 'google-sheets' && config.spreadsheetId) {
-    try {
-      const plugin = pluginManager.getConnector('google-sheets');
-      if (!plugin) {
-        return {
-          success: false,
-          message: 'Google Sheets plugin not found',
-          recordsProcessed: 0
-        };
-      }
+  // Google Sheets used to be imported into the shared SQLite database by a
+  // branch here. It was dead twice over — it keyed on `config.dbType` /
+  // `config.spreadsheetId` while the node records `source*` fields, and it
+  // called `plugin.importToSqlite`, which the connector never implemented — so
+  // a sheet was frozen at the moment it was configured.
+  //
+  // A Sheets source is now an ordinary cloud file: the tab downloads as CSV
+  // through the connector, is read in place by DuckDB, and is refreshed by the
+  // cloudSource branch below on every run, exactly like an S3 object.
 
-      const connectionId = config.connectionId;
-      const fullConfig = await getFullConfig(connectionId);
-
-      if (!fullConfig) {
-        return {
-          success: false,
-          message: 'Google Sheets connection not found',
-          recordsProcessed: 0
-        };
-      }
-
-      // Import Google Sheet to SQLite using connection pool
-      if (!sqlitePool) {
-        throw new Error('SQLite connection pool not available');
-      }
-
-      const tableName = config.tableName || config.sourceTableSchema?.tableName || 'imported_sheet';
-
-      // Use the plugin's import function with connection pool
-      const importResult = await sqlitePool.executeWrite(async (db) => {
-        // Note: Drop table logic is handled within the plugin's importToSqlite function
-        return await plugin.importToSqlite(
-          fullConfig.dbConfig,
-          connectionId,
-          config.spreadsheetId,
-          config.sheetName,
-          tableName,
-          db,
-          appSqliteDbPath
-        );
-      });
-
-      if (importResult.success) {
-        return {
-          success: true,
-          message: `Successfully imported ${importResult.rowCount || 0} rows from Google Sheets`,
-          recordsProcessed: importResult.rowCount || 0
-        };
-      } else {
-        return {
-          success: false,
-          message: importResult.message || 'Google Sheets import failed',
-          recordsProcessed: 0
-        };
-      }
-    } catch (error) {
-      console.error('[Workflow Execution] Google Sheets import error:', error);
-      return {
-        success: false,
-        message: error.message,
-        recordsProcessed: 0
-      };
-    }
-  }
 
   // For other data sources, just validate that the configuration exists
   return {
@@ -650,34 +462,114 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     };
   }
 
+  // Wired to a different node than this transformer was built against. Unlike
+  // an output — which only forwards what it reads, so it can safely follow the
+  // wire (see executeOutputNode) — a transformer's SQL NAMES its source table.
+  // Re-pointing it here would run that SQL against a table it was not written
+  // for, so the run proceeds as configured and says what it saw. The editor
+  // re-points and flags the node on rewire; regenerating it is the real fix.
+  // Wired to a different node than this transformer was built against. Unlike
+  // an output — which only forwards what it reads, so it can safely follow the
+  // wire (see executeOutputNode) — a transformer's SQL NAMES its source table.
+  //
+  // What matters is whether the node now in that position holds DIFFERENT data,
+  // not that the id changed: swapping in another node that reads the same table
+  // on the same connection leaves every statement correct, and refusing there
+  // would block a run for nothing. Checked against the live graph, so it holds
+  // for a workflow rewired outside the editor too.
+  if (config.sourceNodeId && config.sourceNodeId !== sourceNode.id) {
+    const wired = sourceIdentityOf(sourceNode.data?.config || {});
+    const recorded = sourceIdentityOf(config);
+    if (identityDiffers(recorded, wired)) {
+      return {
+        success: false,
+        message: `This transformer was built against ${config.sourceNodeLabel || config.sourceNodeId} `
+          + `and is now wired to ${sourceNode.data?.config?.node_name || sourceNode.data?.label || sourceNode.id}, `
+          + `which reads ${wired.tableName || 'something else'} rather than ${recorded.tableName || 'what it was built for'}. `
+          + 'Its SQL still names the old source. Rebuild the transformer from its chat before running it.',
+        recordsProcessed: 0,
+      };
+    }
+    console.warn(
+      `[Workflow Execution] Transformer ${node.id} was built against ${config.sourceNodeId} `
+      + `but is wired to ${sourceNode.id}; both read the same table, so the run continues.`,
+    );
+  }
+
+  // The source this transformer was built against now reads a different table
+  // or connection, and its SQL names the old one. Its TARGET is stale too: for
+  // an in-place transformation `targetTableName` IS the source table it was
+  // built for, and `targetSchema` / `targetLocalPath` came from that source
+  // (workflowBuilder.js). So running it does not merely read the wrong rows —
+  // it WRITES to the table the parent has abandoned, and reports success.
+  // Refused until the node is rebuilt, which is the only thing that
+  // regenerates the statements and the target together.
+  if (config.sourceMoved) {
+    return {
+      success: false,
+      message: `This transformer's source moved (${describeMove(config.sourceMoved)}) after the `
+        + "transformer was built, so its SQL reads the old table and its target still names it. "
+        + 'Rebuild the transformer from its chat before running it.',
+      recordsProcessed: 0,
+    };
+  }
+
   try {
     // Check if this transformation uses a skill
     if (config.usesSkill && config.skillId) {
       console.log(`[Workflow Execution] Executing skill transformation: ${config.skillId}`);
 
-      // Get source connection info
-      const rawSourceConfig = sourceNode.data?.config || {};
-      let sourceConnection = rawSourceConfig.connection || rawSourceConfig;
-      // Datasource node configs store fields with a `source*` prefix
-      // (sourceDbType, sourceLocalPath, sourceConnectionId, ...) while skills
-      // read the canonical un-prefixed names. Map both shapes so the skill
-      // sees a uniform sourceConnection regardless of which node produced it.
-      sourceConnection = {
-        ...sourceConnection,
-        id: sourceConnection.id || sourceConnection.sourceConnectionId,
-        name: sourceConnection.name || sourceConnection.sourceConnectionName,
-        dbType: sourceConnection.dbType || sourceConnection.sourceDbType,
-        dbConfig: sourceConnection.dbConfig || sourceConnection.sourceDbConfig,
-        dbCategory: sourceConnection.dbCategory || sourceConnection.sourceDbCategory,
-        connectionType: sourceConnection.connectionType || sourceConnection.sourceConnectionType,
-        localPath: sourceConnection.localPath
-          || sourceConnection.sourceLocalPath
-          || sourceConnection.targetLocalPath
+      // What this node reads, in the shape skills expect (un-prefixed names,
+      // like a saved connection record).
+      //
+      // Taken from THIS NODE's own `source*` fields — the same fields the node
+      // chat's skill path reads (NodeChatPanel.js) and the same ones the
+      // non-skill transformer path reads. They were resolved at build time by
+      // copySourceFromUpstream, which reads the parent TARGET-first, so they are
+      // already correct whatever the parent is.
+      //
+      // This used to re-derive them from the PARENT node's config using
+      // `source*` lookups. That only works when the parent is a dataSource --
+      // the one node type that describes ITSELF with `source*`. Every other node
+      // describes its OUTPUT with `target*`, so a join or transformer parent
+      // yielded dbType/id/name === undefined, the local-DuckDB branch was
+      // skipped, and the read fell through to runQuery(undefined):
+      // "Connection not found: undefined".
+      const parentConfig = sourceNode.data?.config || {};
+      let sourceConnection = {
+        id:             config.sourceConnectionId,
+        name:           config.sourceConnectionName,
+        dbType:         config.sourceDbType || config.sourceType,
+        dbConfig:       config.sourceDbConfig,
+        dbCategory:     config.sourceDbCategory,
+        connectionType: config.sourceConnectionType,
+        localPath:      config.sourceLocalPath,
+        indexName:      config.sourceIndexName,
       };
-      const sourceTableSchema = sourceNode.data?.config?.targetTableSchema || sourceNode.data?.config?.sourceTableSchema;
+      // Nodes built before those fields were recorded fall back to deriving from
+      // the parent -- target-first this time, matching copySourceFromUpstream.
+      if (!sourceConnection.dbType && !sourceConnection.id) {
+        const p = parentConfig.connection || parentConfig;
+        sourceConnection = {
+          ...p,
+          id:             p.targetConnectionId   || p.sourceConnectionId   || p.id,
+          name:           p.targetConnectionName || p.sourceConnectionName || p.name,
+          dbType:         p.targetDbType         || p.sourceDbType         || p.dbType,
+          dbConfig:       p.targetDbConfig       || p.sourceDbConfig       || p.dbConfig,
+          dbCategory:     p.targetDbCategory     || p.sourceDbCategory     || p.dbCategory,
+          connectionType: p.targetConnectionType || p.sourceConnectionType || p.connectionType,
+          localPath:      p.targetLocalPath      || p.sourceLocalPath      || p.localPath,
+        };
+      }
+      // The node's own recorded input shape. Downstream propagation refreshes
+      // this when a parent is rebuilt, so preferring it is also what makes that
+      // refresh reach skills.
+      const sourceTableSchema = config.sourceTableSchema
+        || parentConfig.targetTableSchema
+        || parentConfig.sourceTableSchema;
 
       // Determine operation type
-      const isNoSQL = ['mongodb', 'nedb'].includes(sourceConnection?.dbType);
+      const isNoSQL = sourceConnection?.dbType === 'mongodb';
       const operationType = isNoSQL ? 'nosql' : 'sql';
 
       // Get source schema
@@ -691,7 +583,8 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
           localPath: sourceConnection.localPath ||
                      sourceNodeConfig?.targetLocalPath ||
                      sourceNodeConfig?.sourceLocalPath ||
-                     sourceNodeConfig?.targetDbConfig?.dbPath
+                     sourceNodeConfig?.targetDbConfig?.dbPath ||
+                     config.targetDbConfig?.dbPath
         };
       }
 
@@ -781,7 +674,6 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
         pluginManager: helpers.pluginManager,
         getFullConfig: helpers.getFullConfig,
         appSqliteDbPath: helpers.appSqliteDbPath,
-        sqlitePool: helpers.sqlitePool,
 
         // Spread any additional skill params last (allows overrides)
         ...config.skillParams
@@ -813,19 +705,18 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
       };
     }
 
-    // Get source local path if needed (for NeDB or local SQLite operations)
-    const isNeDB = dbType === 'nedb';
+    // Get source local path if needed (for local file operations)
     const isLocalStorage = config.transformationSettings?.storageLocation === 'local';
     const isInPlace = config.transformationSettings?.operationMode === 'in_place';
 
     // Cross-database NoSQL case: the source is MongoDB but the destination is a
-    // local NeDB file (target dbType "nedb" / storageLocation "local"). The read
-    // and aggregation must run against MongoDB; the resulting documents are then
-    // persisted to local NeDB by handleTransformNoSQL via saveToLocalNeDB.
+    // local DuckDB table (storageLocation "local"). The read and aggregation
+    // must run against MongoDB; the resulting documents are then written to the
+    // workflow's DuckDB database by handleTransformNoSQL.
     // Routing off the *target* dbType alone would mistakenly try to open a local
-    // NeDB source file that does not exist ("Source NeDB file not found").
+    // source file that does not exist.
     const isMongoSourceToLocal =
-      sourceDbType === 'mongodb' && dbType !== 'mongodb' && (isNeDB || isLocalStorage);
+      sourceDbType === 'mongodb' && dbType !== 'mongodb' && isLocalStorage;
 
     // Diagnostic: the exact inputs that drive transformer routing. If the
     // running main process predates the isMongoSourceToLocal guard, this line
@@ -845,16 +736,16 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     //   sourceConnectionId: config.sourceConnectionId,
     //   targetConnectionId: config.targetConnectionId,
     //   targetLocalPath: config.targetLocalPath,
-    //   flags: { isNeDB, isLocalStorage, isInPlace, isMongoSourceToLocal },
+    //   flags: { isLocalStorage, isInPlace, isMongoSourceToLocal },
     //   route: isMongoSourceToLocal
     //     ? 'mongo-source-to-local (handleTransformNoSQL dbType=mongodb)'
-    //     : (['mongodb', 'nedb'].includes(dbType)
+    //     : (dbType === 'mongodb'
     //         ? `nosql (handleTransformNoSQL dbType=${dbType})`
     //         : 'sql (handleTransformSQL)')
     // }, null, 2));
 
     if (isMongoSourceToLocal) {
-      console.log('[Transformer Routing] -> mongo-source-to-local: aggregating on MongoDB, writing result to local NeDB');
+      console.log('[Transformer Routing] -> mongo-source-to-local: aggregating on MongoDB, writing result to local DuckDB');
       const result = await handleTransformNoSQL({
         dbType: 'mongodb',
         config: config.sourceDbConfig || config.dbConfig,
@@ -888,18 +779,15 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
     const isSqlSourceToLocal =
       isLocalStorage && !isInPlace &&
       (dbType === 'duckdb' || dbType === 'sqlite') &&
-      sourceDbType && !['duckdb', 'sqlite', 'nedb', 'mongodb'].includes(sourceDbType);
+      sourceDbType && !['duckdb', 'sqlite', 'mongodb'].includes(sourceDbType);
 
-    const sourceLocalPath = (isNeDB || isLocalStorage || isInPlace || dbType === 'duckdb')
+    const sourceLocalPath = (isLocalStorage || isInPlace || dbType === 'duckdb')
       ? getSourceLocalPath(node, nodeMap, edges)
       : null;
 
-    // NoSQL transformations (MongoDB, NeDB)
-    if (['mongodb', 'nedb'].includes(dbType)) {
-      console.log(`[Transformer Routing] -> nosql branch dbType=${dbType}, sourceLocalPath=${sourceLocalPath}` +
-        (dbType === 'nedb' && sourceDbType === 'mongodb'
-          ? '  ⚠️ NeDB branch with a MongoDB source — this yields "Source NeDB file not found". Restart Electron to pick up the mongo-source guard.'
-          : ''));
+    // NoSQL transformations (MongoDB)
+    if (dbType === 'mongodb') {
+      console.log(`[Transformer Routing] -> nosql branch dbType=${dbType}, sourceLocalPath=${sourceLocalPath}`);
       const result = await handleTransformNoSQL({
         dbType,
         config: config.targetDbConfig || config.dbConfig,
@@ -944,6 +832,11 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
       targetSchema: config.targetSchema || config.sourceSchema || config.schema,
       targetTableName: config.targetTableName || config.targetCollection,
       sourceLocalPath: sourceLocalPath,
+      // The source's IDENTITY, from the NODE's config. handleTransformSQL used
+      // to read these off its `config` argument, which is the target database
+      // config passed just above — a different object that has never held them.
+      sourceTableName: config.sourceTableName || config.sourceTableSchema?.tableName || null,
+      sourceConnectionName: config.sourceConnectionName || null,
       insertSql: config.targetInsertSql,
       // A local DuckDB target writes one Parquet file per node, so it needs to
       // know which node it is.
@@ -955,10 +848,17 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
 
     return {
       success: result.success,
+      // Set by the DuckDB transform paths when the table they created came out
+      // empty — a real count read back off the table, not an absent one — and
+      // by a remote in-place transform whose DDL failed while its DML went
+      // through, which is what a rerun of an ALTER looks like.
+      warning: !!result.warning,
       message: result.message || (result.success ? 'SQL transformation completed' : 'SQL transformation failed'),
       recordsProcessed: result.rowCount || result.recordCount || 0
     };
   } catch (error) {
+    // A stop stays an exception all the way to the runner — see executeOutputNode.
+    if (isCancelledError(error)) throw error;
     console.error('[Workflow Execution] Transformer error:', error);
     return {
       success: false,
@@ -972,6 +872,140 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
  * Execute a Join node
  * Calls the join handler directly
  */
+/**
+ * Fill in a vector source's index coordinates from the node that produced it.
+ *
+ * A Pinecone index is identified by `indexName` + `namespace`, never by a table
+ * name. The builder now records both onto each join source
+ * (enrichJoinSourcesConfig), but workflows built before that carry neither — and
+ * the executor's fallback chain ends at the table name, so it would call
+ * `/indexes/<tableName>` and get a 404 for an index that was never named that.
+ *
+ * The upstream node still knows: a vector transformer records `indexName` /
+ * `namespace` at its config top level when it writes the embeddings. Reading
+ * them here means an existing workflow runs correctly without being rebuilt.
+ *
+ * Only fills gaps — anything already on the source config wins, and non-vector
+ * sources are returned untouched.
+ */
+/**
+ * What a node config says it READS — target-first, because every node type but
+ * a dataSource describes its output with `target*`. Mirrors the renderer's
+ * SOURCE_IDENTITY_KEYS (src/utils/workflowUtils.js); keep the two in step.
+ */
+function sourceIdentityOf(config = {}) {
+  return {
+    connectionId: config.targetConnectionId || config.sourceConnectionId || null,
+    tableName: config.targetTableName || config.targetCollection
+      || config.sourceTableName || config.sourceCollection || null,
+    localPath: config.targetLocalPath || config.sourceLocalPath || null,
+  };
+}
+
+/** Whether two identities disagree. A side that states nothing never disagrees. */
+function identityDiffers(a, b) {
+  return ['connectionId', 'tableName', 'localPath']
+    .some((k) => !!a?.[k] && !!b?.[k] && a[k] !== b[k]);
+}
+
+/** How a moved source reads in an error: "customers" → "orders on another connection". */
+function describeMove(moved) {
+  const from = moved?.from || {};
+  const to = moved?.to || {};
+  const elsewhere = from.connectionId && to.connectionId && from.connectionId !== to.connectionId;
+  return `${from.tableName || 'what it was built against'} → ${to.tableName || 'another table'}`
+    + (elsewhere ? ' on another connection' : '');
+}
+
+/**
+ * The failure for a join whose source has been re-pointed since it was built,
+ * or null when every step still reads what its SQL names.
+ *
+ * `sourceMoved` is stamped by whichever pass re-pointed the step — the editor's
+ * on every canvas change, the builder's on a single-node chat rebuild. Both
+ * refresh WHERE a source is read from and leave HOW it is read alone, so the
+ * marker is the one thing that can tell the executor the two no longer agree.
+ *
+ * ONLY a rebuild clears it, because only a rebuild regenerates the step's SQL,
+ * DDL and staging table against the source that is actually there now. The
+ * card's "Keep as is" deliberately does NOT: it answers for the node's logic,
+ * and no answer makes a `CREATE TABLE` for one table's columns correct for
+ * another's. A run allowed through on that assurance writes real rows into a
+ * real database.
+ */
+function staleJoinSource(sourcesConfig, parentIds, nodeMap) {
+  const steps = Array.isArray(sourcesConfig) ? sourcesConfig.filter(Boolean) : [];
+  const wired = new Set(parentIds || []);
+  const named = new Set(steps.map((s) => s.sourceNodeId).filter(Boolean));
+  const labelOf = (id) => nodeMap?.get(id)?.data?.config?.node_name
+    || nodeMap?.get(id)?.data?.label
+    || id;
+
+  const reasons = [];
+
+  // RETARGETED — the step still exists, but reads a different object now.
+  const moved = steps.filter((s) => s.sourceMoved);
+  if (moved.length) {
+    reasons.push(`a source moved (${moved.map((s) => describeMove(s.sourceMoved)).join('; ')})`);
+  }
+
+  // REMOVED — a step whose node no longer feeds this join. Checked against the
+  // live graph rather than a saved flag, so it holds however the edge went
+  // away: deleted on the canvas, the node itself deleted, or a workflow
+  // hand-edited outside the editor. The join SQL still names that source's
+  // table, and the step still carries the connection to reach it — so the run
+  // would go on reading a source the user has disconnected, and succeed.
+  const removed = steps.filter((s) => s.sourceNodeId && !wired.has(s.sourceNodeId));
+  if (removed.length) {
+    reasons.push(`a source is no longer connected (${removed.map((s) => s.tableName || labelOf(s.sourceNodeId)).join(', ')})`);
+  }
+
+  // ADDED — a node feeds this join that the generated SQL has never heard of.
+  // Running would quietly ignore it and write a result missing whatever the
+  // user attached it for.
+  const added = [...wired].filter((id) => !named.has(id));
+  if (added.length) {
+    reasons.push(`a new source is connected that the join does not read (${added.map(labelOf).join(', ')})`);
+  }
+
+  if (reasons.length === 0) return null;
+  return {
+    success: false,
+    message: `This join's sources changed after it was built — ${reasons.join('; ')}. Its SQL, DDL `
+      + 'and staging tables still describe the old set of sources. Rebuild the join from its chat '
+      + 'before running it.',
+    recordsProcessed: 0,
+  };
+}
+
+function withVectorIndexCoordinates(sourcesConfig, nodeMap) {
+  if (!Array.isArray(sourcesConfig) || !nodeMap) return sourcesConfig;
+  return sourcesConfig.map((sc) => {
+    if (!sc || (sc.indexName && sc.namespace)) return sc;
+    const upstream = nodeMap.get(sc.sourceNodeId);
+    const up = upstream?.data?.config;
+    if (!up) return sc;
+    const indexName = sc.indexName || up.indexName || up.targetIndexName || up.skillParams?.indexName || null;
+    const namespace = sc.namespace || up.namespace || up.targetNamespace || up.skillParams?.namespace || null;
+    if (!indexName && !namespace) return sc;
+    return {
+      ...sc,
+      ...(indexName ? { indexName } : {}),
+      ...(namespace ? { namespace } : {}),
+      connection: {
+        ...(sc.connection || {}),
+        ...(indexName ? { indexName } : {}),
+        ...(namespace ? { namespace } : {}),
+        dbConfig: {
+          ...(sc.connection?.dbConfig || {}),
+          ...(indexName ? { indexName } : {}),
+          ...(namespace ? { namespace } : {}),
+        },
+      },
+    };
+  });
+}
+
 async function executeJoinNode(node, nodeMap, edges, helpers) {
   const { getFullConfig } = helpers;
 
@@ -1015,9 +1049,25 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
     };
   }
 
+  // The join's SQL, DDL and staging tables were generated for ONE set of
+  // sources, each read a specific way. Three things can leave that set behind,
+  // and all three are refused here rather than run:
+  //
+  //   - a source RETARGETED at another table or connection (the re-point passes
+  //     move the identity and deliberately leave the SQL alone);
+  //   - a source DISCONNECTED or deleted, whose step the SQL still names and
+  //     whose connection the step still carries — so the join would keep
+  //     reading a source that is no longer part of the workflow;
+  //   - a source ADDED that the SQL has never heard of, which the run would
+  //     ignore while reporting success.
+  const movedSource = staleJoinSource(
+    config.sourcesConfig, sourceEdges.map((e) => e.source), nodeMap,
+  );
+  if (movedSource) return movedSource;
+
   try {
     // Build destination connection from config. Include localPath so a local
-    // file destination (LanceDB directory / SQLite / NeDB file) resolves to the
+    // file destination (LanceDB directory / SQLite file) resolves to the
     // right path — the vector branch falls back to destinationConnection.localPath.
     const destinationConnection = {
       id: config.targetConnectionId || config.connectionId,
@@ -1030,13 +1080,13 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
     // (saved Pinecone connection OR local LanceDB table) gets embedded + upserted
     // by the handler's vector branch.
     const joinConfig = {
-      sourcesConfig: config.sourcesConfig,
+      sourcesConfig: withVectorIndexCoordinates(config.sourcesConfig, nodeMap),
       joinSql: config.joinSql,
       targetDdl: config.targetDdl,
       transformFunction: config.transformFunction,
       targetTableName: config.targetTableName,
       targetCollection: config.targetCollection,
-      // Carried so a local NeDB join writes to the file its readers already
+      // Carried so a local join writes to the store its readers already
       // point at, rather than falling back to a derived path.
       targetLocalPath: config.targetLocalPath,
       vectorDestination: config.vectorDestination
@@ -1053,10 +1103,14 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
 
     return {
       success: result.success,
+      // Set by the DuckDB join when the table it wrote came out empty.
+      warning: !!result.warning,
       message: result.message || (result.success ? 'Join executed successfully' : 'Join execution failed'),
       recordsProcessed: result.rowCount || result.recordCount || result.documentsInserted || 0
     };
   } catch (error) {
+    // A stop stays an exception all the way to the runner — see executeOutputNode.
+    if (isCancelledError(error)) throw error;
     console.error('[Workflow Execution] Join error:', error);
     return {
       success: false,
@@ -1126,21 +1180,78 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
     // resolved when the node was configured (OutputNodeChat.js:305). Prefer
     // them. Deriving from the parent instead mixes its source* and target*
     // sides — for a transformer that yields dbType from its source (mongodb)
-    // beside localPath from its target (a NeDB file), a pair that matches no
+    // beside localPath from its target (a local file), a pair that matches no
     // read branch in executeOutput. Parent target* comes next, since a
     // transformer/join writes to its target; parent source* is last, covering
     // a datasource parent, which has no target side.
     const sourceConfig = sourceNode.data?.config || {};
 
+    // Those recorded fields are only trustworthy while they still describe the
+    // node that actually feeds this one. Inserting a transformer between a data
+    // source and an output rewires the edge but leaves this node's copy naming
+    // the old parent — and since the copy wins every `||` below, the output
+    // would go on reading the data source and quietly ignore the new node.
+    //
+    // The editor re-points a node's input as soon as its edge changes
+    // (workflowUtils.syncNodeSourcesToEdges), so this covers workflows saved
+    // before that and any rewire that reached the DB another way.
+    const recordedParent = config.sourceNodeId;
+    const staleSource = !!recordedParent && recordedParent !== sourceNode.id;
+    if (staleSource) {
+      console.warn(
+        `[Workflow Execution] Output ${node.id} records source ${recordedParent} `
+        + `but is wired to ${sourceNode.id}; reading the wired one.`,
+      );
+    }
+
+    // Naming the right parent is not enough: the parent can be rebuilt IN PLACE
+    // onto a different connection or table (an assistant "modify" does exactly
+    // that, keeping the node id), leaving this copy pointing at what the parent
+    // abandoned. A workflow whose Mongo source and transformer were moved to a
+    // new connection failed here with "MongoDB URI is required", because the
+    // copy still asked for the replaced connection. The parent is the authority
+    // on what it just produced, so where the two disagree the copy loses.
+    //
+    // The editor refreshes the copy as soon as the parent moves
+    // (workflowUtils.syncNodeSourcesToEdges); this covers workflows saved before
+    // it did, and any edit that reached the database another way.
+    const parentOut = {
+      connectionId: sourceConfig.targetConnectionId || sourceConfig.sourceConnectionId,
+      tableName: sourceConfig.targetTableName || sourceConfig.sourceTableName,
+      collection: sourceConfig.targetCollection || sourceConfig.sourceCollection,
+      localPath: sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath,
+      indexName: sourceConfig.targetIndexName || sourceConfig.sourceIndexName,
+    };
+    // Only compared where both sides state something: a parent that never names
+    // a collection must not make a copy that does look wrong.
+    const disagrees = (mine, theirs) => !!mine && !!theirs && mine !== theirs;
+    const staleTarget = !staleSource && (
+      disagrees(config.sourceConnectionId, parentOut.connectionId)
+      || disagrees(config.sourceTableName, parentOut.tableName)
+      || disagrees(config.sourceCollection, parentOut.collection)
+      || disagrees(config.sourceLocalPath, parentOut.localPath)
+      || disagrees(config.sourceIndexName, parentOut.indexName)
+    );
+    if (staleTarget) {
+      console.warn(
+        `[Workflow Execution] Output ${node.id} records connection `
+        + `${config.sourceConnectionId}/${config.sourceTableName || config.sourceCollection || ''} `
+        + `but ${sourceNode.id} now writes ${parentOut.connectionId}/`
+        + `${parentOut.tableName || parentOut.collection || ''}; reading what it writes.`,
+      );
+    }
+
+    const own = (staleSource || staleTarget) ? {} : config;
+
     const connection = {
-      id: config.sourceConnectionId || sourceConfig.targetConnectionId || sourceConfig.sourceConnectionId,
-      name: config.sourceConnectionName || sourceConfig.targetConnectionName || sourceConfig.sourceConnectionName,
-      connectionType: config.sourceConnectionType || sourceConfig.targetConnectionType || sourceConfig.sourceConnectionType,
-      dbType: config.sourceDbType || sourceConfig.targetDbType || sourceConfig.sourceDbType,
-      dbConfig: config.sourceDbConfig || sourceConfig.targetDbConfig || sourceConfig.sourceDbConfig,
-      localPath: config.sourceLocalPath || sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath,
-      dbCategory: config.sourceDbCategory || sourceConfig.targetDbCategory || sourceConfig.sourceDbCategory,
-      indexName: config.sourceIndexName || sourceConfig.targetIndexName || sourceConfig.sourceIndexName // For Pinecone
+      id: own.sourceConnectionId || sourceConfig.targetConnectionId || sourceConfig.sourceConnectionId,
+      name: own.sourceConnectionName || sourceConfig.targetConnectionName || sourceConfig.sourceConnectionName,
+      connectionType: own.sourceConnectionType || sourceConfig.targetConnectionType || sourceConfig.sourceConnectionType,
+      dbType: own.sourceDbType || sourceConfig.targetDbType || sourceConfig.sourceDbType,
+      dbConfig: own.sourceDbConfig || sourceConfig.targetDbConfig || sourceConfig.sourceDbConfig,
+      localPath: own.sourceLocalPath || sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath,
+      dbCategory: own.sourceDbCategory || sourceConfig.targetDbCategory || sourceConfig.sourceDbCategory,
+      indexName: own.sourceIndexName || sourceConfig.targetIndexName || sourceConfig.sourceIndexName // For Pinecone
     };
 
     const sourceConnectionId = connection.id;
@@ -1165,7 +1276,9 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
       : null;
     const result = await executeOutput(
       sourceConnection,
-      config.sourceTableSchema,
+      // Which table/collection to read, and its shape. Same rule as the
+      // connection above: a stale copy describes the wrong node's output.
+      own.sourceTableSchema || sourceConfig.targetTableSchema || sourceConfig.sourceTableSchema,
       config.outputSettings,
       pluginManager,
       getFullConfig,
@@ -1175,10 +1288,18 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
 
     return {
       success: result.success,
+      // A node that succeeded with something worth saying — an empty source,
+      // so nothing was written. The runner logs it at warn level; dropping it
+      // here left an empty run indistinguishable from a full one.
+      warning: !!result.warning,
       message: result.message || (result.success ? 'Output executed successfully' : 'Output execution failed'),
       recordsProcessed: result.rowCount || result.recordCount || 0
     };
   } catch (error) {
+    // The last catch between the batch-insert loop and the runner. A stop has
+    // to stay an exception through here, or it arrives as { success: false }
+    // and the run is recorded as FAILED — see executionCancel.js.
+    if (isCancelledError(error)) throw error;
     console.error('[Workflow Execution] Output error:', error);
     return {
       success: false,

@@ -84,6 +84,25 @@ module.exports = {
   name: 'SQLite',
   dbCategory: 'SQL',
 
+  /**
+   * Column types for a CREATE TABLE this app generates. See the note on
+   * `types` in plugins/connectors/snowflake/index.js.
+   *
+   * SQLite has four storage classes and no date or boolean type, so most of
+   * these collapse to TEXT or INTEGER. That is correct HERE — it was only
+   * wrong as the silent fallback every other engine used to get.
+   */
+  types: {
+    NULL: () => 'TEXT',
+    DATE_ONLY: () => 'TEXT',
+    TIMESTAMP: () => 'TEXT',
+    BOOLEAN: () => 'INTEGER',
+    INTEGER: () => 'INTEGER',
+    FLOAT: () => 'REAL',
+    OBJECT: () => 'TEXT',
+    STRING: () => 'TEXT',
+  },
+
   testConnection: async (config) => {
     try {
       await query(config.dbPath, 'SELECT 1');
@@ -130,6 +149,13 @@ module.exports = {
 
   getColumns: async (config, connectionId, schema, table) => {
     try {
+      // Accept a database-qualified "main.orders" as well as a bare table.
+      // PRAGMA table_info takes ONE identifier, so the qualified form would ask
+      // for a table whose name contains a dot and come back empty — silently,
+      // since the caller that needs this treats a failed lookup as "cannot
+      // check". SQLite has no schema layer, so the qualifier is simply dropped.
+      const parts = String(table || '').split('.');
+      if (parts.length === 2) [, table] = parts;
       const rows = await query(config.dbPath, `PRAGMA table_info(${quote(table)})`);
       return {
         success: true,
@@ -237,9 +263,36 @@ module.exports = {
    * `main` is implicit and prefixing it breaks nothing but reads badly, so
    * only the table itself is quoted.
    */
-  quoteIdentifier: (identifier, schema = null) => (
-    schema && schema !== 'main' ? `${quote(schema)}.${quote(identifier)}` : quote(identifier)
-  ),
+  // A dotted name given as one string ("main.orders", or an attached database's
+  // "aux.orders") is a database-qualified table name, so each part is quoted
+  // separately — quoting it whole would name a single table containing a dot,
+  // which never matches the unquoted form the insert path builds. "main" is
+  // dropped for the same reason it is dropped from the `schema` argument: it is
+  // the default database, and naming it adds nothing.
+  quoteIdentifier: (identifier, schema = null) => {
+    if (!identifier) return identifier;
+    // Already quoted — hand it back untouched. Callers pass identifiers that
+    // another layer has sometimes quoted already, and quoting a second time
+    // produces ONE identifier whose text is the quoted string, which resolves
+    // to nothing: a read of "PUBLIC"."public.transactions" came back as
+    // `Object 'TERNLUX.PUBLIC.""PUBLIC"."public.transactions""' does not exist`.
+    // The SQL Server connector has always done this; the rest now agree.
+    if (typeof identifier === 'string'
+        && identifier.startsWith('"') && identifier.endsWith('"') && identifier.length > 1) {
+      return identifier;
+    }
+
+    if (schema) {
+      return schema === 'main' ? quote(identifier) : `${quote(schema)}.${quote(identifier)}`;
+    }
+    if (typeof identifier === 'string' && identifier.includes('.')) {
+      const parts = identifier.split('.');
+      const [head, ...rest] = parts;
+      if (parts.length === 2 && head === 'main') return quote(rest[0]);
+      return parts.map(quote).join('.');
+    }
+    return quote(identifier);
+  },
 
   getPreviewQuery: (tableName, limit = 100) => `SELECT * FROM ${tableName} LIMIT ${limit}`,
 

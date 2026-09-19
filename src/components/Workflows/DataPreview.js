@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Card, Tabs, Table, Typography, Spin, Empty, Button, Space, message, Tooltip, Collapse } from 'antd';
 import {
   EyeOutlined,
@@ -15,30 +15,23 @@ import {
 import axios from 'axios';
 import Editor from '@monaco-editor/react';
 import { nodeDisplayName } from './nodes/nodeCardShared';
+// Whether a node's output exists yet is workflow state, not node config — a
+// transformer/join/output names its target table the moment it is built, and
+// only a run puts anything behind that name. See utils/executedNodes.js.
+import { awaitsExecution as nodeAwaitsExecution } from '../../utils/executedNodes';
+// The same full-screen Monaco editor the chat and the steps editor use, so a
+// code edit looks and behaves identically wherever it is started from.
+import CodeEditorPopup from '../Chat/CodeEditorPopup';
+// Rows look the same wherever they come from: the Data Explorer's grid, JSON
+// cards and Table/JSON switch, rendering a node's data here too.
+import {
+  Grid, JsonView, RowDetail, ViewToggle, autoViewFor, useCopySelection,
+} from '../DatabaseExplorer/ResultsView';
+import { C, MONO, Icon } from '../DatabaseExplorer/theme';
 
 const { Title, Text } = Typography;
 const { TabPane } = Tabs;
 const { Panel } = Collapse;
-
-// Node types whose output is created by running them: until then their target
-// table/collection is a name in the config and nothing else. `config.executed`
-// records whether the run has happened — set false when the node is built or
-// reconfigured, true by the executor (NodeExecution/workflowExecutionHelpers
-// markNodeExecuted, which also writes it to the saved workflow).
-const EXECUTED_FLAG_NODE_TYPES = new Set(['transformer', 'join', 'output']);
-
-/**
- * Would reading this node's output query something that isn't there yet?
- *
- * Only an explicit `false` counts. Nodes saved before the flag existed have no
- * `executed` at all, and those may well have been run — refusing to preview
- * them would break working workflows, so they fall through to the query (and,
- * if the table really is missing, to the pending-execution state below).
- */
-const awaitsExecution = (node) =>
-  !!node &&
-  EXECUTED_FLAG_NODE_TYPES.has(node.type) &&
-  node.data?.config?.executed === false;
 
 // The shape renderDataTable shows as "runs first, previews after".
 const pendingExecutionResult = () => ({
@@ -48,10 +41,189 @@ const pendingExecutionResult = () => ({
   pendingExecution: true,
 });
 
+/**
+ * How many rows a fetched result actually holds.
+ *
+ * `data` is the array of display rows for a tabular fetch and the array of
+ * documents for a document store, so both are counted the same way.
+ */
+const rowsIn = (data) => (Array.isArray(data?.data) ? data.data.length : 0);
+
+/** The table / collection / index a config reads, named for the empty notice. */
+const datasetNameOf = (config, side = 'source') => (
+  side === 'target'
+    ? (config?.targetTableName || config?.targetCollection
+      || config?.targetIndexName || config?.indexName)
+    : (config?.sourceTableName || config?.sourceCollection || config?.sourceIndexName
+      || config?.sourceDataset || config?.dataset)
+) || null;
+
+/**
+ * "This read succeeded, and there was nothing in it."
+ *
+ * Amber, not red: an empty table is a legitimate state, not a failure — the
+ * connection worked and the table exists. It is called out because the
+ * consequences appear far from here, in a transformer that produces nothing
+ * and an output node that has nothing to write, where the emptiness is much
+ * harder to recognise for what it is.
+ */
+const EmptyDataNotice = ({ children }) => (
+  <div style={{
+    display: 'flex', alignItems: 'flex-start', gap: 8, flexShrink: 0,
+    margin: '0 0 8px', padding: '8px 10px',
+    background: C.amberD, border: `1px solid ${C.amberB}`, borderRadius: 6,
+  }}>
+    <span style={{ display: 'flex', flexShrink: 0, marginTop: 1 }}>
+      {Icon('alert', C.amber, 14)}
+    </span>
+    <span style={{ fontSize: 12, lineHeight: 1.5, color: C.text }}>{children}</span>
+  </div>
+);
+
+/**
+ * The warning shown when a preview comes back with no rows, worded for the
+ * node it belongs to: what is empty, and what that means when the workflow
+ * runs. An empty grid on its own reads as a broken node, which is how an empty
+ * source table came to look like a preview failure.
+ */
+const emptyNoticeFor = (kind, config) => {
+  const name = datasetNameOf(config, kind === 'transformed' ? 'target' : 'source');
+  const named = name ? `"${name}"` : 'This source';
+  switch (kind) {
+    case 'dataSource':
+      return `${named} has no rows. The connection and the table are fine — the table is `
+        + 'empty — but every node downstream of this source will have nothing to process.';
+    case 'source':
+      return `${named} has no rows, so this node will produce nothing when it runs.`;
+    case 'output':
+      return `${named} has no rows, so running this output writes nothing to its destination.`;
+    case 'transformed':
+      return 'This node ran and produced no rows. Check that its source has data and that '
+        + "the transformation's filters aren't excluding everything.";
+    default:
+      return `${named} has no rows.`;
+  }
+};
+
+/**
+ * Translate a fetch result into the shape the Data Explorer's views read:
+ * { columns: [{ name, type }], rows: [{ [column]: value }] }.
+ *
+ * Three sources feed in. A document store hands back row OBJECTS under `data`
+ * with isJson; a tabular fetch hands back display strings under `data` plus the
+ * untouched rows under `rawRows`; and a result with neither is empty. The raw
+ * rows are preferred wherever they exist — the JSON view exists to show values
+ * as they are, and pre-formatted strings would defeat the point of switching to
+ * it.
+ *
+ * Columns come from the store when it declares them, so an empty result still
+ * shows its headers, and are otherwise unioned across the rows: documents in
+ * one collection need not agree on their keys, and a grid built from the first
+ * row alone would silently drop the fields the others added.
+ */
+const toResultShape = (data) => {
+  if (!data) return { columns: [], rows: [] };
+
+  const declared = (data.rawColumns || data.headers || [])
+    .map((c) => (typeof c === 'string' ? { name: c, type: '' } : { name: c.name, type: c.type || '' }))
+    .filter((c) => c.name);
+
+  const rows = Array.isArray(data.rawRows) ? data.rawRows
+    : data.isJson ? (Array.isArray(data.data) ? data.data : [])
+      : (data.data || []).map((cells) => {
+        const row = {};
+        (data.headers || []).forEach((name, i) => { row[name] = cells[i]; });
+        return row;
+      });
+
+  if (declared.length) return { columns: declared, rows };
+
+  const names = [];
+  const seen = new Set();
+  rows.forEach((row) => {
+    if (!row || typeof row !== 'object') return;
+    Object.keys(row).forEach((k) => { if (!seen.has(k)) { seen.add(k); names.push(k); } });
+  });
+  return { columns: names.map((name) => ({ name, type: '' })), rows };
+};
+
+/**
+ * One result, rendered the way the Data Explorer renders results.
+ *
+ * Its own component because each block owns view, selection and open-row state:
+ * the Preview tab and the Transformed tab show different results side by side,
+ * and switching one to JSON should not switch the other.
+ */
+const ResultBlock = ({ data, height }) => {
+  const hostRef = useRef(null);
+  const [viewOverride, setViewOverride] = useState(null);
+  const [selection, setSelection] = useState(null);
+  const [openRow, setOpenRow] = useState(null);
+
+  const result = useMemo(() => toResultShape(data), [data]);
+  const autoView = useMemo(
+    () => autoViewFor(result, { isDocumentStore: !!data?.isJson }),
+    [result, data],
+  );
+  const view = viewOverride || autoView;
+
+  // A different result is a different selection — and different row indices.
+  useEffect(() => { setSelection(null); setOpenRow(null); }, [data]);
+
+  useCopySelection(hostRef, result, selection);
+
+  const rowCount = result.rows.length;
+
+  return (
+    <div
+      ref={hostRef}
+      tabIndex={-1}
+      style={{
+        height, minHeight: 0, display: 'flex', flexDirection: 'column',
+        background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6,
+        overflow: 'hidden', outline: 'none',
+      }}
+    >
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+        padding: '5px 8px', background: C.surface, borderBottom: `1px solid ${C.border}`,
+      }}>
+        <span style={{ fontSize: 10.5, fontFamily: MONO, color: C.muted }}>
+          {rowCount} {rowCount === 1 ? 'row' : 'rows'}
+          {data?.storageType ? ` · ${data.storageType}` : ''}
+        </span>
+        <div style={{ flex: 1 }} />
+        <ViewToggle view={view} onChange={setViewOverride} />
+      </div>
+
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {view === 'grid' ? (
+          <Grid
+            result={result}
+            openRow={openRow}
+            onOpenRow={setOpenRow}
+            selection={selection}
+            onSelect={setSelection}
+          />
+        ) : (
+          <JsonView result={result} />
+        )}
+        {view === 'grid' && openRow !== null && (
+          <RowDetail result={result} index={openRow} onClose={() => setOpenRow(null)} />
+        )}
+      </div>
+    </div>
+  );
+};
+
 const DataPreview = ({
   selectedNode,
   nodes,
   edges,
+  // `{ [nodeId]: boolean }` — which nodes have actually run. Read before
+  // querying anything a transformer/join/output only PLANS to write; only an
+  // explicit `false` blocks a read. See utils/executedNodes.js.
+  executedNodes = {},
   isNodeSidebarOpen,
   onNodeUpdate,
   dbTables = [],
@@ -59,6 +231,11 @@ const DataPreview = ({
   refreshTrigger = 0,
   onClose = null
 }) => {
+  const awaitsExecution = useCallback(
+    (node) => nodeAwaitsExecution(node, executedNodes),
+    [executedNodes],
+  );
+
   // Component state
   const [isExpanded, setIsExpanded] = useState(false);
   const [height, setHeight] = useState(300);
@@ -80,14 +257,25 @@ const DataPreview = ({
   const [dbSchema, setDbSchema] = useState({});
   const [loadingSchema, setLoadingSchema] = useState(false);
 
+  // Full-screen code editor. `configKey` is the config field the open block was
+  // read from, so a save writes back to the field it came from rather than to a
+  // guess — "JavaScript function" is `transformFunction` on a transformer and
+  // `apiFetchCode` on a REST API source, and the two must not be confused.
+  const [codeEditor, setCodeEditor] = useState(null);
+
   // Refs for resizing
   const containerRef = useRef(null);
   const isDragging = useRef(false);
   // Two separate effects watch the node config and both call fetchPreviewData,
   // so one selection change used to fire two identical queries — enough to race
   // a connection that was being torn down ("connection is in closed state").
-  // This holds the descriptor of the last fetch issued; a repeat is ignored.
+  // This holds the descriptor of the fetch currently running; a repeat of it is
+  // ignored, and it is cleared the moment that fetch settles.
   const inFlightFetchKey = useRef(null);
+  // The descriptor of the rows currently on screen. Refetching it would only
+  // redraw the same table, so it is skipped too — but unlike the in-flight key
+  // it moves with the selection, so returning to an earlier table still fetches.
+  const appliedFetchKey = useRef(null);
   // Monotonic id for preview fetches, so a slow one that resolves after the
   // user has already picked a different table is discarded instead of
   // overwriting the newer selection.
@@ -125,31 +313,80 @@ const DataPreview = ({
     }
 
     try {
-      // Handle SQLite/NeDB databases (including imported spreadsheets)
-      // Check if this is a SQLite or NeDB connection first
+      // Handle local database files (including imported spreadsheets)
       const dbType = connection.targetDbType || config.targetDbType || config.sourceDbType;
       
       // Handle vector databases (LanceDB, Pinecone)
       if (dbType === 'lancedb' || dbType === 'pinecone') {
         console.log('config: ', config)
         // For Pinecone, use indexName; for LanceDB, use tableName
+        // A node writing to Pinecone records the index under the plain
+        // `indexName` key — `sourceIndexName`/`targetIndexName` are only set on
+        // nodes that went through source/target resolution. Leaving it out of
+        // this chain fell through to `targetTableName` and asked Pinecone for an
+        // index named after the table, which 404s.
+        const indexName = config.indexName || config.sourceIndexName || config.targetIndexName
+          || config.skillParams?.indexName || null;
         const tableName = dbType === 'pinecone'
-          ? (config.sourceIndexName || config.targetIndexName || config.targetTableName || config.sourceTableName)
+          ? (indexName || config.targetTableName || config.sourceTableName)
           : (config.targetTableName || config.sourceTableName);
-        const namespace = config.namespace || config.targetTableSchema?.schema || '';
+        // A Pinecone index is addressed by index + NAMESPACE, and getTables lists
+        // one entry per namespace (the namespace arriving as the table's
+        // `schema`). A data source records the pick under `sourceNamespace` /
+        // `sourceSchema`; reading only `namespace`/`targetTableSchema` sent every
+        // source read to the default namespace, which returns zero rows for an
+        // index whose vectors all live under a named one.
+        //
+        // `sourceSchema` is only a namespace when the index itself came from the
+        // source side. On a node WRITING to Pinecone it is the schema of the
+        // relational input ("public"), which is not a namespace at all.
+        const readsSourceIndex = !config.indexName && !config.targetIndexName
+          && !config.skillParams?.indexName && !!config.sourceIndexName;
+        const namespace = config.namespace
+          || config.sourceNamespace || config.targetNamespace
+          || config.skillParams?.namespace
+          || (readsSourceIndex
+            ? (config.sourceSchema || config.sourceTableSchema?.schema)
+            : config.targetTableSchema?.schema)
+          || '';
 
         if (!tableName) {
-          message.error('Vector database table/index name not found');
+          // Not an error: the chat pushes a partial config the moment a
+          // connection is picked, before the user has chosen an index.
+          console.warn('[vector preview] no table/index name in config yet');
           return null;
         }
+
+        console.log('[vector preview] requesting', {
+          vectorDbType: dbType,
+          tableName,
+          indexName,
+          namespace,
+          connectionId: config.targetConnectionId || config.sourceConnectionId
+        });
 
         const result = await window.electronAPI.skills.queryVectorPreview({
           vectorDbType: dbType,
           tableName: tableName,
-          namespace: namespace,
+          // Pinecone addresses an INDEX, and a node writing to it records that
+          // name separately from its `targetTableName` — the two are different
+          // strings. Without this the preview asked for an index named after the
+          // table and got a 404. LanceDB ignores it and keeps using tableName.
+          indexName,
+          namespace,
           dbConfig: config.targetDbConfig || config.sourceDbConfig,
           connectionId: config.targetConnectionId || config.sourceConnectionId,
           targetLocalPath: config.targetLocalPath || config.sourceLocalPath
+        });
+
+        console.log('[vector preview] result', {
+          success: result.success,
+          message: result.message,
+          recordCount: result.recordCount,
+          queriedIndex: result.queriedIndex,
+          queriedNamespace: result.queriedNamespace,
+          indexStats: result.indexStats,
+          data: result.data
         });
 
         if (!result.success) {
@@ -157,18 +394,51 @@ const DataPreview = ({
           return null;
         }
 
+        // An empty read of a populated index means the namespace is wrong, and
+        // the two are indistinguishable in an empty grid. The stats say which:
+        // they list every namespace the index holds and how much is in each.
+        const rows = result.data || [];
+        if (rows.length === 0) {
+          const nsStats = result.indexStats?.raw?.namespaces || {};
+          const populated = Object.entries(nsStats)
+            .filter(([, s]) => (s?.recordCount ?? s?.vectorCount ?? 0) > 0)
+            .map(([ns]) => (ns === '' ? '(default)' : ns));
+          if (populated.length > 0) {
+            message.info(
+              `No vectors in namespace ${result.queriedNamespace ? `"${result.queriedNamespace}"` : '(default)'}` +
+              ` of "${result.queriedIndex || tableName}". This index holds vectors in: ${populated.join(', ')}.`
+            );
+          }
+        }
+
         return {
           headers: [],
-          data: result.data || [],
+          data: rows,
           metadata: { rowCount: result.recordCount || 0 },
           isJson: true,
           storageType: result.storageType || dbType
         };
       }
 
-      if (dbType === 'sqlite' || dbType === 'nedb' || dbType === 'duckdb') {
-        // Use sourceLocalPath for data source nodes, fallback to connection fileInfo
-        const localPath = config.sourceLocalPath || connection.fileInfo?.filePath;
+      if (dbType === 'sqlite' || dbType === 'duckdb') {
+        // WHICH SIDE of this config to read — decided once, because the file and
+        // the table name have to come from the same one.
+        //
+        // A transformer's config describes two different places: `source*` is
+        // the file it READS, `target*` the table it WRITES. Taking the path from
+        // one and the name from the other asked for the output table inside the
+        // INPUT file. On a CSV that passed unnoticed (the name is ignored), but
+        // for a workbook the name selects the sheet, so previewing an .xlsx-fed
+        // transformer failed with `Sheet "denied_stores" not found ... Did you
+        // mean: "Sheet1"` — the target table looked for among the source's
+        // sheets.
+        //
+        // Target wins when this config has one, which is what the callers want:
+        // previewing a node whose parent is a transformer/join shows what that
+        // parent PRODUCED. A data source has no target side and reads as itself.
+        const readsTarget = !!(config.targetLocalPath && (config.targetTableName || config.targetCollection));
+        const localPath = (readsTarget ? config.targetLocalPath : config.sourceLocalPath)
+          || connection.fileInfo?.filePath;
 
         if (!localPath || !window.electronAPI.db?.readLocalCollection) {
           message.error('Database path not found');
@@ -176,12 +446,23 @@ const DataPreview = ({
         }
 
         // Determine storage type from connection dbType
-        const storageType = dbType === 'sqlite' ? 'sqlite' : dbType === 'duckdb' ? 'duckdb' : 'nedb';
-        // SQL stores take a preview statement; NeDB has none.
-        const isSqlStore = storageType === 'sqlite' || storageType === 'duckdb';
-        const sqlPreview = isSqlStore ? config.targetPreviewSql || config.sourcePreviewSql : null;
-        // Get table name for SQL queries
-        const tableName = isSqlStore ? (config.targetTableName || config.sourceTableName || config.table) : null;
+        const storageType = dbType === 'sqlite' ? 'sqlite' : 'duckdb';
+        // Every local store here is a SQL store.
+        const isSqlStore = true;
+        // The stored preview SQL belongs to the same side as the path. A
+        // transformer's `targetPreviewSql` is its transform SELECT, written
+        // against the SOURCE's table names, so it cannot run against the target
+        // database — the DuckDB reader ignores it and reads the table by name
+        // (electron.js `db:read-local-collection`), which is what we want here.
+        const sqlPreview = isSqlStore
+          ? (readsTarget ? config.targetPreviewSql : config.sourcePreviewSql)
+          : null;
+        // Get table name for SQL queries — and, for a workbook, the sheet.
+        const tableName = isSqlStore
+          ? (readsTarget
+            ? (config.targetTableName || config.targetCollection)
+            : (config.sourceTableName || config.table))
+          : null;
         // console.log('sqlPreview: ', sqlPreview)
         const result = await window.electronAPI.db.readLocalCollection(localPath, 1000, storageType, sqlPreview, tableName);
         // console.log('result: ', result)
@@ -192,15 +473,15 @@ const DataPreview = ({
 
         const rows = result.rows || [];
 
-        // Check if this is SQLite (json: false) or NeDB (json: true)
+        // A document-shaped result (json: true) can still come back from a
+        // remote MongoDB read; local files are always tabular.
         if (result.json) {
-          // NeDB/MongoDB data - return as JSON
           return {
             headers: [],
             data: rows,
             metadata: { rowCount: rows.length },
             isJson: true,
-            storageType: 'NeDB'
+            storageType: 'Documents'
           };
         } else {
           // Tabular data (SQLite / DuckDB) - format as table. DuckDB reports
@@ -233,6 +514,11 @@ const DataPreview = ({
           return {
             headers,
             data: formattedRows,
+            // The unformatted rows, kept beside the display ones: the grid and
+            // the JSON view want a STRUCT column as an object, not as the string
+            // the table cell needs. See toResultShape.
+            rawRows: rows,
+            rawColumns: result.columns || null,
             metadata: { rowCount: formattedRows.length },
             isJson: false,
             storageType: label,
@@ -285,6 +571,7 @@ const DataPreview = ({
         return {
           headers,
           data: rows,
+          rawRows: sheetData.rows || [],
           metadata: { rowCount: rows.length }
         };
       }
@@ -330,6 +617,19 @@ const DataPreview = ({
           if (isMissingTable && isTargetPreview) {
             return pendingExecutionResult();
           }
+          // The message alone names neither the query that failed nor the
+          // dialect it was written for. Preview SQL is generated once and
+          // stored on the node, so it outlives a later change of connection or
+          // table — a syntax error here usually means the stored SQL and the
+          // connection now executing it disagree.
+          console.error('[DataPreview] Query failed:', result.message, {
+            dbType: connection.dbType,
+            connectionName: connection.name,
+            queryField: isTargetPreview
+              ? 'targetPreviewSql'
+              : (query === config.previewSql ? 'previewSql' : 'sourcePreviewSql'),
+            query,
+          });
           message.error('Database query failed: ' + result.message);
           return null;
         }
@@ -368,6 +668,8 @@ const DataPreview = ({
         return {
           headers,
           data: formattedRows,
+          rawRows: rows,
+          rawColumns: result.columns || null,
           metadata: { rowCount: formattedRows.length },
           isJson: false
         };
@@ -406,6 +708,7 @@ const DataPreview = ({
   // render paths) are wiped so no stale rows survive the switch.
   useEffect(() => {
     inFlightFetchKey.current = null;
+    appliedFetchKey.current = null;
     previewRequestSeq.current += 1; // orphan any in-flight fetch for the old node
     setPreviewData(null);
     setPreviewDataBySource({});
@@ -458,6 +761,10 @@ const DataPreview = ({
           // No Schema tab for an API source, and nothing to preview until its
           // fetch has run — the endpoint details are the useful view.
           setActiveTab('details');
+        } else if (selectedNode.type === 'output') {
+          // The Schema tab is data-source only, so an output node must not
+          // default to it however many tables the active connection has.
+          setActiveTab('preview');
         } else if (dbTables.length > 0){
           setActiveTab('schema');
         }else{
@@ -470,7 +777,21 @@ const DataPreview = ({
         // }
 
         // console.log('useEffect: ', selectedNode.type)
-        if (selectedNode.type === 'dataSource') {
+        if (selectedNode.type === 'output') {
+          // An output node reads its OWN recorded source — buildConfig stores
+          // the whole input block, sourcePreviewSql included — but the parent
+          // is what answers "does that data exist yet". `executed` on an output
+          // node means its write ran, which says nothing about whether the
+          // transformer feeding it has produced a table to read.
+          const parentNode = connectedDataSources[0];
+          const config = selectedNode.data?.config;
+          if (parentNode && awaitsExecution(parentNode)) {
+            setPreviewData(pendingExecutionResult());
+            setLoadingPreview(false);
+          } else if (config && config.sourceConnectionId) {
+            fetchPreviewData(config);
+          }
+        } else if (selectedNode.type === 'dataSource') {
           // For data sources, use the node's own config
           const config = selectedNode.data?.config;
           // DataSource nodes use sourceConnectionId
@@ -514,7 +835,7 @@ const DataPreview = ({
     };
     console.log('refreshNodeData: ', selectedNode.type)
     // Handle different node types
-    if (selectedNode.type === 'dataSource') {
+    if (selectedNode.type === 'dataSource' || selectedNode.type === 'output') {
       // Data source: clear its own cache (use sourceConnectionId for data sources)
       const connectionId = nodeConfig.sourceConnectionId || nodeConfig.connectionId;
       const sourceIdentifier = nodeConfig.sourceDataset || nodeConfig.dataset || nodeConfig.table || '';
@@ -571,9 +892,23 @@ const DataPreview = ({
         }
       }
     }
-  }, [selectedNode, connectedDataSources, activeTab]);
+    // `executedNodes` is in here because this closure decides, through
+    // awaitsExecution, whether a table is there to be read — and the run that
+    // creates it is exactly what the refresh below reacts to. Left out, the
+    // post-run refresh would fire holding the map as it stood BEFORE the run
+    // and keep showing "run this first" over output that now exists. (It used
+    // to ride in on `selectedNode`, back when the flag was stamped onto the
+    // node itself.)
+  }, [selectedNode, connectedDataSources, activeTab, executedNodes]);
 
   // Refresh when config changes (save/update)
+  //
+  // The identifier the user picks has to be watched, not just the connection:
+  // for a SQL source the pick rewrites sourcePreviewSql and for a file source it
+  // rewrites sourceLocalPath, but a vector or NoSQL source changes NEITHER — the
+  // index/namespace/collection is the whole selection. Watching only the
+  // connection meant a Pinecone source fetched once (before an index was
+  // chosen), found nothing to query, and never ran again.
   useEffect(() => {
     refreshNodeData(true); // Don't force refetch, only clear cache
   }, [
@@ -583,6 +918,10 @@ const DataPreview = ({
     selectedNode?.data?.config?.targetPreviewSql,
     selectedNode?.data?.config?.sourceLocalPath,
     selectedNode?.data?.config?.targetLocalPath,
+    selectedNode?.data?.config?.sourceTableName,
+    selectedNode?.data?.config?.sourceIndexName,
+    selectedNode?.data?.config?.sourceNamespace,
+    selectedNode?.data?.config?.sourceCollection,
   ]);
 
   // Refresh when execution completes
@@ -590,8 +929,9 @@ const DataPreview = ({
     if (refreshTrigger > 0) {
       console.log('refreshTrigger: ', refreshTrigger)
       // The config descriptor is unchanged but the DATA moved, so drop the
-      // de-dupe guard and let the query run again.
+      // de-dupe guards and let the query run again.
       inFlightFetchKey.current = null;
+      appliedFetchKey.current = null;
       refreshNodeData(true); // Force refetch
     }
   }, [refreshTrigger, refreshNodeData]);
@@ -617,7 +957,7 @@ const DataPreview = ({
     }
 
     // A REST API source has no data until its fetch function has been written
-    // (in the chat) and run. Reading the NeDB collection before that hits an
+    // (in the chat) and run. Reading the table before that hits an
     // empty / not-yet-materialised file and reports it as corrupt, so wait.
     // Both conditions matter: no fetch function means nothing was ever written,
     // and a stale sourceLocalPath can point at another node's file.
@@ -631,18 +971,31 @@ const DataPreview = ({
     setAwaitingApiConfig(false);
 
     // Collapse the duplicate fetches the two config-watching effects above
-    // would otherwise fire for a single selection change.
+    // would otherwise fire for a single selection change. Two keys are needed,
+    // not one: the fetch that is still running, and the one whose rows are
+    // already on screen. Matching only the first (and never clearing it once the
+    // fetch settled) meant a selection could never be returned to — picking A,
+    // then B, then A again was skipped as a duplicate and left B's rows showing.
     const fetchKey = JSON.stringify([
       connectionId,
       config.sourceDbType || config.targetDbType,
       config.sourceTableName || config.targetTableName,
       config.sourceCollection || config.targetCollection,
-      config.sourceIndexName,
+      // Index AND namespace: Pinecone lists one table per namespace, all sharing
+      // the index name, so a key without the namespace treats a switch between
+      // them as the same fetch and never refetches.
+      config.sourceIndexName || config.targetIndexName || config.indexName,
+      config.sourceNamespace ?? config.targetNamespace ?? config.namespace ?? config.sourceSchema,
       config.sourcePreviewSql || config.targetPreviewSql,
       config.sourceLocalPath || config.targetLocalPath,
     ]);
-    if (inFlightFetchKey.current === fetchKey) return;
+    if (inFlightFetchKey.current === fetchKey || appliedFetchKey.current === fetchKey) return;
     inFlightFetchKey.current = fetchKey;
+    // Once this fetch settles it is no longer "in flight"; whether it may be
+    // skipped from then on is appliedFetchKey's call.
+    const releaseFetchKey = () => {
+      if (inFlightFetchKey.current === fetchKey) inFlightFetchKey.current = null;
+    };
 
     // Sequence number for this request. A slow query for the table the user has
     // since navigated away from must not paint over the one they picked next,
@@ -661,9 +1014,15 @@ const DataPreview = ({
         const isLocalPlaceholder = connectionId?.startsWith('local-');
 
         if (isLocalPlaceholder) {
-          // Create a synthetic connection object for local storage
-          const dbType = config.sourceDbType || config.targetDbType;
-          const localPath = config.sourceLocalPath || config.targetLocalPath;
+          // Create a synthetic connection object for local storage.
+          // Same side rule as fetchLocalData: a config with a target table
+          // describes a node's OUTPUT, and its dbType/path must be read from
+          // that side or the fallback here points at the file it READ.
+          const readsTarget = !!(config.targetLocalPath && (config.targetTableName || config.targetCollection));
+          const dbType = (readsTarget ? config.targetDbType : config.sourceDbType)
+            || config.sourceDbType || config.targetDbType;
+          const localPath = (readsTarget ? config.targetLocalPath : config.sourceLocalPath)
+            || config.targetLocalPath;
 
           connection = {
             id: connectionId,
@@ -681,6 +1040,7 @@ const DataPreview = ({
           connection = await connectionsDb.getById(connectionId);
 
           if (!connection) {
+            releaseFetchKey();
             if (isStale()) return;
             message.error('Connection not found');
             setLoadingPreview(false);
@@ -690,6 +1050,7 @@ const DataPreview = ({
 
         // Fetch local data
         const localData = await fetchLocalData(config, connection);
+        releaseFetchKey();
 
         // The user moved on while this was in flight — cache the result under
         // its own key but leave the visible table alone.
@@ -699,13 +1060,17 @@ const DataPreview = ({
             ...prev,
             [connectionId + connectionSourceIdentifier]: localData
           }));
-          if (!isStale()) setPreviewData(localData);
+          if (!isStale()) {
+            setPreviewData(localData);
+            appliedFetchKey.current = fetchKey;
+          }
         }
 
         if (!isStale()) setLoadingPreview(false);
         return;
       } catch (error) {
         console.error('Error fetching local data:', error);
+        releaseFetchKey();
         if (isStale()) return;
         message.error('Failed to load local data');
         setLoadingPreview(false);
@@ -782,9 +1147,9 @@ const DataPreview = ({
    * What a transformer/join/output shows in its Preview tab is its parent's
    * output, so this reads the parent's config — and when that parent is itself a
    * transformer or a join, the table it reads is the one the parent WRITES.
-   * That table exists only after the parent has run, which is what
-   * `config.executed` records. Without this check the preview queries it anyway
-   * and a freshly built workflow greets the user with "Table
+   * That table exists only after the parent has run, which is what the
+   * workflow's `executedNodes` map records. Without this check the preview
+   * queries it anyway and a freshly built workflow greets the user with "Table
    * 'db.some_table' doesn't exist" when nothing is actually wrong — it just
    * hasn't been executed yet.
    */
@@ -878,7 +1243,7 @@ const DataPreview = ({
   };
 
   // Render data table
-  const renderDataTable = (data, loading) => {
+  const renderDataTable = (data, loading, emptyNotice = null) => {
     if (loading) {
       return (
         <div style={{ textAlign: 'center', padding: '50px' }}>
@@ -921,113 +1286,41 @@ const DataPreview = ({
       );
     }
 
-    // Render JSON view for MongoDB data
-    if (data.isJson) {
+    // A read that succeeded and came back with nothing. This is NOT the "No
+    // data available" above — that one means no fetch happened at all — and it
+    // is not an error: the table exists and is empty. Say so, because the
+    // failure it causes surfaces elsewhere (an output node with nothing to
+    // write used to fail the whole run here). The grid stays underneath
+    // whenever the columns are known, so the shape is still readable.
+    if (emptyNotice && rowsIn(data) === 0) {
+      const columnCount = (data.headers?.length || 0) || (data.rawColumns?.length || 0);
       return (
-        <div style={{ height: height - 120, backgroundColor: '#fff' }}>
-          <Editor
-            height="100%"
-            language="json"
-            value={JSON.stringify(data.data, null, 2)}
-            beforeMount={(monaco) => {
-              monaco.editor.defineTheme('ternlux-light', {
-                base: 'vs',
-                inherit: true,
-                rules: [],
-                colors: {
-                  'editor.background': '#ffffff',
-                  'editor.foreground': '#111827',
-                  'editorLineNumber.foreground': '#9ca3af',
-                  'editorLineNumber.activeForeground': '#5a6678',
-                  'editor.selectionBackground': '#dbeafe',
-                  'editor.inactiveSelectionBackground': '#eef1f6',
-                  'editor.lineHighlightBackground': '#f7f9fc',
-                  'editorCursor.foreground': '#2563eb',
-                  'editorIndentGuide.background': '#eef1f6',
-                  'editorIndentGuide.activeBackground': '#cdd2db',
-                  'editorWhitespace.foreground': '#e2e6eb',
-                  'editorWidget.background': '#ffffff',
-                  'editorWidget.border': '#e2e6eb',
-                  'editorGutter.background': '#ffffff',
-                  'scrollbarSlider.background': '#e2e6eb88',
-                  'scrollbarSlider.hoverBackground': '#cdd2dbcc',
-                  'scrollbarSlider.activeBackground': '#5a667888',
-                  'minimap.background': '#f7f9fc',
-                },
-              });
-            }}
-            theme="ternlux-light"
-            options={{
-              readOnly: true,
-              minimap: { enabled: true },
-              fontSize: 13,
-              fontFamily: 'JetBrains Mono, Menlo, Consolas, monospace',
-              scrollBeyondLastLine: false,
-              automaticLayout: true,
-              wordWrap: 'on',
-              tabSize: 2,
-              renderWhitespace: 'selection',
-              padding: { top: 12, bottom: 12 },
-            }}
-          />
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+          <EmptyDataNotice>{emptyNotice}</EmptyDataNotice>
+          {columnCount > 0 && <ResultBlock data={data} height={height - 165} />}
         </div>
       );
     }
 
-    // Render table view for SQL data
-    if (!data.headers || data.headers.length === 0) {
-      return (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description="No data available"
-        />
-      );
-    }
-
-    const columns = data.headers.map((header, index) => ({
-      title: header,
-      dataIndex: index.toString(),
-      key: index.toString(),
-      ellipsis: true,
-      width: 150,
-      align: 'left'
-    }));
-
-    const dataSource = data.data.map((row, index) => {
-      const record = { key: index };
-      row.forEach((cell, cellIndex) => {
-        record[cellIndex.toString()] = cell;
-      });
-      return record;
-    });
-
-    return (
-      <Table
-        columns={columns}
-        dataSource={dataSource}
-        size="small"
-        scroll={{ x: true, y: height - 120 }}
-        locale={{
-          emptyText: dataSource.length === 0 && columns.length > 0
-            ? 'Table is empty (no rows)'
-            : 'No data available'
-        }}
-        pagination={{
-          pageSize: 50,
-          showSizeChanger: false,
-          showQuickJumper: true,
-          showTotal: (total, range) => `${range[0]}-${range[1]} of ${total} rows`
-        }}
-      />
-    );
+    // Rows, the way the Data Explorer shows rows — same grid, same JSON cards,
+    // same Table/JSON switch, so a node's data reads exactly like a query's.
+    return <ResultBlock data={data} height={height - 120} />;
   };
 
   // Render tabs for multiple data sources (joins) or single data table
   const renderDataSourceTabs = () => {
     // console.log('previewData: ', previewData)
-    // For data source nodes, just show the single data table
-    if (selectedNode?.type === 'dataSource') {
-      return renderDataTable(previewData, loadingPreview);
+    // For data source and output nodes, just show the single data table.
+    // Both read a source side: the data source reads its own table, and an
+    // output node reads the input it was built against — so an empty result
+    // means the same thing in both, worded for what it costs each of them.
+    if (selectedNode?.type === 'dataSource' || selectedNode?.type === 'output') {
+      return renderDataTable(
+        previewData,
+        loadingPreview,
+        emptyNoticeFor(selectedNode.type === 'output' ? 'output' : 'dataSource',
+          selectedNode.data?.config),
+      );
     }
 
     // For joins with multiple connected sources, show tabs
@@ -1069,7 +1362,11 @@ const DataPreview = ({
                 tab={source}
                 key={index.toString()}
               >
-                {renderDataTable(sourceData, isLoadingThisSource)}
+                {renderDataTable(
+                  sourceData,
+                  isLoadingThisSource,
+                  emptyNoticeFor('source', sourceConfig),
+                )}
               </TabPane>
             );
           })}
@@ -1077,8 +1374,14 @@ const DataPreview = ({
       );
     }
 
-    // For transformers or single-source scenarios
-    return renderDataTable(previewData, loadingPreview);
+    // For transformers or single-source scenarios. What is on screen is the
+    // PARENT's output, so an empty result is the parent's emptiness, not this
+    // node's — name the parent's dataset in the notice.
+    return renderDataTable(
+      previewData,
+      loadingPreview,
+      emptyNoticeFor('source', connectedDataSources[0]?.data?.config),
+    );
   };
 
 
@@ -1197,7 +1500,15 @@ const DataPreview = ({
           sourceTableName: nodeConfig.targetTableName,
           sourceCollection: nodeConfig.targetCollection,
           sourceConnectionId: nodeConfig.targetConnectionId,
-          sourceIndexName: nodeConfig.targetIndexName
+          // A node writing to Pinecone records its index and namespace under the
+          // plain `indexName`/`namespace` keys (skillParams carries the same
+          // pair); `targetIndexName` is generally not set. Reading only the
+          // target* spelling left both blank here, so the preview asked for an
+          // index named after the target table and got a 404.
+          sourceIndexName: nodeConfig.indexName
+            || nodeConfig.targetIndexName
+            || nodeConfig.skillParams?.indexName,
+          namespace: nodeConfig.namespace || nodeConfig.skillParams?.namespace || ''
         };
 
         // Fetch local data using the transformed table's configuration
@@ -1316,7 +1627,7 @@ const DataPreview = ({
     }));
 
     try {
-      // Handle file-based connections (local SQLite/NeDB)
+      // Handle file-based connections (local DuckDB/SQLite)
       if (connection.connectionType === 'file') {
         const localPath = connection.fileInfo?.filePath || connection.localPath;
 
@@ -1379,38 +1690,6 @@ const DataPreview = ({
               }
             }));
           } 
-        } else if (connection.dbType === 'nedb') {
-          // For NeDB, infer columns from sample data
-          const result = await window.electronAPI.db.readLocalCollection(
-            localPath,
-            1,
-            'nedb',
-            null,
-            null
-          );
-
-          if (result.success && result.rows && result.rows.length > 0) {
-            const columns = Object.keys(result.rows[0]).map(name => ({
-              name,
-              type: 'unknown',
-              nullable: true,
-              isPrimary: name === '_id'
-            }));
-
-            setDbSchema(prev => ({
-              ...prev,
-              [tableName]: {
-                ...prev[tableName],
-                columns: columns,
-                loading: false
-              }
-            }));
-          } else {
-            setDbSchema(prev => ({
-              ...prev,
-              [tableName]: { ...prev[tableName], columns: [], loading: false }
-            }));
-          }
         }
         return;
       }
@@ -1579,17 +1858,33 @@ const DataPreview = ({
       config.joinDescription || '';
 
     // Code blocks (SQL / DDL / functions) present on this node.
+    //
+    // `configKey` names the config field a block was read from. A block that has
+    // one can be opened full screen and edited, because a save knows where to
+    // put the result; a block without one stays read-only. Several titles read
+    // from a choice of fields, so the key is resolved the same way the value is.
     const codeBlocks = [];
-    const addCode = (title, code, lang) => { if (nonEmpty(code)) codeBlocks.push({ title, code: String(code), lang }); };
+    const addCode = (title, code, lang, configKey = null) => {
+      if (nonEmpty(code)) codeBlocks.push({ title, code: String(code), lang, configKey });
+    };
     addCode('Generated SQL', config.targetSql || config.joinSql, 'sql');
     addCode('DDL (CREATE TABLE)', config.targetDdl, 'sql');
     addCode('Insert SQL', config.targetInsertSql, 'sql');
     addCode('Source SQL', config.sourceSql || config.sourcePreviewSql, 'sql');
-    addCode('JavaScript function', config.transformFunction || config.apiFetchCode, 'javascript');
+    addCode(
+      'JavaScript function',
+      config.transformFunction || config.apiFetchCode,
+      'javascript',
+      nonEmpty(config.transformFunction) ? 'transformFunction' : 'apiFetchCode',
+    );
     if (config.nosqlOperation) addCode('NoSQL operation', typeof config.nosqlOperation === 'string' ? config.nosqlOperation : JSON.stringify(config.nosqlOperation, null, 2), 'json');
     if (config.aggregationPipeline) addCode('Aggregation pipeline', typeof config.aggregationPipeline === 'string' ? config.aggregationPipeline : JSON.stringify(config.aggregationPipeline, null, 2), 'json');
 
     const rowStyle = { display: 'grid', gridTemplateColumns: '128px 1fr', gap: '2px 12px', padding: '6px 0', borderBottom: '1px solid #f0f2f5' };
+    // Not the primary rendering any more, but still the floor: Monaco is fetched
+    // from a CDN (no monaco-editor dependency, no loader.config), so on a slow
+    // link — or none — this is what stands in for it. Plain and unhighlighted,
+    // but the code is readable, which a spinner or an empty box would not be.
     const preStyle = {
       margin: 0, padding: '10px 12px', borderRadius: 6, overflow: 'auto',
       background: '#f7f9fc', border: '1px solid #e2e6eb',
@@ -1611,8 +1906,13 @@ const DataPreview = ({
       </div>
     );
 
-    // JSON blocks render in a Monaco editor for clean, formatted output;
-    // SQL / JS stay as a lightweight <pre>.
+    // Every block renders in Monaco — the same editor as the full-screen popup,
+    // so SQL and JavaScript are syntax-highlighted here instead of arriving as
+    // flat monospace text. Read-only, and stripped of the chrome that only
+    // makes sense at full size (minimap, folding, line-highlight, overview
+    // ruler); the panels are collapsed by default, and antd only mounts a
+    // panel's children once it is opened, so no editor is created for a block
+    // nobody looks at.
     const defineCodeTheme = (monaco) => {
       monaco.editor.defineTheme('ternlux-code', {
         base: 'vs', inherit: true, rules: [],
@@ -1626,37 +1926,46 @@ const DataPreview = ({
       });
     };
     const renderCode = (b) => {
-      if (b.lang === 'json') {
-        const editorHeight = Math.min(340, Math.max(96, b.code.split('\n').length * 18 + 20));
-        return (
-          <div style={{ border: '1px solid #e2e6eb', borderRadius: 6, overflow: 'hidden' }}>
-            <Editor
-              height={editorHeight}
-              language="json"
-              value={b.code}
-              beforeMount={defineCodeTheme}
-              theme="ternlux-code"
-              options={{
-                readOnly: true,
-                minimap: { enabled: false },
-                fontSize: 12,
-                fontFamily: "'JetBrains Mono', Menlo, Consolas, monospace",
-                lineNumbers: 'off',
-                folding: false,
-                scrollBeyondLastLine: false,
-                automaticLayout: true,
-                wordWrap: 'on',
-                tabSize: 2,
-                renderLineHighlight: 'none',
-                overviewRulerLanes: 0,
-                scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
-                padding: { top: 8, bottom: 8 },
-              }}
-            />
-          </div>
-        );
-      }
-      return <pre style={preStyle}>{b.code}</pre>;
+      // Wrapping is on, so a long line occupies more than one visual row and a
+      // line count alone under-measures the block. Approximate the wrapped rows
+      // from the panel's usable width; the clamp keeps a short block from
+      // getting a scrollbar and a long one from swallowing the panel.
+      const CHARS_PER_ROW = 78;
+      const rows = b.code.split('\n')
+        .reduce((n, line) => n + Math.max(1, Math.ceil(line.length / CHARS_PER_ROW)), 0);
+      const editorHeight = Math.min(340, Math.max(96, rows * 18 + 20));
+      return (
+        <div style={{ border: '1px solid #e2e6eb', borderRadius: 6, overflow: 'hidden' }}>
+          <Editor
+            height={editorHeight}
+            language={b.lang}
+            value={b.code}
+            beforeMount={defineCodeTheme}
+            theme="ternlux-code"
+            loading={<pre style={{ ...preStyle, border: 'none', width: '100%', height: '100%', margin: 0 }}>{b.code}</pre>}
+            options={{
+              readOnly: true,
+              minimap: { enabled: false },
+              fontSize: 12,
+              fontFamily: "'JetBrains Mono', Menlo, Consolas, monospace",
+              // Line numbers earn their place on SQL and JS — they are what a
+              // stack trace or an "error near line N" refers to.
+              lineNumbers: 'on',
+              lineNumbersMinChars: 3,
+              lineDecorationsWidth: 6,
+              folding: false,
+              scrollBeyondLastLine: false,
+              automaticLayout: true,
+              wordWrap: 'on',
+              tabSize: 2,
+              renderLineHighlight: 'none',
+              overviewRulerLanes: 0,
+              scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+              padding: { top: 8, bottom: 8 },
+            }}
+          />
+        </div>
+      );
     };
 
     // Unconfigured chat node → neutral empty state.
@@ -1704,6 +2013,22 @@ const DataPreview = ({
               <Panel
                 key={String(i)}
                 header={<span style={groupHeaderStyle}>{b.title}</span>}
+                extra={b.configKey ? (
+                  <Tooltip title="Edit full screen">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<ExpandOutlined />}
+                      // The button sits inside the panel header, so without this
+                      // every click would also collapse or expand the panel.
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setCodeEditor({ title: b.title, code: b.code, language: b.lang, configKey: b.configKey });
+                      }}
+                      style={{ color: '#5a6678' }}
+                    />
+                  </Tooltip>
+                ) : null}
               >
                 {renderCode(b)}
               </Panel>
@@ -1975,8 +2300,10 @@ const DataPreview = ({
     return null;
   }
 
-  // Don't render for start and output nodes
-  if (selectedNode.type === 'start' || selectedNode.type === 'output') {
+  // A start node carries no data. An output node does: its config records the
+  // source it drains (sourceConnectionId / sourceTableName / sourceLocalPath),
+  // which is the data about to be written, so it previews like a data source.
+  if (selectedNode.type === 'start') {
     return null;
   }
 
@@ -2182,14 +2509,20 @@ const DataPreview = ({
             </TabPane>
           )}
 
-          {selectedNode.data.label !== 'Data Source' && !isApiDataSource && <TabPane
+          {/* An output node has no transform of its own — it writes what it is
+              given — and stores no target* preview SQL, so the tab would only
+              ever render its disabled placeholder. */}
+          {selectedNode.data.label !== 'Data Source' && !isApiDataSource
+            && selectedNode?.type !== 'output' && <TabPane
             tab={
               <span>
                 <SwapOutlined style={{ marginRight: 6 }} />
                 Transformed
                 {/* The tick means "there are rows here". A node still waiting to
-                    run has a placeholder, not an output. */}
-                {transformedData && !transformedData.pendingExecution &&
+                    run has a placeholder, not an output — and one that ran and
+                    produced nothing has an output with no rows in it, which is
+                    the warning inside the tab, not a tick. */}
+                {transformedData && !transformedData.pendingExecution && rowsIn(transformedData) > 0 &&
                   <span style={{ marginLeft: 4, color: '#52c41a' }}>✓</span>}
               </span>
             }
@@ -2209,11 +2542,36 @@ const DataPreview = ({
                 />
               </div>
             ) : (
-              renderDataTable(transformedData, loadingTransformed)
+              renderDataTable(
+                transformedData,
+                loadingTransformed,
+                emptyNoticeFor('transformed', selectedNode.data?.config),
+              )
             )}
           </TabPane>}
         </Tabs>
       </div>
+
+      {/* Full-screen code editor. Mounted here rather than inside the Details
+          tab so switching tabs behind it cannot unmount it mid-edit. */}
+      <CodeEditorPopup
+        open={!!codeEditor}
+        onClose={() => setCodeEditor(null)}
+        title={codeEditor?.title || 'Code'}
+        code={codeEditor?.code || ''}
+        language={codeEditor?.language || 'javascript'}
+        onSave={(newCode) => {
+          if (!codeEditor || !selectedNode) return;
+          // Merge onto the CURRENT config rather than the copy captured when
+          // the editor opened, so an edit made here does not roll back anything
+          // the chat or a form changed while it was open.
+          onNodeUpdate?.(selectedNode.id, {
+            ...(selectedNode.data?.config || {}),
+            [codeEditor.configKey]: newCode,
+          });
+          message.success(`${codeEditor.title} updated`);
+        }}
+      />
     </div>
   );
 };

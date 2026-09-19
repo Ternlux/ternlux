@@ -35,6 +35,7 @@ const { toolsForTurn } = require('./toolSchemas');
 // rather than re-derived so "1000 tokens" means the same thing here as it does
 // when the window is being packed.
 const { estimateTokens } = require('../aiProviders');
+const { stripVectors } = require('../lib/promptSanitize');
 // Every prompt this module sends is built here. buildPrompt(kind, params)
 // returns { text, meta }: `text` is sent to the model, `meta` describes the
 // same call as parameters and is what the dev prompt log records instead of the
@@ -125,8 +126,57 @@ function plannerChatHistory(history, message) {
       const text = String((m && (m.text || m.content)) || '').trim();
       if (!text) return [];
       const isClar = m.role === 'assistant' && m.clarification === true;
-      return [{ sender: m.role === 'user' ? 'user' : 'assistant', text: isClar ? `Clarification by AI: ${text}` : text }];
+      return [{ sender: m.role === 'user' ? 'user' : 'assistant', text: isClar ? `${CLARIFICATION_PREFIX}${text}` : text }];
     });
+}
+
+/**
+ * The label a clarification question wears in a transcript.
+ *
+ * Added when a conversation is rendered FOR a model (plannerChatHistory above,
+ * planToReviewHistory in the renderer), never stored on the message or on the
+ * plan. Anything kept is kept bare, so a question that makes a second trip
+ * through one of those renderers is labelled once rather than twice.
+ */
+const CLARIFICATION_PREFIX = 'Clarification by AI: ';
+
+/** A question with its label removed — repeated labels included. */
+function stripClarificationPrefix(text) {
+  let out = String(text || '').trim();
+  while (out.startsWith(CLARIFICATION_PREFIX)) {
+    out = out.slice(CLARIFICATION_PREFIX.length).trim();
+  }
+  return out;
+}
+
+/**
+ * The clarification Q&A pairs a transcript records, as data.
+ *
+ * The sub-agent asks its questions through `final_answer` — an ordinary
+ * assistant message — and the user's reply is the turn that follows. Those
+ * answers routinely SETTLE the request ("that table doesn't exist, use this one
+ * instead?" / "yes"), and the planner honours them because it reads the whole
+ * transcript. Nothing else did: `plan.clarifications` is filled only by the
+ * mid-build ClarificationNeeded path, so a question answered BEFORE the plan
+ * reached the builder and never reached the post-build reviewer — which then
+ * failed correct builds for disagreeing with wording the user had already
+ * replaced.
+ *
+ * Questions are stored WITHOUT the label; whoever renders them adds it.
+ */
+function clarificationPairs(history) {
+  const rows = Array.isArray(history) ? history : [];
+  const pairs = [];
+  for (let i = 0; i < rows.length - 1; i += 1) {
+    const text = String(rows[i]?.text || '');
+    if (!text.startsWith(CLARIFICATION_PREFIX)) continue;
+    const next = rows[i + 1];
+    if ((next?.sender || next?.role) !== 'user') continue;
+    const question = stripClarificationPrefix(text);
+    const answer = String(next.text || next.content || '').trim();
+    if (question && answer) pairs.push({ question, answer });
+  }
+  return pairs;
 }
 
 function summarizeWorkflow(wf) {
@@ -155,7 +205,7 @@ function summarizeConnection(c) {
     dbCategory: c.dbCategory || null,
     connectionType: c.connectionType || null,
   };
-  // For imported-file connections (sqlite/nedb/lancedb), the table/collection
+  // For imported-file connections (duckdb/sqlite/lancedb), the table/collection
   // name usually does NOT match the connection name — e.g. a spreadsheet
   // imported as "orders" lands in a table called "orders_Sheet1", and several
   // imports share one app-wide SQLite db. Surface the owned table names so the
@@ -207,7 +257,21 @@ function nodeOutline(node) {
       break;
     case 'dataSource':
       out.connection = cfg.sourceConnectionName || null;
-      out.source     = cfg.sourceTable || cfg.sourceCollection || null;
+      // `sourceTable` is written ONLY on the database path (buildDataSourceConfig
+      // Branch 4, and DataSourceNodeChat's `connectionType === 'database'` block).
+      // A file, LanceDB or REST source records the same thing under
+      // sourceTableName / sourceSelectedTables / sourceDataset, so reading
+      // `sourceTable` alone outlined every file-backed source as `source: null`
+      // — a fully configured node that the change reviewer then failed for "not
+      // identifying its source", with a remediation naming a field no builder
+      // writes. Read the whole family.
+      out.source     = cfg.sourceTable
+        || cfg.sourceTableName
+        || cfg.sourceCollection
+        || cfg.sourceIndexName
+        || (Array.isArray(cfg.sourceSelectedTables) ? cfg.sourceSelectedTables[0] : null)
+        || cfg.sourceDataset
+        || null;
       if (cfg.sourceQueryDescription) out.description = cfg.sourceQueryDescription;
       break;
     case 'transformer':
@@ -279,7 +343,7 @@ function summarizeExecution(e) {
 // The chat assistant runs in ANALYSIS mode and must never mutate a user's
 // data. "Read-only" can NOT be assumed from the store type — every connector's
 // runQuery entry point can also write (SQL: any statement; MongoDB: drop /
-// insert* / aggregate $out|$merge; NeDB: insert/update/remove/drop; LanceDB &
+// insert* / aggregate $out|$merge; LanceDB &
 // Pinecone: upsert/update/delete). So before any query runs we ask the model
 // to classify it and refuse anything that isn't a pure read. To CHANGE data,
 // the user must build a workflow (plan_workflow_build), which goes through the
@@ -445,7 +509,20 @@ const SHARED_TOOLS = {
       safeConfig.apiParamKeys = safeConfig.apiParams.map((p) => p && p.key).filter(Boolean);
       delete safeConfig.apiParams;
     }
-    return { ...safe, dbConfig: safeConfig };
+    // An EMPTY fileInfo.tables is not the same claim as an absent one, and this
+    // record is a snapshot taken when the connection was created — it goes stale
+    // whenever the store behind it changes. Handing `tables: []` to the agent
+    // asserts "this connection has no tables", which it then reports to the user
+    // or stalls on, instead of calling get_tables and reading the store. Drop
+    // the key when it is empty, matching summarizeConnection, so an unknown
+    // reads as unknown.
+    const safeFileInfo = safe.fileInfo && typeof safe.fileInfo === 'object'
+      ? { ...safe.fileInfo }
+      : safe.fileInfo;
+    if (safeFileInfo && Array.isArray(safeFileInfo.tables) && safeFileInfo.tables.length === 0) {
+      delete safeFileInfo.tables;
+    }
+    return { ...safe, ...(safeFileInfo ? { fileInfo: safeFileInfo } : {}), dbConfig: safeConfig };
   },
   async list_executions({ getDb }, args) {
     const db = getDb('executions');
@@ -480,9 +557,18 @@ const SHARED_TOOLS = {
       const conn = helpers.connections.find(
         (c) => (c.id || c._id) === args.connection || c.name === args.connection
       );
-      const owned = Array.isArray(conn?.fileInfo?.tables)
-        ? conn.fileInfo.tables.map((t) => (typeof t === 'string' ? t : t?.name)).filter(Boolean)
-        : [];
+      // getTables reads the store and falls back to the recorded snapshot on its
+      // own, so it is both fresher and no less available than fileInfo.tables —
+      // which goes stale as soon as the file behind it gains or loses a table.
+      let owned = [];
+      try {
+        owned = (await helpers.getTables(args.connection) || [])
+          .map((t) => (typeof t === 'string' ? t : t?.name)).filter(Boolean);
+      } catch {
+        owned = Array.isArray(conn?.fileInfo?.tables)
+          ? conn.fileInfo.tables.map((t) => (typeof t === 'string' ? t : t?.name)).filter(Boolean)
+          : [];
+      }
       if (owned.length === 1) {
         table = owned[0];
       } else if (owned.length > 1) {
@@ -697,13 +783,16 @@ async function runJavascriptTool({ helpers, provider }, args) {
     if (table && typeof skill.loadSourceRecords === 'function') {
       try {
         records = await skill.loadSourceRecords({ sourceConnection, sourceTableSchema, helpers });
-        sourceTableSchema.sampleData = (records || []).slice(0, 3);
+        // `records` stays whole — the skill runs against the real rows. Only the
+        // copy that becomes prompt context loses its vectors: three rows of a
+        // vector table is ~24k tokens of float literals otherwise.
+        sourceTableSchema.sampleData = stripVectors((records || []).slice(0, 3));
       } catch (_err) { records = []; }
     }
   }
 
   // Minimal plan envelope — buildFunctionPrompt only reads summary/outputType/
-  // provider hints. We always run inline to NeDB-shaped (plain JSON) output;
+  // provider hints. We always run inline to plain-JSON output;
   // the function can still emit a `vector` field if the user asked for one.
   const plan = {
     summary: request,
@@ -777,6 +866,15 @@ const WORKFLOW_TOOLS = new Set([
   'list_connections', 'get_connection',
   'list_workflows', 'get_workflow', 'get_workflow_nodes',
   'get_tables', 'get_columns', 'run_query',
+  // The sub-agent's one "act" tool, and it is here for a single reason: an API
+  // source is the only source whose shape cannot be looked up. get_tables /
+  // get_columns answer for a database; a REST endpoint only answers by being
+  // CALLED. Without this the planner writes the transformer against a response
+  // it has never seen, and the first time anything actually calls the API is
+  // inside the data-source build — where a failure surfaces as a downstream
+  // node with no schema. http_request is deliberately NOT here: it cannot
+  // authenticate, so it cannot probe most of the endpoints that matter.
+  'run_javascript',
   'propose_plan',
   'exit_workflow_mode',
 ]);
@@ -942,29 +1040,6 @@ function formatRouterChat(chat) {
     .join('\n');
 }
 
-/**
- * Take the node's pending question OFF the transcript.
- *
- * Clearing `pendingSkill` is not enough to kill a build. The non-skill builder
- * stages re-derive their question each run and bind the answer by matching the
- * question TEXT, then taking the user messages that follow it — so a question
- * left sitting in the chat can still capture a later, unrelated message as its
- * answer. A pending question is always the trailing bot message (the user's
- * reply is only committed by buildNodeConfig, which a cancel never reaches), so
- * dropping trailing clarifications removes exactly the open ones.
- *
- * @returns {Array} the rewritten chat, with a note recording the cancellation.
- */
-function clearPendingQuestion(config, note) {
-  const chat = Array.isArray(config?.chat) ? config.chat.map((m) => ({ ...m })) : [];
-  while (chat.length) {
-    const last = chat[chat.length - 1];
-    if (last && last.sender === 'bot' && last.metadata?.clarification) chat.pop();
-    else break;
-  }
-  return workflowBuilder.noteNodeContext({ existingConfig: { ...(config || {}), chat }, note }).chat;
-}
-
 /** The node's current logic, formatted for the router prompt. */
 function formatNodeDetails(config) {
   const c = config || {};
@@ -978,27 +1053,54 @@ function formatNodeDetails(config) {
 }
 
 /**
- * Run the router for the focused node.
+ * The question the focused node's builder is waiting on, or null.
  *
- * @returns {Promise<{decision:string, deliver:string, note:string|null, answer:string|null}>}
- *          Always resolves. Any failure — no AI, an unparseable reply, a budget
- *          exhausted — returns `continue`, because the router is a guard in
- *          front of the builder and must never become a way for the build to
- *          fail. Degrading to today's behaviour is the correct fallback.
+ * A skill dialog parks its own question on `pendingSkill`; a builder-stage
+ * question is the last bot message tagged as a clarification. Null means the
+ * builder is not waiting on anything — the user is asking for a build outright,
+ * and the gate has nothing to judge.
  */
-async function runNodeBuildRouter(ctx, tn) {
-  const CONTINUE = { decision: 'continue', deliver: 'builder', note: null, answer: null };
-  if (!ctx.helpers || typeof ctx.helpers.callAI !== 'function') return CONTINUE;
+function pendingBuilderQuestion(config) {
+  const c = config || {};
+  // A skill dialog clears itself: buildNodeConfig sets pendingSkill to null the
+  // moment the skill converges, so its presence means genuinely unanswered.
+  const skill = c.pendingSkill?.skillId ? c.pendingSkill : null;
+  if (skill?.question) return { question: skill.question, skillId: skill.skillId };
+
+  // A builder-stage question has no such flag, so "unanswered" has to be read
+  // off the transcript: it is pending only while it is still the LAST thing
+  // said. Once a user message follows it, buildNodeConfig has committed that
+  // reply and the question is spent — treating it as pending would put the gate
+  // in front of every later build on this node, judging fresh requests against
+  // a question that was settled turns ago.
+  const chat = Array.isArray(c.chat) ? c.chat : [];
+  for (let i = chat.length - 1; i >= 0; i -= 1) {
+    const m = chat[i];
+    if (!m) continue;
+    if (m.sender === 'user') return null;
+    if (m.sender === 'bot' && m.metadata?.clarification && m.text) {
+      return { question: m.text, skillId: null };
+    }
+  }
+  return null;
+}
+
+/**
+ * Run the gate for the focused node.
+ *
+ * @returns {Promise<{relevant:boolean, note:string|null}>}
+ *          Always resolves, and always resolves to `relevant: true` on any
+ *          failure — no AI, an unparseable reply, the budget exhausted. This is
+ *          a guard in front of the builder; it must never become the reason a
+ *          build cannot happen. Degrading to "forward it" is the correct
+ *          fallback, because that is what the code did before the gate existed.
+ */
+async function runNodeBuildRouter(ctx, tn, pending) {
+  const FORWARD = { relevant: true, note: null };
+  if (!ctx.helpers || typeof ctx.helpers.callAI !== 'function') return FORWARD;
 
   const config = tn.config || {};
   const chat = Array.isArray(config.chat) ? config.chat : [];
-  // The question the builder is waiting on, if any. A skill dialog parks its own
-  // question on `pendingSkill`; a builder-stage question is the last bot message
-  // tagged as a clarification.
-  const pendingSkill = config.pendingSkill?.skillId ? config.pendingSkill : null;
-  const lastClarification = [...chat].reverse()
-    .find((m) => m && m.sender === 'bot' && m.metadata?.clarification);
-  const pendingQuestion = pendingSkill?.question || lastClarification?.text || null;
 
   const prompt = buildPrompt('nodeBuildRouter', {
     nodeType: tn.type,
@@ -1007,12 +1109,15 @@ async function runNodeBuildRouter(ctx, tn) {
     nodeConfigured: !!(config.targetSql || config.joinSql || config.transformFunction
       || config.nosqlOperation || config.apiFetchCode),
     nodeDetails: formatNodeDetails(config),
-    pendingQuestion,
-    pendingSkillId: pendingSkill?.skillId || null,
+    pendingQuestion: pending.question,
+    pendingSkillId: pending.skillId,
     userMessage: ctx.message || '',
     recentChat: formatRouterChat(chat),
     connections: (ctx.helpers.connections || []).map(summarizeConnection),
     systemContext: workflowBuilder.buildSystemContext(),
+    // How this node type is actually configured. Without it the gate is judging
+    // "is this relevant?" against a question full of terms it does not know.
+    nodeTypeDocs: workflowBuilder.nodeTypeDocsAsPromptSection(tn.type),
     maxActions: MAX_ACTIONS_PER_STEP,
     maxRounds: MAX_ROUTER_ROUNDS,
   });
@@ -1021,7 +1126,7 @@ async function runNodeBuildRouter(ctx, tn) {
   // One decision turn is always allowed on top of the gathering budget.
   for (let round = 0; round <= MAX_ROUTER_ROUNDS; round++) {
     const turnPrompt = scratchpad.length === 0
-      ? 'Decide now, or look something up first.'
+      ? 'Decide whether the user\'s message replies to the pending question, or look something up first.'
       : `Work so far:\n${formatScratchpad(scratchpad)}\n\n${round >= MAX_ROUTER_ROUNDS
           ? 'You are out of lookups. Reply with Schema B — decide.'
           : 'Continue: look something else up, or decide.'}`;
@@ -1036,31 +1141,18 @@ async function runNodeBuildRouter(ctx, tn) {
       });
       parsed = parseModelJson(raw);
     } catch (_err) {
-      // Including MAX_TOKENS: a router that cannot answer must not stop a build.
-      return CONTINUE;
+      // Including MAX_TOKENS: a gate that cannot answer must not stop a build.
+      return FORWARD;
     }
 
     // Schema B — a decision.
-    if (parsed && parsed.decision) {
-      const decision = String(parsed.decision).trim().toLowerCase();
-      if (!['continue', 'answer', 'cancel'].includes(decision)) return CONTINUE;
-      const note = String(parsed.note || '').trim() || null;
-      const answer = String(parsed.answer || '').trim() || null;
-      let deliver = String(parsed.deliver || '').trim().toLowerCase();
-      if (!['builder', 'user', 'both'].includes(deliver)) {
-        // Infer from what it actually produced rather than refusing the turn.
-        deliver = decision === 'continue' ? 'builder' : (note ? 'both' : 'user');
-      }
-      // "answer"/"cancel" stop the build, so they MUST have something to say.
-      // Without it the user would get an empty bubble and no build — worse than
-      // simply letting the builder run.
-      if (decision !== 'continue' && !answer) return CONTINUE;
-      return { decision, deliver, note, answer };
+    if (parsed && typeof parsed.relevant === 'boolean') {
+      return { relevant: parsed.relevant, note: String(parsed.note || '').trim() || null };
     }
 
     // Schema A — gather, then loop.
     const actions = Array.isArray(parsed?.actions) ? parsed.actions.slice(0, MAX_ACTIONS_PER_STEP) : [];
-    if (actions.length === 0 || round >= MAX_ROUTER_ROUNDS) return CONTINUE;
+    if (actions.length === 0 || round >= MAX_ROUTER_ROUNDS) return FORWARD;
 
     const executed = [];
     for (const a of actions) {
@@ -1078,7 +1170,7 @@ async function runNodeBuildRouter(ctx, tn) {
     scratchpad.push({ index: scratchpad.length + 1, thought: String(parsed?.thought || '').trim(), actions: executed });
   }
 
-  return CONTINUE;
+  return FORWARD;
 }
 
 /**
@@ -1103,55 +1195,51 @@ async function buildNodeTool(ctx, args) {
   const request = String(ctx.message || '').trim();
   if (!request) throw new Error('There is no user message to build from.');
 
-  // ── The gate. Everything that reaches a builder comes through here first.
-  const routed = await runNodeBuildRouter(ctx, tn);
+  // ── The gate ────────────────────────────────────────────────────────────
+  //
+  // It runs ONLY when the builder is already waiting on an answer. A direct
+  // build request — "build this join", "change it to match on name" — has no
+  // question to be relevant to, so it goes straight through. That is both the
+  // common case and the cheap one: no extra AI call in front of an ordinary
+  // build.
+  const pending = pendingBuilderQuestion(tn.config);
+  const routed = pending ? await runNodeBuildRouter(ctx, tn, pending) : { relevant: true, note: null };
 
-  // A note is written onto the node whatever the decision was — it is a fact
-  // the builder will need, and it is just as needed on the turn AFTER an
-  // "answer" as on a "continue". Written straight onto the in-memory node too,
-  // because `__nodeBuild` only reaches the builder via the renderer and that
-  // round-trip does not settle before buildNodeConfig runs a few lines below.
+  // Anything the gate looked up is written onto the node before the builder
+  // runs — and written to the in-memory node too, because `__nodeBuild` only
+  // reaches the builder via the renderer, and that round-trip does not settle
+  // before buildNodeConfig runs a few lines below. Kept on the not-relevant
+  // path as well: a fact is worth having either way.
   let routerConfig = null;
-  if (routed.note && (routed.deliver === 'builder' || routed.deliver === 'both')) {
+  if (routed.note) {
     const { chat } = workflowBuilder.noteNodeContext({ existingConfig: tn.config || null, note: routed.note });
     tn.config = { ...(tn.config || {}), chat };
     routerConfig = { chat };
   }
 
-  // The builder does not run. The router answers the user directly, and the turn
-  // ends here the same way a builder's own question does — verbatim, without
-  // paying another model round-trip to relay it.
-  if (routed.decision === 'answer' || routed.decision === 'cancel') {
-    const cancelled = routed.decision === 'cancel';
-    // "cancel" DISCARDS the parked skill dialog AND takes the open question off
-    // the transcript, so the user's next message starts clean instead of being
-    // read as a late answer to a conversation they walked away from. "answer"
-    // leaves both in place — the builder is still waiting, and the router's
-    // reply said so.
-    const cancelConfig = cancelled
-      ? {
-          pendingSkill: null,
-          chat: clearPendingQuestion(tn.config, 'The user stopped this build before it ran; any question the builder was waiting on was dropped.'),
-        }
-      : {};
-    if (cancelled) tn.config = { ...(tn.config || {}), ...cancelConfig };
+  // Not a reply to the pending question. The builder does not run and the gate
+  // does NOT speak: it returns an ordinary tool result and the main agent takes
+  // it from here, with its own tools and its own voice.
+  //
+  // Deliberately not a short-circuit. An earlier version ended the turn with
+  // text of its own, which meant a message it misjudged left the node in the
+  // identical state next turn — the same question pending, the same reply
+  // withheld, forever. Handing back to the agent instead means every path out
+  // of here makes progress: the builder runs, or the agent answers.
+  if (!routed.relevant) {
     return {
-      needs_input: !cancelled,
-      routed: routed.decision,
-      deliver: routed.deliver,
-      __nodeBuild: {
-        nodeId: tn.nodeId,
-        nodeType: tn.type,
-        partial: true,
-        config: { ...(routerConfig || {}), ...cancelConfig },
-      },
-      __shortCircuit: {
-        finalAnswer: routed.answer,
-        // Not a clarification: the user is not expected to "answer" this, and
-        // tagging it as one would make the NEXT message look like a reply to it.
-        clarification: false,
-        agentSource: 'node-router',
-      },
+      built: false,
+      forwarded_to_builder: false,
+      reason: 'not_an_answer_to_pending_question',
+      pending_question: pending.question,
+      // What the agent is expected to do with this.
+      guidance: 'The user\'s message does not answer the question this node\'s builder is waiting on, '
+        + 'so it was not forwarded. Answer the user yourself. Record anything the builder will need with '
+        + 'add_node_context, and end by repeating the pending question above so they know what is still open. '
+        + 'The builder is still waiting; their next message can answer it.',
+      ...(routerConfig ? {
+        __nodeBuild: { nodeId: tn.nodeId, nodeType: tn.type, partial: true, config: routerConfig },
+      } : {}),
     };
   }
 
@@ -1171,7 +1259,7 @@ async function buildNodeTool(ctx, args) {
       // Data Source (REST API) needs its API connection id; transformer/join don't.
       connectionId: tn.connectionId || null,
       // Scopes any file this build writes (the REST API fetch materialises rows
-      // into local NeDB) under this workflow.
+      // into local DuckDB) under this workflow.
       workflowId: tn.workflowId || null,
     });
   } catch (err) {
@@ -1363,6 +1451,79 @@ async function runMainTool(name, args, ctx) {
 }
 
 /**
+ * Has a REST API source actually been called, before a plan is built on it?
+ *
+ * Two questions, both answered from facts rather than from the model's account
+ * of itself:
+ *
+ *   1. Does this request involve a saved REST API connection? Decided by
+ *      looking for that connection's own NAME or ID in the request text — not
+ *      by reading the request for API-ish language. A connection either is
+ *      named or it isn't.
+ *   2. If so, did a run_javascript call in this conversation actually SUCCEED
+ *      and return rows? A call that threw (a 401 does: axios rejects on a
+ *      non-2xx by default) comes back as `ok: false`, and one the user declined
+ *      never ran at all. Neither teaches anybody what the endpoint returns.
+ *
+ * What this cannot judge is an endpoint that answers 200 with an error BODY —
+ * `{"success": false, "error": {...}}` is a row like any other. That one stays
+ * the model's to read, which is why the failure message says what a real
+ * response has to look like rather than just "call it again".
+ *
+ * @returns {{blocked: boolean, reason?: string}}
+ */
+function apiProbeGate({ request, connections, scratchpad, history }) {
+  const haystack = String(request || '').toLowerCase();
+  const named = (connections || [])
+    .filter((c) => c && c.dbType === 'rest-api')
+    .filter((c) => {
+      const name = String(c.name || '').trim().toLowerCase();
+      const id = String(c.id || c._id || '').trim().toLowerCase();
+      return (name && haystack.includes(name)) || (id && haystack.includes(id));
+    });
+  if (!named.length) return { blocked: false };
+
+  let attempted = false;
+  // This turn's steps, then the earlier turns'. A build that pauses on a
+  // clarification ("replace or upsert?") resumes in a NEW turn with an empty
+  // scratchpad, and the probe it already ran lives in history by then — without
+  // reading both, answering one question would cost the user a second approval
+  // prompt for a call that has already been made.
+  const steps = [
+    ...(Array.isArray(scratchpad) ? scratchpad : []),
+    ...(Array.isArray(history) ? history.filter((m) => m && m.kind === 'step') : []),
+  ];
+  for (const step of steps) {
+    for (const a of Array.isArray(step?.actions) ? step.actions : []) {
+      if (!a || a.tool !== 'run_javascript') continue;
+      attempted = true;
+      // The renderer replays the approved run's real outcome into this same
+      // action slot — in the scratchpad AND in the step message — so `ok` and
+      // `result` here describe what the code DID, not the pre-approval
+      // placeholder the tool first returned.
+      const rows = a.ok && a.result && (a.result.rows || []);
+      if (a.ok && a.result?.ran === true && Array.isArray(rows) && rows.length) {
+        return { blocked: false };
+      }
+    }
+  }
+
+  const which = named.map((c) => `"${c.name}"`).join(', ');
+  return {
+    blocked: true,
+    reason: attempted
+      ? `The API call for ${which} did not return any rows, so there is still no response shape to plan `
+        + 'against and propose_plan was not run. Do NOT plan around what the response might contain. Tell '
+        + 'the user exactly what came back — the status code, the error the API reported, or that it was '
+        + 'empty — and let them fix the endpoint or the credentials on the connection first.'
+      : `This workflow reads from ${which}, a REST API connection, and nothing has called it yet — so the `
+        + 'response shape is unknown and propose_plan was not run. Call run_javascript first (it resolves '
+        + 'the saved credentials itself via ctx.apiCredentials), read the rows it returns, and then propose '
+        + 'the plan describing the fields you actually saw.',
+  };
+}
+
+/**
  * Workflow sub-agent tool runner. Owns `propose_plan` (real planner) and
  * `exit_workflow_mode` (flip back to main).
  */
@@ -1371,6 +1532,12 @@ async function runWorkflowTool(name, args, ctx) {
   if (!WORKFLOW_TOOLS.has(name)) throw new Error(`Unknown tool for workflow agent: ${name}`);
 
   if (SHARED_TOOLS[name]) return SHARED_TOOLS[name](ctx, args);
+
+  // Same implementation the main agent uses, approval gate included: the
+  // renderer's pause/replay loop is driven by `__pendingApproval` on the step,
+  // not by which agent asked, so a probe here stops for the user exactly as it
+  // does in a normal chat.
+  if (name === 'run_javascript') return runJavascriptTool(ctx, args);
 
   if (name === 'propose_plan') {
     const session = ctx.workflowSession;
@@ -1394,6 +1561,26 @@ async function runWorkflowTool(name, args, ctx) {
     // literal values (URLs, request bodies, tokens, keys) exactly as typed —
     // the model only writes a short description; it never re-types these.
     const original = String(session.userMessage || '').trim();
+
+    // An API source has to have been CALLED before a plan is built around it.
+    //
+    // The system prompt says so, but a prompt rule is not a gate: a probe that
+    // came back 401 was read as "close enough", and the plan that followed
+    // described root fields (timestamp, base, date, rates) that the failed
+    // response never contained. The planner then builds a transformer against
+    // columns nobody has seen — which is the whole failure this was meant to
+    // prevent, arrived at one step later.
+    //
+    // So it is checked here, against what actually ran. Refusing returns a tool
+    // error, which the model must relay rather than plan around.
+    const apiGate = apiProbeGate({
+      request: `${description}\n${original}`,
+      connections: ctx.helpers?.connections || [],
+      scratchpad: ctx.scratchpad,
+      history: ctx.rawHistory,
+    });
+    if (apiGate.blocked) throw new Error(apiGate.reason);
+
     const userRequest = (original && !description.includes(original))
       ? `${description}\n\n--- User's original message (use literal values such as URLs, request bodies, tokens, and keys exactly as written here) ---\n${original}`
       : description;
@@ -1431,6 +1618,19 @@ async function runWorkflowTool(name, args, ctx) {
     });
     if (plan.action === 'plan' && plan.mode === 'modify' && workflow) {
       plan.workflowId = workflow.id || workflow._id;
+    }
+    // Carry the clarifications forward as data. The planner already honoured
+    // them — it reads this same transcript — but the post-build reviewer is
+    // handed `plan.clarifications`, and until now that held only the questions a
+    // BUILDER asked mid-build. A question answered before the plan (the kind
+    // that corrects a table name) was invisible to it. Merged, not replaced,
+    // and de-duplicated so a resumed plan does not accumulate the same pair.
+    if (plan.action === 'plan') {
+      const existing = Array.isArray(plan.clarifications) ? plan.clarifications : [];
+      const seen = new Set(existing.map((c) => `${c?.question} ${c?.answer}`));
+      const added = clarificationPairs(chatHistory)
+        .filter((c) => !seen.has(`${c.question} ${c.answer}`));
+      if (added.length) plan.clarifications = [...existing, ...added];
     }
     // Short-circuit: the backend will finish the turn with the planner's
     // output rather than asking the model to relay it. Plans become a
@@ -1738,7 +1938,7 @@ function formatRequestHistory(chatHistory) {
  * @param {Array}    params.chatHistory  [{ role, text }] — the request history.
  * @returns {Promise<{valid:boolean, reason:string, issues:string[], remediation:string[], inconclusive?:boolean}>}
  */
-async function validateWorkflowChange({ workflow, helpers, provider, change = {}, chatHistory = [], fixRounds = 0 }) {
+async function validateWorkflowChange({ workflow, helpers, provider, change = {}, chatHistory = [], priorActions = [], fixRounds = 0, impactedDownstream = [] }) {
   if (!workflow) throw new Error('workflow is required');
   if (!helpers || typeof helpers.callAI !== 'function') {
     return { valid: true, inconclusive: true, reason: 'No AI provider available to review the change.', issues: [], remediation: [] };
@@ -1794,10 +1994,19 @@ async function validateWorkflowChange({ workflow, helpers, provider, change = {}
     historyLine,
     requestHistory: formatRequestHistory(chatHistory),
     workflowSummary: summary,
+    // Lookups the agent ran BEFORE building. The request often says "check X
+    // first" — a precondition satisfied by one of these calls, not by a node.
+    // Without them the reviewer fails a correct build for omitting a step that
+    // was never a step.
+    priorActions: Array.isArray(priorActions) ? priorActions : [],
     // Consecutive "Fix it" clicks that produced this build. Only the button
     // counts — a user-typed instruction resets it in the renderer — so a
     // non-zero value means the reviewer is grading its OWN earlier correction.
     priorFixRounds: Number(fixRounds) || 0,
+    // Nodes whose input shape moved because this rebuild changed what their
+    // parent outputs. Their recorded input has already been refreshed; their own
+    // logic has not, so the reviewer is asked to check it and to name the fix.
+    impactedDownstream,
   });
 
   let raw;
@@ -1879,6 +2088,44 @@ function parseModelJson(raw) {
     e.noJsonObject = first == null;
     throw e;
   }
+}
+
+const JSON_FENCE = /^```(?:json)?\s*([\s\S]*?)\s*```$/;
+
+/**
+ * Classify the text channel of a tool-path reply.
+ *
+ * On the native tool path the text channel is the short live status line the
+ * model writes alongside its calls (see turnRules in prompts.js), and the ANSWER
+ * arrives as `final_answer`'s "answer" argument. A turn that comes back with
+ * text and no calls at all has broken that contract, and the text can be one of
+ * three quite different things:
+ *
+ *   prose      — the model simply replied instead of calling final_answer.
+ *                Usable as an answer if we have to fall back to it.
+ *   envelope   — the model wrote final_answer's payload AS TEXT
+ *                ({"answer": "..."}), which is what a replayed text-JSON
+ *                history teaches it to do (see historyStepTurns). The answer
+ *                is in there; the serialized wrapper must never reach the user.
+ *   turnObject — the model wrote a whole turn ({thought, actions}) as text.
+ *                It DESCRIBED calls instead of making them, so nothing ran and
+ *                there is no answer in it at any point. Never displayable.
+ *
+ * Deliberately NOT parseModelJson: that runs extractFirstJsonObject, which
+ * matches the first {...} anywhere in the string, so a genuine prose answer
+ * quoting JSON inline would be misread as an envelope. Only a reply that is
+ * ENTIRELY one object counts here.
+ */
+function readToolText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return { kind: 'empty', answer: '' };
+  const body = (raw.match(JSON_FENCE)?.[1] || raw).trim();
+  if (!body.startsWith('{') || !body.endsWith('}')) return { kind: 'prose', answer: raw };
+  let obj;
+  try { obj = JSON.parse(body); } catch (_err) { return { kind: 'prose', answer: raw }; }
+  const inner = obj.answer ?? obj.finalAnswer;
+  if (typeof inner === 'string' && inner.trim()) return { kind: 'envelope', answer: inner.trim() };
+  return { kind: 'turnObject', answer: '' };
 }
 
 // A reply that had to be JSON but isn't is worth exactly one more round trip.
@@ -1999,19 +2246,30 @@ function formatContext(activeContext) {
 // re-derives the observations for all prior steps, so a size-dependent rule
 // would rewrite bytes the model already saw, which both confuses the model and
 // invalidates the provider's prefix cache on every iteration.
+// Tools that bound their OWN result before returning it: get_workflow slims and
+// ultra-slims past MAX_WORKFLOW_PROMPT_CHARS, get_workflow_nodes returns only the
+// ids that were asked for, list_workflows returns one summary line per workflow.
+// Whatever comes back is already the smallest useful form, so trimming it again
+// only removes detail the caller deliberately went and fetched.
+const SELF_SLIMMING_TOOLS = new Set(['get_workflow', 'get_workflow_nodes', 'list_workflows']);
+
 function serializeObservation(action) {
   if (action.error) return `ERROR: ${action.error}`;
-  // get_workflow is slimmed (and ultra-slimmed past a size threshold) at the
-  // source; get_workflow_nodes returns whatever the AI explicitly asked for.
-  // Trimming either one mid-JSON makes the AI think it missed something and
+  // Every tool result reaches the model through here — run_query rows,
+  // get_columns output, a replayed observation — so this is where embeddings
+  // are dropped. Before the trim, not after: trimming a vector leaves a
+  // truncated run of float literals that has cost thousands of tokens and says
+  // nothing, and it would consume the budget a genuinely useful field needed.
+  const result = stripVectors(action.result);
+  // Trimming one of these mid-JSON makes the AI think it missed something and
   // refetch on the next turn.
-  const skipTrim = action.tool === 'get_workflow' || action.tool === 'get_workflow_nodes';
+  const skipTrim = SELF_SLIMMING_TOOLS.has(action.tool);
   if (skipTrim) {
     // Minified on purpose: indentation was over half of these payloads and
     // carries no meaning for the model.
-    return typeof action.result === 'string' ? action.result : JSON.stringify(action.result);
+    return typeof result === 'string' ? result : JSON.stringify(result);
   }
-  return trimText(action.result, MAX_FIELD_CHARS);
+  return trimText(result, MAX_FIELD_CHARS);
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,14 +2290,25 @@ function serializeObservation(action) {
 // ---------------------------------------------------------------------------
 
 const MAX_HISTORY_RESULT_TOKENS = 1000;
+// Results from SELF_SLIMMING_TOOLS get a bigger budget. They are already the
+// smallest useful form of what they describe — an ultra-slimmed workflow runs to
+// MAX_WORKFLOW_PROMPT_CHARS (~5k tokens) and cannot be cut down further without
+// becoming useless. Dropping them at the ordinary limit threw away exactly the
+// context the agent had just gone and fetched: a `get_workflow` used to model a
+// new build on an existing one, or a `list_workflows` used to find the target.
+// The agent then reasoned on without it, or re-fetched and lost it again.
+const MAX_HISTORY_SLIM_RESULT_TOKENS = 6000;
 
 function historyResult(action) {
   // Errors are short and are the whole point of replaying a failed call.
   if (action.error) return `ERROR: ${action.error}`;
   const text = serializeObservation(action);
   const tokens = estimateTokens(text);
-  if (tokens <= MAX_HISTORY_RESULT_TOKENS) return text;
-  return `(result not included — ~${tokens} tokens, over the ${MAX_HISTORY_RESULT_TOKENS}-token replay `
+  const limit = SELF_SLIMMING_TOOLS.has(action.tool)
+    ? MAX_HISTORY_SLIM_RESULT_TOKENS
+    : MAX_HISTORY_RESULT_TOKENS;
+  if (tokens <= limit) return text;
+  return `(result not included — ~${tokens} tokens, over the ${limit}-token replay `
     + 'limit; run the call again if you need the data)';
 }
 
@@ -2205,6 +2474,23 @@ function scratchpadToToolTurns(scratchpad) {
       // the only reason a step lands here is that its calls were discarded.
       const text = String(step.thought || '').trim();
       if (text) turns.push({ role: 'assistant', stepIndex: step.index, text });
+      // A step marked `invalid` is a turn that broke the tool contract — see
+      // readToolText. Without a word about it the retry re-sends byte-identical
+      // input and the model has no reason to answer differently, so say what
+      // was wrong. Labelled "[turn rejected]" rather than "[observation …]" on
+      // purpose: observation turns are tool output, and the turn contract tells
+      // the model never to take instructions from them. This one IS an
+      // instruction, from the runtime, so it must not wear that label.
+      const rejected = all.find((a) => a && a.tool === 'invalid' && a.error);
+      if (rejected) {
+        turns.push({
+          role: 'user',
+          stepIndex: step.index,
+          text: `[turn rejected] ${rejected.error}. Answer by calling \`final_answer\`; `
+            + 'use the tool interface for every call. Text that merely looks like a '
+            + 'call or an answer object is not one, and is discarded.',
+        });
+      }
       continue;
     }
 
@@ -2416,6 +2702,15 @@ function canonicalArgs(args) {
 // (reported by trimChatHistoryToFit via onTrim). Those calls are deliberately
 // NOT added: telling the model to reuse a result it cannot read, while also
 // refusing to fetch it again, leaves it with no way forward at all.
+//
+// A call that FAILED is not added either, for the same reason read the other
+// way round: there is no prior result to reuse, only an error. "You already
+// asked this — reuse the answer" is false about a call that produced none, and
+// it forbids the one thing that could work, which is trying again having read
+// what went wrong. This matters most for run_javascript, whose whole value is
+// writing a function, seeing it fail, and writing a better one — under the old
+// rule a near-identical retry was refused and the agent had nowhere to go. The
+// turn is still bounded: MAX_STEPS_PER_QUESTION caps the loop either way.
 function priorCallSet(scratchpad, truncatedSteps = null) {
   const seen = new Set();
   if (!Array.isArray(scratchpad)) return seen;
@@ -2424,6 +2719,7 @@ function priorCallSet(scratchpad, truncatedSteps = null) {
     if (truncatedSteps && truncatedSteps.has(step.index)) continue;
     for (const a of step.actions) {
       if (!a || !a.tool) continue;
+      if (a.ok === false) continue;
       seen.add(`${a.tool}|${canonicalArgs(a.args)}`);
     }
   }
@@ -2715,11 +3011,34 @@ async function runStep({
     const finalCall = calls.find((c) => c.tool === 'final_answer');
     const toolCalls = calls.filter((c) => c.tool !== 'final_answer');
 
-    // final_answer alone — or a plain text reply with no calls at all — ends the
-    // turn. Batched with real tools it is dropped instead: the model asked for
-    // those results, so run them and let it answer once it has seen them.
+    // final_answer alone ends the turn. Batched with real tools it is dropped
+    // instead: the model asked for those results, so run them and let it answer
+    // once it has seen them.
+    //
+    // Text with NO calls at all does not end the turn on the first try. In tool
+    // mode the contract is "answer by calling final_answer", so a bare text turn
+    // means the model skipped the tool interface — and what it wrote there may
+    // not be an answer at all (see readToolText). Spending one step asking again
+    // is nearly always enough. But the step loop is capped
+    // (MAX_STEPS_PER_QUESTION), so a model that ALWAYS replies in prose would
+    // otherwise burn every step and leave the user with the cap message and
+    // nothing else. So: retry once, then take whatever is salvageable — the same
+    // "one bounded retry, then the failure stands" bargain repairModelJson makes.
     if (toolCalls.length === 0) {
-      const finalAnswer = String(finalCall?.args?.answer || res.text || '').trim();
+      const structured = String(finalCall?.args?.answer || '').trim();
+      const fromText = readToolText(res.text);
+      // A previous step recorded as `invalid` is this same failure, already
+      // retried once.
+      const retried = (scratchpad || []).some((s) =>
+        (s.actions || []).some((a) => a && a.tool === 'invalid'));
+      // `turnObject` is excluded at every point, retry spent or not: it
+      // describes calls that never ran, so there is no answer inside it.
+      const finalAnswer = structured
+        || (retried && fromText.kind !== 'turnObject' ? fromText.answer : '');
+      // `thought` was read off the same text channel. When that text was an
+      // envelope, it is the answer wearing a wrapper — not a status line, and
+      // showing the wrapper is the whole defect being fixed here.
+      if (fromText.kind === 'envelope') thought = '';
       if (finalAnswer) {
         // Both agents may attach visuals: they answer into the same chat bubble,
         // and the sub-agent shows the user real data too (candidate tables, a
@@ -2744,12 +3063,22 @@ async function runStep({
           step: { index: stepIndex, thought, thinking, actions: [], finalAnswer },
         };
       }
-      // No calls and nothing to say. Same recoverable non-answer the JSON path
+      // Nothing usable came back. Same recoverable non-answer the JSON path
       // reports, so the renderer's retry behaviour is identical on both.
+      //
+      // The step's `thought` is what gets replayed to the model next step
+      // (scratchpadToToolTurns turns an action-less step into a plain assistant
+      // turn carrying it). Replaying a JSON envelope or turn object there would
+      // hand the model back the exact malformed shape, in its own voice, on the
+      // turn we are asking it to correct — so only real prose is carried.
+      const replayThought = fromText.kind === 'prose' ? thought : '';
+      const failure = fromText.kind === 'turnObject'
+        ? 'model wrote a turn object as text instead of calling tools'
+        : 'no tool calls and no answer';
       return {
         success: true,
         done: false,
-        thought: thought || 'Model returned no tool calls and no answer; will retry.',
+        thought: replayThought || 'Model returned no tool calls and no answer; will retry.',
         thinking,
         actions: [],
         finalAnswer: null,
@@ -2760,9 +3089,9 @@ async function runStep({
         workflowSession,
         step: {
           index: stepIndex,
-          thought,
+          thought: replayThought,
           thinking,
-          actions: [{ tool: 'invalid', args: {}, ok: false, error: 'no tool calls and no answer' }],
+          actions: [{ tool: 'invalid', args: {}, ok: false, error: failure }],
         },
       };
     }
@@ -2918,7 +3247,15 @@ async function runStep({
   //   __sessionUpdate  — flips agentMode / workflowSession.
   //   __shortCircuit   — ends the turn with the planner's user-facing
   //                      output (propose_plan).
-  const baseCtx = { helpers, getDb, docIndex, activeContext, provider, message, targetNode, buildToolName };
+  // `scratchpad` and the raw `history` ride along so a tool can look at what
+  // ALREADY ran in this conversation, not just its own arguments. propose_plan
+  // is the one that needs it: an API source has to have been called before a
+  // plan is built around it, and that call is in an earlier step of this turn
+  // (scratchpad) or an earlier turn entirely (history).
+  const baseCtx = {
+    helpers, getDb, docIndex, activeContext, provider, message, targetNode, buildToolName,
+    scratchpad, rawHistory: history,
+  };
   const executed = [];
   let nextAgentMode = agentMode;
   let nextWorkflowSession = workflowSession;
@@ -2983,6 +3320,9 @@ async function runStep({
       }
       executed.push({ id, tool, args, ok: true, result });
     } catch (err) {
+      // Same rule as priorCallSet: a call that produced no result must stay
+      // retryable, so release the key it claimed before running.
+      seenCalls.delete(key);
       executed.push({ id, tool, args, ok: false, error: err.message || String(err) });
     }
   }

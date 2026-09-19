@@ -15,7 +15,7 @@ endpoint would ask the user to re-enter tokens for every endpoint. Instead:
 - **DataSource node** = the actual request. An AI-assisted chat helps the user
   describe what to pull and produces a fetch plan that's persisted on the node.
 
-The DataSource materialises each run into a local NeDB collection, so Preview,
+The DataSource materialises each run into a local DuckDB table, so Preview,
 Joins, Transformers, and Branches see it as an ordinary NoSQL source.
 
 ## Config fields

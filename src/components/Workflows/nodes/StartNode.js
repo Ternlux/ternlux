@@ -1,8 +1,9 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { PlayCircleOutlined, ClockCircleOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { NODE_COLORS } from './nodeCardShared';
 
-const ACCENT = '#2563eb';
+const ACCENT = NODE_COLORS.start;
 const MONO = "'JetBrains Mono', monospace";
 const TEXT = '#111827';
 const MUTED = '#5a6678';

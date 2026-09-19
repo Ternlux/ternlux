@@ -67,6 +67,20 @@ const CodeEditorPopup = ({
             open={open}
             onClose={onClose}
             fullScreen
+            // MUI traps focus inside a Dialog: FocusTrap listens for `focusin`
+            // on the document and, whenever the focused element is outside the
+            // dialog, calls rootElement.focus() to pull it back. The pinned
+            // assistant rail sits outside — the dialog is portalled to <body>
+            // and App.css keeps it clear of the rail — so clicking the chat
+            // input focused it and had focus yanked away again before a single
+            // keystroke landed.
+            //
+            // The rail is deliberately still visible and usable next to this
+            // editor (asking the assistant about the code you are editing is
+            // the obvious thing to want), so the trap has to be off rather than
+            // the rail covered. Focus still moves INTO the editor on open —
+            // that is disableAutoFocus, left alone.
+            disableEnforceFocus
             PaperProps={{
                 sx: {
                     bgcolor: '#fff',

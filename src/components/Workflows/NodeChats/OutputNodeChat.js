@@ -2,7 +2,9 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { message as antdMessage } from 'antd';
 import { connectionsDb } from '../../../utils/localDb';
 import { loadTableSchema } from '../../../utils/tableSchemaUtils';
+import { sourceFieldsFromUpstream } from '../../../utils/workflowUtils';
 import CloudStorageBrowser from '../CloudStorageBrowser';
+import GoogleSheetsPicker from '../GoogleSheetsPicker';
 import {
   FileExcelOutlined,
   FileTextOutlined,
@@ -41,12 +43,22 @@ const FORMAT_OPTIONS = [
   { label: 'JSON — export as JSON file', value: 'json' },
   { label: 'CSV — export as CSV file', value: 'csv' },
   { label: 'Excel — export as .xlsx', value: 'excel' },
-  { label: 'NeDB — local NeDB database', value: 'nedb' },
+  { label: 'DuckDB — local DuckDB database', value: 'duckdb' },
   { label: 'SQLite — local SQLite database', value: 'sqlite' },
   { label: 'LanceDB — local vector database', value: 'lancedb' },
   { label: 'Parquet — export as Parquet file', value: 'parquet' },
   { label: 'Avro — export as Avro file', value: 'avro' },
 ];
+
+/**
+ * Local formats whose file holds MANY tables, so the node has to say which one
+ * it writes — the same reason Excel has to name a sheet. Everything else here
+ * is one dataset per file, where the path alone identifies the destination.
+ */
+const TABLE_FORMATS = new Set(['sqlite', 'duckdb', 'lancedb']);
+
+/** Where the file extension differs from the format's name. Only Excel does. */
+const EXTENSION_BY_FORMAT = { excel: 'xlsx' };
 
 /**
  * A sheet name Excel will accept: at most 31 characters, none of `\ / ? * [ ] :`,
@@ -66,23 +78,43 @@ const sanitizeSheetName = (name, fallback = 'Data') => {
   return cleaned || fallback;
 };
 
+/**
+ * A table name SQLite and DuckDB will both accept unquoted: letters, digits and
+ * underscores, not starting with a digit. Mirrors sanitizeIdentifier in
+ * public/duckdb/index.js, which applies the same rules again at write time —
+ * this copy exists because the renderer cannot reach into the main process's
+ * modules, exactly like sanitizeSheetName above.
+ */
+const sanitizeTableName = (name, fallback = 'data') => {
+  const cleaned = String(name || '')
+    .replace(/[^a-zA-Z0-9_]/g, '_')
+    .replace(/^(?=\d)/, '_')
+    .slice(0, 80);
+  return cleaned || fallback;
+};
+
 const GROUP_ORDER = ['Databases', 'Vector', 'Cloud Storage', 'APIs', 'Local Files', 'Other'];
 
 /**
  * Undo the pre-quoting an earlier build applied before saving. The executor
- * quotes and schema-qualifies the name itself, so a stored `db`.`tbl` came back
- * doubled up ("Table 'db.tbl' doesn't exist"). Strip the quote characters and,
- * if the leading segment is just this connection's own database/schema, drop
- * it too — that qualifier gets re-added at run time.
+ * quotes the name itself, so a stored `db`.`tbl` came back doubled up
+ * ("Table 'db.tbl' doesn't exist"). Stripping the quote characters is all that
+ * is needed: what a destination stores is the PLAIN name, quoted once at run
+ * time by the target connector's quoteIdentifier.
+ *
+ * The qualifier is deliberately kept. This used to also drop a leading segment
+ * that matched the connection's own database/schema, because the executor
+ * re-added it — but it read `database || schema`, and a two-part destination
+ * name means a SCHEMA on every engine here except MySQL (database) and
+ * BigQuery (dataset). On a Postgres connection to a database named `reporting`,
+ * a destination of `reporting.orders` — meaning the SCHEMA `reporting` — was
+ * stripped to `orders` and then resolved through search_path, writing to a
+ * different table than the one named. Every connector now quotes a qualified
+ * name correctly on its own, so there is nothing left for this to repair.
  */
-const normalizeSavedTableName = (raw, conn) => {
-  if (!raw || !conn) return raw;
-  const bare = String(raw).replace(/[`"[\]]/g, '');
-  const parts = bare.split('.');
-  if (parts.length !== 2) return bare;
-  const qualifier = (conn.dbConfig?.database || conn.dbConfig?.schema || '').toLowerCase();
-  if (qualifier && parts[0].toLowerCase() === qualifier) return parts[1];
-  return bare;
+const normalizeSavedTableName = (raw) => {
+  if (!raw) return raw;
+  return String(raw).replace(/[`"[\]]/g, '');
 };
 
 const categorizeConnection = (conn) => {
@@ -102,7 +134,6 @@ const getDbIcon = (dbType) => {
     mssql: MssqlIcon,
     mongodb: MongodbIcon,
     sqlite: SqlliteIcon,
-    nedb: SqlliteIcon,
     gcs: GoogleCloudStorageIcon,
     dropbox: DropboxIcon,
     'google-drive': GoogleDriveIcon,
@@ -138,8 +169,9 @@ const OutputNodeChat = ({
   onSave,
   onCancel,
   onDirtyChange,
-  executeOutput,
-  executingInd,
+  // True while the panel is running this node. Running is started from the
+  // panel header, not from here; this only keeps the form's own controls from
+  // being edited or re-saved underneath a run in flight.
   executing = false,
 }) => {
   const initialized = useRef(false);
@@ -167,12 +199,18 @@ const OutputNodeChat = ({
     // one sheet — pointing several nodes at the same workbook with different
     // sheet names is how a multi-sheet file gets built.
     sheetName: saved?.sheetName || null,
+    // What to do with what is already at the destination on every run:
+    // 'append' adds to it, 'truncate' empties it first. Only destinations that
+    // KEEP rows between runs have the choice — a file is rewritten whole
+    // whatever this says — so the control below is shown for those only.
+    // Defaults to append, which is what every output node did before.
+    writeMode: saved?.writeMode || 'append',
   });
 
   const [dirty, setDirty] = useState(false);
   const [attempted, setAttempted] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
   const [executionError, setExecutionError] = useState(null);
+
 
   const [cloudStorageBrowserOpen, setCloudStorageBrowserOpen] = useState(false);
 
@@ -261,7 +299,7 @@ const OutputNodeChat = ({
     }
     try {
       const sourceConfig = source?.data?.config || {};
-      const isNoSQL = connection.dbType === 'mongodb' || connection.dbType === 'nedb';
+      const isNoSQL = connection.dbType === 'mongodb';
 
       let tableName = null;
       let tableSchema = null;
@@ -271,7 +309,6 @@ const OutputNodeChat = ({
       if (isNoSQL) {
         tableName = sourceConfig.targetCollection || sourceConfig.sourceCollection || sourceConfig.table;
         localPath = sourceConfig.targetLocalPath || sourceConfig.sourceLocalPath;
-        if (connection.dbType === 'nedb') queryConnection = { ...connection, dbType: 'mongodb' };
       } else {
         tableSchema = sourceConfig.targetSchema || sourceConfig.sourceSchema || connection.dbConfig?.schema;
         tableName = sourceConfig.targetTableName || sourceConfig.sourceTableName || sourceConfig.table;
@@ -355,7 +392,7 @@ const OutputNodeChat = ({
       if (saved?.outputType === 'connection' && savedTable) {
         const dest = destinations.find((d) => d.id === saved.connectionId);
         if (dest && dest.group !== 'Cloud Storage') {
-          const fixed = normalizeSavedTableName(savedTable, dest.connection);
+          const fixed = normalizeSavedTableName(savedTable);
           if (fixed !== savedTable) {
             setOutputSettings((prev) => ({ ...prev, tableName: fixed }));
           }
@@ -408,6 +445,13 @@ const OutputNodeChat = ({
 
   const dbType = selectedDestination?.connection?.dbType;
 
+  // Destinations that KEEP what was written last time, so "append or replace?"
+  // is a real question. A table, a collection, a vector index and a Sheets tab
+  // all qualify. An object in cloud storage and a local file do not: the write
+  // replaces the whole file, which is the same thing every run.
+  const keepsRowsBetweenRuns = outputSettings.outputType === 'connection'
+    && (destKind === 'database' || destKind === 'vector' || dbType === 'google-sheets');
+
   // ── Validation ───────────────────────────────────────────────────────────
 
   const missing = useMemo(() => {
@@ -418,6 +462,10 @@ const OutputNodeChat = ({
       // A workbook needs a tab to write to, and the user can clear the field.
       if (outputSettings.format === 'excel' && !String(outputSettings.sheetName || '').trim()) {
         out.sheetName = true;
+      }
+      // A multi-table file needs to say which table, for the same reason.
+      if (TABLE_FORMATS.has(outputSettings.format) && !String(outputSettings.tableName || '').trim()) {
+        out.tableName = true;
       }
     } else {
       if (!outputSettings.connectionId) out.connectionId = true;
@@ -433,12 +481,16 @@ const OutputNodeChat = ({
   const needsCloudPick = outputSettings.outputType === 'connection' && destKind === 'cloud';
   const cloudBlocked = needsCloudPick && !outputSettings.tableName;
 
-  // `executing` is panel-level (the header Run button shares it); `submitting`
-  // is this form's own click guard.
-  const running = executing || submitting;
+  // Panel-level: the header's Run button is what sets it. Saving is synchronous
+  // now, so this form has no in-flight state of its own to track.
+  const running = executing;
+
+  // Saving needs a complete, valid form and something to save. Nothing here
+  // gates RUNNING — that is the header's decision, and it turns on `dirty`.
+  const canSave = !running && !cloudBlocked && missingCount === 0 && dirty;
 
   const gateMessage = running
-    ? 'Running the output…'
+    ? 'Running the output — it can be stopped from the execution monitor.'
     : cloudBlocked
     ? 'Pick an upload path to enable Save'
     : executionError
@@ -468,9 +520,28 @@ const OutputNodeChat = ({
   }, [outputSettings.outputType, outputSettings.format, outputSettings.sheetName,
     sourceTableSchema, sourceNode, defaultSheetName]);
 
+  // What the table is called when the user hasn't said: the table this node is
+  // writing. Two output nodes on one database file then land on different tables
+  // by default instead of overwriting each other — the Excel rule, applied to
+  // the formats that also hold more than one dataset per file.
+  const defaultTableName = useCallback(
+    () => sanitizeTableName(sourceTableSchema?.tableName || sourceNode?.data?.label),
+    [sourceTableSchema, sourceNode],
+  );
+
+  // Same fill-in as the sheet name above, for a node saved before this field
+  // existed or whose format was set before the source finished loading.
+  useEffect(() => {
+    if (outputSettings.outputType !== 'local' || !TABLE_FORMATS.has(outputSettings.format)) return;
+    if (outputSettings.tableName) return;
+    if (!sourceTableSchema && !sourceNode) return;
+    setOutputSettings((prev) => (prev.tableName ? prev : { ...prev, tableName: defaultTableName() }));
+  }, [outputSettings.outputType, outputSettings.format, outputSettings.tableName,
+    sourceTableSchema, sourceNode, defaultTableName]);
+
   const changeOutputType = (value) => {
     // Switching sides drops whatever the other side had picked.
-    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null, sheetName: null });
+    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null, sheetName: null, writeMode: 'append' });
     setAttempted(false);
   };
 
@@ -484,7 +555,7 @@ const OutputNodeChat = ({
       antdMessage.warning('Choose an output format first.');
       return;
     }
-    const fileExtension = outputSettings.format === 'excel' ? 'xlsx' : outputSettings.format;
+    const fileExtension = EXTENSION_BY_FORMAT[outputSettings.format] || outputSettings.format;
     const defaultFileName = `output_${node.id.slice(0, 8)}.${fileExtension}`;
     try {
       const result = await window.electronAPI.selectSavePath(defaultFileName, fileExtension);
@@ -503,11 +574,22 @@ const OutputNodeChat = ({
 
   const buildConfig = (finalSettings) => {
     if (!sourceNode || !sourceConnection) return {};
-    return {
-      nodeType: 'output',
 
-      sourceNodeId: sourceNode.id,
-      sourceNodeLabel: sourceNode.data?.label,
+    // The full input snapshot, taken the same way the canvas takes it on a
+    // rewire (workflowUtils.sourceFieldsFromUpstream) and the headless builder
+    // takes it on a chat build (workflowBuilder.copySourceFromUpstream). This
+    // panel used to hand-copy a subset, which left out `sourcePreviewSql` —
+    // and without a statement to run, the Data Preview has nothing to show for
+    // a live database source. Going through the shared helper means all three
+    // paths record an output node's input identically.
+    const upstream = sourceFieldsFromUpstream(sourceNode);
+
+    // What this panel resolved wins over the raw copy where it knows better:
+    // it has already followed the datasource/transformer split to pick the
+    // right connection, and loaded the schema for the table actually read.
+    // Only defined values override, so a field the panel could not determine
+    // falls back to the upstream copy instead of blanking it.
+    const resolved = {
       sourceConnectionId: sourceConnection.id,
       sourceConnectionName: sourceConnection.name,
       sourceConnectionType: sourceConnection.connectionType,
@@ -517,54 +599,50 @@ const OutputNodeChat = ({
       sourceTableName: sourceTableSchema?.tableName,
       sourceCollection: sourceTableSchema?.tableName,
       sourceLocalPath: sourceConnection.localPath,
+    };
+    Object.keys(resolved).forEach((k) => {
+      if (resolved[k] === undefined) delete resolved[k];
+    });
 
+    return {
+      nodeType: 'output',
+      ...upstream,
+      ...resolved,
       outputSettings: finalSettings,
     };
   };
 
-  // Run the output, then persist — the footer action is "Run & Save".
-  const handleSave = async () => {
+  /**
+   * Persist the configuration. Writes nothing to the destination.
+   *
+   * This used to be "Run & Save": the output was executed first and the config
+   * was only kept if the run succeeded. That tied two unrelated decisions
+   * together in the wrong direction — a user correcting a wrong destination had
+   * to WRITE TO THE WRONG DESTINATION to record the correction, and a run that
+   * failed for an unrelated reason (a closed connection, a locked file) threw
+   * away settings that were perfectly good. Saving is now free and immediate;
+   * running is a separate, deliberate act.
+   *
+   * The table name goes through as the user typed it. insertToConnection quotes
+   * and schema-qualifies it itself, and hands the RAW name to batchInsert —
+   * pre-quoting here produced `db`.`tbl` which then got re-qualified, so CREATE
+   * TABLE failed silently and the insert reported "table doesn't exist".
+   */
+  const handleSave = () => {
     setAttempted(true);
     if (missingCount > 0 || cloudBlocked) return;
-    if (submitting) return; // guard against a double click racing the first run
 
     setExecutionError(null);
-    setSubmitting(true);
-
-    // The table name goes through as the user typed it. insertToConnection
-    // quotes and schema-qualifies it itself, and hands the RAW name to
-    // batchInsert — pre-quoting here produced `db`.`tbl` which then got
-    // re-qualified, so CREATE TABLE failed silently and the insert reported
-    // "table doesn't exist".
-    const finalSettings = outputSettings;
-
-    executingInd(true);
-    try {
-      const result = await executeOutput({
-        sourceConnection,
-        sourceTableSchema,
-        outputSettings: finalSettings,
-        onSuccess: (res) => {
-          antdMessage.success(res.message || 'Output complete.');
-          if (res.filePath) antdMessage.info(`File saved at: ${res.filePath}`);
-        },
-        onError: (err) => {
-          setExecutionError(`Output failed: ${err.error || err.message}`);
-        },
-      });
-
-      if (!result.success) return;
-
-      onSave(buildConfig(finalSettings), []);
-      // Ran and saved — nothing left to do until a setting changes, and
-      // clearing `dirty` is what takes the footer action back off screen.
-      setDirty(false);
-      setAttempted(false);
-    } finally {
-      executingInd(false);
-      setSubmitting(false);
-    }
+    onSave(buildConfig(outputSettings), []);
+    // Saved — this is what enables Run, and what takes the unsaved marker off.
+    setDirty(false);
+    setAttempted(false);
   };
+
+  // Running lives in the panel header, next to the unsaved marker — see
+  // handleHeaderExecute in NodeChatPanel. This form's job ends at saving a
+  // valid configuration; what the header needs to decide whether it may run is
+  // the dirty flag, which already travels up through onDirtyChange.
 
   // ── Render ───────────────────────────────────────────────────────────────
 
@@ -627,6 +705,10 @@ const OutputNodeChat = ({
                     format: v,
                     savePath: null,
                     sheetName: v === 'excel' ? (outputSettings.sheetName || defaultSheetName()) : null,
+                    // Cleared for every other format so a name left over from the
+                    // connection side, or from a format that addresses tables,
+                    // can't travel to one where the path IS the destination.
+                    tableName: TABLE_FORMATS.has(v) ? (outputSettings.tableName || defaultTableName()) : null,
                   })}
                 />
               </Field>
@@ -641,6 +723,20 @@ const OutputNodeChat = ({
                     value={outputSettings.sheetName ?? ''}
                     placeholder={defaultSheetName()}
                     onChange={(v) => patch({ sheetName: v })}
+                  />
+                </Field>
+              )}
+              {TABLE_FORMATS.has(outputSettings.format) && (
+                <Field
+                  label="Table name"
+                  required
+                  invalid={invalid('tableName')}
+                  hint={<>The table this output writes, replaced on every run. An existing database file keeps its other tables, so a second output node pointed at the same file adds another table rather than replacing it. Letters, digits and underscores.</>}
+                >
+                  <TextInput
+                    value={outputSettings.tableName ?? ''}
+                    placeholder={defaultTableName()}
+                    onChange={(v) => patch({ tableName: v })}
                   />
                 </Field>
               )}
@@ -749,6 +845,32 @@ const OutputNodeChat = ({
           </Card>
         )}
 
+        {keepsRowsBetweenRuns && (
+          <Card label="Write mode">
+            <Fields>
+              <Field
+                label="What should happen to the rows already there?"
+                hint={outputSettings.writeMode === 'truncate'
+                  ? (dbType === 'google-sheets'
+                    ? 'The tab is cleared before the rows are written, so it holds only this run.'
+                    : destKind === 'vector'
+                      ? 'The index (or namespace) is emptied first, so stale vectors cannot survive a re-run.'
+                      : 'The table is emptied first — TRUNCATE where the engine supports it, DELETE otherwise. The table itself is kept.')
+                  : 'Rows are added to whatever is already there. Re-running adds another copy.'}
+              >
+                <Segmented
+                  value={outputSettings.writeMode}
+                  options={[
+                    { label: 'Append', value: 'append' },
+                    { label: 'Truncate & insert', value: 'truncate' },
+                  ]}
+                  onChange={(v) => patch({ writeMode: v })}
+                />
+              </Field>
+            </Fields>
+          </Card>
+        )}
+
         {!isLocal && destKind === 'cloud' && (
           <Card label="Upload path">
             <Handoff
@@ -758,7 +880,8 @@ const OutputNodeChat = ({
             >
               <HandoffBody>
                 Browse the bucket and pick the container and object path the results are written to.
-                Save stays disabled until a path is chosen.
+                Save stays disabled until a path is chosen. The object is replaced on every run —
+                a file has no append.
               </HandoffBody>
               {outputSettings.tableName ? (
                 <Picked>Uploading to <code>{outputSettings.tableName}</code></Picked>
@@ -779,22 +902,33 @@ const OutputNodeChat = ({
         onCancel={onCancel}
         cancelDisabled={running}
         onSave={handleSave}
-        saveLabel={running ? 'Running…' : 'Run & Save Configuration'}
-        // Nothing edited, nothing to run or save — so the button stays disabled
-        // until something changes. This covers BOTH the moment the form opens
-        // and the moment a run finishes (which clears `dirty`), so a successful
-        // run cannot be repeated by accident on a config that has not moved.
-        saveDisabled={running || cloudBlocked || !dirty}
+        saveLabel="Save configuration"
+        // Nothing edited, nothing to save. Unlike before, this no longer gates
+        // running as well — a saved config can be run as many times as the user
+        // wants without having to change something first.
+        saveDisabled={!canSave}
         saveDisabledReason={running
-          ? 'The output is running — wait for it to finish.'
+          ? 'The output is running — stop it from the execution monitor, or wait.'
           : cloudBlocked
             ? 'Pick an upload path in the storage browser first.'
-            : !dirty
-              ? 'Nothing has changed yet. Edit a setting to run and save again.'
-              : undefined}
+            : missingCount > 0
+              ? 'Finish the configuration first.'
+              : !dirty
+                ? 'Nothing has changed since the last save.'
+                : undefined}
       />
 
       {cloudStorageBrowserOpen && selectedDestination?.connection && pluginManager && (
+        selectedDestination.connection?.dbType === 'google-sheets' ? (
+          // Spreadsheet through Google's Picker, then the tab to write into —
+          // see GoogleSheetsPicker for why the generic browser is not used.
+          <GoogleSheetsPicker
+            connection={selectedDestination.connection}
+            mode="output"
+            onFileSelect={handleCloudStoragePathSelect}
+            onClose={() => setCloudStorageBrowserOpen(false)}
+          />
+        ) : (
         <CloudStorageBrowser
           open={cloudStorageBrowserOpen}
           onClose={() => setCloudStorageBrowserOpen(false)}
@@ -804,6 +938,7 @@ const OutputNodeChat = ({
           mode="output"
           sourceDbType={sourceConnection?.dbType}
         />
+        )
       )}
     </FormScope>
   );

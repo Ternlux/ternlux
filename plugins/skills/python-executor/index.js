@@ -52,7 +52,7 @@ module.exports = {
   buildSkillPrompt: (params) => {
     const { userRequest, sourceTableSchema, operationType = 'sql', settings = {}, currentState = {} } = params;
 
-    // Build the main prompt similar to nedbTransformationNewTable
+    // Build the main prompt for a new-table transformation
     const sourceTableInfo = `
 Source: ${sourceTableSchema.sourceNodeLabel || 'Unknown'}
 - Table/Collection name: ${sourceTableSchema.tableName}
@@ -84,17 +84,17 @@ Analyze the user's request and determine the appropriate action:
    - General questions about the workflow
    - Requesting a different type of operation
 
-2. **answer_directly** - If the request is:
-   - A question about the transformation you've already created
-   - Asking for clarification about what the code does
-   - General information query that doesn't need execution
-
-3. **ask_questions** - If you need:
+2. **ask_questions** - Everything short of executing. Use it if you need:
    - More details about the transformation logic
    - Clarification on column names or operations
    - User preferences for handling edge cases
+   - To answer a question about the code you already wrote, or about what it
+     does — answer it inside followUpQuestion, then say what you still need
+   - To report something you cannot do (a column that is not in the source)
+   You are a builder, not a chat partner: apart from unrelateSkill, executing and
+   asking are the only two ways this ends.
 
-4. **execute** - When you're ready to execute:
+3. **execute** - When you're ready to execute:
    - User has provided all necessary information
    - You have complete Python transformation code
    - Code includes a transform(data) function
@@ -128,12 +128,11 @@ ${currentState.pythonCode ? `\n**Current Python Code**:\n\`\`\`python\n${current
 
 Return your response in JSON format:
 {
-  "action": "unrelateSkill" | "answer_directly" | "ask_questions" | "execute",
+  "action": "unrelateSkill" | "ask_questions" | "execute",
   "pythonCode": "Complete Python code (ONLY if action is 'execute')",
   "targetColumns": [{"name": "col", "type": "TYPE"}],   // ONLY if action is 'execute': every column the code RETURNS, in order. Downstream nodes are configured from this, so it must match what transform() actually emits — "*" only if the shape is unchanged from the source
   "explanation": "Explanation of what you're doing or asking",
   "followUpQuestion": "Question for user (ONLY if action is 'ask_questions')",
-  "directAnswer": "Answer to user's question (ONLY if action is 'answer_directly')",
   "reasoning": "Why you chose this action"
 }`;
 
@@ -375,9 +374,12 @@ Otherwise use standard SQL/NoSQL transformation.
       pluginManager,
       getFullConfig,
       appSqliteDbPath,
-      sqlitePool,
       helpers,
-      targetLocalPath = null
+      targetLocalPath = null,
+      // The table the BUILDER named for this node. The workflow executor sends
+      // it as `targetTable`; TransformerNodeChat's ad-hoc runs do not, and fall
+      // back to the node-id name below.
+      targetTable = null
     } = params;
     const startTime = Date.now();
 
@@ -409,23 +411,6 @@ Otherwise use standard SQL/NoSQL transformation.
             'duckdb', { query: `SELECT * FROM "${tableName}"` }, localPath,
           );
           console.log(`[Python Executor] Loaded ${sourceData.length} rows from ${tableName}`);
-        } else if (sourceConnection.dbType === 'nedb') {
-          const Datastore = require('@seald-io/nedb');
-          // NeDB doesn't use table names in queries, just the file path
-          const db = new Datastore({ filename: sourceConnection.localPath, autoload: false });
-
-          await new Promise((resolve, reject) => {
-            db.loadDatabase((err) => err ? reject(err) : resolve());
-          });
-
-          sourceData = await new Promise((resolve, reject) => {
-            db.find({}).limit(1000000).exec((err, docs) => {
-              if (err) reject(err);
-              else resolve(docs);
-            });
-          });
-
-          console.log(`[Python Executor] Loaded ${sourceData.length} documents from local NeDB`);
         } else if (sourceConnection.dbType === 'sqlite') {
           const sqlite3 = require('sqlite3').verbose();
           const db = new sqlite3.Database(sourceConnection.localPath);
@@ -453,7 +438,7 @@ Otherwise use standard SQL/NoSQL transformation.
 
         // Use the quoted tableName for SQL (already includes schema if needed)
         // Use originalTableName for NoSQL collections (no schema needed)
-        const isNoSQLDb = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
+        const isNoSQLDb = sourceConnection.dbType === 'mongodb';
         const tableNameForQuery = isNoSQLDb
           ? (sourceTableSchema.originalTableName || sourceTableSchema.tableName)
           : sourceTableSchema.tableName;
@@ -475,8 +460,8 @@ Otherwise use standard SQL/NoSQL transformation.
           sheetName: sourceTableSchema.sheetName,
           range: null,
 
-          // Common
-          limit: 1000000
+          // Common. No limit — the script receives the whole source; a
+          // million-row cap here silently shortened what it computed over.
         };
 
         const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
@@ -619,15 +604,27 @@ if __name__ == '__main__':
       // Step 3: Save transformed data to local file
       const { data: transformedData, recordCount, executionTime } = result;
       // A node's output is a table in its workflow's own DuckDB database,
-      // whatever shape the transform had. It used to land in a NeDB file under
+      // whatever shape the transform had. It used to land in a local file under
       // the process's working directory, or in the app-wide SQLite — neither of
       // which any current reader looks in, and the first of which is not even
       // writable in a packaged app.
       const targetDbType = 'duckdb';
 
-      // Generate target table/collection name from node ID or use default
+      // Where the result is written.
+      //
+      // The name the BUILDER chose wins. It is what the node records as
+      // `targetTableName`, what its preview SQL selects from, and what every
+      // downstream node reads — so deriving a different one here (from the node
+      // id) wrote the rows to a table nothing else knew about. The run reported
+      // success and the output then failed to read with "Table … does not
+      // exist", because it genuinely did not.
+      //
+      // The node-id name stays as the fallback for an ad-hoc run from the node
+      // chat, where no target has been settled yet.
       const nodeId = params.nodeId || `transform_${Date.now()}`;
-      const targetTableName = nodeId.replace(/-/g, '_').toLowerCase();
+      const targetTableName = (typeof targetTable === 'string' && targetTable.trim())
+        ? targetTable.trim()
+        : nodeId.replace(/-/g, '_').toLowerCase();
 
       // The workflow builder records targetLocalPath as the workflow's own
       // database (workflow-data/<workflowId>.duckdb), so the result becomes a

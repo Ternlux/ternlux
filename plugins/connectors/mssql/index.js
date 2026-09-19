@@ -5,8 +5,98 @@
 
 const mssql = require('mssql');
 
+// A table value constructor - the `VALUES (...), (...)` of a multi-row INSERT -
+// accepts at most 1000 row expressions in one statement. Past that SQL Server
+// rejects the whole statement outright ("The number of row value expressions in
+// the INSERT statement exceeds the maximum allowed number of 1000 row values").
+const MSSQL_MAX_ROWS_PER_INSERT = 1000;
+
+// A request carries at most 2100 parameters. node-mssql runs a parameterized
+// query through sp_executesql, which spends two of those on the statement text
+// and the parameter declaration, so the rows in one statement have to fit in
+// what is left. The margin below that is deliberate headroom, not a measured
+// limit - the cost of one extra statement is a round trip, the cost of getting
+// it wrong is the whole batch.
+const MSSQL_MAX_PARAMS_PER_STATEMENT = 2000;
+
+// The widest NVARCHAR that can be declared with a length; beyond it the type
+// has to be NVARCHAR(MAX).
+const NVARCHAR_MAX_DECLARED_LENGTH = 4000;
+
 // Connection pool cache
 const connectionPools = new Map();
+
+/**
+ * Bind one JavaScript value to a named parameter, choosing the SQL Server type
+ * explicitly rather than leaving it to the driver's inference.
+ *
+ * Text is always bound as NVARCHAR. Inserting into a VARCHAR column converts it
+ * back down, but inserting into an NVARCHAR column keeps every character - the
+ * opposite of what a VARCHAR literal does, which drops anything outside the
+ * server's collation codepage on the way in.
+ *
+ * Dates are DATETIME2 rather than the driver's inferred DATETIME, whose
+ * resolution is ~3.33ms: sending a DATETIME into a DATETIME2 column would round
+ * the timestamp before it ever reached the column that could hold it.
+ *
+ * @param {object} request - mssql Request to bind on.
+ * @param {string} name - Parameter name, without the leading '@'.
+ * @param {*} val - Value from the source row.
+ */
+function bindValue(request, name, val) {
+  if (val === null || val === undefined) {
+    request.input(name, mssql.NVarChar, null);
+    return;
+  }
+
+  if (typeof val === 'string') {
+    const length = val.length > NVARCHAR_MAX_DECLARED_LENGTH
+      ? mssql.MAX
+      // NVARCHAR(0) is not a valid declaration, so an empty string still needs 1.
+      : Math.max(val.length, 1);
+    request.input(name, mssql.NVarChar(length), val);
+    return;
+  }
+
+  if (typeof val === 'boolean') {
+    request.input(name, mssql.Bit, val);
+    return;
+  }
+
+  if (typeof val === 'bigint') {
+    // Passed as text: the driver's BIGINT takes the full 64-bit range, which a
+    // JS number cannot carry through without losing the low digits.
+    request.input(name, mssql.BigInt, val.toString());
+    return;
+  }
+
+  if (typeof val === 'number') {
+    if (Number.isInteger(val)) {
+      if (val >= -2147483648 && val <= 2147483647) {
+        request.input(name, mssql.Int, val);
+      } else {
+        request.input(name, mssql.BigInt, val);
+      }
+      return;
+    }
+    request.input(name, mssql.Float, val);
+    return;
+  }
+
+  if (val instanceof Date) {
+    request.input(name, mssql.DateTime2, val);
+    return;
+  }
+
+  if (Buffer.isBuffer(val)) {
+    request.input(name, mssql.VarBinary(mssql.MAX), val);
+    return;
+  }
+
+  // Objects and arrays go in as JSON text, matching what the other connectors
+  // write for the same value.
+  request.input(name, mssql.NVarChar(mssql.MAX), JSON.stringify(val));
+}
 
 /**
  * Get or create connection pool
@@ -65,12 +155,63 @@ function quoteSqlServerIdentifier(identifier, schema = null) {
   return `[${identifier}]`;
 }
 
+/**
+ * A driver failure, with the driver's own classification kept alongside the text.
+ *
+ * The message alone cannot be reasoned about — "Duplicate column name 'x'" is
+ * prose that moves with the server's version and locale. The CODE is the
+ * driver's own answer to what KIND of failure this is, and the transform
+ * executor uses it to tell a structural change that was ALREADY APPLIED (what
+ * the second run of an in-place ALTER looks like) from one that genuinely
+ * failed. Callers that only read `message` are unaffected.
+ */
+const queryError = (error) => ({
+  success: false,
+  message: error.message,
+  // `code` on an mssql error is the transport-level kind ('EREQUEST'); what
+  // classifies the failure is SQL Server's error NUMBER (2705 is a duplicate
+  // column name), which sits on the wrapper or on the driver's original error.
+  code: error.code,
+  errno: error.number != null ? error.number : (error.originalError && error.originalError.info && error.originalError.info.number),
+});
+
+/**
+ * NVARCHAR length for a column whose longest SAMPLED value is `maxLen`.
+ * Capped at 4000, not 65535: that is the widest non-MAX NVARCHAR SQL Server
+ * accepts (4000 two-byte characters = the 8000-byte page limit). Anything
+ * longer has to be NVARCHAR(MAX), which the STRING rule below handles.
+ */
+const nvarcharFor = (maxLen) => Math.ceil(Math.min(Math.max((maxLen || 0) * 1.5, 255), 4000));
+
 module.exports = {
   type: 'connector',
   id: 'mssql',
   name: 'SQL Server',
   icon: './icon.svg',
   dbCategory: 'SQL',
+
+  /**
+   * Column types for a CREATE TABLE this app generates. See the note on
+   * `types` in plugins/connectors/snowflake/index.js.
+   *
+   * Text columns are NVARCHAR, never VARCHAR: VARCHAR stores one byte per
+   * character in the database's collation codepage, so anything outside it —
+   * accented names, CJK, emoji — is silently replaced with '?' on the way in,
+   * and the loss is not recoverable afterwards. (TEXT, an older default here,
+   * is worse still: non-unicode AND deprecated by SQL Server.)
+   */
+  types: {
+    NULL: () => 'NVARCHAR(MAX)',
+    DATE_ONLY: () => 'DATE',
+    // DATETIME2, not DATETIME: wider range and no 3.33ms rounding.
+    TIMESTAMP: () => 'DATETIME2',
+    // BIT, not BOOLEAN — SQL Server has no boolean type.
+    BOOLEAN: () => 'BIT',
+    INTEGER: () => 'INT',
+    FLOAT: () => 'FLOAT',
+    OBJECT: () => 'NVARCHAR(MAX)',
+    STRING: (maxLen) => (maxLen > 255 ? 'NVARCHAR(MAX)' : `NVARCHAR(${nvarcharFor(maxLen)})`),
+  },
 
   /**
    * Test database connection
@@ -93,7 +234,7 @@ module.exports = {
       await pool.close();
       return { success: true, message: 'Connection successful' };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -114,7 +255,7 @@ module.exports = {
         tables: result.recordset
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -123,6 +264,22 @@ module.exports = {
    */
   getColumns: async (config, connectionId, schema, table) => {
     try {
+      // Accept a qualified "dbo.orders" as well as a bare table with the schema
+      // passed separately — the same two shapes quoteSqlServerIdentifier above
+      // handles. Split BEFORE the 'dbo' default, or the qualifier is lost and
+      // the lookup searches dbo for a table whose NAME contains a dot.
+      // A schema passed SEPARATELY settles it: `table` is then the table's whole
+      // name, dots included. A table really can be called "public.transactions",
+      // and taking the first segment off one looks up a DIFFERENT table — which
+      // fails silently, because the callers that need this read a failed lookup
+      // as "cannot check" rather than as an error.
+      // Only a name arriving with no schema beside it may have a qualifier read
+      // out of it, and even there a genuinely dotted name cannot be told apart
+      // from a qualified one — so that split is a last resort, not the default.
+      const parts = String(table || '').split('.');
+      if (!schema && parts.length === 2) {
+        [schema, table] = parts;
+      }
       schema = schema || 'dbo';
       console.log('config, connectionId, schema, table: ', config, connectionId, schema, table)
       const pool = await getPool(config, connectionId);
@@ -150,7 +307,7 @@ module.exports = {
         columns: result.recordset
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -186,7 +343,7 @@ module.exports = {
           rowCount: result.rowsAffected?.[0] ?? result.recordset?.length
         };
       } catch (error) {
-        return { success: false, message: error.message };
+        return queryError(error);
       }
     }
 
@@ -194,7 +351,7 @@ module.exports = {
     try {
       pool = await getPool(config, connectionId);
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
 
     return new Promise((resolve) => {
@@ -202,6 +359,7 @@ module.exports = {
       let columns = [];
       let affected = 0;
       let settled = false;
+      let cancelledAtCap = false;
       const finish = (value) => {
         if (settled) return;
         settled = true;
@@ -219,10 +377,23 @@ module.exports = {
           // One past the cap, so "is there more?" is observed rather than
           // assumed. Cancelling stops SQL Server sending the rest.
           if (rows.length <= maxRows) rows.push(row);
-          if (rows.length > maxRows) request.cancel();
+          // Rows already in flight keep arriving after the cancel is sent, so
+          // the flag is what stops it being sent again for each of them.
+          if (rows.length > maxRows && !cancelledAtCap) {
+            cancelledAtCap = true;
+            request.cancel();
+          }
         });
         request.on('rowsaffected', (count) => { affected += count || 0; });
-        request.on('error', (err) => finish({ success: false, message: err.message }));
+        request.on('error', (err) => {
+          // A cancel WE asked for is how the cap is enforced, not a failure:
+          // the driver reports it as RequestError('Canceled.', 'ECANCEL'), and
+          // reporting that back turned every read past the cap into a query
+          // that appeared to fail. 'done' always follows the error in stream
+          // mode, and that is what resolves the rows we did collect.
+          if (cancelledAtCap && err && err.code === 'ECANCEL') return;
+          finish(queryError(err));
+        });
         request.on('done', () => finish({
           success: true,
           rows: rows.slice(0, maxRows),
@@ -235,7 +406,7 @@ module.exports = {
 
         request.query(sqlQuery);
       } catch (error) {
-        finish({ success: false, message: error.message });
+        finish(queryError(error));
       }
     });
   },
@@ -305,7 +476,7 @@ module.exports = {
         request.query(query);
       });
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -321,7 +492,7 @@ module.exports = {
   },
 
   /**
-   * Batch insert rows into a table (uses Table-Valued Parameters with transaction)
+   * Batch insert rows into a table (parameterized multi-row INSERT in a transaction)
    */
   batchInsert: async (config, connectionId, tableName, columns, rows) => {
     try {
@@ -338,24 +509,54 @@ module.exports = {
 
         // Quote column names for SQL Server
         const quotedColumns = columns.map(col => `[${col}]`);
+        const quotedTable = quoteSqlServerIdentifier(tableName);
 
-        // Build multi-row INSERT using MSSQL's table value constructor
-        const valueRows = rows.map(row => {
-          const values = columns.map(col => {
-            const val = row[col];
-            if (val === null || val === undefined) return 'NULL';
-            if (typeof val === 'string') return `'${val.replace(/'/g, "''")}'`;
-            if (val instanceof Date) return `'${val.toISOString()}'`;
-            if (typeof val === 'object') return `'${JSON.stringify(val).replace(/'/g, "''")}'`;
-            return val;
+        // One INSERT per slice of rows, not one for the whole call: the caller
+        // sizes its chunk for memory (tens of thousands of rows), while a single
+        // statement is bounded twice over - at most MSSQL_MAX_ROWS_PER_INSERT
+        // row expressions in the table value constructor, and at most
+        // MSSQL_MAX_PARAMS_PER_STATEMENT parameters across all of them. The
+        // slices all run inside the one transaction, so the call as a whole
+        // still lands or rolls back together.
+        if (!columns || columns.length === 0) {
+          throw new Error(`Cannot insert into ${tableName}: no columns to write.`);
+        }
+        const rowsPerStatement = Math.min(
+          MSSQL_MAX_ROWS_PER_INSERT,
+          Math.floor(MSSQL_MAX_PARAMS_PER_STATEMENT / columns.length),
+        );
+        if (rowsPerStatement < 1) {
+          // A single row already exceeds the ceiling - no slicing can help.
+          throw new Error(
+            `Cannot insert into ${tableName}: ${columns.length} columns exceeds `
+            + `SQL Server's limit of ${MSSQL_MAX_PARAMS_PER_STATEMENT} parameters per statement.`
+          );
+        }
+
+        for (let start = 0; start < rows.length; start += rowsPerStatement) {
+          const slice = rows.slice(start, start + rowsPerStatement);
+
+          // Build a parameterized multi-row INSERT. Values are bound, never
+          // interpolated: a literal has to be escaped correctly for every type
+          // it could hold, and a single missed case is both a broken write and
+          // an injection point. A fresh request per statement - parameters
+          // accumulate on the one they are bound to.
+          const request = transaction.request();
+          const valueRows = slice.map((row, rowIndex) => {
+            const placeholders = columns.map((col, colIndex) => {
+              const name = `p${rowIndex}_${colIndex}`;
+              bindValue(request, name, row[col]);
+              return `@${name}`;
+            });
+            return `(${placeholders.join(', ')})`;
           });
-          return `(${values.join(', ')})`;
-        });
 
-        const insertSql = `INSERT INTO ${quoteSqlServerIdentifier(tableName)} (${quotedColumns.join(', ')}) VALUES ${valueRows.join(', ')}`;
-        // console.log('insertSql: ', insertSql)
+          const insertSql = `INSERT INTO ${quotedTable} (${quotedColumns.join(', ')}) VALUES ${valueRows.join(', ')}`;
+          // console.log('insertSql: ', insertSql)
 
-        await transaction.request().query(insertSql);
+          await request.query(insertSql);
+        }
+
         // Commit transaction
         await transaction.commit();
 
@@ -369,7 +570,7 @@ module.exports = {
         throw error;
       }
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -454,61 +655,70 @@ module.exports = {
     - Database type: Microsoft SQL Server
     - Target schema: ${targetSchema || 'dbo'}
     - Target table name: ${fullTableName}
-    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local SQLite'}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
+    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local DuckDB'}
 
     ${settings.storageLocation === 'database'
       ? `**Instructions for Database Storage**:
-    Generate transformation SQL that:
-    1. Creates a new table in SQL Server with the transformed structure
-    2. Populates it with transformed data using INSERT INTO ... SELECT
+
+    The target is TRUNCATED AND LOADED on every run: the executor drops it
+    before your ddl runs, so your ddl always creates it fresh and your sql
+    always loads it from empty. Nothing survives a run. So do not write
+    IF NOT EXISTS, do not check for or delete prior rows, and do not try to
+    merge, upsert, or de-duplicate against what was there last time — write the
+    plain CREATE and the plain load.
+
+    You return TWO separate statements, and the executor runs them in order:
+
+      1. \`ddl\`  — a plain CREATE TABLE that declares the columns and types.
+      2. \`sql\`  — an INSERT INTO ... SELECT that loads those columns.
+
+    Do NOT combine them. A CREATE TABLE ... AS SELECT (or SELECT ... INTO) is not
+    accepted here: the two fields are executed as separate statements, so putting
+    the SELECT in \`ddl\` leaves \`sql\` with nothing to do.
+
+    **\`sql\` MUST NOT BE EMPTY.** It is the only statement that puts rows in the
+    table. Leave it empty and the run creates an empty table and loads nothing —
+    the node reports success having produced no data. If you find yourself with
+    nothing to put in \`sql\`, you have written the SELECT into \`ddl\` by
+    mistake: split it back out into a CREATE plus an INSERT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "CREATE TABLE statement",
-      "sql": "INSERT INTO statement with SELECT query",
+      "ddl": "CREATE TABLE statement (columns + types) — creates the table, inserts nothing",
+      "sql": "INSERT INTO <target> (cols...) SELECT ... — REQUIRED, this is what loads the rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
       "previewSql": "SELECT query to preview the transformed data (TOP 100)"
     }`
-      : `**Instructions for Local SQLite Storage**:
-    Generate SQL to fetch data from SQL Server and save it locally to SQLite.
+      : `**Instructions for Local Storage**:
+    The rows are fetched from SQL Server and written into a table in THIS
+    workflow's own local DuckDB database. Nothing is written back to SQL Server.
 
-    **You must provide THREE separate SQL statements**:
-    1. **DDL**: SQLite CREATE TABLE statement with appropriate SQLite data types
-       - Use SQLite types: INTEGER, REAL, TEXT, BLOB
-       - Column names must match the SELECT query output
-    2. **SQL (SELECT)**: SQL Server SELECT query to fetch and transform data from the source
-       - This will be executed on SQL Server database
-       - Include all transformations (filtering, calculations, etc.)
-       - Use SQL Server syntax (e.g., TOP instead of LIMIT)
-    3. **INSERT**: SQLite INSERT statement to insert the fetched data
-       - Use parameterized query with ? placeholders
-       - Column order must match the SELECT query output exactly
-
-    **SQLite Data Type Mapping**:
-    - INTEGER: for whole numbers (int, bigint, identity, etc.)
-    - REAL: for floating point numbers (float, real, decimal, numeric)
-    - TEXT: for strings (varchar, nvarchar, char, nchar, text, datetime, datetime2)
-    - BLOB: for binary data (varbinary, image)
+    You provide ONE statement: the SQL Server SELECT that produces the rows you
+    want. That is the only thing that runs. Its result is streamed straight into
+    the local table, which is replaced on every run with the column types
+    inferred from the data — so there is no CREATE TABLE to write, no INSERT,
+    and no type mapping to choose. Do NOT emit "ddl" or "insertSql": nothing
+    reads them, and inventing them only risks contradicting the SELECT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "SQLite CREATE TABLE ${fullTableName.split('.').pop()} (...columns...)",
-      "sql": "SQL Server SELECT query to fetch transformed data",
-      "insertSql": "SQLite table INSERT INTO ${fullTableName.split('.').pop()} (...columns...) VALUES (?, ?, ...)",
+      "sql": "SQL Server SELECT query producing the transformed rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
-      "previewSql": "SQLite table SELECT * FROM ${fullTableName.split('.').pop()} LIMIT 100"
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"   // reads the LOCAL table, so this one is DuckDB SQL
     }
 
     **Example**:
     {
       "explanation": "Fetch active customers with calculated total spending",
-      "ddl": "CREATE TABLE customers_transformed (customer_id INTEGER, name TEXT, email TEXT, total_spending REAL)",
-      "sql": "SELECT TOP 10000 customer_id, name, email, (purchase_count * avg_purchase) as total_spending FROM dbo.customers WHERE status = 'active'",
-      "insertSql": "INSERT INTO customers_transformed (customer_id, name, email, total_spending) VALUES (?, ?, ?, ?)",
-      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, {"name": "email", "type": "TEXT"}, {"name": "total_spending", "type": "REAL"}],
-      "previewSql": "SELECT * FROM customers_transformed LIMIT 100"
+      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) AS total_spending FROM customers WHERE status = 'active'",
+      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "VARCHAR"}, {"name": "email", "type": "VARCHAR"}, {"name": "total_spending", "type": "DOUBLE"}],
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"
     }`}
 
     Be specific and provide working SQL. Use SQL Server-specific features where appropriate (e.g., IDENTITY, NVARCHAR, XML/JSON functions).`,
@@ -525,6 +735,10 @@ module.exports = {
     - Database type: Microsoft SQL Server
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
 
     Analyze the request and determine what operations are needed:
 
@@ -547,7 +761,19 @@ module.exports = {
     **Important**:
     - In-place mode only supports database storage (cannot store locally while modifying remote source).
     - For explanations text to bolden key points use **text** and to break lines use \\n
-    - If both ddl and sql are provided, ddl will execute first, then sql
+    - **Exactly ONE statement per field.** The "ddl" field is sent to the driver
+      as a single statement, and so is "sql". No semicolon-separated scripts, no
+      dynamic or guarded DDL, no procedure bodies — the driver runs one
+      statement per field and rejects everything after the first. Several
+      structural changes have to fit inside that one statement; if they cannot,
+      the transformation needs more than one node.
+    - ddl executes first, then sql. When BOTH are present, a failing ddl does
+      NOT fail the node — only a failing sql does, and the ddl's error is
+      reported alongside the result. That is what lets the node be rerun: on the
+      second run the structural change fails because the first run already
+      applied it, the DML behind it still runs, and the node succeeds. Write the
+      plain statement and let a rerun report it. When ddl is the ONLY field, its
+      failure IS the node's failure.
 
     Return your response in this JSON format:
     {

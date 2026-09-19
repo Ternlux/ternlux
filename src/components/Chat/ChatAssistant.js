@@ -2,6 +2,8 @@ import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMe
 import { C, SANS, MONO, I, MoreMenu } from '../Workflows/_designShared';
 import DataVisualization from './DataVisualization';
 import { loadJoinDestinations, hasJoinDestination } from '../Workflows/joinDestinations';
+// One hue per node type, decided by the canvas cards — see NODE_COLORS.
+import { NODE_COLORS } from '../Workflows/nodes/nodeCardShared';
 
 const MAX_STEPS_PER_QUESTION = 8;
 // Consecutive "Fix it" clicks on a review verdict before the button stops being
@@ -130,10 +132,13 @@ const nodeChatToReviewHistory = (chat, fallbackConfig = null) => {
     .map((m) => {
       if (m.sender === 'user') return { role: 'user', text: String(m.text) };
       const meta = m.metadata || {};
-      const prefix = meta.clarification ? 'Clarification by AI: '
+      // Stripped before it is re-applied, for the same reason planToReviewHistory
+      // does it: the label belongs to the rendering, not to the stored text.
+      const body = meta.clarification ? stripClarificationPrefix(m.text) : String(m.text).trim();
+      const prefix = meta.clarification ? CLARIFICATION_PREFIX
         : meta.context ? 'Context from the chat: '
           : '';
-      return { role: 'assistant', text: `${prefix}${String(m.text).trim()}` };
+      return { role: 'assistant', text: `${prefix}${body}` };
     });
   if (rows.length) return rows;
   // Legacy / hand-edited nodes carry no chat. Fall back to the request slot the
@@ -148,23 +153,117 @@ const nodeChatToReviewHistory = (chat, fallbackConfig = null) => {
 
 // A workflow build's own record: the brief the planner worked to, the
 // clarification Q&A that refined it, and the plan that was executed.
+// The label a clarification wears in a transcript rendered for a model. Kept
+// off the stored question, and stripped before it is re-applied, so a question
+// that makes a second trip through here is labelled once, not twice.
+const CLARIFICATION_PREFIX = 'Clarification by AI: ';
+const stripClarificationPrefix = (text) => {
+  let out = String(text || '').trim();
+  while (out.startsWith(CLARIFICATION_PREFIX)) out = out.slice(CLARIFICATION_PREFIX.length).trim();
+  return out;
+};
+
+// Splits `userRequest` back into the two things propose_plan glued together:
+// the description the sub-agent wrote, and the user's message verbatim. The
+// append exists so the BUILDER keeps literal values (URLs, request bodies,
+// keys) the paraphrase would drop — see propose_plan in chat/chatAssistant.js.
+const ORIGINAL_MESSAGE_SPLIT = /\n\n--- User's original message[^\n]*---\n/;
+
 const planToReviewHistory = (plan) => {
   const p = plan || {};
   const rows = [];
-  const request = String(p.userRequest || p.request || '').trim();
-  if (request) rows.push({ role: 'user', text: request });
+  const raw = String(p.userRequest || p.request || '').trim();
+  const [description, original = ''] = raw.split(ORIGINAL_MESSAGE_SPLIT);
+  if (description.trim()) rows.push({ role: 'user', text: description.trim() });
+  // As its own row, and labelled. Glued onto the request it read as the spec,
+  // and a reviewer would fail a build for following a clarification that
+  // replaced this wording — the message says test_transaction_products, the
+  // build says transaction_products, and nothing on the row explained why.
+  if (original.trim()) {
+    rows.push({
+      role: 'user',
+      text: `The request as FIRST TYPED, superseded by anything clarified below: ${original.trim()}`,
+    });
+  }
   for (const c of Array.isArray(p.clarifications) ? p.clarifications : []) {
     if (!c) continue;
-    if (c.question) rows.push({ role: 'assistant', text: `Clarification by AI: ${String(c.question).trim()}` });
+    const question = stripClarificationPrefix(c.question);
+    if (question) rows.push({ role: 'assistant', text: `${CLARIFICATION_PREFIX}${question}` });
     if (c.answer) rows.push({ role: 'user', text: String(c.answer).trim() });
   }
   if (Array.isArray(p.steps) && p.steps.length) {
+    // Two rows, not one. This was a single "Planned build (JSON)" dump of the
+    // whole plan — and formatRequestHistory trims EVERY row to
+    // MAX_REVIEW_MSG_CHARS, so on any workflow past a dozen nodes the tail was
+    // cut off. The tail is exactly the list of nodes this change did NOT touch:
+    // on a 20-step modify the six trailing output ids were dropped, the reviewer
+    // could not tell they were untouched, and it failed the build for "not
+    // replacing" an output node belonging to an earlier request the user had
+    // already moved on from. Ids are cheap; in their own row they survive whole.
+    const built = p.steps.filter((s) => s && typeof s === 'object');
+    const untouched = p.steps.filter((s) => typeof s === 'string');
     rows.push({
       role: 'assistant',
-      text: `Planned build (JSON): ${JSON.stringify({ name: p.name, mode: p.mode, steps: p.steps })}`,
+      text: `Built or rebuilt by THIS change (${built.length}): ${JSON.stringify({ name: p.name, mode: p.mode, steps: built })}`,
     });
+    if (untouched.length) {
+      rows.push({
+        role: 'assistant',
+        text: `Left EXACTLY as it was by this change — context only, not part of it (${untouched.length}): ${untouched.join(', ')}`,
+      });
+    }
   }
   return rows;
+};
+
+// Tools that route or propose rather than look something up. They tell the
+// reviewer nothing about the state of the world, and their args restate the
+// request it is already being given.
+const NON_EVIDENCE_TOOLS = new Set([
+  'plan_workflow_build', 'propose_plan', 'final_answer', 'exit_workflow_mode',
+]);
+
+const MAX_ACTION_RESULT_CHARS = 600;
+const MAX_PRIOR_ACTIONS = 12;
+
+/**
+ * The lookups the agent ran BEFORE the build — get_tables, get_columns,
+ * run_query, list_connections and the like.
+ *
+ * The reviewer judges the pipeline against the user's request, and that request
+ * routinely contains instructions of the form "check X first" / "make sure Y
+ * doesn't already exist". Those are preconditions the agent satisfies by
+ * CALLING A TOOL while planning, not steps that can exist as nodes in a graph.
+ * Without this evidence the reviewer sees the instruction, finds no node doing
+ * it, and fails a correct build for omitting something that was in fact done.
+ *
+ * Results are truncated hard: a get_tables on a busy database runs to hundreds
+ * of entries, and the reviewer only needs to see WHAT was checked and roughly
+ * what came back.
+ */
+const collectPriorActions = (msgs) => {
+  const out = [];
+  for (const m of Array.isArray(msgs) ? msgs : []) {
+    if (m?.kind !== 'step' || !Array.isArray(m.actions)) continue;
+    for (const a of m.actions) {
+      if (!a || !a.tool || NON_EVIDENCE_TOOLS.has(a.tool)) continue;
+      let result;
+      try {
+        result = a.ok === false
+          ? `(failed) ${String(a.error || '').slice(0, MAX_ACTION_RESULT_CHARS)}`
+          : JSON.stringify(a.result);
+      } catch (_err) {
+        result = '(unserialisable)';
+      }
+      result = String(result ?? '');
+      if (result.length > MAX_ACTION_RESULT_CHARS) {
+        result = `${result.slice(0, MAX_ACTION_RESULT_CHARS)}… (truncated)`;
+      }
+      out.push({ tool: a.tool, args: a.args || {}, result });
+    }
+  }
+  // Keep the most recent — those reflect the state the build was planned against.
+  return out.slice(-MAX_PRIOR_ACTIONS);
 };
 
 const nowTs = () => new Date().toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' });
@@ -241,8 +340,14 @@ const MdInline = ({ line }) => (
         return <strong key={i} style={{ fontWeight: 700 }}>{p.slice(2, -2)}</strong>;
       if (p.startsWith('`') && p.endsWith('`') && p.length >= 2)
         return (
+          // `color` is not optional here, however inherited it looks: the chip
+          // paints its own pale background, so it has to state its own text
+          // colour too. A user's bubble is blue with white text, and a chip
+          // that inherited that came out white-on-white — unreadable exactly
+          // where code matters most, in the message quoting a column name.
+          // The fenced-block <pre> below has always set it; this never did.
           <code key={i} style={{
-            fontFamily: MONO, fontSize: 11, background: C.s2,
+            fontFamily: MONO, fontSize: 11, background: C.s2, color: C.text,
             padding: '1px 5px', borderRadius: 3, border: `1px solid ${C.border}`,
           }}>{p.slice(1, -1)}</code>
         );
@@ -300,15 +405,28 @@ const Markdown = ({ text }) => {
 // field on its response; the renderer attaches it directly to the
 // finalAnswer message so PlanCard can render it.
 
+// A plan step is a node that doesn't exist yet, so it wears that node's colour
+// — taken from NODE_COLORS, the canvas's own palette, rather than a second set
+// of hexes here. These two DID drift: the plan used to badge a data source
+// navy and an output green while the canvas drew them cyan and pink, so the
+// same step changed colour the moment it became a card.
+//
+// `bg` is the accent at 10% (the `1a` suffix), the same wash the cards use for
+// their selected-state glow.
 const STEP_BADGE = {
-  start:       { label: 'START',      color: '#0f766e', bg: '#ccfbf1' },
-  dataSource:  { label: 'DATA SRC',   color: '#1e40af', bg: '#dbeafe' },
-  // Purple transformer, orange join — the same hues the canvas cards use
-  // (TransformerNode #7c3aed, JoinNode #d97706), so a step reads as the node
-  // it will become.
-  transformer: { label: 'TRANSFORM',  color: '#6b21a8', bg: '#e9d5ff' },
-  join:        { label: 'JOIN',       color: '#9a3412', bg: '#fed7aa' },
-  output:      { label: 'OUTPUT',     color: '#166534', bg: '#bbf7d0' },
+  start:       { label: 'START',     color: NODE_COLORS.start },
+  dataSource:  { label: 'DATA SRC',  color: NODE_COLORS.dataSource },
+  transformer: { label: 'TRANSFORM', color: NODE_COLORS.transformer },
+  join:        { label: 'JOIN',      color: NODE_COLORS.join },
+  output:      { label: 'OUTPUT',    color: NODE_COLORS.output },
+};
+
+// The badge and the step's left edge, from one accent — mirroring the card,
+// which is an accent left border with the accent's icon and title beside it.
+const badgeFor = (stepType) => {
+  const known = STEP_BADGE[stepType];
+  if (known) return { ...known, bg: `${known.color}1a` };
+  return { label: String(stepType).toUpperCase(), color: C.muted, bg: C.s2 };
 };
 
 // ── Workflow plan card — shown when an assistant message carries a
@@ -317,7 +435,7 @@ const STEP_BADGE = {
 // (workflow:executeBuild), bypassing the AI; the Cancel button just locks
 // the card. Once the user has either accepted or cancelled, the buttons
 // are replaced with a status line so they cannot fire twice.
-const PlanCard = ({ plan, status, onAccept, onCancel, stale = false }) => {
+const PlanCard = ({ plan, status, onAccept, onCancel, stale = false, blockedReason = null }) => {
   // `settled` — acted on. `stale` — never acted on, but the conversation moved
   // past it. Both replace the buttons; only the wording differs, because
   // "you didn't answer this" is not the same as "you did".
@@ -348,8 +466,10 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false }) => {
           // add otherwise). Normalize before rendering.
           const isShorthand = typeof raw === 'string';
           const stepType = isShorthand ? null : raw.stepType;
+          // A kept node is not being built, so it stays neutral rather than
+          // claiming one of the type colours.
           const badge = stepType
-            ? (STEP_BADGE[stepType] || { label: String(stepType).toUpperCase(), color: C.muted, bg: C.s2 })
+            ? badgeFor(stepType)
             : { label: 'KEEP', color: C.muted, bg: C.s2 };
           const titleSuffix = isShorthand
             ? `Keep ${raw}`
@@ -360,6 +480,9 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false }) => {
             <li key={i} style={{
               padding: '8px 10px', borderRadius: 4,
               border: `1px solid ${C.border}`, background: C.bg,
+              // The card's signature edge, so a plan reads as the stack of
+              // nodes it will produce.
+              borderLeft: `3px solid ${badge.color}`,
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: prompt ? 4 : 0 }}>
                 <span style={{
@@ -405,26 +528,44 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false }) => {
           {shown.message}
         </div>
       ) : (
-        <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'flex-end' }}>
-          <button type="button" onClick={onCancel} disabled={status?.kind === 'running'}
-            style={{
-              padding: '6px 12px', fontSize: 11, fontWeight: 600,
-              borderRadius: 4, border: `1px solid ${C.border}`, background: '#fff',
-              color: C.muted, cursor: status?.kind === 'running' ? 'default' : 'pointer',
-              fontFamily: SANS, opacity: status?.kind === 'running' ? 0.6 : 1,
+        <>
+          {/* Why Accept is unavailable, said before the click rather than
+              after it. Cancel stays live throughout — discarding a plan never
+              touches the canvas, so nothing has to be saved first. */}
+          {blockedReason && (
+            <div style={{
+              marginTop: 10, padding: '6px 10px', borderRadius: 4,
+              fontSize: 11, fontFamily: SANS, lineHeight: 1.5,
+              background: '#fffbeb', border: '1px solid #fcd34d', color: '#92400e',
             }}>
-            Cancel
-          </button>
-          <button type="button" onClick={onAccept} disabled={status?.kind === 'running'}
-            style={{
-              padding: '6px 14px', fontSize: 11, fontWeight: 600,
-              borderRadius: 4, border: 'none', background: C.accent,
-              color: '#fff', cursor: status?.kind === 'running' ? 'default' : 'pointer',
-              fontFamily: SANS, opacity: status?.kind === 'running' ? 0.7 : 1,
-            }}>
-            {status?.kind === 'running' ? 'Building…' : 'Accept plan'}
-          </button>
-        </div>
+              {blockedReason}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'flex-end' }}>
+            <button type="button" onClick={onCancel} disabled={status?.kind === 'running'}
+              style={{
+                padding: '6px 12px', fontSize: 11, fontWeight: 600,
+                borderRadius: 4, border: `1px solid ${C.border}`, background: '#fff',
+                color: C.muted, cursor: status?.kind === 'running' ? 'default' : 'pointer',
+                fontFamily: SANS, opacity: status?.kind === 'running' ? 0.6 : 1,
+              }}>
+              Cancel
+            </button>
+            <button type="button" onClick={onAccept}
+              disabled={status?.kind === 'running' || !!blockedReason}
+              title={blockedReason || undefined}
+              style={{
+                padding: '6px 14px', fontSize: 11, fontWeight: 600,
+                borderRadius: 4, border: 'none',
+                background: blockedReason ? C.dim : C.accent,
+                color: '#fff',
+                cursor: (status?.kind === 'running' || blockedReason) ? 'default' : 'pointer',
+                fontFamily: SANS, opacity: status?.kind === 'running' ? 0.7 : 1,
+              }}>
+              {status?.kind === 'running' ? 'Building…' : 'Accept plan'}
+            </button>
+          </div>
+        </>
       )}
     </div>
   );
@@ -504,10 +645,11 @@ const JoinDestinationPicker = ({ node, destinations, loading, onPick }) => {
 // node from the turn payload; re-opening the panel restores it as long as the
 // node is still selected on the canvas (see focusDismissed).
 // Matches the canvas cards: transformer purple, join orange, source cyan.
-const NODE_CHIP_COLOR = { transformer: '#7c3aed', join: '#d97706', dataSource: '#0891b2' };
 const FocusNodeChip = ({ node, typeLabel, onClear }) => {
   if (!node) return null;
-  const color = NODE_CHIP_COLOR[node.type] || C.accent;
+  // Same palette as the card being focused — these hexes used to be repeated
+  // here, which is half of how the plan badges drifted out of step.
+  const color = NODE_COLORS[node.type] || C.accent;
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 6,
@@ -613,7 +755,11 @@ const AgentChip = ({ label, onClear, disabled }) => (
 // is actually parked on THIS approval. A bubble that was superseded still
 // renders its record, but can never offer a button that does nothing.
 const ApprovalPanel = ({ approval, live, onApprove, onDecline }) => {
-  const [showCode, setShowCode] = useState(true);
+  // Collapsed by default. The explanation is what the approval decision turns
+  // on; the source is there for whoever wants to read it before allowing the
+  // run, and the toggle says how many lines are waiting. Matches the code panel
+  // below, which has always started collapsed.
+  const [showCode, setShowCode] = useState(false);
   const code = approval.code || '';
   const lines = code ? code.split('\n').length : 0;
   const settled = approval.state === 'approved' ? 'approved'
@@ -759,12 +905,20 @@ const ReviewFixPanel = ({ fix, onFix, onLeave, busy = false, stale = false }) =>
   if (state === 'sent') {
     return (
       <div style={{ marginTop: 7, fontSize: 11, color: C.muted, fontFamily: SANS }}>
-        Asked to apply those changes.
+        Asked to apply those changes{fix.workflowName ? ` to ${fix.workflowName}` : ''}.
       </div>
     );
   }
   return (
-    <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center' }}>
+    <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+      {/* What the buttons act on. Several workflows can be under discussion in
+          one conversation, so the target is named next to the decision rather
+          than left to be inferred from the message above. */}
+      {fix.workflowName && (
+        <span style={{ fontSize: 11, color: C.muted, fontFamily: SANS, marginRight: 2 }}>
+          Applies to <strong style={{ color: C.text }}>{fix.workflowName}</strong>:
+        </span>
+      )}
       <button type="button" onClick={onFix} disabled={busy}
         style={{
           padding: '4px 10px', borderRadius: 4, border: 'none',
@@ -1411,9 +1565,9 @@ const AGENT_LABELS = {
   planner:     'Workflow planner',
   builder:     'Node builder',
   reviewer:    'Change reviewer',
-  // The gate in front of build_transformer / build_join / build_dataSource: it
-  // answered instead of forwarding the message to the node builder.
-  'node-router': 'Node-build router',
+  // NOTE: no 'node-router' entry. The build gate never authors a reply — when a
+  // message isn't an answer to the builder's pending question it hands back to
+  // the main agent, and the main agent's own label applies.
 };
 const agentLabel = (source) => {
   if (!source) return null;
@@ -1422,14 +1576,18 @@ const agentLabel = (source) => {
   return AGENT_LABELS[s] || s;
 };
 
-const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDeclineCode, onRunNode, onSkipNode, activeApprovalMsgId = null, isEditing, onSaveEdit, onCancelEdit, busy = false, stale = false }) => {
+const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDeclineCode, onRunNode, onSkipNode, activeApprovalMsgId = null, isEditing, onSaveEdit, onCancelEdit, busy = false, stale = false, retryable = true, planBlockedReason = null }) => {
   const isUser = m.role === 'user';
   const plan = !isUser && !m.error && m.workflowPlan && Array.isArray(m.workflowPlan.steps)
     ? m.workflowPlan
     : null;
   const bodyText = m.text;
   const canEdit  = isUser && typeof onEdit === 'function';
-  const canRetry = !isUser && !m.error && m.kind === 'final' && typeof onRetry === 'function';
+  // `retryable` is decided by the parent, which can see the bubble's neighbours:
+  // only the last answer of a turn gets the button, since retrying any earlier
+  // bubble in the same run re-sends the identical user message (see
+  // retryableIdx). The local conditions still apply on top of it.
+  const canRetry = retryable && !isUser && !m.error && m.kind === 'final' && typeof onRetry === 'function';
   // Offered on a bubble whose answer stopped at the model's output limit —
   // `resume` carries what the model wrote plus the inputs needed to finish it.
   const canContinue = !isUser && !!(m.resume && m.resume.partialText) && typeof onContinue === 'function';
@@ -1571,6 +1729,7 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
               plan={plan}
               status={m.planStatus || { kind: 'idle' }}
               stale={stale}
+              blockedReason={planBlockedReason}
               onAccept={() => onAction && onAction('accept-plan', plan, m.id)}
               onCancel={() => onAction && onAction('cancel-plan', plan, m.id)}
             />
@@ -1766,6 +1925,10 @@ const Composer = ({ value, setValue, onSend, onCancel, busy }) => {
 // dropped into, with a title bar instead of a right border.
 const HistorySidebar = ({
   conversations, activeId, onSelect, onNewChat, onDeleteConvo, onExportConvo,
+  // Ids of conversations with a turn in flight. Run state is per chat, so a
+  // chat left thinking while the user works in another one has to say so here
+  // — otherwise the only way to find it again is to open each in turn.
+  busyIds = null,
   width = 260, onClose = null,
 }) => {
   // Newest first.
@@ -1817,8 +1980,11 @@ const HistorySidebar = ({
         </div>
         {sorted.map((c) => {
           const isActive = c.id === activeId;
+          const isBusy = !!busyIds?.has(c.id);
           const last = c.messages[c.messages.length - 1];
-          const preview = last?.text?.slice(0, 80) || 'No messages yet';
+          const preview = isBusy
+            ? 'Working…'
+            : (last?.text?.slice(0, 80) || 'No messages yet');
           return (
             <div key={c.id} onClick={() => onSelect(c.id)}
               style={{
@@ -1834,11 +2000,21 @@ const HistorySidebar = ({
                 <div style={{
                   fontSize: 11, fontWeight: 600, color: C.text, letterSpacing: '-0.01em',
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  display: 'flex', alignItems: 'center', gap: 5,
                 }}>
-                  {c.title}
+                  {isBusy && (
+                    <span title="This chat is waiting on a reply" style={{
+                      width: 5, height: 5, borderRadius: '50%', flexShrink: 0,
+                      background: C.accent, animation: 'dgconvobusy 1.4s ease infinite',
+                    }} />
+                  )}
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {c.title}
+                  </span>
                 </div>
                 <div style={{
-                  fontSize: 10, color: C.muted, marginTop: 2,
+                  fontSize: 10, marginTop: 2,
+                  color: isBusy ? C.accent : C.muted,
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                 }}>
                   {preview}
@@ -1852,6 +2028,7 @@ const HistorySidebar = ({
           );
         })}
       </div>
+      <style>{'@keyframes dgconvobusy { 0%,80%,100% { opacity: 0.25 } 40% { opacity: 1 } }'}</style>
     </div>
   );
 };
@@ -2125,9 +2302,45 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     };
   }, [railActive, railWidth]);
   const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [stage, setStage] = useState('Thinking…');
   const [pinnedContext, setPinnedContext] = useState(null);
+
+  // ── Per-conversation run state ───────────────────────────────────────────
+  // A turn belongs to the conversation it was sent from, NOT to whichever chat
+  // happens to be on screen while it runs. Starting a new chat (or switching to
+  // one) used to inherit the running chat's spinner: "Thinking…" over an empty
+  // transcript, a disabled composer, and a Stop button that cancelled someone
+  // else's turn — while the chat actually working looked idle the moment you
+  // came back to it.
+  //
+  // So everything a live turn owns is keyed by conversation id: whether it is
+  // busy, the stage label, the cancel flag, which loop owns the convo, and any
+  // parked code approval. `runRef` is authoritative and `runStates` is its
+  // render mirror — `send`'s re-entry guard has to read the CURRENT value
+  // synchronously, before React has re-rendered (the same reason agentLoopRef
+  // exists below).
+  //   runRef.current: { [convoId]: { busy: true, stage: string } }
+  const runRef = useRef({});
+  const [runStates, setRunStates] = useState({});
+  const patchRun = useCallback((convoId, patch) => {
+    if (!convoId) return;
+    const cur = runRef.current[convoId] || { busy: false, stage: 'Thinking…' };
+    const next = { ...cur, ...patch };
+    const map = { ...runRef.current };
+    // An idle conversation carries no entry at all, so a stage set outside a
+    // turn (reviewChange during an Accept-plan build, say) stays invisible
+    // rather than lighting the chat up as busy.
+    if (next.busy) map[convoId] = next;
+    else delete map[convoId];
+    runRef.current = map;
+    setRunStates(map);
+  }, []);
+  const setConvoBusy = useCallback((convoId, busy, stageText) => {
+    patchRun(convoId, stageText === undefined ? { busy } : { busy, stage: stageText });
+  }, [patchRun]);
+  const setConvoStage = useCallback((convoId, stageText) => {
+    patchRun(convoId, { stage: stageText });
+  }, [patchRun]);
+  const isConvoBusy = useCallback((convoId) => !!runRef.current[convoId]?.busy, []);
 
   // Multi-conversation state. New chat starts fresh; switching conversations
   // swaps in their messages. History sidebar (expanded mode) lists them all.
@@ -2154,6 +2367,24 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   const isRestarted = restartedConvoIds.has(activeId);
   const messages = (isRestarted ? [] : activeConvo?.messages) || [];
 
+  // Everything below renders the FOCUSED conversation's run state. Another
+  // chat's turn keeps running in the background with its own entry in
+  // `runStates`; it simply isn't what this panel is showing.
+  const loading = !!runStates[activeId]?.busy;
+  const stage = runStates[activeId]?.stage || 'Thinking…';
+  // Which conversations are mid-turn — the history list badges them so a chat
+  // left thinking is still visible after switching away from it.
+  const busyConvoIds = useMemo(
+    () => new Set(Object.keys(runStates).filter((id) => runStates[id]?.busy)),
+    [runStates],
+  );
+
+  // Read by reviewChange for the pre-build lookups. A ref rather than a
+  // dependency: runBuild and send both close over reviewChange, and making it
+  // change identity on every message would churn the whole callback chain.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
   // Index of the last USER message. Anything offering a choice above it — Accept
   // plan, Fix it, Run this node — is an offer the user has already answered by
   // moving on, so its buttons go. Leaving them live means a click acts on
@@ -2169,6 +2400,57 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     }
     return -1;
   }, [messages]);
+
+  // Which bubbles may offer Retry: the LAST retryable answer in each run of
+  // back-to-back assistant messages, i.e. the one immediately before the next
+  // user turn (or the end of the transcript).
+  //
+  // One turn routinely appends several bubbles — the answer, a reviewer
+  // verdict, a build confirmation, a warnings list — and every one of them used
+  // to carry its own Retry. They were not alternatives: handleRetryMessage
+  // walks back to the nearest preceding USER message, which is the same message
+  // for every bubble in the run, so all those buttons trimmed to the same point
+  // and re-sent the same thing. A column of identical buttons that reads as a
+  // choice between "retry from here" and "retry from there" when there is none.
+  //
+  // The run is scanned rather than just taking the last bubble, because the
+  // final message of a turn is often one that can't be retried at all (a
+  // nodeRun panel, a build log), and the answer above it is what the user means
+  // by "try that again".
+  const retryableIdx = useMemo(() => {
+    const eligible = new Set();
+    let candidate = -1;
+    messages.forEach((m, i) => {
+      if (m?.role === 'user') { candidate = -1; return; }
+      // Mirrors Bubble's own test — a bubble that would never draw the button
+      // must not claim the run's slot and hide it from the answer above.
+      if (m && !m.error && m.kind === 'final') {
+        if (candidate >= 0) eligible.delete(candidate);
+        candidate = i;
+        eligible.add(i);
+      }
+    });
+    return eligible;
+  }, [messages]);
+
+  // The open editor has uncommitted work. Broadcast by WorkflowEditor; false
+  // whenever no editor is open, so a closed canvas can never leave a plan
+  // stuck.
+  const [canvasDirty, setCanvasDirty] = useState(false);
+  useEffect(() => {
+    const handler = (e) => setCanvasDirty(!!e.detail?.dirty);
+    window.addEventListener('ternlux:workflow-dirty', handler);
+    return () => window.removeEventListener('ternlux:workflow-dirty', handler);
+  }, []);
+
+  // Why Accept plan is unavailable, or null when it is fine to click. Building
+  // reads the workflow from the database, so unsaved canvas edits would be
+  // planned against the older saved copy and then overwritten. The save gate
+  // enforces this at click time either way; saying it on the button turns a
+  // refusal into an instruction.
+  const planBlockedReason = canvasDirty
+    ? 'Save the workflow first — this plan builds from the saved version, so unsaved canvas edits would be overwritten.'
+    : null;
   // Whether the NEXT message goes to the workflow sub-agent rather than the
   // main assistant — the same condition `send` reads off the convo when it
   // stamps a new user message. A restarted chat always starts on main, so its
@@ -2176,10 +2458,12 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   const inWorkflowAgent = !isRestarted && activeConvo?.agentMode === 'workflow';
 
   const scrollRef = useRef(null);
-  // Cancel flag — set when the user clicks Stop. Checked between steps;
-  // cancellation just means "do not issue the next chat:step call". The
-  // currently in-flight call still completes, but its result is discarded.
-  const cancelledRef = useRef(false);
+  // Cancel flags — the conversation ids whose turn the user has stopped.
+  // Checked between steps; cancellation just means "do not issue the next
+  // chat:step call" for THAT conversation. The currently in-flight call still
+  // completes, but its result is discarded. Keyed by convo so Stop in one chat
+  // cannot end a turn running in another.
+  const cancelledRef = useRef(new Set());
   // The build currently in flight, pinned above the composer rather than
   // appended to the thread: { logs, status: 'running'|'waiting'|'paused', note }.
   // It spans EVERY pass of one build — each clarification the builder raises
@@ -2206,26 +2490,29 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // approval. The three exits (Run / Don't run / a new user message) all go
   // through `settleApproval`, which is what guarantees the loop can never be
   // left suspended.
-  //   { msgId, runToken, resolve }
-  const approvalRef = useRef(null);
-  // Id of the step whose approval the loop is parked on, or null. Drives which
-  // panel may show working buttons — a superseded step keeps its record but
-  // can never offer a control that does nothing.
-  const [awaitingApproval, setAwaitingApproval] = useState(null);
-  // True for as long as a send() turn owns the conversation. `loading` can't
-  // serve here: it's state, so a send() closure that settles an approval and
-  // waits for the old turn to unwind would still read the stale value.
-  const agentLoopRef = useRef(false);
+  //   Map<convoId, { msgId, runToken, resolve }>
+  // One entry per conversation: two chats can each be parked on their own
+  // approval, and neither Approve button may settle the other's promise.
+  const approvalRef = useRef(new Map());
+  // Per conversation, the id of the step whose approval that chat's loop is
+  // parked on. Drives which panel may show working buttons — a superseded step
+  // keeps its record but can never offer a control that does nothing.
+  //   { [convoId]: msgId }
+  const [awaitingApprovalByConvo, setAwaitingApprovalByConvo] = useState({});
+  const awaitingApproval = awaitingApprovalByConvo[activeId] || null;
+  // The conversation ids a send() turn currently owns. `runStates` can't serve
+  // here: it's state, so a send() closure that settles an approval and waits
+  // for the old turn to unwind would still read the stale value.
+  const agentLoopRef = useRef(new Set());
 
   // `send` is defined far below these handlers, so Edit and Retry cannot list
   // it as a dependency — naming it in a dep array would read the binding during
   // render, before its `const` is initialized, and throw. Reaching it through a
   // ref instead is what keeps them on the CURRENT send: memoized on
   // [activeConvo, …], they otherwise keep whichever send existed when they were
-  // last rebuilt, and `send` closes over `loading`. A turn ends by appending its
-  // final message (rebuilding the handlers while loading is still true) and only
-  // then clearing the flag, so the captured send stays one that returns early on
-  // `if (loading) return` — and Save & submit silently does nothing.
+  // last rebuilt. (send's own busy guard reads `runRef`, so it no longer goes
+  // stale with the closure — but the handlers still need the send bound to the
+  // conversation the user is actually looking at.)
   const sendRef = useRef(null);
 
   // How many times IN A ROW the user has clicked "Fix it" on a review verdict.
@@ -2238,21 +2525,55 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // Only the button increments it (`fromReviewFix` on the message). A message
   // the user TYPED — even one that repeats the suggested fix in their own words
   // — resets it to 0: that is a fresh instruction from a human, not the loop
-  // feeding itself.
-  const fixRoundsRef = useRef(0);
+  // feeding itself. Counted per conversation — rounds spent in one chat say
+  // nothing about the reviewer's record in another.
+  //   { [convoId]: number }
+  const fixRoundsRef = useRef({});
 
-  const settleApproval = useCallback((decision) => {
-    const pending = approvalRef.current;
+  // Settle the approval parked on ONE conversation. Returns false when that
+  // chat has nothing waiting, so a stale click is distinguishable.
+  const settleApproval = useCallback((decision, convoId) => {
+    if (!convoId) return false;
+    const pending = approvalRef.current.get(convoId);
     if (!pending) return false;
-    approvalRef.current = null;
-    setAwaitingApproval(null);
+    approvalRef.current.delete(convoId);
+    setAwaitingApprovalByConvo((prev) => {
+      if (!(convoId in prev)) return prev;
+      const next = { ...prev };
+      delete next[convoId];
+      return next;
+    });
     pending.resolve(decision);
     return true;
   }, []);
 
+  // What this conversation is about, resolved to ONE shape that both the chip
+  // and the backend read as-is.
+  //
+  // The workflow editor reports a workflow the user just created the only way
+  // it can: by the id it is scoped by, since there is no name until they type
+  // one and no database row until the first save. Two things get settled here
+  // rather than downstream, so nothing has to re-derive them:
+  //   • name — an unnamed workflow is shown (and described to the model) by its
+  //     id, and swaps to the real name the moment the user sets one.
+  //   • id — dropped while the workflow is unsaved. It addresses nothing yet,
+  //     and every workflow tool looks its target up in the database, so sending
+  //     it would turn "the workflow you have open" into "Workflow not found".
+  //     Without an id a build request is planned as a new workflow, which is
+  //     exactly what an unsaved canvas is.
   const effectiveContext = useMemo(() => {
     if (pinnedContext === 'cleared') return null;
-    return pinnedContext || incomingContext;
+    const ctx = pinnedContext || incomingContext;
+    if (!ctx || ctx.kind !== 'workflow') return ctx;
+    const { unsaved, ...rest } = ctx;
+    if (!unsaved) return { ...rest, name: ctx.name || ctx.id || null };
+    return {
+      ...rest,
+      name: ctx.name || ctx.id || null,
+      id: null,
+      summary: `${ctx.summary ? `${ctx.summary} · ` : ''}open in the editor but never saved — `
+        + 'there is no stored copy to read or modify, so treat any build as a new workflow',
+    };
   }, [pinnedContext, incomingContext]);
 
   useEffect(() => { setPinnedContext(null); }, [incomingContext?.kind, incomingContext?.id]);
@@ -2403,20 +2724,28 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     return () => { cancelled = true; };
   }, []);
 
-  // Debounced upsert of the ACTIVE conversation only — the user can only
-  // modify one chat at a time, and writing the whole list back on every
-  // keystroke is wasted I/O. Switching chats causes activeConvo's reference
-  // to change, which fires the effect for the newly-focused chat (so even
-  // a brand-new chat created via "+ New chat" gets persisted as soon as
-  // it's selected).
+  // Debounced upsert of the conversations that can actually be changing: the
+  // one on screen, plus any with a turn still in flight. Writing the whole list
+  // back on every keystroke is wasted I/O, but "active only" is no longer
+  // enough — a chat left thinking while the user starts a new one goes on
+  // appending its answer in the background, and those messages have to reach
+  // disk without waiting for the user to switch back to it.
+  //
+  // Switching chats changes activeConvo's reference, which fires this for the
+  // newly-focused chat (so even a brand-new chat from "+ New chat" is persisted
+  // as soon as it is selected).
+  const convosToPersist = useMemo(() => {
+    const ids = new Set([activeId, ...busyConvoIds]);
+    return conversations.filter((c) => ids.has(c.id));
+  }, [conversations, activeId, busyConvoIds]);
+
   useEffect(() => {
     if (!hydratedRef.current) return;
     if (!window.electronAPI?.db?.update) return;
-    if (!activeConvo) return;
+    if (!convosToPersist.length) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
-      try {
-        const c = activeConvo;
+      for (const c of convosToPersist) {
         const doc = {
           id: c.id,
           title: c.title || 'New chat',
@@ -2427,23 +2756,30 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           updatedAt: c.updatedAt || Date.now(),
           createdAt: c.createdAt || Date.now(),
         };
-        await window.electronAPI.db.update(
-          'chatSessions',
-          { id: c.id },
-          { $set: sanitizeForNedb(doc) },
-          { upsert: true },
-        );
-      } catch (err) {
-        console.warn('[ChatAssistant] failed to persist chat history:', err.message);
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await window.electronAPI.db.update(
+            'chatSessions',
+            { id: c.id },
+            { $set: sanitizeForNedb(doc) },
+            { upsert: true },
+          );
+        } catch (err) {
+          console.warn('[ChatAssistant] failed to persist chat history:', err.message);
+        }
       }
     }, 400);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [activeConvo]);
+  }, [convosToPersist]);
 
   const updateConvo = useCallback((id, patch) => {
     setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch, updatedAt: Date.now() } : c)));
   }, []);
 
+  // A brand-new conversation starts idle no matter what the chat being left
+  // behind is doing. Nothing here touches another convo's run state — a turn in
+  // flight keeps its own entry in `runStates`, its own Stop flag and its own
+  // parked approval, and goes on writing into the conversation that asked.
   const newChat = useCallback(() => {
     const fresh = blankConvo();
     setConversations((prev) => [fresh, ...prev]);
@@ -2471,6 +2807,13 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // NeDB collection, and ensures we always have at least one convo open.
   const deleteConvo = useCallback(async (convoId) => {
     if (!convoId) return;
+    // A turn still running for this chat has nowhere left to write. Stop it and
+    // release everything keyed by the id so a deleted conversation can't leave
+    // a busy entry, a parked approval promise, or a fix-round tally behind.
+    cancelledRef.current.add(convoId);
+    settleApproval({ approved: false }, convoId);
+    setConvoBusy(convoId, false);
+    delete fixRoundsRef.current[convoId];
     try {
       if (window.electronAPI?.db?.remove) {
         await window.electronAPI.db.remove('chatSessions', { id: convoId }, {});
@@ -2490,7 +2833,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       }
       return remaining;
     });
-  }, [activeId]);
+  }, [activeId, settleApproval, setConvoBusy]);
 
   // Export the conversation as a JSON file download. The blob is built and
   // released immediately after the click — no need to keep object URLs.
@@ -2521,23 +2864,28 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     }
   }, [conversations]);
 
+  // Stop only ever stops the chat the user is looking at — another
+  // conversation's turn keeps running.
   const cancel = useCallback(() => {
-    cancelledRef.current = true;
+    if (!activeId) return;
+    cancelledRef.current.add(activeId);
     // Stop while code is waiting on approval means "don't run it".
-    settleApproval({ approved: false });
-  }, [settleApproval]);
+    settleApproval({ approved: false }, activeId);
+  }, [activeId, settleApproval]);
 
   // The two buttons on a code-approval bubble. Both just settle the promise
   // the parked loop is awaiting; the loop owns everything that happens next.
+  // Bubbles only render for the focused chat, so the approval looked up is
+  // always that chat's.
   const handleApproveCode = useCallback((m) => {
-    if (approvalRef.current?.msgId !== m.id) return;   // stale bubble
-    settleApproval({ approved: true });
-  }, [settleApproval]);
+    if (approvalRef.current.get(activeId)?.msgId !== m.id) return;   // stale bubble
+    settleApproval({ approved: true }, activeId);
+  }, [activeId, settleApproval]);
 
   const handleDeclineCode = useCallback((m) => {
-    if (approvalRef.current?.msgId !== m.id) return;
-    settleApproval({ approved: false });
-  }, [settleApproval]);
+    if (approvalRef.current.get(activeId)?.msgId !== m.id) return;
+    settleApproval({ approved: false }, activeId);
+  }, [activeId, settleApproval]);
 
   // Append a message to the active conversation. Reads `prev` so it stays
   // safe under concurrent updates from inside the step loop. Every message
@@ -2724,8 +3072,13 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   const reviewChange = useCallback(async (workflowId, change, pendingNode = null, chatHistory = []) => {
     const passthrough = { valid: true, inconclusive: true };
     if (!workflowId || !window.electronAPI?.workflow?.validateChange) return passthrough;
+    // The conversation this review belongs to, fixed at the render that built
+    // this callback — the same one `appendMessage` writes into. The user may be
+    // looking at a different chat by the time the verdict lands.
+    const convoId = activeId;
+    const fixRounds = fixRoundsRef.current[convoId] || 0;
 
-    setStage('Checking the result…');
+    setConvoStage(convoId, 'Checking the result…');
     let res;
     try {
       res = await window.electronAPI.workflow.validateChange({
@@ -2737,10 +3090,17 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         // previous failed attempt, which the reviewer then judged this build
         // against. Each caller passes the record its builder actually used.
         chatHistory,
+        // The lookups the agent ran while planning. Unlike chatHistory this IS
+        // read off the panel: it is evidence of what was checked, not a
+        // statement of intent, so the objection above does not apply — and the
+        // panel is the only place the tool calls are recorded. Edit/Retry
+        // truncates `messages`, so an abandoned attempt's lookups drop out with
+        // the turns that produced them.
+        priorActions: collectPriorActions(messagesRef.current),
         pendingNode,
         // Consecutive "Fix it" clicks that led here. Lets the reviewer see that
         // it is grading its own previous instruction rather than a fresh build.
-        fixRounds: fixRoundsRef.current,
+        fixRounds,
       });
     } catch (err) {
       return { ...passthrough, reason: err.message || String(err) };
@@ -2748,6 +3108,30 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     if (!res?.success) return { ...passthrough, reason: res?.message || '' };
 
     const drift = res.drift && res.drift.drifted ? res.drift : null;
+
+    // What the rebuild moved underneath other nodes. Shown whether or not the
+    // reviewer found a problem: the user asked for ONE node to change and
+    // several ended up reading something different, which they should see
+    // either way. Their recorded input is already updated; their own logic is
+    // not, which is what the reviewer was asked to check.
+    const impacted = Array.isArray(res.impactedDownstream) ? res.impactedDownstream : [];
+    const impactLines = impacted.length
+      ? `\n**This also changed what these nodes read:**\n${impacted.map((d) => {
+        const delta = [
+          // A source that moved has no column delta to show — the table is
+          // simply a different one now, and the node's own SQL still names the
+          // old it was built against.
+          d.movedFrom
+            ? `now reads ${d.movedTo?.tableName || 'another table'}`
+              + `${d.movedFrom.connectionId !== d.movedTo?.connectionId ? ' on another connection' : ''}`
+              + `, not ${d.movedFrom.tableName || 'what it was built against'}`
+            : '',
+          d.removed?.length ? `no longer has ${d.removed.join(', ')}` : '',
+          d.added?.length ? `now has ${d.added.join(', ')}` : '',
+        ].filter(Boolean).join('; ');
+        return `- ${d.nodeLabel || d.nodeId}${delta ? ` — ${delta}` : ''}`;
+      }).join('\n')}`
+      : '';
 
     if (res.valid) {
       // Inconclusive reviews stay silent — an "I couldn't check" bubble on every
@@ -2757,10 +3141,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           role: 'assistant', kind: 'final', ts: nowTs(), agentSource: 'reviewer',
           text: `✓ The change matches what you asked for.\n\n**Heads up — output validation may no longer fit:** ${drift.reason}\n\nRegenerate it from Execution Steps → Validate workflow output.`,
         });
-      } else if (!res.inconclusive) {
+      } else if (!res.inconclusive || impactLines) {
         appendMessage({
           role: 'assistant', kind: 'final', ts: nowTs(), agentSource: 'reviewer',
-          text: `✓ Checked against your request${res.reason ? ` — ${res.reason}` : '.'}`,
+          text: `✓ Checked against your request${res.reason ? ` — ${res.reason}` : '.'}${impactLines}`,
         });
       }
       return res;
@@ -2777,21 +3161,29 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // wrong verdict rewrite the node further and further from the user's
     // request — with no human judgement between rounds. The verdict is still
     // shown; the user is asked to say what they want instead.
-    const exhausted = fixRoundsRef.current >= MAX_REVIEW_FIX_ROUNDS;
+    const exhausted = fixRounds >= MAX_REVIEW_FIX_ROUNDS;
     const hasEdits = res.remediation.length > 0;
     const canFix = hasEdits && !exhausted;
+    // Which workflow this verdict is about. Named in the message because a
+    // conversation can have several workflows in play, and "the workflow" names
+    // none of them — the user is being asked to approve a change and has to see
+    // to what.
+    const wfId = res.workflowId || workflowId || null;
+    const wfName = res.workflowName || null;
+    const subject = wfName ? `**${wfName}**` : 'The workflow';
     const lines = [
       `**This doesn't match what you asked for.** ${res.reason || ''}`.trim(),
       res.issues.length ? `\n**What's wrong:**\n${res.issues.map((i) => `- ${i}`).join('\n')}` : '',
+      impactLines,
       // Still worth printing when the button is gone: the user can act on it
       // themselves, or see that the reviewer is circling the same point.
       hasEdits ? `\n**What I'd change:**\n${res.remediation.map((r) => `- ${r}`).join('\n')}` : '',
       drift ? `\n**Output validation may no longer fit:** ${drift.reason}` : '',
       canFix
-        ? '\nThe workflow was saved as-is. Want me to make those changes?'
+        ? `\n${subject} was saved as-is. Want me to make those changes?`
         : exhausted
-          ? `\nThe workflow was saved as-is. I've already applied ${fixRoundsRef.current} round(s) of my own corrections and it still isn't right, so I'd rather not keep changing it — each round moves further from what you asked for. Tell me what it should do and I'll rebuild it, or open it on the canvas to edit by hand.`
-          : '\nThe workflow was saved as-is. Tell me what it should do instead and I\'ll rebuild it, or open it on the canvas to edit by hand.',
+          ? `\n${subject} was saved as-is. I've already applied ${fixRounds} round(s) of my own corrections and it still isn't right, so I'd rather not keep changing it — each round moves further from what you asked for. Tell me what it should do and I'll rebuild it, or open it on the canvas to edit by hand.`
+          : `\n${subject} was saved as-is. Tell me what it should do instead and I'll rebuild it, or open it on the canvas to edit by hand.`,
     ].filter(Boolean);
     appendMessage({
       role: 'assistant', kind: 'final', ts: nowTs(), agentSource: 'reviewer',
@@ -2802,6 +3194,12 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         reviewFix: {
           state: 'pending',
           scope: change.kind === 'node' ? 'node' : 'workflow',
+          // The TARGET, carried explicitly. Without it the fix turn said "this
+          // workflow" and the agent inferred which one from the chat's context
+          // — which pointed at a different, older workflow, and the planner
+          // correctly reported that the node did not exist there.
+          workflowId: wfId,
+          workflowName: wfName,
           nodeIds: Array.isArray(change.nodeIds) ? change.nodeIds : [],
           issues: res.issues,
           remediation: res.remediation,
@@ -2809,7 +3207,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       } : {}),
     });
     return res;
-  }, [appendMessage]);
+  }, [appendMessage, activeId, setConvoStage]);
 
   // Run executeBuild and handle all three terminal cases: success, error,
   // and "the builder needs more info from the user". For the third case we
@@ -2834,7 +3232,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           kind: 'idle',
           message: gate.reason === 'save-failed'
             ? 'The workflow could not be saved, so nothing was built. Fix the reported problem and accept the plan again.'
-            : 'Cancelled — your unsaved changes are untouched. Save the workflow, then accept the plan again.',
+            : gate.reason === 'unnamed-workflow'
+              ? 'This workflow has never been saved. Give it a name and save it, then accept the plan again.'
+              : 'Cancelled — your unsaved changes are untouched. Save the workflow, then accept the plan again.',
         },
       });
       return;
@@ -2846,7 +3246,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // lines refresh in place) instead of opening a second one.
     setPin((prev) => ({
       convoId: activeId,
-      logs: prev?.logs || [],
+      // Only a pin belonging to THIS conversation is a resume of the same run.
+      // One left over from another chat's build is a different run's log and
+      // must not be carried into this one's panel.
+      logs: prev?.convoId === activeId ? (prev.logs || []) : [],
       status: 'running',
       note: null,
     }));
@@ -2937,6 +3340,18 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             text: INVALID_RESPONSE_MESSAGE,
             agentSource: 'builder',
             invalidJson: resp.rawResponse || '(empty response)',
+          });
+        } else {
+          // Say what went wrong IN THE THREAD, the way the pause branches above
+          // already do. The status line on the plan card carries the same text,
+          // but it is a one-line chip on a card the user has usually scrolled
+          // past — and a builder's reason is a sentence worth reading ("the API
+          // call for X returned no rows — check the endpoint and credentials").
+          // Without this the whole failure reads as "Build failed."
+          appendMessage({
+            role: 'assistant', error: true, ts: nowTs(),
+            text: resp?.message || 'Build failed.',
+            agentSource: 'builder',
           });
         }
         updateConvo(activeId, { pendingBuild: null });
@@ -3119,9 +3534,17 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     const edits = (fix.remediation || []).map((r) => `- ${r}`).join('\n');
     if (!edits) return;
     patchMessage(msgId, { reviewFix: { ...fix, state: 'sent' } });
+    // Name the TARGET outright. This used to say "this workflow", leaving the
+    // agent to work out which one from the chat's context — and it picked a
+    // different, older workflow, so the planner was asked to edit a node that
+    // workflow had never contained and (correctly) refused. The id is what the
+    // agent routes on; the name is there so the sentence is readable.
+    const wf = fix.workflowName
+      ? `the workflow "${fix.workflowName}"${fix.workflowId ? ` (id: ${fix.workflowId})` : ''}`
+      : (fix.workflowId ? `workflow id ${fix.workflowId}` : 'this workflow');
     const scope = fix.scope === 'node'
-      ? `the node currently in focus${fix.nodeIds?.length ? ` (${fix.nodeIds.join(', ')})` : ''}`
-      : 'this workflow';
+      ? `${fix.nodeIds?.length ? `node ${fix.nodeIds.join(', ')}` : 'the node currently in focus'} in ${wf}`
+      : wf;
     // sendRef, not send: send is declared below this point. That is what the
     // ref exists for — see its declaration.
     //
@@ -3131,7 +3554,14 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // their message is a fresh brief, and `send` resets the counter on it.
     sendRef.current?.([
       ...messages,
-      { ...makeUserMsg(`Apply these corrections to ${scope}:\n${edits}`), fromReviewFix: true },
+      {
+        ...makeUserMsg(
+          `Apply these corrections to ${scope}:\n${edits}`
+          + '\n\nModify that exact workflow — do not create a new one, and do not '
+          + 'retarget to a different workflow.',
+        ),
+        fromReviewFix: true,
+      },
     ]);
   }, [patchMessage, loading, messages, makeUserMsg]);
 
@@ -3211,8 +3641,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       return;
     }
 
-    setLoading(true);
-    setStage('Continuing…');
+    // Whose chat this continuation belongs to — the user can switch away while
+    // it runs, and the spinner has to stay with the conversation it is for.
+    const convoId = activeConvo.id;
+    setConvoBusy(convoId, true, 'Continuing…');
     try {
       // One IPC for every kind of truncation; the response shape says what came
       // back — a re-validated plan, a build call to resume from, or plain text.
@@ -3263,11 +3695,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     } catch (err) {
       patchMessage(botMsgId, { text: `Could not continue the answer: ${err.message || String(err)}` });
     } finally {
-      setLoading(false);
-      setStage('');
+      setConvoBusy(convoId, false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeConvo, loading, patchMessage, runBuild]);
+  }, [activeConvo, loading, patchMessage, runBuild, setConvoBusy]);
 
   // Retry handler — finds the most recent user message at-or-before the
   // clicked bot message, trims the tail, and re-sends with that user
@@ -3302,21 +3733,31 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // conversation's messages, then run the chat:step loop using everything
   // before the last element as cross-turn history.
   const send = useCallback(async (historyArray) => {
+    // The conversation this turn belongs to, fixed here and used for every
+    // piece of run state below. It is NOT re-read as the turn progresses: the
+    // user is free to start a new chat or switch to an old one while this runs,
+    // and the spinner, stage label, Stop button and approval must all stay with
+    // the chat that asked. (appendMessage/patchMessage/updateConvo are already
+    // bound to it by this callback's own closure.)
+    const turnConvoId = activeId;
     // A new message while code is awaiting approval cancels that run and is
-    // treated as an ordinary new turn. `loading` is still true at this point
-    // (the loop is parked), so this has to settle the approval BEFORE the
-    // guard below — settling lets the old loop unwind and clear `loading`.
+    // treated as an ordinary new turn. This chat is still busy at this point
+    // (its loop is parked), so this has to settle the approval BEFORE the
+    // guard below — settling lets the old loop unwind and release the convo.
     let supersededApprovalMsgId = null;
-    if (approvalRef.current) {
-      supersededApprovalMsgId = approvalRef.current.msgId;
-      settleApproval({ approved: false, supersededByNewMessage: true });
+    const parkedApproval = approvalRef.current.get(turnConvoId);
+    if (parkedApproval) {
+      supersededApprovalMsgId = parkedApproval.msgId;
+      settleApproval({ approved: false, supersededByNewMessage: true }, turnConvoId);
       // Wait for the parked loop to run its decline branch and release the
       // turn. Bounded so a wedged loop can't hang the composer forever.
-      for (let guard = 0; agentLoopRef.current && guard < 500; guard++) {
+      for (let guard = 0; agentLoopRef.current.has(turnConvoId) && guard < 500; guard++) {
         // eslint-disable-next-line no-await-in-loop
         await new Promise((r) => setTimeout(r, 4));
       }
-    } else if (loading) {
+    } else if (isConvoBusy(turnConvoId)) {
+      // Only THIS chat being mid-turn blocks a send. Another conversation
+      // thinking in the background is none of this one's business.
       return;
     }
     if (!Array.isArray(historyArray) || historyArray.length === 0) return;
@@ -3327,7 +3768,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // retry, edit-and-resubmit, and the review "Fix it" button — so this is the
     // one place the remediation-round counter can be kept honest. Only the
     // button flags its message; anything the user wrote themselves resets it.
-    fixRoundsRef.current = userMsg.fromReviewFix ? fixRoundsRef.current + 1 : 0;
+    fixRoundsRef.current[turnConvoId] = userMsg.fromReviewFix
+      ? (fixRoundsRef.current[turnConvoId] || 0) + 1
+      : 0;
     if (!window.electronAPI?.chat?.step) {
       appendMessage({
         role: 'assistant', error: true, ts: nowTs(),
@@ -3340,13 +3783,13 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // wiped, the user msg's agentMode tag is normalized to 'main' (so the
     // workflow sub-agent doesn't resume on top of a "new" chat), and we
     // drop any in-flight build/session state on the convo.
-    const wasRestarted = restartedConvoIds.has(activeId);
+    const wasRestarted = restartedConvoIds.has(turnConvoId);
     let effHistory = historyArray;
     if (wasRestarted) {
       setRestartedConvoIds((prev) => {
-        if (!prev.has(activeId)) return prev;
+        if (!prev.has(turnConvoId)) return prev;
         const next = new Set(prev);
-        next.delete(activeId);
+        next.delete(turnConvoId);
         return next;
       });
       const { workflowBuilder: _wb, ...rest } = userMsg;
@@ -3377,7 +3820,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     const restartUpdate = wasRestarted
       ? { agentMode: 'main', workflowSession: null, pendingBuild: null }
       : {};
-    updateConvo(activeId, { messages: effHistory, ...titleUpdate, ...restartUpdate });
+    updateConvo(turnConvoId, { messages: effHistory, ...titleUpdate, ...restartUpdate });
     setInput('');
 
     // If we're waiting on an answer from the user for an in-flight workflow
@@ -3413,21 +3856,18 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       // Show a conversation-level "thinking" indicator while the build
       // resumes — answering a clarification otherwise looked unresponsive
       // because runBuild only updates the plan card far up the thread.
-      setLoading(true);
-      setStage('Building workflow…');
+      setConvoBusy(turnConvoId, true, 'Building workflow…');
       try {
         await runBuild(nextPlan, pendingBuild.msgId);
       } finally {
-        setLoading(false);
-        setStage('Thinking…');
+        setConvoBusy(turnConvoId, false);
       }
       return;
     }
 
-    setLoading(true);
-    agentLoopRef.current = true;
-    setStage('Thinking…');
-    cancelledRef.current = false;
+    setConvoBusy(turnConvoId, true, 'Thinking…');
+    agentLoopRef.current.add(turnConvoId);
+    cancelledRef.current.delete(turnConvoId);
 
     // Cross-turn history sent to the model is the chat BEFORE the new user
     // turn — intermediate steps for this question live in the local
@@ -3453,7 +3893,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
               ...(m.clarification ? { clarification: true } : {}),
             }
       ));
-    const ctx = effectiveContext;
+    // Not const: the save gate below can turn an unsaved canvas into a saved
+    // workflow mid-turn, and the context has to start pointing at it.
+    let ctx = effectiveContext;
     const scratchpad = [];
     // Seed the agent mode + session from the user message's own stamps —
     // Edit/Retry pass the target message's session so the re-run resumes
@@ -3488,7 +3930,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     try {
       let i = 0;
       while (i < MAX_STEPS_PER_QUESTION) {
-        if (cancelledRef.current) {
+        if (cancelledRef.current.has(turnConvoId)) {
           appendMessage({
             role: 'assistant', kind: 'final', ts: nowTs(),
             text: '_Stopped by user._',
@@ -3512,11 +3954,29 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           if (!gate.ok) {
             appendMessage({
               role: 'assistant', kind: 'final', ts: nowTs(),
-              text: gate.reason === 'invalid-workflow'
-                ? 'I left the workflow alone — it has unsaved changes that can\'t be saved yet (check the workflow name). Fix that, save, and ask me again.'
-                : 'Left the workflow untouched — your unsaved changes are still on the canvas. Save it and ask me again, and I\'ll plan against what you see now.',
+              text: gate.reason === 'unnamed-workflow'
+                ? 'This workflow has never been saved, so there is nothing for me to build on yet. Give it a name, save it, and ask me again — then I can extend what you have instead of starting a separate workflow.'
+                : gate.reason === 'invalid-workflow'
+                  ? 'I left the workflow alone — it has unsaved changes that can\'t be saved yet (check the workflow name). Fix that, save, and ask me again.'
+                  : 'Left the workflow untouched — your unsaved changes are still on the canvas. Save it and ask me again, and I\'ll plan against what you see now.',
             });
             break;
+          }
+          // The gate just turned an unsaved canvas into a saved workflow.
+          //
+          // The build target was resolved back on the FIRST turn, from a
+          // context that deliberately carries no id while the workflow is
+          // unsaved (see effectiveContext) — so it currently reads "create a
+          // new workflow", which would strand the nodes the user just saved in
+          // a workflow the build ignores. Point both the context and the
+          // in-flight session at the record that now exists.
+          if (gate.workflowId) {
+            if (!ctx || ctx.kind !== 'workflow' || !ctx.id) {
+              ctx = { ...(ctx || {}), kind: 'workflow', id: gate.workflowId };
+            }
+            if (workflowSession && !workflowSession.workflowId) {
+              workflowSession = { ...workflowSession, workflowId: gate.workflowId };
+            }
           }
         }
 
@@ -3551,7 +4011,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
 
         // Discard the result silently if the user cancelled while it was in
         // flight — the final "stopped" message was already appended above.
-        if (cancelledRef.current) break;
+        if (cancelledRef.current.has(turnConvoId)) break;
 
         if (!resp?.success) {
           appendMessage({
@@ -3572,21 +4032,29 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         // The main agent names a new conversation as part of its answer, so the
         // title lands on whichever step finally answers. Replaces the
         // placeholder seeded from the user's text when the send started.
-        if (resp.chatTitle) updateConvo(activeId, { title: resp.chatTitle });
+        if (resp.chatTitle) updateConvo(turnConvoId, { title: resp.chatTitle });
 
         // A build_* tool built/refined the focused node OR committed follow-up
         // chat (partial) — hand it to WorkflowEditor to write onto the node.
         // The committed chat history is what carries clarification Q&A forward.
         if (resp.nodeBuild && resp.nodeBuild.nodeId && resp.nodeBuild.config) {
           window.dispatchEvent(new CustomEvent('ternlux:apply-node-config', { detail: resp.nodeBuild }));
-          // Same merge the editor just did, kept here so the next step's
-          // targetNode already carries it (see appliedNodeConfig).
+          // Same apply the editor just did, kept here so the next step's
+          // targetNode already carries it (see appliedNodeConfig) — and so the
+          // review below judges exactly what landed on the node.
+          //
+          // A finished build REPLACES; only a `partial` commit merges. Matches
+          // mergeConfigWithName in WorkflowEditor: a completed build hands back
+          // a whole config, and letting an earlier step's fields survive into it
+          // is how a rebuilt node keeps SQL the new build never wrote.
           appliedNodeConfig = {
             nodeId: resp.nodeBuild.nodeId,
-            config: {
-              ...(appliedNodeConfig?.nodeId === resp.nodeBuild.nodeId ? appliedNodeConfig.config : {}),
-              ...resp.nodeBuild.config,
-            },
+            config: resp.nodeBuild.partial
+              ? {
+                ...(appliedNodeConfig?.nodeId === resp.nodeBuild.nodeId ? appliedNodeConfig.config : {}),
+                ...resp.nodeBuild.config,
+              }
+              : { ...resp.nodeBuild.config },
           };
           // A finished node (not a partial chat commit) gets the same review a
           // full build does. The config is passed as `pendingNode` because the
@@ -3639,7 +4107,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         if (resp.nextAgentMode)               agentMode       = resp.nextAgentMode;
         if ('workflowSession' in resp)        workflowSession = resp.workflowSession || null;
         if (resp.pendingPlanWorkflowBuild)    pendingPlanArgs = resp.pendingPlanWorkflowBuild.args || {};
-        setStage(agentMode === 'workflow' ? 'Workflow builder…' : 'Thinking…');
+        setConvoStage(turnConvoId, agentMode === 'workflow' ? 'Workflow builder…' : 'Thinking…');
 
         // A short-circuit turn (propose_plan) returns BOTH a tool step
         // AND a finalAnswer in the same response — render the step
@@ -3718,10 +4186,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             if (approvalMsgId) patchMessage(approvalMsgId, { approval: { ...approval, state } });
           };
 
-          setStage('Waiting for your approval…');
+          setConvoStage(turnConvoId, 'Waiting for your approval…');
           const decision = await new Promise((resolve) => {
-            approvalRef.current = { msgId: approvalMsgId, runToken: pa.runToken, resolve };
-            setAwaitingApproval(approvalMsgId);
+            approvalRef.current.set(turnConvoId, { msgId: approvalMsgId, runToken: pa.runToken, resolve });
+            setAwaitingApprovalByConvo((prev) => ({ ...prev, [turnConvoId]: approvalMsgId }));
           });
 
           if (!decision?.approved) {
@@ -3739,7 +4207,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             break;
           }
 
-          setStage('Running approved code…');
+          setConvoStage(turnConvoId, 'Running approved code…');
           let execResp;
           try {
             execResp = await window.electronAPI.chat.runApprovedJavascript({ runToken: pa.runToken });
@@ -3753,20 +4221,74 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           // waiting on — success or failure, it learns what actually
           // happened and carries on from there.
           const slot = scratchpad[scratchpad.length - 1];
-          const action = slot?.actions?.find((a) => a.id === pa.actionId)
-            || slot?.actions?.find((a) => a.tool === 'run_javascript');
+          const isSlot = (a, i, list) => (a.id === pa.actionId
+            || (!list.some((x) => x.id === pa.actionId) && a.tool === 'run_javascript'));
+          const action = slot?.actions?.find(isSlot);
+          // A failure has to carry the SOURCE back, not just the message.
+          //
+          // The model writes the function, never sees it again, and is handed
+          // one line: `ERROR: Header name must be a valid HTTP token ["api
+          // key"]`. Since "api key" is also what the connection calls its saved
+          // parameter, that reads as a fact about the CONNECTION — and the model
+          // spent four turns insisting the user fix a connection that was fine,
+          // because nothing in its context showed that its own code had put that
+          // name in a header. Replaying the source turns an unattributable error
+          // into an ordinary bug it can find and fix.
+          //
+          // The source is safe to show: credentials are resolved inside the
+          // running function via ctx.apiCredentials, so this text never holds a
+          // secret — that is the same reason it is shown to the user for approval.
+          // STOP here and report. Do not retry on your own: an endpoint, a
+          // credential and an auth scheme are the user's to settle, and guessing
+          // at them spends a real request and a real approval click per guess.
+          // A model told to "try again with a correction" writes a function that
+          // swallows the error and returns a placeholder row instead — which
+          // then reads downstream as a successful call.
+          const failure = (msg) => [
+            msg,
+            '',
+            'This is the function that failed — you wrote it, so read the error against it before '
+            + 'concluding anything about the connection or the endpoint:',
+            pa.transformFunction || '(source unavailable)',
+            '',
+            'Now STOP and tell the user, in your answer: what you called, what came back, and what '
+            + 'you think is wrong. Do NOT call run_javascript again on your own — not with a '
+            + 'different endpoint, a different auth scheme, or error handling that hides the '
+            + 'failure. Wait for the user. When they tell you what to change (a URL, a parameter, '
+            + 'where the credential goes), apply exactly that and call run_javascript again.',
+          ].join('\n');
+          const outcome = execResp?.success
+            ? { ok: true, result: execResp.result }
+            : { ok: false, error: failure(execResp?.message || 'The approved code failed to run.') };
           if (action) {
-            if (execResp?.success) {
+            if (outcome.ok) {
               delete action.error;
               action.ok = true;
-              action.result = execResp.result;
+              action.result = outcome.result;
             } else {
               delete action.result;
               action.ok = false;
-              action.error = execResp?.message || 'The approved code failed to run.';
+              action.error = outcome.error;
             }
           }
-          setStage('Thinking…');
+          // The same outcome into the MESSAGE, not just the scratchpad. The
+          // bubble kept the placeholder the tool returned before approval
+          // ("ran": false, "awaitingApproval": true), so the saved transcript
+          // said the code never ran no matter what it did — and a later turn,
+          // which reads history rather than this turn's scratchpad, was told the
+          // same. Both readers now see what actually happened.
+          if (stepMsgId && action) {
+            patchMessage(stepMsgId, {
+              actions: (resp.actions || []).map((a, i, list) => {
+                if (!isSlot(a, i, list)) return a;
+                const { result, error, ...rest } = a;
+                return outcome.ok
+                  ? { ...rest, ok: true, result: outcome.result }
+                  : { ...rest, ok: false, error: outcome.error };
+              }),
+            });
+          }
+          setConvoStage(turnConvoId, 'Thinking…');
           i++;
           continue;
         }
@@ -3832,19 +4354,50 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       }
       // Persist whatever mode/session the conversation ended on so the
       // NEXT user message resumes in the right agent.
-      updateConvo(activeId, { agentMode, workflowSession });
+      updateConvo(turnConvoId, { agentMode, workflowSession });
       // Never leave an approval promise dangling — if the turn ended by any
       // other route (error, step cap, cancel) the bubble must stop waiting.
-      settleApproval({ approved: false });
-      setLoading(false);
-      agentLoopRef.current = false;
-      setStage('Thinking…');
-      cancelledRef.current = false;
+      settleApproval({ approved: false }, turnConvoId);
+      setConvoBusy(turnConvoId, false);
+      agentLoopRef.current.delete(turnConvoId);
+      cancelledRef.current.delete(turnConvoId);
     }
-  }, [input, loading, messages, effectiveContext, activeId, activeConvo, restartedConvoIds, updateConvo, appendMessage, patchMessage, runBuild, reviewChange, settleApproval]);
+  }, [input, messages, effectiveContext, activeId, activeConvo, restartedConvoIds, updateConvo, appendMessage, patchMessage, runBuild, reviewChange, settleApproval, setConvoBusy, setConvoStage, isConvoBusy]);
 
   // Edit / Retry reach send through this — see sendRef's declaration.
   sendRef.current = send;
+
+  // ── A fresh chat, opened with its first message already written ──────────
+  //
+  // The canvas asks for this when a node's input has moved under it: the
+  // prompt over the node (SourceChangedPopup → WorkflowEditor) offers Rebuild,
+  // and the request arrives here as the opening message of a NEW conversation,
+  // so a rebuild never lands in the middle of whatever the user was discussing.
+  //
+  // The send waits a render: `send` binds the conversation it writes into when
+  // it is called, so sending in the same tick as `newChat` would put the
+  // message in the chat being left behind. Parking it in state lets the new
+  // conversation become the active one first.
+  const [seededRequest, setSeededRequest] = useState(null);
+
+  useEffect(() => {
+    const handler = (e) => {
+      const text = String(e.detail?.text || '').trim();
+      if (!text) return;
+      setOpen(true);
+      newChat();
+      setSeededRequest({ text, at: Date.now() });
+    };
+    window.addEventListener('ternlux:chat-new-message', handler);
+    return () => window.removeEventListener('ternlux:chat-new-message', handler);
+  }, [newChat]);
+
+  useEffect(() => {
+    if (!seededRequest) return;
+    // Cleared first: one send per request, however this effect is re-run.
+    setSeededRequest(null);
+    send([makeUserMsg(seededRequest.text)]);
+  }, [seededRequest, send, makeUserMsg]);
 
   // ── Floating launcher button ─────────────────────────────────────────────
   if (!open) {
@@ -3887,21 +4440,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           userSelect: 'none', touchAction: 'none',
         }),
       }}>
-      {!expanded && <IconGrip color={C.dim} size={11} />}
+      {/* {!expanded && <IconGrip color={C.dim} size={11} />} */}
       {/* History sits on the left, where the expanded layout keeps its
           conversation sidebar — the popup overlay opens from the same corner. */}
-      {!expanded && (
-        <button type="button" onClick={() => setHistoryOpen((v) => !v)}
-          title={historyOpen ? 'Back to chat' : 'Chat history'}
-          style={{
-            padding: 6, borderRadius: 4,
-            background: historyOpen ? C.aD : 'transparent',
-            border: 'none', cursor: 'pointer',
-            color: historyOpen ? C.accent : C.muted, display: 'flex', flexShrink: 0,
-          }}>
-          {I('clock', historyOpen ? C.accent : C.muted, 14)}
-        </button>
-      )}
+
       <div style={{
         width: 28, height: 28, borderRadius: 5, background: C.aD,
         border: '1px solid #bfdbfe', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
@@ -3930,6 +4472,18 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
                 : 'Ternlux Assistant · ready')}
         </div>
       </div>
+      {!expanded && (
+        <button type="button" onClick={() => setHistoryOpen((v) => !v)}
+          title={historyOpen ? 'Back to chat' : 'Chat history'}
+          style={{
+            padding: 6, borderRadius: 4,
+            background: historyOpen ? C.aD : 'transparent',
+            border: 'none', cursor: 'pointer',
+            color: historyOpen ? C.accent : C.muted, display: 'flex', flexShrink: 0,
+          }}>
+          {I('clock', historyOpen ? C.accent : C.muted, 14)}
+        </button>
+      )}
       <button type="button" onClick={restartChat}
         title="Restart current chat"
         disabled={!messages.length}
@@ -4053,6 +4607,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
               m={m}
               // The user has spoken since this offer was made — see lastUserIdx.
               stale={i < lastUserIdx}
+              // Only the turn's last answer offers Retry — see retryableIdx.
+              retryable={retryableIdx.has(i)}
+              planBlockedReason={planBlockedReason}
               onAction={(action, payload, id) => (
                 action === 'apply-review-fix' || action === 'dismiss-review-fix'
                   ? handleReviewFix(action, payload, id)
@@ -4147,6 +4704,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
               <HistorySidebar
                 conversations={conversations}
                 activeId={activeId}
+                busyIds={busyConvoIds}
                 width="100%"
                 onClose={() => setHistoryOpen(false)}
                 onSelect={(id) => { setActiveId(id); setHistoryOpen(false); }}
@@ -4179,6 +4737,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         <HistorySidebar
           conversations={conversations}
           activeId={activeId}
+          busyIds={busyConvoIds}
           onSelect={(id) => setActiveId(id)}
           onNewChat={newChat}
           onDeleteConvo={deleteConvo}

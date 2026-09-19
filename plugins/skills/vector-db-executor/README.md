@@ -4,7 +4,7 @@ A Ternlux skill plugin for performing vector database operations with automatic 
 
 ## Features
 
-- **Embedding Generation**: Automatically generate embeddings using OpenAI or HuggingFace models
+- **Embedding Generation**: Automatically generate embeddings using OpenAI models
 - **Multiple Vector Databases**: Support for LanceDB (local) and Pinecone (cloud)
 - **Vector Operations**: Upsert, query (semantic search), delete, and update
 - **Cost Estimation**: Automatic cost estimation for OpenAI embeddings
@@ -36,7 +36,6 @@ setup.bat
 This will install all required dependencies:
 - `@lancedb/lancedb` - Local vector database
 - `openai` - OpenAI embeddings API
-- `@huggingface/inference` - HuggingFace embeddings API
 
 ## Configuration
 
@@ -44,17 +43,12 @@ This will install all required dependencies:
 
 You'll need API keys for the embedding providers you want to use:
 
-1. **OpenAI** (optional, for OpenAI embeddings)
+1. **OpenAI** (required — embeddings are generated with OpenAI)
    - Get your API key from: https://platform.openai.com/api-keys
    - Models: `text-embedding-3-small`, `text-embedding-3-large`, `text-embedding-ada-002`
    - Pricing: $0.02-$0.13 per 1M tokens
 
-2. **HuggingFace** (optional, for HuggingFace embeddings)
-   - Get your API key from: https://huggingface.co/settings/tokens
-   - Models: `sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`
-   - Free tier available
-
-3. **Pinecone** (optional, only if using Pinecone cloud vector database)
+2. **Pinecone** (optional, only if using Pinecone cloud vector database)
    - Get your API key from: https://app.pinecone.io/
    - Requires creating an index beforehand
 
@@ -109,12 +103,6 @@ You'll need API keys for the embedding providers you want to use:
 - `text-embedding-3-large` (3072 dimensions, $0.13/1M tokens) - Higher quality
 - `text-embedding-ada-002` (1536 dimensions, $0.10/1M tokens) - Legacy model
 
-**HuggingFace Models:**
-- `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) - Fast and efficient
-- `BAAI/bge-small-en-v1.5` (384 dimensions) - Good quality
-- `BAAI/bge-base-en-v1.5` (768 dimensions) - Better quality
-- `BAAI/bge-large-en-v1.5` (1024 dimensions) - Best quality
-
 ### Operations
 
 **Upsert (Insert/Update)**
@@ -146,7 +134,7 @@ Load from Database/File
     ↓
 Extract Text Column
     ↓
-Generate Embeddings (OpenAI/HuggingFace)
+Generate Embeddings (OpenAI)
     ↓
 Prepare Vector Records
     ↓
@@ -168,7 +156,6 @@ For OpenAI embeddings, the skill automatically estimates costs:
 
 - Embeddings are generated in batches for efficiency
 - OpenAI: 100 texts per batch
-- HuggingFace: 1 text per batch
 - Handles large datasets automatically
 
 ### Metadata Preservation
@@ -211,10 +198,10 @@ When querying, your search text is automatically embedded using the same model:
 **"Dimension mismatch"**
 - Pinecone index dimension must match embedding model
 - text-embedding-3-small = 1536 dimensions
-- sentence-transformers/all-MiniLM-L6-v2 = 384 dimensions
+- text-embedding-3-large = 3072 dimensions
 
 **"API key is required"**
-- Add your OpenAI or HuggingFace API key
+- Add your OpenAI API key
 - Check that the key is valid and has credits
 
 **"Table does not exist" (LanceDB)**
@@ -229,7 +216,6 @@ When querying, your search text is automatically embedded using the same model:
 
 1. **Use smaller models** for faster embedding:
    - OpenAI: text-embedding-3-small
-   - HuggingFace: sentence-transformers/all-MiniLM-L6-v2
 
 2. **Limit data size** for large datasets:
    - Filter source data before embedding

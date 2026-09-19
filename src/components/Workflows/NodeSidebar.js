@@ -105,7 +105,7 @@ const NodeSidebar = ({ isOpen, node, nodes, edges, onClose, onConfigUpdate }) =>
     const token = localStorage.getItem('auth-token');
 
     if (!token) {
-      // No session — load from local NeDB
+      // No session — load from the local store
       try {
         const local = await connectionsDb.getAll();
         setConnections(local);

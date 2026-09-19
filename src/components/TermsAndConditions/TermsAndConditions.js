@@ -8,15 +8,15 @@ import {
   FormControlLabel,
   Divider,
   Alert,
-  Switch,
+  Link,
   Card,
   CardContent,
 } from '@mui/material';
 import {
-  GavelOutlined,
   CheckCircle,
   InsightsOutlined,
   ShieldOutlined,
+  OpenInNew,
 } from '@mui/icons-material';
 
 const STORAGE_KEY_ACCEPTED = 'ternlux_terms_accepted';
@@ -24,19 +24,63 @@ const STORAGE_KEY_VERSION = 'ternlux_terms_version';
 const STORAGE_KEY_ANALYTICS = 'ternlux_analytics_opt_in';
 const TERMS_VERSION = '1.0';
 
+// The published documents. The copy in the scroll area is a snapshot taken at
+// this version; these are the live ones, and the agreement is to them.
+const TERMS_URL = 'https://www.ternlux.com/terms-and-conditions/';
+const PRIVACY_URL = 'https://www.ternlux.com/privacy-policy/';
 
+/**
+ * A link out to a published document.
+ *
+ * `target="_blank"` is what carries it out of the app: Electron's window-open
+ * handler denies the in-app navigation and hands the URL to the system browser
+ * (see setWindowOpenHandler in public/electron.js), so the consent screen is
+ * never navigated away from.
+ *
+ * The click is also stopped from propagating — these links sit inside a
+ * checkbox's label, and a label click toggles the checkbox. Reading the terms
+ * would otherwise agree to them on your behalf.
+ */
+const DocLink = ({ href, children }) => (
+  <Link
+    href={href}
+    target="_blank"
+    rel="noreferrer"
+    onClick={(e) => e.stopPropagation()}
+    sx={{
+      fontWeight: 700,
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 0.35,
+      verticalAlign: 'baseline',
+    }}
+  >
+    {children}
+    <OpenInNew sx={{ fontSize: 13 }} />
+  </Link>
+);
 
 const TermsAndConditions = ({ onComplete }) => {
   const [accepted, setAccepted] = useState(false);
-  // Analytics is opt-IN and off by default (matches the Terms copy below and
-  // the Privacy settings default). The user must affirmatively enable it.
-  const [analyticsOptIn, setAnalyticsOptIn] = useState(false);
+  // Analytics is a choice, not a default: `null` means the user has not made
+  // one yet, and neither button is selected until they do. Continue is gated on
+  // it, so nobody is opted in — or out — by a switch they never touched.
+  const [analyticsOptIn, setAnalyticsOptIn] = useState(null);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  const chooseAnalytics = (value) => {
+    setAnalyticsOptIn(value);
+    setError('');
+  };
 
   const handleContinue = async () => {
     if (!accepted) {
       setError('You must accept the Terms and Conditions to continue.');
+      return;
+    }
+    if (analyticsOptIn === null) {
+      setError('Choose whether to share anonymous analytics to continue.');
       return;
     }
     setSubmitting(true);
@@ -128,10 +172,17 @@ const TermsAndConditions = ({ onComplete }) => {
           <Typography variant="h5" fontWeight={800} mb={0.5} textAlign="center">
             Welcome to Ternlux
           </Typography>
-          <Typography variant="body2" color="text.secondary" mb={3} textAlign="center">
+          <Typography variant="body2" color="text.secondary" mb={2} textAlign="center">
             Before you get started, take a moment to review our Terms and Conditions
             and choose your analytics preference.
           </Typography>
+
+          {/* The published documents, reachable without scrolling the snapshot
+              below — the acceptance line links to the same two. */}
+          <Box sx={{ display: 'flex', justifyContent: 'center', gap: 3, mb: 3 }}>
+            <DocLink href={TERMS_URL}>Terms and Conditions</DocLink>
+            <DocLink href={PRIVACY_URL}>Privacy Policy</DocLink>
+          </Box>
 
           {/* Terms scroll area */}
           <Paper
@@ -238,7 +289,7 @@ const TermsAndConditions = ({ onComplete }) => {
 <p>The Software is designed to interoperate with third-party software, APIs, and services that you choose to configure, including without limitation:</p>
 <ul>
   <li><strong>AI / LLM providers</strong> — Anthropic, OpenAI, Google AI Studio (Gemini), HuggingFace Inference, and any other provider supported now or in the future;</li>
-  <li><strong>Databases</strong> — PostgreSQL, MySQL, Microsoft SQL Server, MongoDB, BigQuery, Snowflake, Amazon Redshift, and similar;</li>
+  <li><strong>Databases</strong> — PostgreSQL, MySQL, Microsoft SQL Server, MongoDB, BigQuery, Snowflake, and similar;</li>
   <li><strong>Cloud storage and SaaS</strong> — Amazon S3, Google Cloud Storage, Azure Blob Storage, Dropbox, Google Drive, Google Sheets, Microsoft OneDrive, SharePoint, Slack, Pinecone, and similar;</li>
   <li><strong>Arbitrary REST API endpoints</strong> — any HTTPS endpoint you configure via the REST API connector; and</li>
   <li><strong>OAuth identity providers</strong> used by any of the above</li>
@@ -454,7 +505,7 @@ const TermsAndConditions = ({ onComplete }) => {
             sx={{
               borderRadius: 2,
               borderWidth: 2,
-              borderColor: analyticsOptIn ? 'primary.main' : 'divider',
+              borderColor: analyticsOptIn === null ? 'divider' : 'primary.main',
               bgcolor: analyticsOptIn ? 'primary.50' : 'background.paper',
               transition: 'all 0.15s ease',
               mb: 3,
@@ -480,24 +531,9 @@ const TermsAndConditions = ({ onComplete }) => {
                 </Box>
 
                 <Box sx={{ flex: 1 }}>
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      gap: 2,
-                      mb: 0.5,
-                    }}
-                  >
-                    <Typography variant="subtitle1" fontWeight={700}>
-                      Share anonymous analytics
-                    </Typography>
-                    <Switch
-                      checked={analyticsOptIn}
-                      onChange={(e) => setAnalyticsOptIn(e.target.checked)}
-                      color="primary"
-                    />
-                  </Box>
+                  <Typography variant="subtitle1" fontWeight={700} mb={0.5}>
+                    Share anonymous analytics
+                  </Typography>
                   <Typography variant="body2" color="text.secondary" lineHeight={1.5}>
                     Help us improve Ternlux by sharing anonymous usage data — feature
                     interactions, performance metrics, and crash reports. We never
@@ -506,10 +542,39 @@ const TermsAndConditions = ({ onComplete }) => {
                     Settings.
                   </Typography>
 
-                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mt: 1.25 }}>
+                  {/* Two buttons rather than a switch: a switch has a default,
+                      and a default is an answer the user never gave. Neither is
+                      selected until one is clicked. */}
+                  <Box sx={{ display: 'flex', gap: 1.5, mt: 2 }}>
+                    <Button
+                      variant={analyticsOptIn === true ? 'contained' : 'outlined'}
+                      onClick={() => chooseAnalytics(true)}
+                      aria-pressed={analyticsOptIn === true}
+                      startIcon={analyticsOptIn === true ? <CheckCircle /> : null}
+                      sx={{ borderRadius: 2, fontWeight: 700, px: 2.5, textTransform: 'none' }}
+                    >
+                      Opt in
+                    </Button>
+                    <Button
+                      variant={analyticsOptIn === false ? 'contained' : 'outlined'}
+                      color={analyticsOptIn === false ? 'inherit' : 'primary'}
+                      onClick={() => chooseAnalytics(false)}
+                      aria-pressed={analyticsOptIn === false}
+                      startIcon={analyticsOptIn === false ? <CheckCircle /> : null}
+                      sx={{ borderRadius: 2, fontWeight: 700, px: 2.5, textTransform: 'none' }}
+                    >
+                      Opt out
+                    </Button>
+                  </Box>
+
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mt: 1.75 }}>
                     <ShieldOutlined sx={{ fontSize: 14, color: 'text.disabled' }} />
                     <Typography variant="caption" color="text.disabled">
-                      Anonymous & aggregated. No workflow data is ever sent.
+                      {analyticsOptIn === null
+                        ? 'Pick one to continue — no analytics are sent until you do.'
+                        : analyticsOptIn
+                          ? 'Anonymous & aggregated. No workflow data is ever sent.'
+                          : 'No analytics will be sent. Nothing about your usage leaves this device.'}
                     </Typography>
                   </Box>
                 </Box>
@@ -535,12 +600,11 @@ const TermsAndConditions = ({ onComplete }) => {
               />
             }
             label={
-              <Typography variant="body2" sx={{mt:1}}>
+              <Typography variant="body2" sx={{ mt: 1 }}>
                 I have read and agree to the{' '}
-                <Box component="span" sx={{ fontWeight: 700 }}>
-                  Terms and Conditions
-                </Box>{' '}
-                outlined above.
+                <DocLink href={TERMS_URL}>Terms and Conditions</DocLink>
+                {' '}and the{' '}
+                <DocLink href={PRIVACY_URL}>Privacy Policy</DocLink>.
               </Typography>
             }
             sx={{ alignItems: 'flex-start', mb: 2 }}
@@ -552,7 +616,7 @@ const TermsAndConditions = ({ onComplete }) => {
             <Button
               variant="contained"
               onClick={handleContinue}
-              disabled={!accepted || submitting}
+              disabled={!accepted || analyticsOptIn === null || submitting}
               startIcon={<CheckCircle />}
               sx={{
                 borderRadius: 2,

@@ -37,7 +37,7 @@ They share a common surface:
 | Connector | Auth | Notes |
 | --- | --- | --- |
 | [Amazon S3](s3.md) | AWS access key + secret | S3-compatible endpoints (MinIO, etc.) supported |
-| [Google Cloud Storage](gcs.md) | Service account JSON or key file | Inline JSON or path to a key file |
+| [Google Cloud Storage](gcs.md) | OAuth | Project id required; optional single-bucket scoping |
 | [Azure Blob Storage](azure-blob.md) | Connection string or account key | Two auth methods supported |
 | [Google Drive](google-drive.md) | OAuth | File IDs, format export |
 | [OneDrive](onedrive.md) | OAuth | Microsoft Graph, multi-tenant aware |
@@ -49,3 +49,7 @@ They share a common surface:
 For OAuth-based connectors (Drive, OneDrive, SharePoint, Dropbox),
 Ternlux refreshes the access token automatically within a five-minute
 buffer of expiry, so a workflow run never lands on a stale token.
+
+Google Cloud Storage authorises the same way but refreshes on demand:
+the Google client swaps an expired access token for a fresh one on the
+next request using the stored refresh token.

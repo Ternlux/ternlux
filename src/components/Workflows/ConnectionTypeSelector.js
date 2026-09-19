@@ -2,46 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Modal, message, Spin } from 'antd';
 import { C, MONO, SANS, I, fullscreenModalProps } from './_designShared';
 import { isLoggedIn } from '../../utils/authService';
-
-const LOGO_PREFIX = 'http://www.ternlux.com/wp-content/uploads/2026/04/';
-
-// Source of truth: connectors mirror the keys/categories used elsewhere in
-// the app. `img` is set only for connectors covered by the ternlux.com logo
-// list; everything else falls back to monogram letters.
-const CONNECTION_TYPES = [
-  // Local files
-  { key: 'spreadsheet', title: 'CSV / Excel',     description: 'Query CSV or Excel files in place, no import step',     category: 'file', img: LOGO_PREFIX + 'CSV.png',  fileBased: true, tone: '#1890ff' },
-  { key: 'json',        title: 'JSON',            description: 'Query JSON files in place, no import step',             category: 'file', img: LOGO_PREFIX + 'JSON.png', fileBased: true, tone: '#fa8c16' },
-  { key: 'duckdb',      title: 'DuckDB',          description: 'Connect to an existing DuckDB database file',           category: 'file', letters: 'DD', tone: '#fff100', fileBased: true },
-  { key: 'sqlite',      title: 'SQLite',          description: 'Connect to an existing SQLite database file',           category: 'file', letters: 'SQ', tone: '#0f80cc', fileBased: true },
-  { key: 'lancedb',     title: 'LanceDB',         description: 'Connect to local LanceDB vector database',             category: 'file', img: LOGO_PREFIX + 'LanceDB.png', tone: '#7c3aed', fileBased: true },
-  { key: 'parquet',     title: 'Parquet',         description: 'Query Parquet files in place, no import step',          category: 'file', letters: 'PQ', tone: '#9254de', fileBased: true },
-  { key: 'avro',        title: 'Avro',            description: 'Import Avro files, converted to Parquet once',          category: 'file', letters: 'AV', tone: '#eb2f96', fileBased: true },
-
-  // Databases
-  { key: 'postgres',  title: 'PostgreSQL',      description: 'Connect to a PostgreSQL database',                category: 'database', img: LOGO_PREFIX + 'PostgreSQL.png',           tone: '#336791' },
-  { key: 'mysql',     title: 'MySQL / MariaDB', description: 'Connect to a MySQL or MariaDB database',          category: 'database', img: LOGO_PREFIX + 'MySQL.png',                tone: '#e48b00' },
-  { key: 'mssql',     title: 'SQL Server',      description: 'Connect to a Microsoft SQL Server database',      category: 'database', img: LOGO_PREFIX + 'Microsoft_SQL_Server.png', tone: '#0078d4' },
-  { key: 'mongodb',   title: 'MongoDB',         description: 'Connect to a MongoDB database or Atlas cluster',  category: 'database', img: LOGO_PREFIX + 'MongoDB.png',              tone: '#00a550' },
-  { key: 'redshift',  title: 'Amazon Redshift', description: 'Connect to an Amazon Redshift data warehouse',    category: 'database', img: LOGO_PREFIX + 'Amazon_Redshift.png',      tone: '#ff9900' },
-  { key: 'bigquery',  title: 'Google BigQuery', description: 'Connect to Google BigQuery data warehouse',       category: 'database', img: LOGO_PREFIX + 'Google_BigQuery.png',      tone: '#4285f4' },
-  { key: 'snowflake', title: 'Snowflake',       description: 'Connect to a Snowflake data warehouse',           category: 'database', img: LOGO_PREFIX + 'Snowflake.png',            tone: '#29b5e8' },
-
-  // Cloud storage
-  { key: 's3',           title: 'Amazon S3',            description: 'Connect to Amazon S3 object storage', category: 'storage', img: LOGO_PREFIX + 'Amazon_S3.png',            tone: '#ff9900' },
-  { key: 'gcs',          title: 'Google Cloud Storage', description: 'Connect to Google Cloud Storage',     category: 'storage', img: LOGO_PREFIX + 'Google_Cloud_Storage.png', tone: '#4285f4' },
-  { key: 'azure-blob',   title: 'Azure Blob Storage',   description: 'Connect to Azure Blob Storage',       category: 'storage', img: LOGO_PREFIX + 'Azure_blob.png',           tone: '#0078d4' },
-  { key: 'dropbox',      title: 'Dropbox',              description: 'Connect to Dropbox cloud storage',    category: 'storage', img: 'http://www.ternlux.com/wp-content/uploads/2026/05/Dropbox-scaled.png', letters: 'DB', tone: '#0061ff' },
-  { key: 'google-drive', title: 'Google Drive',         description: 'Connect to Google Drive',             category: 'storage', letters: 'GD', tone: '#34a853' },
-  { key: 'onedrive',     title: 'OneDrive',             description: 'Connect to Microsoft OneDrive',       category: 'storage', letters: 'OD', tone: '#0078d4' },
-
-  // APIs
-  { key: 'google-sheets', title: 'Google Sheets', description: 'Connect to Google Sheets via OAuth2.0',                                  category: 'api', img: LOGO_PREFIX + 'Google_Sheets.png', tone: '#34a853' },
-  { key: 'rest-api',      title: 'REST API',      description: 'Generic HTTP endpoint — URL + your own key/value credentials here, request authored on the node', category: 'api', letters: 'API', tone: '#2563eb' },
-
-  // Vector
-  { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', letters: 'PC', tone: '#0f172a' },
-];
+import { CONNECTION_TYPES, ConnectorLogo } from './connections/connectorCatalog';
 
 const SECTIONS = [
   { key: 'file',     title: 'Local Files',          desc: 'Files and local databases, queried where they are', buttonText: 'Select',  tagText: 'Ready' },
@@ -104,33 +65,9 @@ const ensureStyles = () => {
 
 // Visual primitives ---------------------------------------------------------
 
-const Icon = ({ c }) => {
-  const [errored, setErrored] = useState(false);
-  const showImg = c.img && !errored;
-  const letters = c.letters || c.title.slice(0, 2).toUpperCase();
-  return (
-    <div className="cts-ico" style={{
-      width: 44, height: 44, borderRadius: 6,
-      background: C.surface, border: `1px solid ${C.border}`,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      overflow: 'hidden', flexShrink: 0, marginTop: 2,
-    }}>
-      {showImg ? (
-        <img
-          src={c.img}
-          alt={c.title}
-          style={{ width: 28, height: 28, objectFit: 'contain' }}
-          onError={() => setErrored(true)}
-        />
-      ) : (
-        <span style={{
-          fontFamily: MONO, fontSize: 11, fontWeight: 700,
-          letterSpacing: '0.04em', color: c.tone || C.muted,
-        }}>{letters}</span>
-      )}
-    </div>
-  );
-};
+const Icon = ({ c }) => (
+  <ConnectorLogo c={c} size={44} imgSize={28} letterSize={11} style={{ marginTop: 2 }} />
+);
 
 const StatusTag = ({ c, installing, installed, locked }) => {
   const base = {

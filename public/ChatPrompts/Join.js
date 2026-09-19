@@ -6,6 +6,31 @@
 const JoinPrompts = {
   /**
    * Analyze join request to determine configuration needs
+   *
+   * ── "merge_existing" is intentionally NOT offered to the model ──────────────
+   *
+   * The prompt used to present `"operationMode": "new_table" | "merge_existing"`
+   * and to gate the target-table rules on `operationMode === 'new_table'`. The
+   * removed behaviour was:
+   *
+   *   - merge_existing meant "the destination table ALREADY exists, append into
+   *     it", so the generator emitted `targetDdl: null`;
+   *   - `targetTableName` and the "Target Table Name" checklist item were only
+   *     REQUIRED for new_table, and optional otherwise.
+   *
+   * It was removed because the executor cannot honour it. NodeExecution.js only
+   * creates the destination under `operationMode === 'new_table' && targetDdl`,
+   * so a merge_existing join into a table that does not exist yet fails at the
+   * INSERT with "Table 'x' doesn't exist" and has no way to create it. Every
+   * live caller already passes 'new_table' (workflowBuilder.js:2647) — the mode
+   * only ever appeared because the model was offered it here.
+   *
+   * To bring it back, the executor needs a create-if-missing path for the
+   * destination (the output node already has one) before the prompt offers the
+   * mode again.
+   *
+   * `operationMode` stays in the signature: it is positional, and callers pass
+   * it. It is simply no longer read.
    */
   joinAnalysisRequest: (
     userRequest,
@@ -25,7 +50,8 @@ ${sourcesInfo}
 Available Destinations:
 ${availableDestinations}
 
-${operationMode === 'new_table' ? 'Operation Mode: NEW TABLE (creating a new table/collection)\n' : ''}
+Operation Mode: NEW TABLE (creating a new table/collection)
+
 ${(vectorContext.hasVectorSource || vectorContext.hasVectorDestination) ? `
 ## Vector / embedding context detected
 ${vectorContext.hasVectorSource ? '- One or more SOURCES are vector databases (LanceDB / Pinecone).\n' : ''}${vectorContext.hasVectorDestination ? '- The DESTINATION is a vector database (LanceDB / Pinecone).\n' : ''}
@@ -67,29 +93,31 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
 
 Analyze the user's request and conversation history to determine the next steps. Return JSON with the following structure:
 {
-  "action": "answer_directly" | "ask_questions" | "generate_join",
+  "action": "ask_questions" | "generate_join",
   "usesSkill": false | true,
   "skillId": "skill-id-here (only if usesSkill is true)",
   "skillExplanation": "Brief explanation of why this skill is being used (only if usesSkill is true)",
   "vectorRequired": false | true,   // true ONLY when this join needs runtime embedding / similarity search (Scenario B). Defaults to false. Read the user's intent — a vector source on its own does NOT imply vectorRequired.
   "inferredSettings": {
     "destinationSelection": "connection_id or local-duckdb or local-lancedb",   // optional; use local-lancedb when the user wants the result stored as a LOCAL vector table — embeddings / a lancedb table / similarity-searchable — and named no saved vector connection. Do NOT downgrade a requested local vector table to local-duckdb
-    "operationMode": "new_table" | "merge_existing",   // optional
-    "targetTableName": "table_name",   // ${operationMode === 'new_table' ? 'REQUIRED for new_table mode' : 'optional'}
-    "joinType": "INNER" | "LEFT" | "FULL",   // optional
-    "joinColumns": [{"source1": "col", "source2": "col"}],   // optional
+    "operationMode": "new_table",   // the only supported mode — always emit exactly this
+    "targetTableName": "table_name",   // REQUIRED
     "selectedColumns": {"sourceLabel1": ["col1", "col2"], "sourceLabel2": ["col3"]}   // optional; "*" as the only entry for a source means ALL of that source's columns — see below
   },
   "followUpQuestion": "Single clear question to ask the user",   // only if action is "ask_questions"
-  "directAnswer": "answer if action is answer_directly",   // only if action is "answer_directly"
   "reasoning": "explanation of decision"
 }
 
 CRITICAL RULES FOR JOINS:
 
-1. When to answer_directly:
-   - User is asking informational questions (not requesting a join)
-   - Examples: "What columns are in source 1?", "How many sources?", "What join types are supported?"
+1. There are exactly TWO actions, and every request ends in one of them — you either
+   build the join, or you ask. You are a builder, not a chat partner: you do not
+   answer questions as an end in itself, and you never report a request as
+   impossible in a way that looks like a finished node. An informational question
+   ("What columns are in source 1?", "What join types are supported?") is
+   "ask_questions": answer it inside followUpQuestion, then ask what you still need.
+   So is anything you cannot do — a named table that is not among the sources
+   above, a request that contradicts them.
 
 2. When to ask_questions:
    - You are missing ANY of the following information needed to generate a join
@@ -114,16 +142,16 @@ CRITICAL RULES FOR JOINS:
 
    d) Table Names and Context: Understanding what each source represents
       - If table names are unclear, ask: "Can you describe what data each source contains?"
-${operationMode === 'new_table' ? `
-   e) Target Table Name: REQUIRED for new_table mode
+   e) Target Table Name: REQUIRED
       - If user hasn't specified a name for the new table/collection, ask: "What would you like to name the new table/collection?"
       - This is MANDATORY before generating the join
-` : ''}
+
 3. When to generate_join:
    - ONLY when you have explicitly confirmed ALL of:
      a) Join relationships (exact column mappings between ALL tables)
      b) Join types (INNER/LEFT/FULL for each join)
-     c) Column selection (which columns from each source)${operationMode === 'new_table' ? '\n     d) Target table name (REQUIRED for new_table mode)' : ''}
+     c) Column selection (which columns from each source)
+     d) Target table name (REQUIRED)
    - User has explicitly stated this information in current or previous messages
    - NO ASSUMPTIONS about relationships even if column names look similar
 
@@ -131,6 +159,18 @@ ${operationMode === 'new_table' ? `
    - Ask ONE clear, specific question at a time
    - Build on previous answers from chat history
    - Be specific: mention table names and column names you've seen
+   - Write for someone who has never seen this system's internals. Ask about
+     THEIR data — tables, columns, the result they want. Never mention the
+     response format, "settings", "configuration", or what this JSON can or
+     cannot express: the user cannot see those, cannot change them, and cannot
+     answer a question about them.
+   - Never ask a question whose only sensible answer is "yes". If there is one
+     reasonable reading of the request, that is not a question — build it.
+   - A request needing several joins, a filter between them, a de-duplication
+     pass, or three or more sources chained in sequence is ORDINARY. The next
+     step writes the join as free-form SQL, or as a JavaScript function for a
+     NoSQL destination, so it can express any number of stages. How involved
+     the join is, is never by itself a reason to ask.
    - Examples of good questions:
      * "I see TableA has 'customer_id' and TableB has 'cust_id'. Should these be joined together? If not, how should TableA be joined with TableB?"
      * "For the join between Customers and Orders, do you want an INNER join (only customers with orders) or LEFT join (all customers, even without orders)?"
@@ -169,13 +209,13 @@ Current: "Include all columns from both tables"
 
 Example 4 - Informational:
 User: "What columns are available in the first source?"
-→ action: "answer_directly", directAnswer: "The first source contains these columns: ..."
+→ action: "ask_questions", followUpQuestion: "The first source contains these columns: ... Which of them should the join match on?"
 
-CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something or answer a question, put that text inside the "directAnswer" field and set "action" to "answer_directly" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
+CRITICAL OUTPUT FORMAT — respond with a SINGLE raw JSON object and NOTHING else. Do not wrap it in markdown code fences, and do not write any text, notes, or commentary before or after the object. If you need to explain something, answer a question, or say why you cannot proceed, put that text inside the "followUpQuestion" field and set "action" to "ask_questions" — never write prose outside the JSON. Any character outside the JSON object will break parsing and cause the request to fail.
 
 The structure above is ANNOTATED, not literal: the "|" unions list the allowed values (pick ONE) and the "//" notes describe each field. Neither is part of the output. Your reply must be strict JSON — no comments, no "|", a comma between every pair of fields.
 
-Watch the nesting: "inferredSettings" contains ONLY destinationSelection, operationMode, targetTableName, joinType, joinColumns and selectedColumns. "reasoning", "followUpQuestion" and "directAnswer" are SIBLINGS of "inferredSettings" at the top level, never inside it. Before you send, check that the last character is the "}" that closes the outermost object, not the one that closes "inferredSettings".
+Watch the nesting: "inferredSettings" contains ONLY destinationSelection, operationMode, targetTableName and selectedColumns. "reasoning" and "followUpQuestion" are SIBLINGS of "inferredSettings" at the top level, never inside it. Before you send, check that the last character is the "}" that closes the outermost object, not the one that closes "inferredSettings".
   `,
 
   /**
@@ -192,17 +232,66 @@ ${JSON.stringify(joinSettings, null, 2)}
 
 Destination Configuration:
 ${JSON.stringify(destinationConfig, null, 2)}
-
+${destinationConfig.quotedTargetRef ? `
+- Write the destination table in SQL as EXACTLY: ${destinationConfig.quotedTargetRef}
+  Use that form as the table name in "targetDdl", the INSERT target in
+  "joinSql", and the FROM clause in "previewSql". Do not re-quote, re-case, add
+  a schema or strip one. The examples below spell the target bare because they
+  are engine-neutral illustrations; this form wins over them.
+` : ''}
 Source Requirements:
 Each source has been analyzed to determine what fields are needed based on source type and destination type.
 
 ${sources.map((src, idx) => `
 Source ${idx + 1}: ${src.sourceNodeLabel || src.sourceNodeId}
-- Table/Index: ${src.tableName}
+- sourceNodeId: ${src.sourceNodeId}
+- Table/Index: ${src.tableName}${src.quotedTableRef ? `
+- Write it in SQL as EXACTLY: ${src.quotedTableRef}` : ''}${src.quotedColumns ? `
+- Write its columns in SQL as EXACTLY: ${Object.values(src.quotedColumns).join(', ')}` : ''}
 - Source Type: ${src.dbType || 'unknown'}${src.isSourceVector ? ' [VECTOR DB]' : ''}
 - In Destination DB: ${src.isInDestinationDb ? 'Yes (no temp table needed)' : 'No (needs temp table)'}
-- Required Fields: ${src.requiredFields.length > 0 ? src.requiredFields.join(', ') : 'None (reference existing table directly in joinSql)'}
+- Required Fields: ${src.requiredFields.length > 0 ? src.requiredFields.join(', ') : 'None (reference existing table directly in joinSql)'}${src.tempTableName ? `
+- Its temp table is already named for you: use "tempTableName": "${src.tempTableName}"${src.quotedTempTableRef ? `
+- Write that temp table in SQL as EXACTLY: ${src.quotedTempTableRef}` : ''}` : ''}
 `).join('')}
+
+Identifier quoting: where a source above gives a "Write it in SQL as EXACTLY"
+form, copy that string verbatim — the table form into the FROM clause of that
+source's \`sql\`, and the column forms wherever you name that source's columns
+in it. They are already quoted for that engine: do not re-quote them, re-case
+them, add a schema, or strip one. The engines disagree about names written
+bare: Snowflake folds them to UPPER case, MySQL and PostgreSQL to lower, so a
+table or column whose real name is lower-case, mixed-case, or contains a dot is
+reachable only when quoted. Writing a name yourself is how a join reads an
+object that does not exist while the same one answers perfectly to the form
+given above.
+
+An ALIAS you invent is your own new name, not one of these — write it plain:
+\`SELECT "unit_price" AS tp_unit_price\`. And a source with no quoted forms
+listed keeps the plain names shown above.
+
+${sources.some((s) => s.tempTableName) ? `Temp tables: where a source above is given a temp table name and a "Write that
+temp table in SQL as EXACTLY" form, both are fixed — do not rename, re-case or
+re-quote either one.
+  • "tempTableName" is the bare name, copied verbatim into that field.
+  • The quoted form is the ONLY way to write that table in SQL: it is the table
+    name in this source's \`ddl\` (\`CREATE TABLE <quoted form> (...)\`), its FROM
+    clause in \`joinSql\`, and its key in \`joinColumns\`.
+These two must name the SAME object, and on some engines a bare name does not.
+The executor CREATEs the table from your \`ddl\` and then loads it through the
+destination's own quoting, so a bare \`CREATE TABLE temp_x\` on Snowflake makes
+TEMP_X while the load asks for "temp_x" — the join then fails with
+\`Table '"temp_x"' does not exist\` after reading every source row for nothing.
+
+` : ''}
+
+Source ids: every "sourceNodeId" you write — in "sourcesConfig" and as a key of
+"selectedColumns" — must be one of these, copied character for character:
+${sources.map((src) => `  ${src.sourceNodeId}`).join('\n')}
+These are opaque keys the executor uses to look up each source's connection.
+Never invent one, never add or drop a suffix, never substitute a label or a
+table name: an id that is not on this list has no connection behind it and the
+join fails at run time.
 
 Column selection: in the TOP-LEVEL "selectedColumns" map, \`["*"]\` means all of
 that source's columns as listed above — use it when you carry a whole side
@@ -342,6 +431,22 @@ You MUST emit a \`javascriptFunction\` (no SQL) plus these top-level vector dest
 Do NOT emit \`targetDdl\`, \`joinSql\`, or \`previewSql\` — those are skipped for vector destinations.
 ` : ''}
 
+"targetColumns" is every column the JOINED OUTPUT actually contains, in order —
+the names as they land in the result, ALIASES INCLUDED. Downstream nodes are
+configured from this list and nothing else, so it must describe what comes OUT,
+not what went in:
+
+  joinSql: SELECT s.customer_id, c.name AS customer_name, s.total_spend ...
+  targetColumns: [{"name":"customer_id","type":"VARCHAR"},
+                  {"name":"customer_name","type":"VARCHAR"},   <- the ALIAS
+                  {"name":"total_spend","type":"DOUBLE"}]
+
+Writing "name" there because that is what the source calls it produces SQL
+further down the pipeline that selects a column the result does not have. This
+is separate from "selectedColumns", which records which columns you READ from
+each source; the two differ exactly wherever you alias, compute or rename.
+For a JavaScript join, list the keys of the objects the function returns.
+
 Output Structure:
 ${destinationConfig.isVectorDestination ? `
 FOR VECTOR DESTINATION:
@@ -360,6 +465,7 @@ All sources are loaded into memory and joined with JavaScript. The skill embeds 
   ],
   "javascriptFunction": "function joinData(source1Data, source2Data) { /* return joined rows */ }",
   "selectedColumns": {"sourceNodeId1": ["col1"], "sourceNodeId2": ["col2"]},
+  "targetColumns": [{"name": "col", "type": "TYPE"}],   // every column the OUTPUT has, aliases included — see above
   "vectorDestination": {
     "vectorDbType": "lancedb",
     "targetTable": "${destinationConfig.tableName}",
@@ -384,7 +490,8 @@ All sources are loaded into memory and joined using JavaScript.
   ],
   "javascriptFunction": "function joinData(source1Data, source2Data, ...) { /* join logic */ return results; }",
   "targetCollection": "${destinationConfig.tableName}",
-  "selectedColumns": {"sourceNodeId1": ["col1", "col2"], "sourceNodeId2": ["col3"]}
+  "selectedColumns": {"sourceNodeId1": ["col1", "col2"], "sourceNodeId2": ["col3"]},
+  "targetColumns": [{"name": "col", "type": "TYPE"}],   // every column the OUTPUT has, aliases included — see above
 }
 
 Example (NoSQL source + SQL source):
@@ -429,7 +536,8 @@ are no temp tables, no CREATE TABLE, and no INSERT. Write ONE SELECT.
   "joinSql": "SELECT ... FROM orders o JOIN customers c ON o.customer_id = c.id",
   "previewSql": "SELECT ... FROM orders o JOIN customers c ON o.customer_id = c.id LIMIT 100",
   "joinColumns": [{"orders": "customer_id", "customers": "id"}],
-  "selectedColumns": {"sourceNodeId1": ["col1"], "sourceNodeId2": ["col2"]}
+  "selectedColumns": {"sourceNodeId1": ["col1"], "sourceNodeId2": ["col2"]},
+  "targetColumns": [{"name": "col", "type": "TYPE"}],   // every column the OUTPUT has, aliases included — see above
 }
 
 The dialect is DuckDB (PostgreSQL-flavoured). Useful extras: SELECT * EXCLUDE
@@ -479,18 +587,19 @@ External sources are loaded into temp tables. Sources already in destination are
     // For each source, include sourceNodeId and ONLY its required fields
     {
       "sourceNodeId": "...",
-      "tempTableName": "temp_node_xxx",   // Only if needs temp table. For databases with schemas (Snowflake, PostgreSQL, etc.), use fully-qualified name matching DDL
-      "ddl": "CREATE TABLE temp_node_xxx (col1 TYPE, col2 TYPE, col3 TYPE)",   // Columns in DDL MUST be in the SAME ORDER as selectedColumns. Table name MUST match tempTableName exactly
+      "tempTableName": "temp_node_xxx",   // Only if needs temp table. Copy the name given for this source in Source Requirements above — do not invent one
+      "ddl": "CREATE TABLE temp_node_xxx (col1 TYPE, col2 TYPE, col3 TYPE)",   // Columns in DDL MUST be in the SAME ORDER as selectedColumns. The table name here MUST be that source's "Write that temp table in SQL as EXACTLY" form — already quoted for this engine, and the examples below show the SHAPE only, not the quoting
       "sql": "SELECT col1, col2, col3 FROM ... {LIMIT_OFFSET_HERE}",   // EITHER, for a SQL source: must end with {LIMIT_OFFSET_HERE}. Columns in SELECT MUST be in the SAME ORDER as selectedColumns
       "nosqlOperation": "...",   // OR, for a NoSQL source needing a temp table: JSON string query. Emit "sql" or "nosqlOperation", never both
       "selectedColumns": ["col1", "col2", "col3"]   // Array defining column order - DDL, SQL, and this array MUST all match
     }
   ],
-  "targetDdl": "CREATE TABLE ...",   // Only if operationMode is "new_table", else null. MUST be a SINGLE CREATE TABLE statement ONLY — the execution engine already DROPs the target table before running this DDL, so do NOT prepend a DROP statement or include any other statement (a multi-statement string only has its FIRST statement executed, which would run the DROP and skip the CREATE)
+  "targetDdl": "CREATE TABLE ...",   // ALWAYS required — never null. Without it the destination table is never created and the joinSql below fails with "table doesn't exist". MUST be a SINGLE CREATE TABLE statement ONLY — the execution engine already DROPs the target table before running this DDL, so do NOT prepend a DROP statement or include any other statement (a multi-statement string only has its FIRST statement executed, which would run the DROP and skip the CREATE)
   "joinSql": "INSERT INTO target_table SELECT ... FROM temp_xxx t1 JOIN existing_table t2 ...",
-  "previewSql": "SELECT * FROM ${destinationConfig.tableName} LIMIT 100",
+  "previewSql": "SELECT * FROM ${destinationConfig.tableName} LIMIT 100",   // SHAPE only — write the target in the exact form given under Destination Configuration
   "joinColumns": [{"table1": "col", "table2": "col"}],
-  "selectedColumns": {"sourceNodeId1": ["col1"], "sourceNodeId2": ["col2"]}
+  "selectedColumns": {"sourceNodeId1": ["col1"], "sourceNodeId2": ["col2"]},
+  "targetColumns": [{"name": "col", "type": "TYPE"}],   // every column the OUTPUT has, aliases included — see above
 }
 
 CRITICAL REQUIREMENTS for DDL, SQL, and selectedColumns order:
@@ -510,6 +619,31 @@ CRITICAL REQUIREMENTS for DDL, SQL, and selectedColumns order:
    FIRST statement of the string is executed — a leading DROP would run and the CREATE
    would be skipped, causing "no such table" when the join INSERT runs. Same for any
    per-source "ddl": a single CREATE TABLE statement, no DROP.
+9. CRITICAL: every "ddl" and "targetDdl" runs on the DESTINATION, so its column types
+   MUST be valid in the DESTINATION's dialect — never in a source's.
+   - Do NOT copy the type names out of a source's sourceTableSchema. Those describe
+     where the data is READ FROM. A source's "VARCHAR" / "DOUBLE" / "TEXT" comes from
+     DuckDB, Snowflake or Postgres and may not even parse on the destination.
+   - Translate each column to the destination's own type, sized where that dialect
+     requires it. MySQL and SQL Server REJECT a bare VARCHAR — it must carry a length,
+     e.g. VARCHAR(255). Postgres, DuckDB and Snowflake accept a bare VARCHAR.
+   - When a source type has no exact destination equivalent, choose the nearest one
+     that holds the values; a wider string type is safer than a numeric guess.
+   - Getting this wrong fails the CREATE TABLE, and the join then reports the missing
+     table rather than the type that was refused.
+10. CRITICAL: a temp table's name is NOT yours to choose. Source Requirements above
+   gives each one a "tempTableName" and the exact form to write it in SQL. Copy the
+   bare name into "tempTableName", and use the quoted form — unchanged — as the table
+   name in that source's "ddl", in its FROM clause in "joinSql", and as its key in
+   "joinColumns". The examples below spell temp tables bare because they are
+   engine-neutral illustrations; the forms given above win over them.
+11. CRITICAL: the same applies to the DESTINATION table. Where Destination
+   Configuration above gives a "Write the destination table in SQL as EXACTLY"
+   form, that form is the table name in "targetDdl", the INSERT target in
+   "joinSql" and the FROM clause in "previewSql" — unchanged. The examples spell
+   it bare; the form given above wins. A name written bare and the same name
+   written quoted are DIFFERENT tables on some engines, so a bare CREATE here
+   builds one table while everything downstream reads another.
 
 Example 1 (External SQL source + SQL source in destination):
 {

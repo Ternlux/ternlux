@@ -38,13 +38,86 @@ async function getConnection(config, connectionId) {
 // wants a params object, so these helpers bridge the two. Raw JSON params are
 // still accepted unchanged, which is what the AI-generated nodes emit.
 
-/** Methods we can execute, mapped to the operation runQuery understands. */
+/**
+ * Methods we can execute, in mongosh spelling.
+ *
+ * `operation` is what runQuery switches on. `args` names the positional
+ * arguments in shell order, so `.updateMany(f, u, o)` arrives as
+ * `{ filter, update, options }`, and `required` is how many of them the driver
+ * will not default for us. `cursor` marks the reads a `.sort()/.limit()/…`
+ * chain may follow — `'pipeline'` for aggregate, whose ordering and projection
+ * belong in the pipeline itself.
+ */
 const SHELL_METHODS = {
-  find: 'find',
-  findOne: 'find',
-  aggregate: 'aggregate',
-  count: 'count',
-  countDocuments: 'count',
+  // reads
+  find: { operation: 'find', args: ['filter', 'projection'], cursor: true },
+  findOne: { operation: 'find', args: ['filter', 'projection'], limit: 1 },
+  aggregate: { operation: 'aggregate', args: ['pipeline'], required: 1, cursor: 'pipeline' },
+  count: { operation: 'count', args: ['filter'] },
+  countDocuments: { operation: 'count', args: ['filter'] },
+  estimatedDocumentCount: { operation: 'estimatedDocumentCount', args: [] },
+  distinct: { operation: 'distinct', args: ['field', 'filter'], required: 1 },
+
+  // writes. The filter is required rather than defaulted: mongosh refuses a
+  // bare .deleteMany(), and "every document in the collection" should have to
+  // be written out as .deleteMany({}) here too.
+  insertOne: { operation: 'insertOne', args: ['document'], required: 1 },
+  insertMany: { operation: 'insertMany', args: ['documents'], required: 1 },
+  updateOne: { operation: 'updateOne', args: ['filter', 'update', 'options'], required: 2 },
+  updateMany: { operation: 'updateMany', args: ['filter', 'update', 'options'], required: 2 },
+  replaceOne: { operation: 'replaceOne', args: ['filter', 'replacement', 'options'], required: 2 },
+  deleteOne: { operation: 'deleteOne', args: ['filter', 'options'], required: 1 },
+  deleteMany: { operation: 'deleteMany', args: ['filter', 'options'], required: 1 },
+  findOneAndUpdate: { operation: 'findOneAndUpdate', args: ['filter', 'update', 'options'], required: 2 },
+  findOneAndReplace: { operation: 'findOneAndReplace', args: ['filter', 'replacement', 'options'], required: 2 },
+  findOneAndDelete: { operation: 'findOneAndDelete', args: ['filter', 'options'], required: 1 },
+  bulkWrite: { operation: 'bulkWrite', args: ['operations', 'options'], required: 1 },
+
+  // collection and index administration
+  drop: { operation: 'drop', args: [] },
+  renameCollection: { operation: 'renameCollection', args: ['target', 'dropTarget'], required: 1 },
+  createIndex: { operation: 'createIndex', args: ['keys', 'options'], required: 1 },
+  dropIndex: { operation: 'dropIndex', args: ['index'], required: 1 },
+  getIndexes: { operation: 'listIndexes', args: [] },
+  indexes: { operation: 'listIndexes', args: [] },
+  listIndexes: { operation: 'listIndexes', args: [] },
+};
+
+/** The same, for the commands written against `db` itself rather than a collection. */
+const DB_METHODS = {
+  getCollectionNames: { operation: 'listCollections', args: [], fixed: { namesOnly: true } },
+  getCollectionInfos: { operation: 'listCollections', args: ['filter'] },
+  createCollection: { operation: 'createCollection', args: ['name', 'options'], required: 1 },
+  runCommand: { operation: 'runCommand', args: ['command'], required: 1 },
+  stats: { operation: 'dbStats', args: [] },
+};
+
+/** Operations that name no collection. Everything else needs one. */
+const DB_LEVEL_OPS = new Set(['listCollections', 'createCollection', 'runCommand', 'dbStats']);
+
+const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * What each named argument has to be, so a mistyped call fails here — with a
+ * sentence about the call the user wrote — rather than deep inside the driver.
+ */
+const ARG_SHAPES = {
+  pipeline: [Array.isArray, 'an array pipeline'],
+  documents: [Array.isArray, 'an array of documents'],
+  operations: [Array.isArray, 'an array of write operations'],
+  update: [(v) => isPlainObject(v) || Array.isArray(v), 'an update document or an aggregation pipeline'],
+  index: [(v) => typeof v === 'string' || isPlainObject(v), 'an index name or a key pattern'],
+  field: [(v) => typeof v === 'string', 'a field name'],
+  target: [(v) => typeof v === 'string', 'the new collection name'],
+  name: [(v) => typeof v === 'string', 'a collection name'],
+  dropTarget: [(v) => typeof v === 'boolean', 'true or false'],
+  filter: [isPlainObject, 'an object'],
+  projection: [isPlainObject, 'an object'],
+  options: [isPlainObject, 'an object'],
+  document: [isPlainObject, 'a document object'],
+  replacement: [isPlainObject, 'a replacement document'],
+  keys: [isPlainObject, 'a key pattern object'],
+  command: [isPlainObject, 'a command document'],
 };
 
 /**
@@ -118,11 +191,53 @@ function parseShellValue(text) {
   return parseFilter(text);
 }
 
+/** `db.<collection>.<method>(` and `db.<method>(`, the two call shapes. */
+const COLLECTION_CALL = /^db\s*\.\s*(?:getCollection\(\s*['"]([^'"]+)['"]\s*\)|([A-Za-z0-9_$][\w$.-]*))\s*\.\s*([A-Za-z]+)\s*\(/;
+const DB_CALL = /^db\s*\.\s*([A-Za-z][\w$]*)\s*\(/;
+
+/** Cursor methods aggregate accepts; the rest are pipeline stages there. */
+const PIPELINE_CHAIN = new Set(['limit', 'explain', 'toArray', 'pretty']);
+const STAGE_FOR = { sort: '$sort', skip: '$skip', project: '$project', projection: '$project', count: '$count' };
+
+/**
+ * Positional shell arguments → the named params runQuery reads, checked
+ * against the method's spec.
+ */
+function applyArgs(spec, method, args, params) {
+  const names = spec.args || [];
+  const required = spec.required || 0;
+
+  if (args.length < required) {
+    throw new Error(`.${method}() needs (${names.slice(0, required).join(', ')})`);
+  }
+  if (args.length > names.length) {
+    throw new Error(
+      names.length
+        ? `.${method}() takes at most ${names.length} argument(s): (${names.join(', ')})`
+        : `.${method}() takes no arguments`,
+    );
+  }
+
+  names.forEach((name, i) => {
+    if (i >= args.length) return;
+    const value = parseShellValue(args[i]);
+    const shape = ARG_SHAPES[name];
+    if (shape && !shape[0](value)) {
+      throw new Error(`.${method}() expects ${name} to be ${shape[1]}`);
+    }
+    params[name] = value;
+  });
+
+  if (spec.fixed) Object.assign(params, spec.fixed);
+  if (spec.limit) params.limit = spec.limit;
+}
+
 /**
  * Turn one statement of editor text into the params object runQuery expects.
- * Accepts either a `db.<collection>.<method>(...)` chain or raw JSON params.
+ * Accepts a `db.<collection>.<method>(...)` chain, a `db.<method>(...)` command,
+ * or raw JSON params.
  *
- * @throws {Error} when the text is neither form, or an argument won't parse
+ * @throws {Error} when the text is none of those, or an argument won't parse
  */
 function parseExplorerQuery(text) {
   const body = String(text || '').trim().replace(/;\s*$/, '');
@@ -131,60 +246,69 @@ function parseExplorerQuery(text) {
   // Raw params object — `{ collection: "x", filter: {...} }`.
   if (body.startsWith('{')) {
     const params = parseShellValue(body);
-    if (!params.collection) {
+    if (!params.collection && !DB_LEVEL_OPS.has(params.operation)) {
       throw new Error('A raw query object needs a "collection" field');
     }
     return params;
   }
 
-  const head = /^db\s*\.\s*(?:getCollection\(\s*['"]([^'"]+)['"]\s*\)|([A-Za-z0-9_$][\w$.-]*))\s*\.\s*([A-Za-z]+)\s*\(/.exec(body);
-  if (!head) {
-    throw new Error('Expected db.<collection>.find(...) / .aggregate([...]), or a raw { collection: … } object');
+  const head = COLLECTION_CALL.exec(body);
+  const dbCall = head ? null : DB_CALL.exec(body);
+  if (!head && !dbCall) {
+    throw new Error('Expected db.<collection>.<method>(…), db.<method>(…), or a raw { collection: … } object');
   }
 
-  const collection = head[1] || head[2];
-  const method = head[3];
-  const operation = SHELL_METHODS[method];
-  if (!operation) {
-    throw new Error(`Unsupported method ".${method}()" — use find, aggregate, or countDocuments`);
+  const method = head ? head[3] : dbCall[1];
+  const spec = head ? SHELL_METHODS[method] : DB_METHODS[method];
+  if (!spec) {
+    throw new Error(head
+      ? `Unsupported method ".${method}()" — this connection runs ${Object.keys(SHELL_METHODS).join(', ')}`
+      : `Unsupported command "db.${method}()" — use ${Object.keys(DB_METHODS).join(', ')}, or db.<collection>.${method}()`);
   }
 
-  const openParen = body.indexOf('(', head[0].length - 1);
+  const params = { operation: spec.operation };
+  if (head) params.collection = head[1] || head[2];
+
+  const call = head || dbCall;
+  const openParen = body.indexOf('(', call[0].length - 1);
   const closeParen = matchBracket(body, openParen);
   if (closeParen === -1) throw new Error(`Unclosed "(" after .${method}`);
 
-  const args = splitArgs(body.slice(openParen + 1, closeParen));
-  const params = { collection };
+  applyArgs(spec, method, splitArgs(body.slice(openParen + 1, closeParen)), params);
 
-  if (operation === 'aggregate') {
-    if (!args.length) throw new Error('aggregate() needs a pipeline array');
-    const pipeline = parseShellValue(args[0]);
-    if (!Array.isArray(pipeline)) throw new Error('aggregate() expects an array pipeline');
-    params.operation = 'aggregate';
-    params.pipeline = pipeline;
-  } else if (operation === 'count') {
-    params.operation = 'count';
-    params.filter = args.length ? parseShellValue(args[0]) : {};
-  } else {
-    params.filter = args.length ? parseShellValue(args[0]) : {};
-    if (args.length > 1) params.projection = parseShellValue(args[1]);
-    if (method === 'findOne') params.limit = 1;
-  }
-
-  // Trailing chain: .sort({...}).limit(n).skip(n).project({...})
+  // Trailing chain: .sort({...}).limit(n).skip(n).project({...}).toArray()
   let rest = body.slice(closeParen + 1);
-  const CHAIN = /^\s*\.\s*(sort|limit|skip|project|projection)\s*\(/;
+  const CHAIN = /^\s*\.\s*(sort|limit|skip|project|projection|count|explain|toArray|pretty)\s*\(/;
   while (CHAIN.test(rest)) {
-    const call = CHAIN.exec(rest);
-    const open = rest.indexOf('(', call[0].length - 1);
+    const chained = CHAIN.exec(rest);
+    const name = chained[1];
+
+    if (!spec.cursor) {
+      throw new Error(`.${name}() cannot follow .${method}(), which returns no cursor`);
+    }
+    if (spec.cursor === 'pipeline' && !PIPELINE_CHAIN.has(name)) {
+      throw new Error(`.${name}() cannot follow .aggregate() — use a ${STAGE_FOR[name]} stage in the pipeline instead`);
+    }
+
+    const open = rest.indexOf('(', chained[0].length - 1);
     const close = matchBracket(rest, open);
-    if (close === -1) throw new Error(`Unclosed "(" after .${call[1]}`);
+    if (close === -1) throw new Error(`Unclosed "(" after .${name}`);
 
     const raw = rest.slice(open + 1, close).trim();
-    const name = call[1];
-    if (name === 'limit' || name === 'skip') {
+    if (name === 'toArray' || name === 'pretty') {
+      // Shell punctuation: both only decide how mongosh PRINTS a cursor, and
+      // the grid does its own rendering. Accepted and ignored so a line pasted
+      // out of a shell session runs unedited.
+      if (raw) throw new Error(`.${name}() takes no arguments`);
+    } else if (name === 'explain') {
+      // `true` is the driver's default verbosity; a string names another.
+      params.explain = raw ? parseShellValue(raw) : true;
+    } else if (name === 'count') {
+      params.operation = 'count';
+      delete params.projection;
+    } else if (name === 'limit' || name === 'skip') {
       const n = Number(raw);
-      if (!Number.isFinite(n)) throw new Error(`.${name}() expects a number`);
+      if (!Number.isFinite(n) || n < 0) throw new Error(`.${name}() expects a non-negative number`);
       params[name] = n;
     } else if (raw) {
       params[name === 'projection' ? 'projection' : name] = parseShellValue(raw);
@@ -196,6 +320,24 @@ function parseExplorerQuery(text) {
   if (rest.trim()) throw new Error(`Unexpected trailing input: ${rest.trim().slice(0, 40)}`);
   return params;
 }
+
+/**
+ * A driver failure, with the driver's own classification kept alongside the text.
+ *
+ * The message alone cannot be reasoned about — "Duplicate column name 'x'" is
+ * prose that moves with the server's version and locale. The CODE is the
+ * driver's own answer to what KIND of failure this is, and the transform
+ * executor uses it to tell a structural change that was ALREADY APPLIED (what
+ * the second run of an in-place ALTER looks like) from one that genuinely
+ * failed. Callers that only read `message` are unaffected.
+ */
+const queryError = (error) => ({
+  success: false,
+  message: error.message,
+  // The driver numbers the condition and names it — e.g. 48 / 'NamespaceExists'.
+  code: error.code,
+  codeName: error.codeName,
+});
 
 module.exports = {
   type: 'connector',
@@ -221,7 +363,7 @@ module.exports = {
       await connection.close();
       return { success: true, message: 'Connection successful' };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -324,21 +466,46 @@ module.exports = {
   },
 
   /**
-   * Run MongoDB query (expects JSON with collection, filter, limit)
-   * Also supports operation types: drop, insertMany
+   * Run one MongoDB operation.
+   *
+   * `query` is a params object — `{ collection, filter, sort, skip, limit,
+   * projection }` for a find, or `{ collection, operation, … }` for anything
+   * else. `operation` is the driver method by its own name:
+   *
+   *   reads    find · aggregate · count · estimatedDocumentCount · distinct
+   *   writes   insertOne · insertMany · updateOne · updateMany · replaceOne ·
+   *            deleteOne · deleteMany · findOneAndUpdate · findOneAndReplace ·
+   *            findOneAndDelete · bulkWrite
+   *   admin    drop · renameCollection · createIndex · dropIndex · listIndexes
+   *   database listCollections · createCollection · runCommand · dbStats
+   *
+   * The Data Explorer reaches all of them through `explorer.parseQuery`, which
+   * translates the mongosh line the user typed into these params.
    */
   /**
-   * @param {number|{maxRows:number}} [limitOrOptions] - Historically a plain
-   *   row limit, and still is for every existing caller. The Data Explorer
-   *   passes `{ maxRows }` instead, which additionally reports whether more
-   *   documents were waiting. Either way the cap is applied to the CURSOR —
-   *   the user's filter or pipeline is never edited.
+   * @param {number|{maxRows:number}|0|null} [limitOrOptions] - Historically a
+   *   plain row limit. The Data Explorer passes `{ maxRows }` instead, which
+   *   additionally reports whether more documents were waiting. Pass `0` (or
+   *   null) for NO cap — a workflow reading a whole collection. Either way the
+   *   cap is applied to the CURSOR; the user's filter or pipeline is never
+   *   edited.
+   *
+   *   The 100 default is a PREVIEW default. It belongs to the Data Explorer and
+   *   to the sample reads that populate a node's schema, and it silently
+   *   truncated every execution path that did not override it: a join's
+   *   anti-join source saw only the first 100 existing documents, so everything
+   *   past position 100 looked new on every run and was re-appended forever.
+   *   Callers that mean "all of it" now say so.
    */
   runQuery: async (config, connectionId, query, limitOrOptions = 100) => {
     try {
+      const noCap = limitOrOptions === 0 || limitOrOptions === null;
       const opts = (limitOrOptions && typeof limitOrOptions === 'object') ? limitOrOptions : null;
-      const limit = opts ? (Number(opts.maxRows) || 100) : limitOrOptions;
+      // 0 reaches the driver as cursor.limit(0), which is MongoDB's own
+      // spelling of "no limit".
+      const limit = opts ? (Number(opts.maxRows) || 100) : (noCap ? 0 : limitOrOptions);
       // Read one past the cap so "there is more" is observed, not guessed.
+      // Never with noCap — opts is null there and nothing is being capped.
       const probe = opts ? limit + 1 : null;
       const connection = await getConnection(config, connectionId);
       query = query?.query ? query.query : query;
@@ -349,6 +516,80 @@ module.exports = {
       // the same as omitting `operation` — fall through to the default find
       // path below instead of failing with "Unknown operation type: find".
       if (params.operation && params.operation !== 'find') {
+        // Database-level commands first: they name no collection, so
+        // db.collection() below would have nothing to open.
+        if (DB_LEVEL_OPS.has(params.operation)) {
+          switch (params.operation) {
+            case 'listCollections': {
+              const infos = await db.listCollections(params.filter || {}).toArray();
+              // getCollectionNames() is the same listing narrowed to the names,
+              // which is what makes it a one-column result rather than a dump.
+              const rows = params.namesOnly ? infos.map((c) => ({ name: c.name })) : infos;
+              return {
+                success: true,
+                rows,
+                columns: rows.length ? Object.keys(rows[0]) : ['name'],
+                rowCount: rows.length,
+                json: true,
+              };
+            }
+
+            case 'createCollection': {
+              const name = params.name || params.collection;
+              if (!name) {
+                return { success: false, message: 'createCollection requires params.name' };
+              }
+              await db.createCollection(name, params.options || {});
+              return {
+                success: true,
+                message: `Created collection "${name}"`,
+                rowCount: 0,
+                mutated: [{ schema: db.databaseName, table: name }],
+              };
+            }
+
+            case 'runCommand': {
+              if (!params.command || typeof params.command !== 'object') {
+                return { success: false, message: 'runCommand requires params.command (object)' };
+              }
+              const out = await db.command(params.command);
+              // A command replies with one document, except the cursor-returning
+              // ones, which put documents in cursor.firstBatch. That is the FIRST
+              // BATCH only — the cursor is never iterated here, so a command with
+              // more than a batch's worth is better run through its own method
+              // (getCollectionInfos, getIndexes, aggregate).
+              const batch = out && out.cursor && Array.isArray(out.cursor.firstBatch)
+                ? out.cursor.firstBatch
+                : null;
+              const rows = batch || [out];
+              return {
+                success: true,
+                rows,
+                columns: rows.length ? Object.keys(rows[0]) : [],
+                rowCount: rows.length,
+                json: true,
+              };
+            }
+
+            case 'dbStats': {
+              const stats = await db.stats();
+              return {
+                success: true,
+                rows: [stats],
+                columns: Object.keys(stats),
+                rowCount: 1,
+                json: true,
+              };
+            }
+
+            default:
+              break;
+          }
+        }
+
+        if (!params.collection) {
+          return { success: false, message: `Operation "${params.operation}" needs a collection` };
+        }
         const coll = db.collection(params.collection);
 
         switch (params.operation) {
@@ -359,7 +600,10 @@ module.exports = {
               return {
                 success: true,
                 message: `Collection "${params.collection}" dropped successfully`,
-                rowCount: 0
+                rowCount: 0,
+                // The tree and the completions built from it are now describing
+                // something that isn't there; the explorer reloads what it's told.
+                mutated: [{ schema: db.databaseName, table: params.collection }]
               };
             } catch (err) {
               // If collection doesn't exist, that's fine
@@ -373,15 +617,172 @@ module.exports = {
               throw err;
             }
 
-          case 'insertMany':
-            // Insert many documents
-            const result = await coll.insertMany(params.documents);
+          case 'deleteMany': {
+            // Empty a collection (or the part of it a filter names) WITHOUT
+            // dropping it — an output node's truncate-and-insert wants the
+            // collection and its indexes to survive the load.
+            const deleted = await coll.deleteMany(params.filter || {});
+            return {
+              success: true,
+              message: `Deleted ${deleted.deletedCount} document(s) from "${params.collection}"`,
+              rowCount: deleted.deletedCount,
+              deletedCount: deleted.deletedCount
+            };
+          }
+
+          case 'insertMany': {
+            // Insert many documents.
+            //
+            // An empty set is a no-op, not an error. The driver disagrees —
+            // insertMany([]) throws `MongoInvalidArgumentError: Invalid
+            // BulkOperation, Batch cannot be empty` — and a caller with
+            // nothing to write is an ordinary outcome, not a broken one. This
+            // connector's own batchInsert has always answered it this way;
+            // runQuery now agrees rather than being the one path that throws.
+            const documents = Array.isArray(params.documents) ? params.documents : [];
+            if (documents.length === 0) {
+              return {
+                success: true,
+                message: `No documents to insert into "${params.collection}"`,
+                rowCount: 0,
+                insertedCount: 0
+              };
+            }
+            const result = await coll.insertMany(documents);
             return {
               success: true,
               message: `Inserted ${result.insertedCount} documents into "${params.collection}"`,
               rowCount: result.insertedCount,
               insertedCount: result.insertedCount
             };
+          }
+
+          case 'insertOne': {
+            const document = params.document
+              || (Array.isArray(params.documents) ? params.documents[0] : null);
+            if (!isPlainObject(document)) {
+              return { success: false, message: 'insertOne requires params.document (object)' };
+            }
+            const inserted = await coll.insertOne(document);
+            return {
+              success: true,
+              message: `Inserted 1 document into "${params.collection}" (_id: ${String(inserted.insertedId)})`,
+              rowCount: 1,
+              insertedCount: 1,
+              insertedId: inserted.insertedId
+            };
+          }
+
+          // One case for the three: they differ only in which document the
+          // driver is handed and how many documents it is allowed to touch.
+          case 'updateOne':
+          case 'updateMany':
+          case 'replaceOne': {
+            const isReplace = params.operation === 'replaceOne';
+            const change = isReplace ? params.replacement : params.update;
+            if (!change || typeof change !== 'object') {
+              return {
+                success: false,
+                message: `${params.operation} requires params.${isReplace ? 'replacement (object)' : 'update (object or pipeline)'}`
+              };
+            }
+            const updated = await coll[params.operation](
+              params.filter || {},
+              change,
+              params.options || {}
+            );
+            const upserted = updated.upsertedId
+              ? ` · upserted _id: ${String(updated.upsertedId)}`
+              : '';
+            return {
+              success: true,
+              message: `Matched ${updated.matchedCount}, modified ${updated.modifiedCount} document(s) in "${params.collection}"${upserted}`,
+              // The documents actually rewritten — the count a caller means by
+              // "how many rows did this change".
+              rowCount: updated.modifiedCount,
+              matchedCount: updated.matchedCount,
+              modifiedCount: updated.modifiedCount,
+              upsertedCount: updated.upsertedCount || 0,
+              upsertedId: updated.upsertedId || null
+            };
+          }
+
+          case 'deleteOne': {
+            const deleted = await coll.deleteOne(params.filter || {}, params.options || {});
+            return {
+              success: true,
+              message: `Deleted ${deleted.deletedCount} document(s) from "${params.collection}"`,
+              rowCount: deleted.deletedCount,
+              deletedCount: deleted.deletedCount
+            };
+          }
+
+          // The findAndModify family: a write that answers with the document.
+          case 'findOneAndUpdate':
+          case 'findOneAndReplace':
+          case 'findOneAndDelete': {
+            const filter = params.filter || {};
+            const options = params.options || {};
+            let outcome;
+
+            if (params.operation === 'findOneAndDelete') {
+              outcome = await coll.findOneAndDelete(filter, options);
+            } else if (params.operation === 'findOneAndReplace') {
+              if (!isPlainObject(params.replacement)) {
+                return { success: false, message: 'findOneAndReplace requires params.replacement (object)' };
+              }
+              outcome = await coll.findOneAndReplace(filter, params.replacement, options);
+            } else {
+              if (!params.update || typeof params.update !== 'object') {
+                return { success: false, message: 'findOneAndUpdate requires params.update (object or pipeline)' };
+              }
+              outcome = await coll.findOneAndUpdate(filter, params.update, options);
+            }
+
+            // Driver 5 wraps the document in { value, lastErrorObject, ok };
+            // driver 6 returns the document itself. Read either.
+            const doc = outcome && typeof outcome === 'object' && 'value' in outcome
+              ? outcome.value
+              : outcome;
+
+            return {
+              success: true,
+              rows: doc ? [doc] : [],
+              columns: doc ? Object.keys(doc) : [],
+              rowCount: doc ? 1 : 0,
+              message: doc ? null : `No document in "${params.collection}" matched`,
+              json: true
+            };
+          }
+
+          case 'bulkWrite': {
+            const operations = Array.isArray(params.operations) ? params.operations : [];
+            // Nothing to do is an ordinary outcome, and the driver rejects an
+            // empty batch — the same reasoning as insertMany above.
+            if (operations.length === 0) {
+              return {
+                success: true,
+                message: `No write operations for "${params.collection}"`,
+                rowCount: 0
+              };
+            }
+            const bulk = await coll.bulkWrite(operations, params.options || {});
+            const counts = {
+              insertedCount: bulk.insertedCount || 0,
+              matchedCount: bulk.matchedCount || 0,
+              modifiedCount: bulk.modifiedCount || 0,
+              deletedCount: bulk.deletedCount || 0,
+              upsertedCount: bulk.upsertedCount || 0
+            };
+            return {
+              success: true,
+              message: `Inserted ${counts.insertedCount}, modified ${counts.modifiedCount}, `
+                + `deleted ${counts.deletedCount}, upserted ${counts.upsertedCount} in "${params.collection}"`,
+              rowCount: counts.insertedCount + counts.modifiedCount
+                + counts.deletedCount + counts.upsertedCount,
+              ...counts
+            };
+          }
 
           case 'count': {
             // Document count for params.filter (defaults to all docs).
@@ -396,22 +797,130 @@ module.exports = {
             };
           }
 
+          case 'estimatedDocumentCount': {
+            // Metadata rather than a scan: no filter is possible, and on a
+            // large collection this is the count you can afford.
+            const n = await coll.estimatedDocumentCount();
+            return {
+              success: true,
+              rows: [{ count: n }],
+              columns: ['count'],
+              rowCount: 1,
+              count: n,
+              json: true,
+            };
+          }
+
+          case 'distinct': {
+            if (typeof params.field !== 'string' || !params.field) {
+              return { success: false, message: 'distinct requires params.field (string)' };
+            }
+            // distinct answers with a bare array; the cap has to be applied
+            // here, where we can still tell whether anything was left behind.
+            const all = await coll.distinct(params.field, params.filter || {});
+            const values = probe ? all.slice(0, limit) : all;
+            return {
+              success: true,
+              // Scalars need a column to sit in, and the field the user asked
+              // about is the one to name it after.
+              rows: values.map((v) => ({ [params.field]: v })),
+              columns: [params.field],
+              rowCount: values.length,
+              truncated: probe ? all.length > values.length : undefined,
+              values,
+              json: true,
+            };
+          }
+
+          case 'createIndex': {
+            if (!isPlainObject(params.keys)) {
+              return { success: false, message: 'createIndex requires params.keys (object)' };
+            }
+            const name = await coll.createIndex(params.keys, params.options || {});
+            return {
+              success: true,
+              message: `Created index "${name}" on "${params.collection}"`,
+              rowCount: 0,
+              indexName: name,
+            };
+          }
+
+          case 'dropIndex': {
+            if (!params.index) {
+              return { success: false, message: 'dropIndex requires params.index (name or key pattern)' };
+            }
+            await coll.dropIndex(params.index);
+            const label = typeof params.index === 'string'
+              ? `"${params.index}"`
+              : JSON.stringify(params.index);
+            return {
+              success: true,
+              message: `Dropped index ${label} on "${params.collection}"`,
+              rowCount: 0,
+            };
+          }
+
+          case 'listIndexes': {
+            const indexes = await coll.indexes();
+            return {
+              success: true,
+              rows: indexes,
+              columns: indexes.length ? Object.keys(indexes[0]) : [],
+              rowCount: indexes.length,
+              json: true,
+            };
+          }
+
+          case 'renameCollection': {
+            if (typeof params.target !== 'string' || !params.target) {
+              return { success: false, message: 'renameCollection requires params.target (new name)' };
+            }
+            await coll.rename(params.target, { dropTarget: Boolean(params.dropTarget) });
+            return {
+              success: true,
+              message: `Renamed "${params.collection}" to "${params.target}"`,
+              rowCount: 0,
+              // Both names moved: one is gone from the tree, the other is new.
+              mutated: [
+                { schema: db.databaseName, table: params.collection },
+                { schema: db.databaseName, table: params.target },
+              ],
+            };
+          }
+
           case 'aggregate': {
             // Run an aggregation pipeline. `params.pipeline` is required.
             if (!Array.isArray(params.pipeline)) {
               return { success: false, message: 'aggregate requires params.pipeline (array)' };
             }
+            if (params.explain) {
+              const plan = await coll.aggregate(params.pipeline)
+                .explain(params.explain === true ? undefined : params.explain);
+              return { success: true, rows: [plan], columns: Object.keys(plan), rowCount: 1, json: true };
+            }
             // Consume the cursor only as far as the cap, rather than appending
             // a $limit stage — the pipeline stays exactly as the user wrote it.
+            //
+            // Two caps can apply: the explorer's (`probe`) and a `.limit(n)` the
+            // user chained onto the call. The tighter one stops the iteration,
+            // but only the explorer's makes the result TRUNCATED — a user who
+            // asked for 10 and got 10 was not cut short. The plain `limit`
+            // argument is deliberately not a cap here: callers reading a whole
+            // collection through a pipeline pass no limit and must keep getting
+            // everything.
+            const asked = Number(params.limit) > 0 ? Number(params.limit) : Infinity;
+            const ceiling = probe ? limit : Infinity;
+            const stopAt = Math.min(asked, ceiling);
+
             let docs;
             let more = false;
-            if (probe) {
+            if (stopAt !== Infinity) {
               const cursor = coll.aggregate(params.pipeline);
               docs = [];
               try {
                 // eslint-disable-next-line no-restricted-syntax
                 for await (const doc of cursor) {
-                  if (docs.length >= limit) { more = true; break; }
+                  if (docs.length >= stopAt) { more = stopAt === ceiling; break; }
                   docs.push(doc);
                 }
               } finally {
@@ -439,11 +948,22 @@ module.exports = {
         }
       }
 
-      // Default: run find query (honors optional sort / projection)
+      // Default: run find query (honors optional sort / skip / projection)
+      if (!params.collection) {
+        return { success: false, message: 'A query needs a collection' };
+      }
       const coll = db.collection(params.collection);
       let cursor = coll.find(params.filter || {});
       if (params.sort) cursor = cursor.sort(params.sort);
+      if (params.skip) cursor = cursor.skip(params.skip);
       if (params.projection) cursor = cursor.project(params.projection);
+
+      if (params.explain) {
+        // A plan, not documents — the cap and the "is there more" probe below
+        // have nothing to apply to.
+        const plan = await cursor.explain(params.explain === true ? undefined : params.explain);
+        return { success: true, rows: [plan], columns: Object.keys(plan), rowCount: 1, json: true };
+      }
       // The cursor does the limiting. When the explorer asked for a cap we read
       // one extra document to tell whether more were waiting, then drop it.
       const requested = params.limit || limit;
@@ -799,7 +1319,7 @@ module.exports = {
         rowsInserted: result.insertedCount
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -840,7 +1360,12 @@ module.exports = {
 
     **Instructions**:
 
-    You are creating a NEW collection with transformed data. Choose the appropriate transformation approach:
+    You are creating a NEW collection with transformed data. The target
+    collection is TRUNCATED AND LOADED on every run — it is replaced wholesale
+    by what this operation produces, and nothing from a previous run survives.
+    Do not try to merge, upsert, or de-duplicate against what was there last
+    time, and do not skip documents on the grounds that an earlier run already
+    handled them. Choose the appropriate transformation approach:
 
     1. **Aggregation Pipeline** (Recommended for MongoDB):
        - Use for: filtering, grouping, projecting fields, lookups, mathematical operations
@@ -1024,8 +1549,16 @@ module.exports = {
     // typed is never edited to add a limit.
     maxRowsOption: true,
     keywords: [
-      'db', 'find', 'findOne', 'aggregate', 'countDocuments', 'sort', 'limit',
-      'skip', 'project',
+      // everything SHELL_METHODS and DB_METHODS accept, plus the cursor chain
+      'db', 'find', 'findOne', 'aggregate', 'count', 'countDocuments',
+      'estimatedDocumentCount', 'distinct',
+      'insertOne', 'insertMany', 'updateOne', 'updateMany', 'replaceOne',
+      'deleteOne', 'deleteMany', 'findOneAndUpdate', 'findOneAndReplace',
+      'findOneAndDelete', 'bulkWrite',
+      'drop', 'renameCollection', 'createIndex', 'dropIndex', 'getIndexes',
+      'getCollectionNames', 'getCollectionInfos', 'createCollection',
+      'runCommand', 'stats',
+      'sort', 'limit', 'skip', 'project', 'explain', 'toArray',
       // pipeline stages
       '$match', '$group', '$project', '$sort', '$limit', '$skip', '$unwind',
       '$lookup', '$addFields', '$set', '$unset', '$replaceRoot', '$facet',
@@ -1034,6 +1567,9 @@ module.exports = {
       '$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$and', '$or',
       '$not', '$nor', '$exists', '$type', '$regex', '$options', '$elemMatch',
       '$size', '$all', '$expr',
+      // update operators — updateOne/updateMany/findOneAndUpdate run here now
+      '$inc', '$mul', '$rename', '$currentDate', '$setOnInsert', '$pull',
+      '$pullAll', '$pop', '$each', '$position',
     ],
     functions: [
       // accumulators and expression operators worth completing

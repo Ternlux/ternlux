@@ -205,13 +205,13 @@ const GoogleDrivePicker = ({ connection, onFileSelect, onClose }) => {
    */
   const saveFileLocally = async (fileData, fileName) => {
     try {
-      if (!window.electronAPI?.saveFileDialog || !window.electronAPI?.cloudStorage?.saveAndRegister) {
+      if (!window.electronAPI?.selectSavePath || !window.electronAPI?.cloudStorage?.saveAndRegister) {
         message.error('Saving Drive files is not available');
         return;
       }
 
       const extension = fileName.includes('.') ? fileName.split('.').pop().toLowerCase() : '';
-      const chosen = await window.electronAPI.saveFileDialog(fileName, extension);
+      const chosen = await window.electronAPI.selectSavePath(fileName, extension);
       if (chosen.canceled || !chosen.filePath) return;
 
       setProcessingFile(true);
@@ -272,7 +272,7 @@ const GoogleDrivePicker = ({ connection, onFileSelect, onClose }) => {
     const isSupported = isSupportedFileType(file.name);
 
     if (!isSupported) {
-      message.warning('This file type is not supported. Please select CSV, Excel, JSON, SQLite, Parquet, Avro, or NeDB files.');
+      message.warning('This file type is not supported. Please select CSV, Excel, JSON, SQLite, Parquet, or Avro files.');
       return false;
     }
     return true;

@@ -114,6 +114,57 @@ function registerTokenRefreshCallback(connectionId, callback) {
   tokenRefreshCallbacks.set(connectionId, callback);
 }
 
+/** A Drive id: opaque, no spaces or slashes, and long. "My Drive" is not one. */
+const looksLikeDriveId = (v) => /^[A-Za-z0-9_-]{11,}$/.test(String(v || ''));
+
+/**
+ * The folder id to write into, from whatever the caller recorded.
+ *
+ * `container` is 'root', a shared drive id, a folder id, or a DISPLAY NAME —
+ * the picker used to store "My Drive", which is what Drive rejected with
+ * `File not found: My Drive`. `segments` are folder names between the
+ * container and the file, which only a path-shaped object name carries.
+ *
+ * A named folder that does not exist is an error rather than a silent write to
+ * the parent: putting the file somewhere other than where the user pointed is
+ * worse than saying so.
+ */
+async function resolveFolderId(drive, container, segments = []) {
+  let parent = 'root';
+  const ref = String(container || '').trim();
+
+  if (ref && ref !== 'root' && ref.toLowerCase() !== 'my drive') {
+    if (looksLikeDriveId(ref)) {
+      parent = ref;
+    } else {
+      // A shared drive named by the picker rather than identified.
+      const drives = await drive.drives.list({ pageSize: 100 }).catch(() => null);
+      const match = (drives?.data?.drives || []).find((d) => d.name === ref);
+      if (!match) {
+        throw new Error(
+          `Google Drive folder "${ref}" could not be resolved. Re-select the destination in the output node.`,
+        );
+      }
+      parent = match.id;
+    }
+  }
+
+  for (const folder of segments) {
+    const escaped = folder.replace(/'/g, "\\'");
+    const res = await drive.files.list({
+      q: `name = '${escaped}' and '${parent}' in parents `
+        + `and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      fields: 'files(id, name)',
+      pageSize: 1,
+    });
+    const found = res.data.files?.[0];
+    if (!found) throw new Error(`Google Drive folder "${folder}" not found in the selected destination`);
+    parent = found.id;
+  }
+
+  return parent;
+}
+
 module.exports = {
   type: 'connector',
   id: 'google-drive',
@@ -135,9 +186,14 @@ module.exports = {
       );
 
       const scopes = [
-        'https://www.googleapis.com/auth/drive.file', // Access to files created/opened by app
-        'https://www.googleapis.com/auth/drive.readonly', // Read-only access to all files
-        'https://www.googleapis.com/auth/drive.metadata.readonly' // Read-only metadata (non-restricted)
+        'https://www.googleapis.com/auth/drive.file', // Non-sensitive: files this app creates or the user picks
+        // Both of the below are RESTRICTED scopes in Google's classification
+        // (publishing an app that requests either requires an annual
+        // third-party security assessment). They are what lets the in-app
+        // browser list a whole Drive; the Sheets connector avoids them by
+        // going through Google's Picker instead — see GoogleSheetsPicker.
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/drive.metadata.readonly'
       ];
 
       const authUrl = oauth2Client.generateAuthUrl({
@@ -399,11 +455,23 @@ module.exports = {
     try {
       const drive = getClient(config, connectionId);
 
-      // Default to root folder if containerName is not a valid folder ID
-      const folderId = containerName === 'root' || !containerName ? 'root' : containerName;
+      // Drive has no path syntax: a file is placed by naming its PARENT'S ID.
+      // What arrives here is whatever the picker recorded — 'root', a shared
+      // drive id, a folder id, or (before this was understood) the display name
+      // "My Drive", which the API reported as `File not found: My Drive`. And
+      // `fileName` may still carry folders ("Reports/data.csv"), which Drive
+      // would take literally as a file called "Reports/data.csv".
+      //
+      // Both are resolved to real ids here, so a config written either way
+      // lands where the user meant.
+      const segments = String(fileName || '').split('/').filter(Boolean);
+      const name = segments.pop();
+      if (!name) return { success: false, message: 'No file name to upload to' };
+
+      const folderId = await resolveFolderId(drive, containerName, segments);
 
       const fileMetadata = {
-        name: fileName,
+        name,
         parents: [folderId]
       };
 
@@ -423,7 +491,7 @@ module.exports = {
 
       return {
         success: true,
-        message: `Successfully uploaded ${fileName}`,
+        message: `Successfully uploaded ${name}`,
         fileId: response.data.id
       };
     } catch (error) {

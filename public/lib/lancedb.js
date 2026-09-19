@@ -14,7 +14,8 @@ const { app } = require('electron');
  * @returns {String} Database path
  */
 function getLanceDBPath(customPath) {
-  if (customPath && !isInvalidLanceDir(customPath)) {
+  const rejected = customPath ? invalidLanceDirReason(customPath) : null;
+  if (customPath && !rejected) {
     return customPath;
   }
 
@@ -25,24 +26,99 @@ function getLanceDBPath(customPath) {
     fs.mkdirSync(dbPath, { recursive: true });
   }
 
+  // Say so. A silent redirect means the caller's recorded target and where its
+  // rows actually land disagree, and nothing downstream — which reads the
+  // recorded path — can find them. That is a node misconfiguration to fix, not
+  // something to absorb quietly.
+  if (customPath) {
+    console.warn(
+      `[lancedb] "${customPath}" is not a LanceDB directory (${rejected}); `
+      + `writing to the default store at "${dbPath}" instead. Whatever recorded that path `
+      + `will look for these rows in the wrong place — repoint the node's target.`,
+    );
+  }
+
   return dbPath;
 }
 
 /**
- * LanceDB needs a *directory*. A NeDB/SQLite file path (e.g. *.db) or any
- * existing regular file would make LanceDB try to create a table inside a file
- * ("Unable to walk dir: ... Not a directory"). Detect those so callers can fall
- * back to the default LanceDB directory instead of crashing — this guards
+ * LanceDB needs a *directory*. A SQLite/DuckDB file path (e.g. *.db) or
+ * any existing regular file would make LanceDB try to create a table inside a
+ * file ("Unable to walk dir: ... Not a directory"). Detect those so callers can
+ * fall back to the default LanceDB directory instead of crashing — this guards
  * against stored node configs whose targetLocalPath still points at a source
- * NeDB file.
+ * data file or at the workflow's own DuckDB database.
+ *
+ * Returns why the path was rejected (for the log), or null when it is usable.
  */
-function isInvalidLanceDir(customPath) {
-  if (/\.(db|sqlite|nedb)$/i.test(customPath)) return true;
+function invalidLanceDirReason(customPath) {
+  if (/\.(db|sqlite|sqlite3|duckdb)$/i.test(customPath)) {
+    return 'it names a database file, not a directory';
+  }
   try {
-    return fs.existsSync(customPath) && fs.statSync(customPath).isFile();
+    if (fs.existsSync(customPath) && fs.statSync(customPath).isFile()) {
+      return 'it already exists as a regular file';
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Is this path a Lance *dataset* (one table) rather than a LanceDB *database*?
+ *
+ * A database is a directory whose children are `<table>.lance` dataset
+ * directories; a dataset is one of those children. The distinction matters
+ * because `connect()` on a dataset SUCCEEDS and then reports zero tables —
+ * there are no `.lance` children inside it — so a path that is one level too
+ * deep looks like a healthy but empty database rather than an error. Every
+ * caller downstream then behaves as if the store were empty.
+ *
+ * Lance stamps each dataset with a manifest and a `_versions` directory, so the
+ * two are cheap to tell apart without opening anything.
+ */
+function isLanceDatasetDir(dirPath) {
+  if (!dirPath) return false;
+  try {
+    if (!fs.statSync(dirPath).isDirectory()) return false;
   } catch {
     return false;
   }
+  return fs.existsSync(path.join(dirPath, '_versions'))
+    || fs.existsSync(path.join(dirPath, '_latest.manifest'));
+}
+
+/**
+ * Resolve a `{ dbPath, tableName }` pair against what `dbPath` actually points
+ * at, so a path naming a TABLE where a DATABASE was expected still works.
+ *
+ * This is a real and silent failure mode rather than a hypothetical one: the
+ * LanceDB export hands back the dataset path it wrote, the connection form
+ * offers a `.lance` filter in its directory picker, and either route saves a
+ * connection whose `fileInfo.filePath` is a dataset. Nothing rejects it, so the
+ * connection lists no tables and the assistant is left asking the user which
+ * table to search.
+ *
+ * When `dbPath` is a dataset, the parent becomes the database and the dataset's
+ * own name becomes the table. The dataset name WINS over a caller-supplied
+ * `tableName`: the path already names exactly one table, so honouring a
+ * different name would open a sibling dataset in the parent directory — for an
+ * export dropped in ~/Downloads that parent holds every unrelated download, and
+ * quietly reading one of those is far worse than failing.
+ */
+function normalizeLanceTarget({ dbPath, tableName } = {}) {
+  if (!isLanceDatasetDir(dbPath)) return { dbPath, tableName };
+
+  const datasetTable = path.basename(dbPath).replace(/\.lance$/i, '');
+  if (tableName && tableName !== datasetTable) {
+    console.warn(
+      `[lancedb] "${dbPath}" is the table "${datasetTable}", but table "${tableName}" was requested; `
+      + `reading "${datasetTable}". Point the connection at the database DIRECTORY `
+      + `("${path.dirname(dbPath)}") if you meant a different table.`,
+    );
+  }
+  return { dbPath: path.dirname(dbPath), tableName: datasetTable, datasetTable };
 }
 
 /**
@@ -52,7 +128,12 @@ function isInvalidLanceDir(customPath) {
  * @returns {Promise<Object>} LanceDB connection
  */
 async function getLanceDBConnection(config = {}) {
-  const dbPath = getLanceDBPath(config.dbPath);
+  // Every open goes through here, including the vector skill's direct ones
+  // (joinHandler, the embed/search handlers), so a path naming a `.lance`
+  // dataset is resolved to its parent database once, here, rather than in each
+  // caller. Callers then open the dataset's own table by name, which is the
+  // name getTables reports for such a connection.
+  const dbPath = getLanceDBPath(normalizeLanceTarget(config).dbPath);
   const db = await lancedb.connect(dbPath);
   return db;
 }
@@ -72,9 +153,9 @@ async function getLanceDBConnection(config = {}) {
  * @returns {Promise<Object>} Operation result
  */
 async function executeLanceDBOperation({ operation, data, config }) {
-  const db = await getLanceDBConnection(config);
-  const tableName = config.tableName || 'vectors';
-  console.log('operation, data, config : ', db, operation, data, config )
+  const target = normalizeLanceTarget(config);
+  const db = await getLanceDBConnection({ ...config, dbPath: target.dbPath });
+  const tableName = target.tableName || 'vectors';
   try {
     switch (operation) {
       case 'upsert':
@@ -167,6 +248,10 @@ async function upsertVectors(db, tableName, data, opts = {}) {
   }
 
   if (!isNewTable) {
+    // A table's vector column is a FIXED-size list: appending a different width
+    // fails inside Lance with a Rust-level message that names neither the table
+    // that has to change nor how it got that way. Check first and say it.
+    await assertVectorWidthMatches(table, records, tableName);
     // Add new vectors to existing table
     await table.add(records);
     console.log(`Added ${records.length} vectors to existing table ${tableName}`);
@@ -180,6 +265,80 @@ async function upsertVectors(db, tableName, data, opts = {}) {
       ? `Created new table '${tableName}' with ${records.length} vectors`
       : `Added ${records.length} vectors to table '${tableName}'`
   };
+}
+
+/**
+ * Plain-JS value for anything Arrow hands back.
+ *
+ * A vector column arrives as an Arrow `Vector`, which BSON/JSON serialisers
+ * cannot represent; byte columns stay as they are, since a Uint8Array is
+ * exactly what a binary field should be.
+ */
+function toPlainValue(value) {
+  if (value === null || typeof value !== 'object') return value;
+  if (value instanceof Date) return value;
+  if (value instanceof Uint8Array || value instanceof Int8Array || value instanceof Uint8ClampedArray) {
+    return value; // binary payload, not a list of numbers
+  }
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) return Array.from(value, Number);
+  if (Array.isArray(value)) return value.map(toPlainValue);
+  if (typeof value.toArray === 'function') return Array.from(value.toArray(), Number); // Arrow Vector
+  if (typeof value.toJSON === 'function') return toPlainRow(value);                    // nested StructRow
+  return value;
+}
+
+/**
+ * A LanceDB row as an ordinary object.
+ *
+ * `table.query().toArray()` yields Arrow `StructRow` PROXIES, not plain
+ * objects, and their `set` trap rejects unknown properties. Anything that
+ * writes to a row it was handed then fails — the MongoDB driver stamps `_id`
+ * onto each document before an insert and dies with "'set' on proxy: trap
+ * returned falsish for property '_id'", which names neither LanceDB nor Arrow.
+ * The proxies are also not serialisable, so every consumer that forwards these
+ * rows (an output node, a preview, a file export) needs real objects.
+ */
+function toPlainRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const source = typeof row.toJSON === 'function' ? row.toJSON() : row;
+  const out = {};
+  for (const [key, value] of Object.entries(source)) out[key] = toPlainValue(value);
+  return out;
+}
+
+/** Every row of a LanceDB read, as ordinary objects. See toPlainRow. */
+const toPlainRows = (rows) => (Array.isArray(rows) ? rows.map(toPlainRow) : rows);
+
+/**
+ * Refuse an append whose vectors are a different width than the table's.
+ *
+ * Lance stores `vector` as a fixed-size list, so the width is part of the
+ * schema and cannot vary between rows. Its own error for this ("`vector` should
+ * have type fixed_size_list:float:0 but type was fixed_size_list:float:1536",
+ * quoting a path inside the Rust crate) says nothing about which table is
+ * wrong or what to do, and a width of 0 is the tell-tale of a table created by
+ * an earlier run that wrote empty vectors.
+ */
+async function assertVectorWidthMatches(table, records, tableName) {
+  const width = Array.isArray(records[0]?.vector) ? records[0].vector.length : null;
+  if (!width) return;
+
+  let existing = null;
+  try {
+    const field = (await table.schema()).fields.find((f) => f.name === 'vector');
+    existing = typeof field?.type?.listSize === 'number' ? field.type.listSize : null;
+  } catch {
+    return; // Can't read the schema — let the write attempt report whatever is wrong.
+  }
+  if (existing === null || existing === width) return;
+
+  const cause = existing === 0
+    ? `Table '${tableName}' stores 0-dimension vectors, so it was created by a run that wrote empty ones.`
+    : `Table '${tableName}' stores ${existing}-dimension vectors.`;
+  throw new Error(
+    `${cause} This batch has ${width}-dimension vectors, and a table's vector width cannot change. `
+    + `Drop the table (or write to a different table name) and run again.`,
+  );
 }
 
 /**
@@ -352,7 +511,7 @@ async function queryVectors(db, tableName, config) {
       throw new Error('LanceDB filter must be a SQL WHERE string, not an object');
     }
 
-    const results = await query.toArray();
+    const results = toPlainRows(await query.toArray());
 
     return {
       success: true,
@@ -460,6 +619,13 @@ async function updateVectors(db, tableName, config) {
  * @returns {Promise<Array<String>>} Array of table names
  */
 async function listTables(config = {}) {
+  // Pointed straight at a dataset: that path names one table and one table
+  // only. Listing the parent instead would report every unrelated `.lance`
+  // sitting next to it, which for an export saved to ~/Downloads is the whole
+  // folder — so answer with the single table the path actually names.
+  if (isLanceDatasetDir(config.dbPath)) {
+    return [path.basename(config.dbPath).replace(/\.lance$/i, '')];
+  }
   const db = await getLanceDBConnection(config);
   const tables = await db.tableNames();
   return tables;
@@ -472,21 +638,22 @@ async function listTables(config = {}) {
  * @returns {Promise<Object>} Table information
  */
 async function getTableInfo(tableName, config = {}) {
-  const db = await getLanceDBConnection(config);
+  const target = normalizeLanceTarget({ ...config, tableName });
+  const db = await getLanceDBConnection({ ...config, dbPath: target.dbPath });
 
   try {
-    const table = await db.openTable(tableName);
+    const table = await db.openTable(target.tableName);
     const count = await table.countRows();
 
     return {
       success: true,
-      tableName,
+      tableName: target.tableName,
       recordCount: count
     };
   } catch (error) {
     return {
       success: false,
-      message: `Table '${tableName}' not found`
+      message: `Table '${target.tableName}' not found`
     };
   }
 }
@@ -498,18 +665,19 @@ async function getTableInfo(tableName, config = {}) {
  * @returns {Promise<Object>} Result
  */
 async function dropTable(tableName, config = {}) {
-  const db = await getLanceDBConnection(config);
+  const target = normalizeLanceTarget({ ...config, tableName });
+  const db = await getLanceDBConnection({ ...config, dbPath: target.dbPath });
 
   try {
-    await db.dropTable(tableName);
+    await db.dropTable(target.tableName);
     return {
       success: true,
-      message: `Table '${tableName}' dropped successfully`
+      message: `Table '${target.tableName}' dropped successfully`
     };
   } catch (error) {
     return {
       success: false,
-      message: `Failed to drop table '${tableName}': ${error.message}`
+      message: `Failed to drop table '${target.tableName}': ${error.message}`
     };
   }
 }
@@ -533,11 +701,21 @@ async function dropTable(tableName, config = {}) {
  */
 async function runQuery({ dbPath, ...query } = {}) {
   const op = (query.operation || 'list').toLowerCase();
-  const tableName = query.tableName || query.table;
-  const config = { dbPath, tableName };
+  // A connection pointed at a `.lance` dataset resolves to its parent database
+  // plus that dataset's name, so a query works whether the saved path names the
+  // database or the table (see normalizeLanceTarget).
+  const config = normalizeLanceTarget({ dbPath, tableName: query.tableName || query.table });
+  const { tableName } = config;
 
   if (op === 'upsert') {
-    return executeLanceDBOperation({ operation: 'upsert', data: query.data, config });
+    // `overwrite` has to survive this hop: it is what makes a "new table" write
+    // idempotent, and dropping it here silently turned every re-run into an
+    // append onto the previous run's schema.
+    return executeLanceDBOperation({
+      operation: 'upsert',
+      data: query.data,
+      config: { ...config, overwrite: query.overwrite === true },
+    });
   }
 
   if (op === 'query' || op === 'queryvectors') {
@@ -570,7 +748,7 @@ async function runQuery({ dbPath, ...query } = {}) {
     const table = await db.openTable(tableName);
     let q = table.query().limit(query.limit || 1000);
     if (typeof query.filter === 'string' && query.filter.trim() !== '') q = q.where(query.filter);
-    return await q.toArray();
+    return toPlainRows(await q.toArray());
   }
 
   throw new Error(`Unknown LanceDB operation: ${op}`);
@@ -584,11 +762,16 @@ async function getTables({ dbPath } = {}) {
 /** getColumns({ dbPath, table }) — infer columns from one sample row. */
 async function getColumns({ dbPath, table } = {}) {
   if (!table) return [];
-  const db = await getLanceDBConnection({ dbPath });
-  const t = await db.openTable(table);
+  const target = normalizeLanceTarget({ dbPath, tableName: table });
+  const db = await getLanceDBConnection({ dbPath: target.dbPath });
+  const t = await db.openTable(target.tableName);
   const sample = await t.query().limit(1).toArray();
   if (!sample.length) return [];
-  return Object.entries(sample[0]).map(([name, value]) => ({
+  // Through toPlainRow first: a raw sample row is an Arrow StructRow whose
+  // embedding column is a Float32Array, which `Array.isArray` says no to — so
+  // the one column a vector search actually needs was reported as a generic
+  // 'object' and nothing downstream could pick it out.
+  return Object.entries(toPlainRow(sample[0])).map(([name, value]) => ({
     name,
     type: Array.isArray(value)
       ? 'vector'
@@ -604,5 +787,13 @@ module.exports = {
   dropTable,
   runQuery,
   getTables,
-  getColumns
+  getColumns,
+  // Path shape helpers — callers that open LanceDB through the client directly
+  // still need to tell a database directory from a single `.lance` dataset.
+  isLanceDatasetDir,
+  normalizeLanceTarget,
+  // For callers that read a table through the LanceDB client directly and
+  // still need ordinary objects to hand on (see toPlainRow).
+  toPlainRow,
+  toPlainRows
 };

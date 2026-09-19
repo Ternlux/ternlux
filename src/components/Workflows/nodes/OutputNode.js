@@ -1,9 +1,9 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { MailOutlined, ExportOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter } from './nodeCardShared';
 
-const COLOR = '#db2777';
+const COLOR = NODE_COLORS.output;
 const MONO = "'JetBrains Mono', monospace";
 const TEXT = '#111827';
 const MUTED = '#5a6678';
@@ -13,11 +13,10 @@ const GREEN = '#059669';
 const OutputNode = ({ data, selected }) => {
   const isConfigured = !!(data.config?.outputSettings?.outputType);
 
-  const getDisplayName = () => {
+  // What the settings alone call this node, used as the last resort below.
+  const settingsName = () => {
     const outputSettings = data.config?.outputSettings;
-    if (!outputSettings?.outputType) {
-      return 'Output';
-    }
+    if (!outputSettings?.outputType) return 'Output';
 
     if (outputSettings.outputType === 'local') {
       const format = outputSettings.format?.toUpperCase() || 'FILE';
@@ -28,6 +27,15 @@ const OutputNode = ({ data, selected }) => {
 
     return 'Output';
   };
+
+  // Named by nodeDisplayName, like every other card — a name the user chose,
+  // then the label, then whatever the config identifies. This node used to read
+  // its settings and nothing else, so it was the one card with nothing to show
+  // before those settings exist: while the AI builder writes a workflow it
+  // draws each node as it starts, config still empty, and the label off the
+  // build plan ("Export enriched orders to CSV") is all any card has to go on.
+  // Every other type already showed it; this one sat there reading "Output".
+  const getDisplayName = () => nodeDisplayName('output', data, settingsName());
 
   const getOutputIcon = () => {
     const outputSettings = data.config?.outputSettings;
@@ -40,7 +48,13 @@ const OutputNode = ({ data, selected }) => {
   };
 
   const getSummary = () => {
-    if (!isConfigured) return 'Click to configure output';
+    if (!isConfigured) {
+      // Mid-build the settings don't exist yet, but the instruction that is
+      // being turned into them does — say that rather than asking the user to
+      // configure a node nobody has finished writing.
+      const request = data.config?.builderPrompt || data.config?.outputDescription;
+      return request ? truncate(request) : 'Click to configure output';
+    }
 
     const outputSettings = data.config?.outputSettings;
 
@@ -49,8 +63,13 @@ const OutputNode = ({ data, selected }) => {
       const fileName = outputSettings.savePath ? outputSettings.savePath.split('/').pop() : 'output file';
       return `Export data to ${format} file: ${fileName}`;
     } else if (outputSettings.outputType === 'connection') {
-      const connectionName = data.config?.sourceConnectionName || 'database';
-      return `Insert data into ${outputSettings.tableName} (${connectionName})`;
+      // The DESTINATION table only. This used to append
+      // `config.sourceConnectionName` as though it named the destination — it
+      // names where the node READS from, so an output reading LanceDB and
+      // writing MySQL labelled itself "(Local LanceDB)". The connection it
+      // actually writes to is resolved from outputSettings.connectionId and
+      // shown by the DestinationFooter below.
+      return `Insert data into ${outputSettings.tableName}`;
     }
 
     return 'Output configured';
@@ -143,6 +162,8 @@ const OutputNode = ({ data, selected }) => {
       </div>
 
       <ExpandableCodes codes={latestCodes} />
+
+      <DestinationFooter type="output" config={data.config || {}} accent={COLOR} />
     </div>
   );
 };

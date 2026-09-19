@@ -1,6 +1,7 @@
 /**
  * Execute NoSQL Join
- * Handles join operations where the destination is a NoSQL database (MongoDB/NeDB)
+ * Handles join operations where the destination is a NoSQL database (MongoDB), or
+ * a local result, which lands as a table in the workflow's DuckDB database.
  *
  * Process:
  * 1. Load all source data into memory (using nosqlOperation queries)
@@ -9,7 +10,6 @@
  */
 
 const { getConnection } = require('../database-connectors');
-const { saveToLocalNeDB } = require('../transfomers/NeDB');
 
 /**
  * Execute a NoSQL join operation
@@ -30,7 +30,7 @@ async function executeNoSQLJoin({
   targetCollection,
   operationMode = 'new_table',
   isLocalStorage = false,
-  // Optional — scopes the local NeDB result to this workflow/node.
+  // Optional — scopes the local result to this workflow/node.
   targetLocalPath = null,
   workflowId = null,
   nodeId = null,
@@ -60,10 +60,12 @@ async function executeNoSQLJoin({
       let sourceData = [];
 
       // Check if source is NoSQL or SQL
-      const isNoSQLSource = ['mongodb', 'nedb'].includes(sourceConnection.dbType);
+      const isNoSQLSource = sourceConnection.dbType === 'mongodb';
 
       if (isNoSQLSource) {
-        // Load from NoSQL source using nosqlOperation
+        // Load from the MongoDB source using nosqlOperation. It is the only
+        // document store left: every local file, JSON included, is read as SQL
+        // by DuckDB and takes the branch below.
         const sourceConn = await getConnection(
           sourceConnection.dbType,
           sourceConnection.dbConfig || {},
@@ -73,42 +75,14 @@ async function executeNoSQLJoin({
         // Parse nosqlOperation (should be JSON string)
         const operation = JSON.parse(sourceConfig.nosqlOperation || '{}');
 
-        if (sourceConnection.dbType === 'mongodb') {
-          // MongoDB query
-          const collection = sourceConn.db.collection(operation.collection || operation.tableName);
-          const filter = operation.filter || {};
-          const limit = operation.limit || 0;
+        const collection = sourceConn.db.collection(operation.collection || operation.tableName);
+        const filter = operation.filter || {};
+        const limit = operation.limit || 0;
 
-          if (limit > 0) {
-            sourceData = await collection.find(filter).limit(limit).toArray();
-          } else {
-            sourceData = await collection.find(filter).toArray();
-          }
-        } else if (sourceConnection.dbType === 'nedb') {
-          // NeDB query
-          const Datastore = require('@seald-io/nedb');
-          const localPath = sourceConnection.fileInfo?.filePath || sourceConnection.localPath;
-
-          const db = new Datastore({ filename: localPath, autoload: false });
-
-          await new Promise((resolve, reject) => {
-            db.loadDatabase((err) => {
-              if (err) reject(err);
-              else resolve();
-            });
-          });
-
-          const filter = operation.filter || {};
-          const limit = operation.limit || 0;
-
-          sourceData = await new Promise((resolve, reject) => {
-            const query = db.find(filter);
-            if (limit > 0) query.limit(limit);
-            query.exec((err, docs) => {
-              if (err) reject(err);
-              else resolve(docs);
-            });
-          });
+        if (limit > 0) {
+          sourceData = await collection.find(filter).limit(limit).toArray();
+        } else {
+          sourceData = await collection.find(filter).toArray();
         }
       } else {
         // Load from SQL source using sql query
@@ -157,8 +131,7 @@ async function executeNoSQLJoin({
 
     if (isLocalStorage) {
       // A join's local result is a table in the workflow's own DuckDB database,
-      // the same as every other node output. It used to be written to a NeDB
-      // file, which nothing downstream reads any more.
+      // the same as every other node output.
       const duck = require('../duckdb');
       const table = targetCollection || `join_${String(nodeId || Date.now()).replace(/[^A-Za-z0-9_]/g, '_')}`;
       const mode = operationMode === 'new_table' ? 'replace' : 'append';

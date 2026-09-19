@@ -92,7 +92,11 @@ module.exports = {
       const redirectUri = config.redirectUri || 'http://localhost:3000/oauth/callback';
       const state = config.state;
 
-      const scopes = encodeURIComponent('Files.ReadWrite.All offline_access');
+      // User.Read is needed by testConnection's /me call. Sites.* is deliberately
+      // left out: it is not valid for personal accounts and tenantId defaults to
+      // 'common', so requesting it would break consent for consumer sign-ins.
+      const requestedScopes = ['User.Read', 'Files.ReadWrite.All', 'offline_access'];
+      const scopes = encodeURIComponent(requestedScopes.join(' '));
       const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?` +
         `client_id=${encodeURIComponent(clientId)}` +
         `&response_type=code` +
@@ -104,7 +108,7 @@ module.exports = {
       return {
         success: true,
         authUrl,
-        scopes: ['Files.ReadWrite.All', 'offline_access']
+        scopes: requestedScopes
       };
     } catch (error) {
       return {
@@ -227,24 +231,46 @@ module.exports = {
    * List containers (OneDrive has root drive)
    */
   getContainers: async (config, connectionId = null) => {
+    const toContainer = (drive) => ({
+      name: drive.name || 'OneDrive',
+      id: drive.id,
+      driveType: drive.driveType,
+      owner: drive.owner?.user?.displayName
+    });
+
     try {
       const client = await getClient(config, connectionId);
 
-      // Get available drives
-      const response = await client.api('/me/drives').get();
-      console.log('response: ', response)
+      // Try to enumerate every drive the user can reach. This can fail with 403
+      // accessDenied on personal accounts and on tenants that block drive
+      // enumeration, even when the token carries Files.ReadWrite.All.
+      try {
+        const response = await client.api('/me/drives').get();
+        return {
+          success: true,
+          containers: response.value.map(toContainer)
+        };
+      } catch (listError) {
+        console.warn(
+          '[OneDrive] /me/drives failed (%s %s), falling back to default drive. Token scopes: %s',
+          listError.statusCode,
+          listError.code,
+          config.scope || 'unknown'
+        );
+      }
+
+      // Fall back to the user's own drive, which every account with OneDrive has.
+      const drive = await client.api('/me/drive').get();
       return {
         success: true,
-        containers: response.value.map(drive => ({
-          name: drive.name || 'OneDrive',
-          id: drive.id,
-          driveType: drive.driveType,
-          owner: drive.owner?.user?.displayName
-        }))
+        containers: [toContainer(drive)]
       };
     } catch (error) {
-      console.log('getContainerserror: ', error)
-      return { success: false, message: error.message };
+      console.error('[OneDrive] Get containers error:', error);
+      const message = error.statusCode === 403
+        ? `Access denied listing OneDrive drives. The account may not have a provisioned OneDrive, or the token is missing Files.ReadWrite.All (granted scopes: ${config.scope || 'unknown'}). Reconnect the account to re-consent.`
+        : error.message;
+      return { success: false, message };
     }
   },
 

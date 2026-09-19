@@ -8,6 +8,11 @@ const mysql = require('mysql2/promise');
 // Connection pool cache
 const connectionPools = new Map();
 
+// Most placeholders a single prepared statement can carry. The protocol writes
+// the parameter count as an unsigned 16-bit integer, so this is a hard ceiling
+// rather than a tunable.
+const MYSQL_MAX_PLACEHOLDERS = 65535;
+
 /**
  * Get or create connection pool
  */
@@ -34,12 +39,55 @@ function getPool(config, connectionId) {
   return connectionPools.get(key);
 }
 
+/**
+ * A driver failure, with the driver's own classification kept alongside the text.
+ *
+ * The message alone cannot be reasoned about — "Duplicate column name 'x'" is
+ * prose that moves with the server's version and locale. The CODE is the
+ * driver's own answer to what KIND of failure this is, and the transform
+ * executor uses it to tell a structural change that was ALREADY APPLIED (what
+ * the second run of an in-place ALTER looks like) from one that genuinely
+ * failed. Callers that only read `message` are unaffected.
+ */
+const queryError = (error) => ({
+  success: false,
+  message: error.message,
+  // mysql2 names the condition ('ER_DUP_FIELDNAME'), numbers it (1060), and
+  // carries the SQL standard state ('42S21').
+  code: error.code,
+  errno: error.errno,
+  sqlState: error.sqlState,
+});
+
+/**
+ * VARCHAR length for a column whose longest SAMPLED value is `maxLen`.
+ * See the note on the same helper in plugins/connectors/postgres/index.js.
+ */
+const varcharFor = (maxLen) => Math.ceil(Math.min(Math.max((maxLen || 0) * 1.5, 255), 65535));
+
 module.exports = {
   type: 'connector',
   id: 'mysql',
   name: 'MySQL',
   icon: './icon.svg',
   dbCategory: 'SQL',
+
+  /**
+   * Column types for a CREATE TABLE this app generates. See the note on
+   * `types` in plugins/connectors/snowflake/index.js.
+   */
+  types: {
+    NULL: () => 'TEXT',
+    DATE_ONLY: () => 'DATE',
+    // DATETIME, not TIMESTAMP: MySQL's TIMESTAMP is a 1970-2038 range stored as
+    // UTC and converted on read, which silently mangles a value outside it.
+    TIMESTAMP: () => 'DATETIME',
+    BOOLEAN: () => 'BOOLEAN',
+    INTEGER: () => 'INT',
+    FLOAT: () => 'DOUBLE',
+    OBJECT: () => 'TEXT',
+    STRING: (maxLen) => (maxLen > 255 ? 'TEXT' : `VARCHAR(${varcharFor(maxLen)})`),
+  },
 
   /**
    * Test database connection
@@ -58,7 +106,7 @@ module.exports = {
       await conn.end();
       return { success: true, message: 'Connection successful' };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -81,7 +129,7 @@ module.exports = {
         tables: rows
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -90,6 +138,23 @@ module.exports = {
    */
   getColumns: async (config, connectionId, schema, table) => {
     try {
+      // Accept a qualified "reporting.orders" as well as a bare table with the
+      // schema (here, the database) passed separately. Taking the qualified
+      // form literally searches for a table whose NAME contains a dot, which
+      // matches nothing — silently, since the caller that needs this treats a
+      // failed lookup as "cannot check". An explicit `schema` wins.
+      // A schema passed SEPARATELY settles it: `table` is then the table's whole
+      // name, dots included. A table really can be called "public.transactions",
+      // and taking the first segment off one looks up a DIFFERENT table — which
+      // fails silently, because the callers that need this read a failed lookup
+      // as "cannot check" rather than as an error.
+      // Only a name arriving with no schema beside it may have a qualifier read
+      // out of it, and even there a genuinely dotted name cannot be told apart
+      // from a qualified one — so that split is a last resort, not the default.
+      const parts = String(table || '').split('.');
+      if (!schema && parts.length === 2) {
+        [schema, table] = parts;
+      }
       const pool = getPool(config, connectionId);
       const [rows] = await pool.execute(`
         SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type,
@@ -105,7 +170,7 @@ module.exports = {
         columns: rows
       };
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -141,7 +206,7 @@ module.exports = {
           rowCount: rows.length
         };
       } catch (error) {
-        return { success: false, message: error.message };
+        return queryError(error);
       }
     }
 
@@ -149,7 +214,7 @@ module.exports = {
     try {
       connection = await getPool(config, connectionId).getConnection();
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
 
     return new Promise((resolve) => {
@@ -174,7 +239,7 @@ module.exports = {
           if (rows.length <= maxRows) rows.push(row);
           if (rows.length > maxRows) stream.destroy();
         });
-        stream.on('error', (err) => finish({ success: false, message: err.message }));
+        stream.on('error', (err) => finish(queryError(err)));
         const done = () => finish({
           success: true,
           rows: rows.slice(0, maxRows),
@@ -185,7 +250,7 @@ module.exports = {
         stream.on('end', done);
         stream.on('close', done);
       } catch (error) {
-        finish({ success: false, message: error.message });
+        finish(queryError(error));
       }
     });
   },
@@ -259,7 +324,7 @@ module.exports = {
         });
       });
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -290,21 +355,47 @@ module.exports = {
         // Start transaction
         await connection.beginTransaction();
 
-        // Build parameterized multi-row INSERT
-        const valuePlaceholders = rows.map(() => `(${columns.map(() => '?').join(', ')})`);
-        const insertSql = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+        // One INSERT per slice of rows, not one for the whole call: a prepared
+        // statement carries at most MYSQL_MAX_PLACEHOLDERS placeholders, while
+        // the caller sizes its chunk for memory (tens of thousands of rows).
+        // Slicing by the actual column count keeps every statement under the
+        // ceiling; they all run inside the one transaction, so the call still
+        // lands or rolls back as a whole.
+        const rowsPerStatement = Math.floor(MYSQL_MAX_PLACEHOLDERS / columns.length);
+        if (rowsPerStatement < 1) {
+          // A single row already exceeds the ceiling - no slicing can help.
+          throw new Error(
+            `Cannot insert into ${tableName}: ${columns.length} columns exceeds `
+            + `the limit of ${MYSQL_MAX_PLACEHOLDERS} placeholders per statement.`
+          );
+        }
 
-        // Flatten all values into a single array
-        const allValues = rows.flatMap(row =>
-          columns.map(col => {
-            const val = row[col];
-            if (val instanceof Date) return val;
-            if (typeof val === 'object' && val !== null) return JSON.stringify(val);
-            return val;
-          })
-        );
+        for (let start = 0; start < rows.length; start += rowsPerStatement) {
+          const slice = rows.slice(start, start + rowsPerStatement);
 
-        await connection.execute(insertSql, allValues);
+          // Build parameterized multi-row INSERT. The table name arrives
+          // UNQUOTED and is quoted here — the contract every other connector
+          // already keeps, and what the connection's own database qualifying it
+          // (quoteIdentifier with the config) resolves a bare name to anyway.
+          // Interpolated bare it could not reach a table whose name carries a
+          // capital, which on a case-sensitive server (lower_case_table_names=0,
+          // the Linux default) is a different table from the folded one.
+          const valuePlaceholders = slice.map(() => `(${columns.map(() => '?').join(', ')})`);
+          const insertSql = `INSERT INTO ${module.exports.quoteIdentifier(tableName, null, config)} `
+            + `(${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+
+          // Flatten all values into a single array
+          const allValues = slice.flatMap(row =>
+            columns.map(col => {
+              const val = row[col];
+              if (val instanceof Date) return val;
+              if (typeof val === 'object' && val !== null) return JSON.stringify(val);
+              return val;
+            })
+          );
+
+          await connection.execute(insertSql, allValues);
+        }
 
         // Commit transaction
         await connection.commit();
@@ -321,7 +412,7 @@ module.exports = {
         throw error;
       }
     } catch (error) {
-      return { success: false, message: error.message };
+      return queryError(error);
     }
   },
 
@@ -398,60 +489,70 @@ module.exports = {
     - Database type: MySQL
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
-    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local SQLite'}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
+    - Storage Location: ${settings.storageLocation === 'database' ? 'Database' : 'Local DuckDB'}
 
     ${settings.storageLocation === 'database'
       ? `**Instructions for Database Storage**:
-    Generate transformation SQL that:
-    1. Creates a new table in MySQL with the transformed structure
-    2. Populates it with transformed data using INSERT INTO ... SELECT
+
+    The target is TRUNCATED AND LOADED on every run: the executor drops it
+    before your ddl runs, so your ddl always creates it fresh and your sql
+    always loads it from empty. Nothing survives a run. So do not write
+    IF NOT EXISTS, do not check for or delete prior rows, and do not try to
+    merge, upsert, or de-duplicate against what was there last time — write the
+    plain CREATE and the plain load.
+
+    You return TWO separate statements, and the executor runs them in order:
+
+      1. \`ddl\`  — a plain CREATE TABLE that declares the columns and types.
+      2. \`sql\`  — an INSERT INTO ... SELECT that loads those columns.
+
+    Do NOT combine them. A CREATE TABLE ... AS SELECT (or SELECT ... INTO) is not
+    accepted here: the two fields are executed as separate statements, so putting
+    the SELECT in \`ddl\` leaves \`sql\` with nothing to do.
+
+    **\`sql\` MUST NOT BE EMPTY.** It is the only statement that puts rows in the
+    table. Leave it empty and the run creates an empty table and loads nothing —
+    the node reports success having produced no data. If you find yourself with
+    nothing to put in \`sql\`, you have written the SELECT into \`ddl\` by
+    mistake: split it back out into a CREATE plus an INSERT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "CREATE TABLE statement",
-      "sql": "INSERT INTO statement with SELECT query",
+      "ddl": "CREATE TABLE statement (columns + types) — creates the table, inserts nothing",
+      "sql": "INSERT INTO <target> (cols...) SELECT ... — REQUIRED, this is what loads the rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
       "previewSql": "SELECT query to preview the transformed data (LIMIT 100)"
     }`
-      : `**Instructions for Local SQLite Storage**:
-    Generate SQL to fetch data from MySQL and save it locally to SQLite.
+      : `**Instructions for Local Storage**:
+    The rows are fetched from MySQL and written into a table in THIS
+    workflow's own local DuckDB database. Nothing is written back to MySQL.
 
-    **You must provide THREE separate SQL statements**:
-    1. **DDL**: SQLite CREATE TABLE statement with appropriate SQLite data types
-       - Use SQLite types: INTEGER, REAL, TEXT, BLOB
-       - Column names must match the SELECT query output
-    2. **SQL (SELECT)**: MySQL SELECT query to fetch and transform data from the source
-       - This will be executed on MySQL database
-       - Include all transformations (filtering, calculations, etc.)
-    3. **INSERT**: SQLite INSERT statement to insert the fetched data
-       - Use parameterized query with ? placeholders
-       - Column order must match the SELECT query output exactly
-
-    **SQLite Data Type Mapping**:
-    - INTEGER: for whole numbers (int, bigint, auto_increment, etc.)
-    - REAL: for floating point numbers (float, double, decimal)
-    - TEXT: for strings (varchar, char, text, datetime, timestamp)
-    - BLOB: for binary data
+    You provide ONE statement: the MySQL SELECT that produces the rows you
+    want. That is the only thing that runs. Its result is streamed straight into
+    the local table, which is replaced on every run with the column types
+    inferred from the data — so there is no CREATE TABLE to write, no INSERT,
+    and no type mapping to choose. Do NOT emit "ddl" or "insertSql": nothing
+    reads them, and inventing them only risks contradicting the SELECT.
 
     Return your response in this JSON format:
     {
       "explanation": "Brief explanation of the transformation approach",
-      "ddl": "SQLite CREATE TABLE ${fullTableName.split('.').pop()} (...columns...)",
-      "sql": "MySQL SELECT query to fetch transformed data",
-      "insertSql": "SQLite table INSERT INTO ${fullTableName.split('.').pop()} (...columns...) VALUES (?, ?, ...)",
+      "sql": "MySQL SELECT query producing the transformed rows",
       "targetColumns": [{"name": "col", "type": "TYPE"}],   // EVERY column of the result, in SELECT order — downstream nodes are configured from this, so it must match the SQL above
-      "previewSql": "SQLite table SELECT * FROM ${fullTableName.split('.').pop()} LIMIT 100"
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"   // reads the LOCAL table, so this one is DuckDB SQL
     }
 
     **Example**:
     {
       "explanation": "Fetch active customers with calculated total spending",
-      "ddl": "CREATE TABLE customers_transformed (customer_id INTEGER, name TEXT, email TEXT, total_spending REAL)",
-      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) as total_spending FROM customers WHERE status = 'active'",
-      "insertSql": "INSERT INTO customers_transformed (customer_id, name, email, total_spending) VALUES (?, ?, ?, ?)",
-      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"}, {"name": "email", "type": "TEXT"}, {"name": "total_spending", "type": "REAL"}],
-      "previewSql": "SELECT * FROM customers_transformed LIMIT 100"
+      "sql": "SELECT customer_id, name, email, (purchase_count * avg_purchase) AS total_spending FROM customers WHERE status = 'active'",
+      "targetColumns": [{"name": "customer_id", "type": "INTEGER"}, {"name": "name", "type": "VARCHAR"}, {"name": "email", "type": "VARCHAR"}, {"name": "total_spending", "type": "DOUBLE"}],
+      "previewSql": "SELECT * FROM ${String(fullTableName).replace(/"/g, '')} LIMIT 100"
     }`}
 
     Be specific and provide working SQL. Use MySQL-specific features where appropriate (e.g., AUTO_INCREMENT, JSON functions).`,
@@ -468,6 +569,10 @@ module.exports = {
     - Database type: MySQL
     - Target schema: ${targetSchema}
     - Target table name: ${fullTableName}
+      That name is already qualified and quoted for this engine. Use it EXACTLY
+      as given: do not re-quote it, do not drop a part of it, and do not "tidy"
+      what looks like a repeated qualifier out of it — a table's own name may
+      contain a dot, so the repetition may be the name.
 
     Analyze the request and determine what operations are needed:
 
@@ -491,7 +596,19 @@ module.exports = {
     **Important**:
     - In-place mode only supports database storage (cannot store locally while modifying remote source).
     - For explanations text to bolden key points use **text** and to break lines use \\n
-    - If both ddl and sql are provided, ddl will execute first, then sql
+    - **Exactly ONE statement per field.** The "ddl" field is sent to the driver
+      as a single statement, and so is "sql". No semicolon-separated scripts, no
+      dynamic or guarded DDL, no procedure bodies — the driver runs one
+      statement per field and rejects everything after the first. Several
+      structural changes have to fit inside that one statement; if they cannot,
+      the transformation needs more than one node.
+    - ddl executes first, then sql. When BOTH are present, a failing ddl does
+      NOT fail the node — only a failing sql does, and the ddl's error is
+      reported alongside the result. That is what lets the node be rerun: on the
+      second run the structural change fails because the first run already
+      applied it, the DML behind it still runs, and the node succeeds. Write the
+      plain statement and let a rerun report it. When ddl is the ONLY field, its
+      failure IS the node's failure.
 
     Return your response in this JSON format:
     {
@@ -566,17 +683,50 @@ module.exports = {
    */
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
-
-    const quotedIdentifier = `\`${identifier}\``;
-
-    // For MySQL, use database name from config if available, otherwise use schema
-    const databaseName = config?.database || schema;
-
-    if (databaseName) {
-      return `\`${databaseName}\`.${quotedIdentifier}`;
+    // Already quoted — hand it back untouched. Callers pass identifiers that
+    // another layer has sometimes quoted already, and quoting a second time
+    // produces ONE identifier whose text is the quoted string, which resolves
+    // to nothing: a read of "PUBLIC"."public.transactions" came back as
+    // `Object 'TERNLUX.PUBLIC.""PUBLIC"."public.transactions""' does not exist`.
+    // The SQL Server connector has always done this; the rest now agree.
+    if (typeof identifier === 'string'
+        && identifier.startsWith('`') && identifier.endsWith('`') && identifier.length > 1) {
+      return identifier;
     }
 
-    return quotedIdentifier;
+
+    const quote = (part) => `\`${String(part).replace(/`/g, '``')}\``;
+
+    // A schema the CALLER passed settles it: the identifier is then the table's
+    // whole name, dots included. A table may genuinely be called
+    // "public.transactions", and reading a qualifier out of a name that already
+    // arrived with its schema beside it drops the real schema AND truncates the
+    // name — the other connectors have always tested the schema first, and this
+    // one now agrees.
+    if (schema) {
+      return `${quote(schema)}.${quote(identifier)}`;
+    }
+
+    // No schema beside it, so a qualifier may be read out of the name itself
+    // ("reporting.orders"). That qualifier is explicit, so it wins over the
+    // connection's own database, and each part is quoted separately: quoting the
+    // whole string would ask for a table whose NAME contains a dot, which never
+    // matches the unquoted `INSERT INTO reporting.orders` the insert path
+    // builds. A name that IS genuinely dotted cannot be told apart from a
+    // qualified one here, which is exactly why the caller passing a schema is
+    // preferred over this reading.
+    if (typeof identifier === 'string' && identifier.includes('.')) {
+      return identifier.split('.').map(quote).join('.');
+    }
+
+    // Nothing explicit either way — fall back to the connection's own database.
+    const databaseName = config?.database;
+
+    if (databaseName) {
+      return `${quote(databaseName)}.${quote(identifier)}`;
+    }
+
+    return quote(identifier);
   },
 
   /**

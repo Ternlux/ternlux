@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import Workflows from './components/Workflows/Workflows'
 import ChatBot from './components/Chat/ChatBot';
 import ChatAssistant from './components/Chat/ChatAssistant';
+import ExecutionMonitor from './components/Workflows/ExecutionMonitor';
 import ApiKeySetup from './components/ApiKeySetup/ApiKeySetup';
 import TermsAndConditions from './components/TermsAndConditions/TermsAndConditions';
 import Settings from './components/Settings/Settings';
@@ -99,6 +100,11 @@ function App() {
         activeContext={chatContext}
         onWorkflowBuilt={handleWorkflowBuilt}
       />
+      {/* Live view of every workflow currently executing — top-left, over
+          everything, and invisible when nothing is running. Mounted here
+          rather than inside Workflows so a CRON or file-watcher run shows up
+          whatever tab is open. */}
+      <ExecutionMonitor />
     </div>
     // <div className="app">
     //   <nav className="app-nav">

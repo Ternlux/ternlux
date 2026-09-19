@@ -32,8 +32,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('api-key:clear'),
 
   /**
-   * Generic local NeDB database access.
+   * The app's own metadata store — internal bookkeeping, not user data.
    * Collections: 'workflows' | 'connections' | 'executions' | 'chatSessions'
+   *            | 'workflowHistory'
    */
   /**
    * Data Explorer. Every database interaction the explorer performs, plus its
@@ -117,8 +118,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     count: (collection, query = {}) =>
       ipcRenderer.invoke('db:count', { collection, query }),
 
-    /** Read from a local NeDB or SQLite file. Returns { success, rows, rowCount, json }. */
-    readLocalCollection: (filePath, limit = 100, storageType = 'nedb', sqlPreview = null, tableName = null) =>
+    /** Read from a local DuckDB or SQLite file. Returns { success, rows, rowCount, json }. */
+    readLocalCollection: (filePath, limit = 100, storageType = 'duckdb', sqlPreview = null, tableName = null) =>
       ipcRenderer.invoke('db:read-local-collection', { filePath, limit, storageType, sqlPreview, tableName }),
   },
 
@@ -166,18 +167,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   registerLocalFile: (params) =>
     ipcRenderer.invoke('file:register-local', params),
 
-  // Legacy import paths. Superseded by registerLocalFile — kept so existing
-  // callers keep working, but new file connections no longer use them.
-  importToSqlite: (params) =>
-    ipcRenderer.invoke('import-to-sqlite', params),
-
-  importToNeDB: (params) =>
-    ipcRenderer.invoke('import-to-nedb', params),
-
   /**
    * Subscribe to progress from a running file import. Imports stream in
    * batches, so this fires roughly four times a second with what has landed
-   * so far — pass an `importId` to importToSqlite/importToNeDB and match on it.
+   * so far — pass an `importId` to registerLocalFile and match on it.
    * The callback receives:
    *   { importId, phase: 'reading'|'writing', rows, table?, sheet?,
    *     bytesRead?, totalBytes?, file? }
@@ -222,18 +215,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
 
 
-    /** Transform NeDB (local file) data. Returns { success, message, documentsProcessed, documentsInserted, localPath }. */
-    // transformNeDB: (sourceLocalPath, targetCollection, operationType, nosqlOperation, transformFunction, operationMode) =>
-    //   ipcRenderer.invoke('dbconn:transform-nedb', {
-    //     sourceLocalPath,
-    //     targetCollection,
-    //     operationType,
-    //     nosqlOperation,
-    //     transformFunction,
-    //     operationMode
-    //   }),
-
-    /** Unified NoSQL transformation (routes to MongoDB or NeDB based on dbType). */
+    /** NoSQL transformation against the source's document-store connector. */
     transformNoSQL: (dbType, config, connectionId, sourceLocalPath, sourceCollection, targetCollection, operationType, nosqlOperation, transformFunction, storageLocation, operationMode, targetLocalPath = null, scope = {}) =>
       ipcRenderer.invoke('dbconn:transform-nosql', {
         dbType,
@@ -248,7 +230,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         storageLocation,
         operationMode,
         targetLocalPath,
-        // Optional { workflowId, nodeId } — scopes the local NeDB output file.
+        // Optional { workflowId, nodeId } — scopes the local output table.
         workflowId: scope.workflowId || null,
         nodeId: scope.nodeId || null
       }),
@@ -283,7 +265,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
         destinationConnection,
         joinConfig,
         operationMode,
-        // Optional { workflowId, nodeId } — scopes the local NeDB output file.
+        // Optional { workflowId, nodeId } — scopes the local output table.
         workflowId: scope.workflowId || null,
         nodeId: scope.nodeId || null
       }),
@@ -302,13 +284,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('dbconn:execute-branch', params),
 
     /**
-     * Execute a REST API fetch function and materialise the response into NeDB.
+     * Execute a REST API fetch function and materialise the response locally.
      * params: {
      *   apiConnectionId: string,
      *   apiConnectionConfig: object,     // public config (no secrets)
      *   apiFetchCode: string,            // async JS function expression with
      *                                    // {{PLACEHOLDER}} tokens
-     *   nedbCollection: string,
+     *   targetCollection: string,
      *   operationMode?: 'new_table' | 'append'
      * }
      * returns: { success, rowCount, collection, localPath, sampleRow, error? }
@@ -353,9 +335,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getPreviewQuery: (dbType, tableName, limit = 100) =>
       ipcRenderer.invoke('dbconn:get-preview-query', { dbType, tableName, limit }),
 
-    /** Import Google Sheet to local SQLite database. Returns { success, localPath, tableName, rowCount, message }. */
-    importGoogleSheetToSqlite: (config, connectionId, spreadsheetId, sheetName) =>
-      ipcRenderer.invoke('google-sheets:import-to-sqlite', { config, connectionId, spreadsheetId, sheetName }),
+    /** Import Google Sheet to a local DuckDB file. Returns { success, localPath, tableName, rowCount, message }. */
+    importGoogleSheetToDuckDb: (config, connectionId, spreadsheetId, sheetName) =>
+      ipcRenderer.invoke('google-sheets:import-to-duckdb', { config, connectionId, spreadsheetId, sheetName }),
   },
 
   /**
@@ -581,8 +563,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * @returns {Promise<{ success, valid, reason, issues, remediation,
      *                     inconclusive?, drift: { drifted, reason } }>}
      */
-    validateChange: ({ workflowId, change = {}, chatHistory = [], pendingNode = null, fixRounds = 0 } = {}) =>
-      ipcRenderer.invoke('workflow:validateChange', { workflowId, change, chatHistory, pendingNode, fixRounds }),
+    validateChange: ({ workflowId, change = {}, chatHistory = [], priorActions = [], pendingNode = null, fixRounds = 0 } = {}) =>
+      ipcRenderer.invoke('workflow:validateChange', { workflowId, change, chatHistory, priorActions, pendingNode, fixRounds }),
 
     /**
      * Subscribe to live build-progress events emitted by executeBuild while a
@@ -617,6 +599,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
      * @returns {Promise<{ success, executionId, message, results }>}
      */
     executeWorkflow: (params) => ipcRenderer.invoke('workflow:execute', params),
+
+    /**
+     * Ask a running execution to stop.
+     *
+     * Cancellation is cooperative and lands BETWEEN nodes: the step in flight
+     * finishes and is recorded, then the run ends with status 'cancelled'. It
+     * does NOT abort a connector call mid-write, so a node that is loading a
+     * large table will keep loading it until it is done. The execution row is
+     * marked `cancelRequested: true` straight away, which is what the monitor
+     * shows as "stopping…".
+     * @param {{ executionId: string }} args
+     * @returns {Promise<{ success: boolean, message: string, alreadyRequested?: boolean }>}
+     */
+    cancelWorkflow: ({ executionId } = {}) =>
+      ipcRenderer.invoke('workflow:cancel', { executionId }),
 
     /**
      * Run a SINGLE node the way a full run would, without recording an
@@ -751,9 +748,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     exportObject: (connectionId, dbType, fileId, mimeType) =>
       ipcRenderer.invoke('cloud-storage:export-object', { connectionId, dbType, fileId, mimeType }),
 
-    /** Import a file from cloud storage to local SQLite/NeDB. Returns { success, localPath, dbType, tables, message }. */
-    importFile: (params) =>
-      ipcRenderer.invoke('cloud-storage:import-file', params),
 
     /**
      * Write downloaded bytes to a path the user chose and register the result

@@ -2,10 +2,11 @@
  * Local SQLite helper. Single entry point: runQuery({ dbPath, query, params })
  * plus getTables / getColumns.
  *
- * Each call opens its own sqlite3 connection — sqlite3 handles its own
- * locking, and the executor's main app DB is owned by SqliteConnectionPool
- * elsewhere; this lib is for arbitrary user-provided SQLite files (e.g. the
- * local outputs of previous nodes).
+ * Each call opens its own sqlite3 connection — sqlite3 handles its own locking.
+ * This is now the ONLY way the app reads SQLite: the shared connection pool it
+ * used to share the job with is gone, along with the transform, join and import
+ * paths that wrote through it. Every SQLite file is a user's own file, opened by
+ * path — a database they picked, or one an output node wrote.
  */
 
 const fs = require('fs');

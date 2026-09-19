@@ -225,12 +225,12 @@
   overflow-y: auto;
 }
 
+/* Lives inside the canvas's top-left ReactFlow Panel, which already places it.
+   Positioning it absolutely took it out of that panel's flow, so the build
+   banner stacked underneath it instead of below it. */
 .workflow-toolbar {
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  z-index: 100;
-  display: flex;
+  display: inline-flex;
+  width: fit-content;
   gap: 8px;
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid #e2e6eb;
@@ -481,6 +481,21 @@
 .react-flow__panel a{
   display: none;
 }
+
+/* `output` is one of ReactFlow's BUILT-IN type names, so our output node also
+   gets the library's default wrapper: 150px wide, padded, bordered. The card
+   inside is 264px, and the build highlight draws on the wrapper — which is why
+   it covered half the node. No other node type here collides. */
+.react-flow__node-output {
+  width: auto;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+  text-align: left;
+}
 /* ── Live AI build ──────────────────────────────────────────────────────────
    While the builder writes a workflow, WorkflowEditor draws each node on the
    canvas as it is built. The classes below are applied to ReactFlow's node
@@ -591,4 +606,93 @@
 @keyframes wf-build-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.72); }
+}
+
+/* ── Workflow execution ────────────────────────────────────────────────────
+   Same idea as the build classes above — applied to ReactFlow's node wrapper
+   so every node type picks them up — but driven by an actual run rather than
+   the AI builder. Declared AFTER the build rules so that in the (rare) case a
+   node carries both, the run state is what you see: a build is history, a run
+   is happening now.
+
+   WorkflowEditor reads the live execution record for the open workflow and
+   decides which of these each node gets (see runClassFor). */
+
+/* The step executing right now. Light green, flashing, so it reads as live. */
+.react-flow__node.wf-node-running {
+  border-radius: 6px;
+  animation: wf-node-running-pulse 1.2s ease-in-out infinite;
+  z-index: 5;
+}
+
+@keyframes wf-node-running-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.55), 0 0 14px 3px rgba(74, 222, 128, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(74, 222, 128, 1), 0 0 32px 10px rgba(74, 222, 128, 0.55);
+  }
+}
+
+/* A step this run has already finished. Steady and quiet — it marks how far
+   the run has got without competing with the node that is actually working. */
+.react-flow__node.wf-node-run-done {
+  border-radius: 6px;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.45);
+}
+
+/* The step that failed on the most recent run. Same red as a rewired input
+   but steady, not pulsing: this is a result to go and read, not something
+   changing under you. It stays until the workflow runs again. */
+.react-flow__node.wf-node-run-failed {
+  border-radius: 6px;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.9), 0 0 18px 4px rgba(220, 38, 38, 0.35);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .react-flow__node.wf-node-running {
+    animation: none;
+    box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.95), 0 0 20px 5px rgba(74, 222, 128, 0.4);
+  }
+}
+
+/* ── A node whose input was rewired ────────────────────────────────────────
+   The card is applied directly (not the ReactFlow wrapper) so this coexists
+   with the build classes above, which own the wrapper's box-shadow. Red and
+   pulsing while the node reads something other than what its logic was
+   written against; it stops the moment the original source is re-attached or
+   the node is regenerated (see workflowUtils.syncNodeSourcesToEdges). */
+.wf-node-source-changed {
+  animation: wf-source-changed-pulse 1s ease-in-out infinite;
+}
+
+@keyframes wf-source-changed-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.55), 0 1px 4px rgba(0, 0, 0, 0.07);
+  }
+  50% {
+    box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.9), 0 0 18px 4px rgba(220, 38, 38, 0.35);
+  }
+}
+
+/* Respect a reduced-motion preference: keep the red ring, drop the pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .wf-node-source-changed {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.85);
+  }
+}
+
+/* ── Google Picker above the app's own layers ─────────────────────────────
+   Used by GoogleDrivePicker (Sheets no longer opens Google's dialog at all —
+   see GoogleSheetsPicker). The workflow editor and its node panels are antd
+   Modals at z-index 1000, and the Picker injects its dialog at the end of
+   <body> with a lower stacking value, so it would otherwise open UNDER the
+   editor. These are the two class names the Picker script uses. */
+.picker-dialog-bg {
+  z-index: 3000 !important;
+}
+
+.picker-dialog {
+  z-index: 3001 !important;
 }

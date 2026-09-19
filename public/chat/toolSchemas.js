@@ -121,7 +121,7 @@ const CONNECTION_TOOLS = [
       type: 'object',
       properties: {
         connection: { type: 'string', description: 'Connection id or name.' },
-        query: { type: 'string', description: 'SQL string, or a JSON object for MongoDB/NeDB connectors.' },
+        query: { type: 'string', description: 'SQL string, or a JSON object for the MongoDB connector.' },
         limit: { type: 'number', description: `Row cap, at most ${MAX_QUERY_ROWS}.` },
       },
       required: ['connection', 'query'],
@@ -155,6 +155,38 @@ const EXECUTION_TOOLS = [
   },
 ];
 
+// Offered to the main agent as an "act/compute" tool, and to the workflow
+// sub-agent for ONE job: calling an API before a plan is proposed, so the
+// planner knows the response shape instead of guessing at it. Declared on its
+// own so the workflow toolbox can take this without taking http_request —
+// which cannot authenticate, and so cannot probe most real endpoints.
+const RUN_JAVASCRIPT_TOOL = {
+  name: 'run_javascript',
+  description: 'Generate AND run a one-off async JavaScript function for logic run_query and http_request '
+    + 'cannot express — per-row AI calls, embeddings, orchestrating several connections, or calling an API '
+    + 'that needs saved credentials. The function runs with ctx helpers (runQuery, askAi, vectorize, axios, '
+    + 'getTables, getColumns, apiCredentials, log); its returned array comes back as `rows`, capped at '
+    + `${MAX_QUERY_ROWS}. This computes an answer to SHOW; it saves nothing — `
+    + 'to build a saved transformer node use plan_workflow_build instead. Sample rows rather than looping over '
+    + 'everything: ctx.askAi and ctx.axios cost money and rate-limit. If `ran` is false the generator needs '
+    + 'clarification (see `questionsNeeded`) — ask the user rather than retrying blindly.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      request: { type: 'string', description: 'Plain-English description of what the function must do.' },
+      source: {
+        type: 'object',
+        description: 'Optional table to load as the function\'s `records` input. Omit to start from an empty '
+          + 'array and have the function fetch what it needs itself.',
+        properties: { connection: { type: 'string' }, table: { type: 'string' } },
+        additionalProperties: false,
+      },
+    },
+    required: ['request'],
+    additionalProperties: false,
+  },
+};
+
 const EXTERNAL_TOOLS = [
   {
     name: 'http_request',
@@ -177,31 +209,7 @@ const EXTERNAL_TOOLS = [
       additionalProperties: false,
     },
   },
-  {
-    name: 'run_javascript',
-    description: 'Generate AND run a one-off async JavaScript function for logic run_query and http_request '
-      + 'cannot express — per-row AI calls, embeddings, orchestrating several connections. The function runs '
-      + 'with ctx helpers (runQuery, askAi, vectorize, axios, getTables, getColumns, log); its returned array '
-      + `comes back as \`rows\`, capped at ${MAX_QUERY_ROWS}. This computes an answer to SHOW; it saves nothing — `
-      + 'to build a saved transformer node use plan_workflow_build instead. Sample rows rather than looping over '
-      + 'everything: ctx.askAi and ctx.axios cost money and rate-limit. If `ran` is false the generator needs '
-      + 'clarification (see `questionsNeeded`) — ask the user rather than retrying blindly.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        request: { type: 'string', description: 'Plain-English description of what the function must do.' },
-        source: {
-          type: 'object',
-          description: 'Optional table to load as the function\'s `records` input. Omit to start from an empty '
-            + 'array and have the function fetch what it needs itself.',
-          properties: { connection: { type: 'string' }, table: { type: 'string' } },
-          additionalProperties: false,
-        },
-      },
-      required: ['request'],
-      additionalProperties: false,
-    },
-  },
+  RUN_JAVASCRIPT_TOOL,
 ];
 
 // ── Main-agent only ────────────────────────────────────────────────────────
@@ -393,6 +401,7 @@ const MAIN_SCHEMAS = [
 const WORKFLOW_SCHEMAS = [
   ...CONNECTION_TOOLS,
   ...WORKFLOW_READ_TOOLS,
+  RUN_JAVASCRIPT_TOOL,
   ...WORKFLOW_ONLY_TOOLS,
 ];
 

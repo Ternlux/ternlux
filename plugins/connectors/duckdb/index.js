@@ -35,6 +35,7 @@
  *   tableSheets name -> sheet, for a workbook's tables — they share one path
  */
 
+const fs = require('fs');
 const path = require('path');
 
 // public/ and plugins/ are siblings in both the repo and the packaged app.
@@ -126,11 +127,88 @@ function tablesOf(config) {
 }
 
 /**
+ * The schema a connection's tables appear under, WITHOUT touching the file.
+ *
+ * A database's schema is its attach alias, which `aliasForDbPath` derives from
+ * the path alone, so this stays a pure function for either kind of connection.
+ * That is what lets the tree be built, and a single schema be re-registered on
+ * demand, without opening anything.
+ */
+const schemaNameFor = (config, connectionId) => (
+  isDatabase(config.dbPath)
+    ? duck.aliasForDbPath(config.dbPath)
+    : schemaFor(connectionId, config)
+);
+
+/**
+ * The sibling connections as registerSchema wants them — each carrying its own
+ * name and the peer list it needs to resolve its schema name the same way from
+ * either side.
+ */
+function siblingsOf(config, connectionId) {
+  const siblings = Array.isArray(config.siblings) ? config.siblings : [];
+  return siblings.map((sib) => ({
+    connectionId: sib.connectionId,
+    name: sib.name,
+    config: {
+      ...sib.config,
+      connectionName: sib.name,
+      siblings: [
+        { connectionId, name: config.connectionName },
+        ...siblings.filter((s) => s.connectionId !== sib.connectionId),
+      ],
+    },
+  }));
+}
+
+/** A file's identity for caching: its path and the version on disk. */
+const fileVersion = (filePath) => {
+  try { return `${filePath}@${fs.statSync(filePath).mtimeMs}`; } catch (_) { return `${filePath}@missing`; }
+};
+
+const fileExists = (filePath) => {
+  try { return fs.statSync(filePath).isFile(); } catch (_) { return false; }
+};
+
+/**
+ * connectionId → the last registration made for it, and the inputs it was made
+ * from. A hit skips the work entirely.
+ *
+ * Registering a data file is not bookkeeping: creating the view BINDS a reader
+ * over it, which sniffs a CSV, verifies a workbook and (before it was pinned)
+ * re-inferred a JSON file's whole schema. That was being paid on the schema
+ * tree, on every column expansion and on every run, for the opened connection
+ * AND every sibling — so re-registering an unchanged file was most of what
+ * opening a large local file cost.
+ *
+ * The key covers everything the registration depends on: the session (a rebuilt
+ * DuckDB instance has none of these views), the schema name it resolved to, and
+ * each backing file's mtime — so a file edited on disk still re-registers, which
+ * is what keeps an external edit visible without reconnecting.
+ *
+ * Only data files are cached. A database is ATTACHed rather than viewed, which
+ * duck already caches, and its table list is a catalog query that must stay
+ * live: a worksheet that creates a table in an attached database has to see it
+ * in the tree without waiting for an mtime to change.
+ */
+const registrationCache = new Map();
+
+function registrationKey(config, schema) {
+  return JSON.stringify([
+    duck.sessionEpoch(),
+    schema,
+    config.format || null,
+    tablesOf(config).map((t) => [t.name, t.sheet || null, fileVersion(t.path)]),
+  ]);
+}
+
+/**
  * Make one connection's tables reachable, and describe what backs each of them.
  *
  * A database is attached under its own catalog alias; its tables are already
  * base tables and are left alone. Data files each become a view in a schema of
- * this connection's own.
+ * this connection's own — and are skipped when nothing about them has changed
+ * since the last call.
  *
  * @returns {Promise<{schema: string, tables: Array<{
  *   schema, name, kind: 'native'|'file', ref, path, format, from
@@ -138,6 +216,21 @@ function tablesOf(config) {
  *   expression that reads the file behind it.
  */
 async function registerSchema(config, connectionId) {
+  if (isDatabase(config.dbPath)) return buildSchema(config, connectionId);
+
+  const schema = schemaFor(connectionId, config);
+  const key = registrationKey(config, schema);
+  const cacheId = connectionId || config.dbPath;
+  const cached = registrationCache.get(cacheId);
+  if (cached && cached.key === key) return cached.result;
+
+  const result = await buildSchema(config, connectionId);
+  registrationCache.set(cacheId, { key, result });
+  return result;
+}
+
+/** registerSchema without the memo — the work itself. */
+async function buildSchema(config, connectionId) {
   if (isDatabase(config.dbPath)) {
     let alias;
     try {
@@ -214,20 +307,12 @@ async function ensureViews(config, connectionId, registered = null) {
     registered.push(...own.tables.map((t) => ({ ...t, primary: true, label: config.connectionName || config.name || null })));
   }
 
-  const siblings = Array.isArray(config.siblings) ? config.siblings : [];
-  for (const sib of siblings) {
+  for (const sib of siblingsOf(config, connectionId)) {
     try {
       // A sibling resolves its own schema name the same way the primary does,
       // so it needs its name AND the same peer list — otherwise the two sides
       // of a collision would disagree about which one keeps the bare name.
-      const peers = [
-        { connectionId, name: config.connectionName },
-        ...siblings.filter((s) => s.connectionId !== sib.connectionId),
-      ];
-      const reg = await registerSchema(
-        { ...sib.config, connectionName: sib.name, siblings: peers },
-        sib.connectionId,
-      );
+      const reg = await registerSchema(sib.config, sib.connectionId);
       if (registered) {
         registered.push(...reg.tables.map((t) => ({ ...t, primary: false, label: sib.name || null })));
       }
@@ -251,6 +336,72 @@ async function ensureViews(config, connectionId, registered = null) {
     : own.schema;
   await duck.exec(`SET search_path = ${duck.quoteLiteral(searchPath)}`);
   return own.schema;
+}
+
+/**
+ * Register only the connection that owns `schemaName`.
+ *
+ * Reading one table's columns needs one view, not the whole session's worth.
+ * Schema names resolve without touching a file (schemaNameFor), so the owner is
+ * found by name and only that connection is registered; an unrecognised schema
+ * falls back to registering everything, which is the answer that cannot be
+ * wrong.
+ */
+async function ensureSchema(config, connectionId, schemaName) {
+  if (!config || !config.dbPath) throw new Error('DuckDB requires a file path');
+  if (!schemaName) return ensureViews(config, connectionId);
+
+  if (schemaNameFor(config, connectionId) === schemaName) {
+    await registerSchema(config, connectionId);
+    return schemaName;
+  }
+
+  const owner = siblingsOf(config, connectionId)
+    .find((sib) => schemaNameFor(sib.config, sib.connectionId) === schemaName);
+  if (!owner) return ensureViews(config, connectionId);
+
+  await registerSchema(owner.config, owner.connectionId);
+  return schemaName;
+}
+
+/**
+ * The tables this connection and its siblings expose — WITHOUT registering
+ * anything.
+ *
+ * A data-file connection already knows its own table names: they are in the
+ * connection record (`tables` / `tablePaths` / `tableSheets`), which is what
+ * `tablesOf` reads. Nothing about naming them requires opening the file, so the
+ * schema tree no longer does — that is the difference between a sidebar that
+ * appears at once and one that waits for every file the user has ever imported
+ * to be sniffed.
+ *
+ * A missing file is dropped here rather than by a failed CREATE VIEW, which is
+ * what registration used to fall back on. The tradeoff is that a file which
+ * EXISTS but cannot be read now lists its table and reports the problem when it
+ * is opened, instead of being silently absent from the tree.
+ *
+ * A database still has to be attached: its table list is in the file, not in
+ * the connection record. Attaching is cached per session and reads no data.
+ */
+async function listTables(config, connectionId) {
+  if (isDatabase(config.dbPath)) {
+    const own = await registerSchema(config, connectionId);
+    return own.tables;
+  }
+
+  const schema = schemaFor(connectionId, config);
+  return tablesOf(config)
+    .filter((table) => fileExists(table.path))
+    .map((table) => ({
+      schema,
+      name: table.name,
+      kind: 'file',
+      ref: `${duck.quoteIdentifier(schema)}.${duck.quoteIdentifier(table.name)}`,
+      path: table.path,
+      format: config.format || duck.detectFormat(table.path),
+      from: null,
+      sheet: table.sheet,
+    }));
 }
 
 /**
@@ -586,10 +737,73 @@ module.exports = {
   name: 'DuckDB',
   dbCategory: 'SQL',
 
+  /**
+   * Column types for a CREATE TABLE this app generates. See the note on
+   * `types` in plugins/connectors/snowflake/index.js.
+   */
+  types: {
+    NULL: () => 'VARCHAR',
+    DATE_ONLY: () => 'DATE',
+    TIMESTAMP: () => 'TIMESTAMP',
+    BOOLEAN: () => 'BOOLEAN',
+    // BIGINT rather than INTEGER: this is a staging engine for data arriving
+    // from elsewhere, and an id that overflows 2^31 would fail the load.
+    INTEGER: () => 'BIGINT',
+    FLOAT: () => 'DOUBLE',
+    // VARCHAR rather than JSON: the value is serialised to a string before it
+    // gets here, and a malformed one would fail the INSERT rather than store.
+    OBJECT: () => 'VARCHAR',
+    // VARCHAR is unbounded in DuckDB — a length would be accepted and ignored.
+    STRING: () => 'VARCHAR',
+  },
+
   testConnection: async (config) => {
     try {
       await ensureViews(config, null);
       return { success: true, message: 'File readable' };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
+   * Undo what registerSchema did, for a connection that has been deleted.
+   *
+   * Browsing a local file leaves a schema of views behind on the shared DuckDB
+   * instance — that is how one file can be joined to another. They outlive the
+   * connection record: delete the connection and its views keep answering, so
+   * a worksheet still resolves `sales_csv.orders` and the file still shows up
+   * among another connection's siblings, until the app is restarted.
+   *
+   * A database-backed connection is ATTACHed rather than viewed, so it is
+   * detached instead — which also lets go of the file handle.
+   *
+   * `config.siblings` must be the connections that REMAIN, exactly as the
+   * explorer passes them when registering: schemaFor resolves a name collision
+   * from the sibling list, so the same list is what reproduces the name this
+   * connection was registered under.
+   *
+   * Never throws. Cleanup that fails is a stale view; cleanup that throws is a
+   * connection the user cannot delete.
+   */
+  releaseConnection: async (config, connectionId) => {
+    try {
+      if (!config || !config.dbPath) return { success: true, message: 'Nothing was registered' };
+      // Whatever is about to be dropped, the memo must stop claiming it is
+      // registered — otherwise the next call would skip rebuilding views that
+      // no longer exist.
+      registrationCache.delete(connectionId || config.dbPath);
+
+      if (isDatabase(config.dbPath)) {
+        await duck.detachDb(config.dbPath);
+        return { success: true, message: 'Database detached' };
+      }
+
+      const schema = schemaFor(connectionId, config);
+      // CASCADE takes the views with the schema; they are only ever views over
+      // a file, so nothing here owns data.
+      await duck.exec(`DROP SCHEMA IF EXISTS ${duck.quoteIdentifier(schema)} CASCADE`);
+      return { success: true, message: `Dropped schema ${schema}` };
     } catch (error) {
       return { success: false, message: error.message };
     }
@@ -601,16 +815,32 @@ module.exports = {
    */
   getTables: async (config, connectionId) => {
     try {
+      if (!config || !config.dbPath) throw new Error('DuckDB requires a file path');
+
       // The opened connection's tables come back flagged primary so the
       // explorer knows which schema to focus, followed by every sibling's —
-      // all joinable, because they share one DuckDB instance. Only siblings
-      // that actually registered are listed.
-      const registered = [];
-      await ensureViews(config, connectionId, registered);
+      // all joinable, because they share one DuckDB instance.
+      //
+      // Nothing is registered here. Listing a name is not reading a file, and
+      // treating it as though it were is what made the sidebar wait on every
+      // file in the session; the views are built when a table is actually
+      // opened, expanded or queried.
+      const listed = (await listTables(config, connectionId))
+        .map((t) => ({ ...t, primary: true, label: config.connectionName || config.name || null }));
+
+      for (const sib of siblingsOf(config, connectionId)) {
+        try {
+          const tables = await listTables(sib.config, sib.connectionId);
+          listed.push(...tables.map((t) => ({ ...t, primary: false, label: sib.name || null })));
+        } catch (_err) {
+          // The file moved, was deleted, or its database will not open. Leaving
+          // it out is what keeps it off the tree.
+        }
+      }
 
       return {
         success: true,
-        tables: registered.map((t) => ({
+        tables: listed.map((t) => ({
           schema: t.schema,
           schemaLabel: t.label,
           primary: t.primary,
@@ -625,7 +855,17 @@ module.exports = {
 
   getColumns: async (config, connectionId, schema, table) => {
     try {
-      await ensureViews(config, connectionId);
+      // Accept a qualified "main.orders" as well as a bare table with the
+      // schema passed separately — the same two shapes quoteIdentifier handles.
+      // An explicit `schema` wins over the qualifier.
+      const parts = String(table || '').split('.');
+      if (parts.length === 2) {
+        if (!schema) [schema] = parts;
+        [, table] = parts;
+      }
+      // Only the schema being asked about has to exist for this — expanding one
+      // table in the tree should not register every other connection's files.
+      await ensureSchema(config, connectionId, schema);
       // Qualify with the schema the tree asked about. Unqualified would resolve
       // through search_path — i.e. always the opened file — so a sibling's
       // columns would come back wrong (or not at all) once siblings are
@@ -738,9 +978,30 @@ module.exports = {
     ],
   },
 
-  quoteIdentifier: (identifier, schema = null) => (
-    schema ? `${duck.quoteIdentifier(schema)}.${duck.quoteIdentifier(identifier)}` : duck.quoteIdentifier(identifier)
-  ),
+  // A dotted name given as one string ("main.orders") is a schema-qualified
+  // table name, so each part is quoted separately. Quoting it whole would name
+  // one table with a dot in it, which never matches the unquoted form the
+  // insert path builds — the same rule the PostgreSQL connector follows, which
+  // is the dialect DuckDB tracks.
+  quoteIdentifier: (identifier, schema = null) => {
+    if (!identifier) return identifier;
+    // Already quoted — hand it back untouched. Callers pass identifiers that
+    // another layer has sometimes quoted already, and quoting a second time
+    // produces ONE identifier whose text is the quoted string, which resolves
+    // to nothing: a read of "PUBLIC"."public.transactions" came back as
+    // `Object 'TERNLUX.PUBLIC.""PUBLIC"."public.transactions""' does not exist`.
+    // The SQL Server connector has always done this; the rest now agree.
+    if (typeof identifier === 'string'
+        && identifier.startsWith('"') && identifier.endsWith('"') && identifier.length > 1) {
+      return identifier;
+    }
+
+    if (schema) return `${duck.quoteIdentifier(schema)}.${duck.quoteIdentifier(identifier)}`;
+    if (typeof identifier === 'string' && identifier.includes('.')) {
+      return identifier.split('.').map((part) => duck.quoteIdentifier(part)).join('.');
+    }
+    return duck.quoteIdentifier(identifier);
+  },
 
   getPreviewQuery: (tableName, limit = 100) => `SELECT * FROM ${tableName} LIMIT ${limit}`,
 

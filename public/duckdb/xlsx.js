@@ -133,6 +133,94 @@ function sanitizeSheetName(name, fallback = 'Data') {
  * @param {object[]} rows     the sheet's contents
  * @param {string[]} columns  column order, since rows are unordered objects
  */
+// The xlsx FORMAT holds at most 1,048,576 rows per sheet — a hard limit of the
+// file format, not of any writer. One row is the header, so this is the data
+// ceiling. Excel itself refuses to open anything claiming more.
+const XLSX_MAX_DATA_ROWS = 1048575;
+
+// What THIS writer can build below that ceiling. SheetJS (0.18.5, the last npm
+// release) stores a sheet as one object with a property per cell, and V8
+// refuses to enumerate an object past ~8.3M properties — the observed failure
+// was "RangeError: Too many properties to enumerate" from inside
+// json_to_sheet. So a sheet that is legal for the format can still be too big
+// for the writer when it is wide: 1M rows × 10 columns is 10M cells. Newer
+// SheetJS has a dense (array-backed) mode that lifts this, but 0.18.5's
+// json_to_sheet silently ignores `dense: true` (verified), so the budget is
+// enforced instead of crashed into. Margin kept under the hard limit.
+const SHEETJS_CELL_BUDGET = 8000000;
+
+/**
+ * Throw with a clear account if a sheet of `rowCount` data rows can't be
+ * written — either at all (format limit) or by this writer (cell budget).
+ *
+ * @param {number} rowCount  Data rows, excluding the header.
+ * @param {number} [colCount] Columns, when known. The format check runs
+ *   without it; the cell-budget check needs it.
+ * @param {string} [rowCountLabel] Optional wording for the row count — the
+ *   early bail in the output reader stops counting at the cap, so it says
+ *   "more than N" rather than claiming a total it never measured.
+ */
+/**
+ * The most data rows a sheet of `colCount` columns can actually hold here —
+ * the format's own ceiling, or the writer's cell budget, whichever bites first.
+ *
+ * Lets a reader stop at the real limit rather than at the row limit alone: a
+ * 12-column source runs out of cells at ~666k rows, well before 1,048,575, and
+ * without this the extra 230k rows are read only to be thrown away.
+ *
+ * @param {number} [colCount] Columns. Unknown (0/null) gives the row ceiling.
+ */
+function maxDataRowsFor(colCount = 0) {
+  if (!colCount || colCount < 1) return XLSX_MAX_DATA_ROWS;
+  // -1 for the header row, which spends cells too.
+  const byCells = Math.floor(SHEETJS_CELL_BUDGET / colCount) - 1;
+  return Math.max(0, Math.min(XLSX_MAX_DATA_ROWS, byCells));
+}
+
+/**
+ * Stop a read that has already gone past what a sheet can hold.
+ *
+ * Called while the source is still being read, so the row count is a FLOOR, not
+ * a total — the message says "more than N" rather than inventing a size that
+ * was never measured.
+ *
+ * @param {number} rowsSoFar Rows read so far.
+ * @param {number} [colCount] Columns, from the first row.
+ */
+function assertSheetBudgetSoFar(rowsSoFar, colCount = 0) {
+  const cap = maxDataRowsFor(colCount);
+  if (rowsSoFar <= cap) return;
+
+  const limitedByCells = colCount >= 1 && cap < XLSX_MAX_DATA_ROWS;
+  throw new Error(
+    `An Excel sheet here holds at most ${cap.toLocaleString()} data rows`
+    + (limitedByCells
+      ? ` at ${colCount} columns (the writer's ${SHEETJS_CELL_BUDGET.toLocaleString()}-cell limit)`
+      : ' (the limit of the .xlsx format)')
+    + `, and this source has more than that. `
+    + 'Export to CSV or Parquet instead, or reduce the rows'
+    + (limitedByCells ? ' or columns' : '') + ' with a transformer first.',
+  );
+}
+
+function assertSheetFits(rowCount, colCount = null, rowCountLabel = null) {
+  const have = rowCountLabel || `${rowCount.toLocaleString()} rows`;
+  if (rowCount > XLSX_MAX_DATA_ROWS) {
+    throw new Error(
+      `An Excel sheet holds at most ${XLSX_MAX_DATA_ROWS.toLocaleString()} data rows and this source has ${have}. `
+      + 'Export to CSV or Parquet instead, or reduce the rows with a transformer first.',
+    );
+  }
+  if (colCount && (rowCount + 1) * colCount > SHEETJS_CELL_BUDGET) {
+    throw new Error(
+      `This sheet needs ${((rowCount + 1) * colCount).toLocaleString()} cells `
+      + `(${have} × ${colCount} columns), which is more than the Excel writer can build `
+      + `(${SHEETJS_CELL_BUDGET.toLocaleString()}). `
+      + 'Export to CSV or Parquet instead, or reduce the rows or columns with a transformer first.',
+    );
+  }
+}
+
 function writeSheet(filePath, sheetName, rows, columns) {
   // eslint-disable-next-line global-require
   const XLSX = require('xlsx');
@@ -143,6 +231,11 @@ function writeSheet(filePath, sheetName, rows, columns) {
   const workbook = existing ? XLSX.readFile(filePath, { cellDates: true }) : XLSX.utils.book_new();
   const sheet = sanitizeSheetName(sheetName);
   const header = columns && columns.length ? columns : Object.keys(rows[0] || {});
+
+  // Refused up front, with the reason, rather than crashed into: past these
+  // sizes json_to_sheet dies mid-build with "Too many properties to enumerate",
+  // an error that names neither the sheet nor what to do about it.
+  assertSheetFits((rows || []).length, header.length);
   const cleaned = (rows || []).map((row) => {
     const out = {};
     for (const name of header) out[name] = cellValue(row ? row[name] : null);
@@ -174,4 +267,9 @@ module.exports = {
   replaceSheet,
   writeSheet,
   sanitizeSheetName,
+  XLSX_MAX_DATA_ROWS,
+  SHEETJS_CELL_BUDGET,
+  maxDataRowsFor,
+  assertSheetBudgetSoFar,
+  assertSheetFits,
 };
