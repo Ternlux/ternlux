@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Form, Input, InputNumber, Switch, Button, Space, message, Alert, Select } from 'antd';
 import { LinkOutlined, CheckCircleOutlined } from '@ant-design/icons';
 import KeyValueFields, { MAX_PAIRS, normalisePairs } from './KeyValueFields';
+import { uniqueNameRule } from './connectionNameRule';
 
 /**
  * Dynamic Connection Form
@@ -12,7 +13,8 @@ const DynamicConnectionForm = ({
   onSave,
   onCancel,
   onTest,
-  editingConnection
+  editingConnection,
+  existingConnections = []
 }) => {
   const [form] = Form.useForm();
   const [testing, setTesting] = useState(false);
@@ -396,7 +398,18 @@ const DynamicConnectionForm = ({
   const visibleFields = (plugin.configSchema?.fields || []).filter(isFieldVisible);
 
   return (
-    <div style={{ padding: '20px 0' }}>
+    // Cap the form to the viewport. A cloud-storage/OAuth connector renders
+    // name + description + every credential field + the authorize block + an
+    // alert — around 900px — and the popup hosting this sizes to its content,
+    // so without a cap it grows past the bottom of the window and sits low
+    // with its buttons below the fold. The FIELDS scroll instead, keeping the
+    // popup short (so it stays high on screen) and the action row in view.
+    <div style={{
+      padding: '20px 0',
+      display: 'flex',
+      flexDirection: 'column',
+      maxHeight: 'calc(100vh - 200px)',
+    }}>
       <Form
         form={form}
         layout="vertical"
@@ -404,12 +417,19 @@ const DynamicConnectionForm = ({
           connectionName: editingConnection?.name || '',
           description: editingConnection?.description || '',
         }}
+        style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
       >
+        {/* Scrolls when the connector has more fields than the window fits.
+            The right padding keeps the scrollbar off the inputs. */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4 }}>
         {/* Connection metadata fields */}
         <Form.Item
           name="connectionName"
           label="Connection Name"
-          rules={[{ required: true, message: 'Connection name is required' }]}
+          rules={[
+            { required: true, message: 'Connection name is required' },
+            uniqueNameRule(existingConnections, editingConnection),
+          ]}
         >
           <Input placeholder={`${plugin.name} Database`} />
         </Form.Item>
@@ -470,9 +490,10 @@ const DynamicConnectionForm = ({
             )}
           </>
         )}
+        </div>
 
-        {/* Action buttons */}
-        <Form.Item style={{ marginBottom: 0, marginTop: 24 }}>
+        {/* Action buttons — outside the scroll region so they stay reachable. */}
+        <Form.Item style={{ marginBottom: 0, marginTop: 24, flexShrink: 0 }}>
           <Space style={{ width: '100%', justifyContent: 'flex-end' }}>
             <Button onClick={onCancel}>
               Cancel

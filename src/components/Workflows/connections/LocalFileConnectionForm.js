@@ -9,6 +9,7 @@ import {
 } from '@ant-design/icons';
 import { ReactComponent as ParquetIcon } from '../../ConnectorImages/Parquet.svg';
 import { ReactComponent as AvroIcon } from '../../ConnectorImages/Avro.svg';
+import { uniqueNameRule } from './connectionNameRule';
 
 const { Dragger } = Upload;
 const { TextArea } = Input;
@@ -54,7 +55,8 @@ const LocalFileConnectionForm = ({
   onSave,
   onCancel,
   editingConnection,
-  initialFile // optional File object (e.g. dropped onto the workflow canvas)
+  initialFile, // optional File object (e.g. dropped onto the workflow canvas)
+  existingConnections = []
 }) => {
   const [form] = Form.useForm();
   const [filePath, setFilePath] = useState(editingConnection?.fileInfo?.filePath || '');
@@ -93,7 +95,10 @@ const LocalFileConnectionForm = ({
     const filters = {
       sqlite: [{ name: 'SQLite Database', extensions: ['db', 'sqlite', 'sqlite3'] }],
       duckdb: [{ name: 'DuckDB Database', extensions: ['duckdb'] }],
-      lancedb: [{ name: 'LanceDB Directory', extensions: ['lance'] }],
+      // No lancedb entry: it opens a DIRECTORY picker below, which ignores
+      // filters. The `.lance` filter that used to sit here only advertised the
+      // wrong thing to pick — a single table folder rather than the database
+      // directory that holds them.
       json: [{ name: 'JSON Files', extensions: ['json'] }],
       // No .xls or .xlsb: DuckDB reads a workbook as an OOXML zip, which the
       // legacy binary formats are not. Offering them in the picker would only
@@ -377,7 +382,18 @@ const LocalFileConnectionForm = ({
               const tablesResult = await window.electronAPI.listLanceDBTables(filePath);
               if (tablesResult.success) {
                 importedTables = tablesResult.tables || [];
-                message.success(`Found ${importedTables.length} table(s) in LanceDB`);
+                // Zero tables is a broken connection, not a successful one: the
+                // assistant is handed a vector store with nothing to search and
+                // can only ask the user which table to use. Say so here, while
+                // the picker is still open and the path can be corrected.
+                if (importedTables.length === 0) {
+                  message.warning(
+                    'No tables found in this LanceDB directory. Select the database folder '
+                    + '— the one that CONTAINS the .lance table folders — not a .lance folder itself.'
+                  );
+                } else {
+                  message.success(`Found ${importedTables.length} table(s) in LanceDB`);
+                }
               } else {
                 message.warning('Could not list LanceDB tables: ' + tablesResult.message);
               }
@@ -400,8 +416,10 @@ const LocalFileConnectionForm = ({
         fileType: fileType,
         fileInfo: {
           originalName: fileName,
-          // The file DuckDB reads: the user's own file for csv/json/parquet, or
-          // the converted Parquet for Excel/Avro.
+          // The file DuckDB reads — the user's own, whatever the format. Nothing
+          // is converted: Excel and Avro are read through extensions that ship
+          // with the app, so this is the path they picked (for a workbook, the
+          // first sheet's entry in `tablePaths`, which is that same file).
           filePath: targetFilePath,
           sourceFilePath: originalFilePath, // Always the file the user picked
           format: fileFormat, // csv | json | parquet | xlsx | avro
@@ -489,7 +507,11 @@ const LocalFileConnectionForm = ({
     const accepts = {
       sqlite: '.db,.sqlite,.sqlite3',
       duckdb: '.duckdb',
-      lancedb: '.lance',
+      // A LanceDB connection points at the database DIRECTORY, whose children
+      // are the `.lance` table folders. Advertising `.lance` here steered the
+      // picker at one of those children — a single table, which `connect()`
+      // reads as a database holding no tables at all.
+      lancedb: '',
       json: '.json',
       spreadsheet: '.csv,.xlsx,.xlsm',
       parquet: '.parquet',
@@ -554,7 +576,8 @@ const LocalFileConnectionForm = ({
 
                 return Promise.resolve();
               }
-            }
+            },
+            uniqueNameRule(existingConnections, editingConnection)
           ]}
           help="A unique name for this data source (letters, numbers, and underscores)"
         >
