@@ -25,6 +25,7 @@ import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleD
 import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
 import CloudStorageBrowser from '../CloudStorageBrowser';
 import GoogleDrivePicker from '../GoogleDrivePicker';
+import GoogleSheetsPicker from '../GoogleSheetsPicker';
 import ConnectionTypeSelector from '../ConnectionTypeSelector';
 import DynamicConnectionForm from '../connections/DynamicConnectionForm';
 import LocalFileConnectionForm from '../connections/LocalFileConnectionForm';
@@ -57,7 +58,6 @@ const getDbIcon = (dbType) => {
     mssql: MssqlIcon,
     mongodb: MongodbIcon,
     sqlite: SqlliteIcon,
-    nedb: SqlliteIcon,
     gcs: GoogleCloudStorageIcon,
     dropbox: DropboxIcon,
     'google-drive': GoogleDriveIcon,
@@ -75,23 +75,45 @@ const getFileIcon = (fileType) => {
     parquet: ParquetIcon,
     avro: AvroIcon,
     sqlite: SqlliteIcon,
-    nedb: SqlliteIcon,
   };
   return iconMap[fileType] || null;
 };
+
+/**
+ * What to show when the dataset list comes back empty.
+ *
+ * A source with nothing in it and a source that could not be READ are different
+ * problems with different fixes, and reporting both as "none found" sends the
+ * user to check settings that are usually fine. The connector's own message is
+ * the half that helps — it names the file that has moved, the extension that
+ * would not load, the port that is closed — so it wins whenever there is one.
+ *
+ * The listing already carried that message back (see loadDatabaseTables); it was
+ * only ever rendered as a hint on the picker, which does not exist while the
+ * list is empty — so every failure read as "no tables found" no matter what.
+ */
+const DatasetEmpty = ({ error, noun }) => (
+  <EmptyState>
+    {error
+      ? `Could not list ${noun}: ${error}`
+      : `No ${noun} found. Check the connection settings.`}
+  </EmptyState>
+);
 
 /** Which dataset step a connection leads to. Mirrors the old chat branching. */
 const connKindOf = (conn) => {
   if (!conn) return null;
   if (conn.dbType === 'rest-api' || conn.dbCategory === 'API') return 'api';
-  // Ahead of the CloudStorage check: Sheets has its own spreadsheet+sheet
-  // import path, not the generic file browser.
-  if (conn.dbType === 'google-sheets') return 'sheets';
-  if (conn.dbCategory === 'CloudStorage') return 'cloud';
+  // Sheets goes through the cloud browser like every other remote store: the
+  // spreadsheet is the container and its tabs are the files. It used to have a
+  // private path that imported the tab into the shared SQLite database, which
+  // made it a snapshot no run could refresh; a tab now downloads as CSV, is
+  // read in place by DuckDB, and re-downloads each run like an S3 object.
+  if (conn.dbCategory === 'CloudStorage' || conn.dbType === 'google-sheets') return 'cloud';
   if (conn.dbCategory === 'Vector' || conn.dbType === 'lancedb' || conn.dbType === 'pinecone') return 'vector';
   // Only a remote document store is still NoSQL. Local files — including JSON —
   // are read as SQL by DuckDB.
-  if (conn.dbType === 'mongodb' || conn.dbType === 'nedb') return 'nosql';
+  if (conn.dbType === 'mongodb') return 'nosql';
   if (conn.connectionType === 'database' || conn.dbType === 'sqlite' || conn.dbType === 'duckdb') return 'sql';
   return 'ready';
 };
@@ -106,7 +128,6 @@ const EXT_FILE_TYPE = {
   '.parquet': 'parquet',
   '.avro': 'avro',
   '.sqlite': 'sqlite', '.sqlite3': 'sqlite', '.db': 'sqlite',
-  '.nedb': 'nedb',
 };
 
 const FILE_TYPE_LABEL = {
@@ -116,7 +137,6 @@ const FILE_TYPE_LABEL = {
   parquet: 'Parquet',
   avro: 'Avro',
   sqlite: 'SQLite',
-  nedb: 'NeDB',
   lancedb: 'LanceDB',
 };
 
@@ -261,6 +281,16 @@ const DataSourceNodeChat = ({
   const [dbTableObjects, setDbTableObjects] = useState([]);
   const [selectedSchema, setSelectedSchema] = useState(initialConfig?.sourceSchema || '');
   const [selectedTableName, setSelectedTableName] = useState('');
+  // Why the table list is empty, when it is empty because the lookup FAILED
+  // rather than because the database holds nothing. Without it a connection
+  // that briefly could not be read looked identical to an empty one, and the
+  // node's own saved table vanished from the form.
+  const [tablesError, setTablesError] = useState('');
+  // A vector index is addressed by index + NAMESPACE, and getTables lists one
+  // row per pair — so the index name alone does not identify a dataset. Kept
+  // apart from selectedSchema, which scopes the SQL table list: here the
+  // namespace is chosen AFTER the index, not before it.
+  const [selectedNamespace, setSelectedNamespace] = useState(initialConfig?.sourceNamespace || '');
   const [tableSchema, setTableSchema] = useState(initialConfig?.sourceTableSchema || null);
   const [latestWithSQL, setLatestWithSQL] = useState(null);
 
@@ -381,6 +411,7 @@ const DataSourceNodeChat = ({
           || initialConfig.sourceIndexName
           || '';
         setSelectedSchema(initialConfig.sourceSchema || '');
+        setSelectedNamespace(initialConfig.sourceNamespace || '');
 
         if (restored.dbType === 'google-sheets') {
           // The spreadsheet + sheet were already imported into SQLite; restore
@@ -427,11 +458,17 @@ const DataSourceNodeChat = ({
     }
 
     setTablesLoading(true);
+    setTablesError('');
     try {
       const result = await onLoadDatabaseTables(conn);
       if (!result?.success) {
         console.log('Failed to load tables: ', result);
         setDbTableObjects([]);
+        setTablesError(
+          result?.message
+          || result?.error
+          || 'Could not read the table list from this connection.',
+        );
         return;
       }
 
@@ -452,6 +489,7 @@ const DataSourceNodeChat = ({
     } catch (err) {
       console.error('Failed to load tables:', err);
       setDbTableObjects([]);
+      setTablesError(err?.message || 'Could not read the table list from this connection.');
     } finally {
       setTablesLoading(false);
     }
@@ -465,6 +503,7 @@ const DataSourceNodeChat = ({
     setSelConn(conn);
     setDbTableObjects([]);
     setSelectedSchema('');
+    setSelectedNamespace('');
     setSelectedTableName('');
     setSelectedSheet('');
     setSheets([]);
@@ -531,14 +570,49 @@ const DataSourceNodeChat = ({
   }, [dbTableObjects]);
 
   const tableOptions = useMemo(() => {
+    // A vector store lists one row per index×namespace, so the raw list repeats
+    // an index once per namespace — identical label, identical value, and only
+    // the first of them reachable. The index list is the distinct names; the
+    // namespace is picked separately below.
+    if (connKind === 'vector') {
+      const seen = new Set();
+      return dbTableObjects
+        .filter((t) => (seen.has(t.name) ? false : seen.add(t.name)))
+        .map((t) => ({ label: t.displayName || t.name, value: t.name }))
+        .sort((a, b) => byName(a.label, b.label));
+    }
     const scoped = schemaOptions.length > 0 && selectedSchema
       ? dbTableObjects.filter((t) => t.schema === selectedSchema)
       : dbTableObjects;
-    return scoped
+    const options = scoped
       .map((t) => ({ label: t.displayName || t.name, value: t.name }))
       .sort((a, b) => byName(a.label, b.label));
+
+    // The table this node is ALREADY configured with always appears, even when
+    // the live list does not contain it — the lookup failed, the connection is
+    // slow, or someone moved the table since. A select whose value is absent
+    // from its options renders blank, so reopening a working node showed no
+    // table at all and looked unconfigured while its config was intact.
+    if (selectedTableName && !options.some((o) => o.value === selectedTableName)) {
+      options.unshift({ label: selectedTableName, value: selectedTableName });
+    }
+    return options;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dbTableObjects, schemaOptions, selectedSchema]);
+  }, [dbTableObjects, schemaOptions, selectedSchema, connKind, selectedTableName]);
+
+  // The namespaces the chosen index actually holds. '' is Pinecone's default
+  // namespace and a real choice, so it is labelled rather than dropped.
+  const namespaceOptions = useMemo(() => {
+    if (connKind !== 'vector' || !selectedTableName) return [];
+    const seen = new Set();
+    return dbTableObjects
+      .filter((t) => t.name === selectedTableName)
+      .map((t) => t.schema || '')
+      .filter((ns) => (seen.has(ns) ? false : seen.add(ns)))
+      .sort(byName)
+      .map((ns) => ({ label: ns === '' ? '(default)' : ns, value: ns }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dbTableObjects, selectedTableName, connKind]);
 
   const sheetOptions = useMemo(() => (
     [...sheets]
@@ -551,8 +625,15 @@ const DataSourceNodeChat = ({
   ), [sheets]);
 
   const selectedTable = useMemo(
-    () => dbTableObjects.find((t) => t.name === selectedTableName) || null,
-    [dbTableObjects, selectedTableName],
+    () => {
+      if (connKind === 'vector') {
+        return dbTableObjects.find(
+          (t) => t.name === selectedTableName && (t.schema || '') === (selectedNamespace || ''),
+        ) || dbTableObjects.find((t) => t.name === selectedTableName) || null;
+      }
+      return dbTableObjects.find((t) => t.name === selectedTableName) || null;
+    },
+    [dbTableObjects, selectedTableName, selectedNamespace, connKind],
   );
 
   // Only one schema / one table (a CSV or single-sheet Excel import, say) means
@@ -637,6 +718,37 @@ const DataSourceNodeChat = ({
     }
   };
 
+  /**
+   * Commit one index×namespace row: sample it for the schema, then push the
+   * pair to the Data Preview. The namespace travels with the index — reading it
+   * back off the index name alone would silently mean the default namespace.
+   */
+  const selectVectorTable = async (table) => {
+    setSelectedNamespace(table.schema || '');
+    setTablesLoading(true);
+    const schema = await loadVectorTableSchema(table);
+    setTablesLoading(false);
+    pushPreview({
+      tableName: table.name,
+      table,
+      namespace: table.schema || '',
+      tableSchema: schema,
+      latestWithSQL: null,
+      sheetImport: null,
+    });
+  };
+
+  /** Switching namespace within the already-chosen index. */
+  const selectNamespace = async (namespace) => {
+    setDirty(true);
+    const table = dbTableObjects.find(
+      (t) => t.name === selectedTableName && (t.schema || '') === (namespace || ''),
+    );
+    if (!table) return;
+    setTableSchema(null);
+    await selectVectorTable(table);
+  };
+
   /** Picking a table loads its schema and the preview query for DataPreview. */
   const selectTable = async (tableName) => {
     setDirty(true);
@@ -647,6 +759,18 @@ const DataSourceNodeChat = ({
     setTableSchema(null);
     setLatestWithSQL(null);
 
+    if (connKind === 'vector') {
+      // Which namespace of the index: the one already chosen if this index has
+      // it, otherwise the default ('') when present, otherwise the first.
+      const rows = dbTableObjects.filter((t) => t.name === tableName);
+      if (rows.length === 0) return;
+      const table = rows.find((t) => (t.schema || '') === (selectedNamespace || ''))
+        || rows.find((t) => (t.schema || '') === '')
+        || rows[0];
+      await selectVectorTable(table);
+      return;
+    }
+
     const table = dbTableObjects.find((t) => t.name === tableName);
     if (!table) return;
 
@@ -655,18 +779,10 @@ const DataSourceNodeChat = ({
       return;
     }
 
-    if (connKind === 'vector') {
-      setTablesLoading(true);
-      const schema = await loadVectorTableSchema(table);
-      setTablesLoading(false);
-      pushPreview({ tableName, table, tableSchema: schema, latestWithSQL: null, sheetImport: null });
-      return;
-    }
-
     setTablesLoading(true);
     try {
       let previewQuery;
-      if (selConn.dbType === 'mongodb' || selConn.dbType === 'nedb') {
+      if (selConn.dbType === 'mongodb') {
         previewQuery = JSON.stringify({ collection: table.name, filter: {}, limit: 100 });
       } else {
         const quoted = await window.electronAPI.dbConnect.quoteIdentifier(
@@ -704,12 +820,17 @@ const DataSourceNodeChat = ({
   const autoPickedRef = useRef(null);
   useEffect(() => {
     if (!onlyTable || selectedTableName) return;
-    if (schemaOptions.length > 0 && !selectedSchema) return;
+    // A schema has to be settled before the table list means anything — except
+    // for a vector store, where `schema` is the namespace and is chosen from
+    // WITHIN the index. Waiting on it there stranded a single-index connection
+    // with several namespaces: the index rendered as a read-only value that no
+    // selection was ever recorded for.
+    if (connKind !== 'vector' && schemaOptions.length > 0 && !selectedSchema) return;
     if (autoPickedRef.current === onlyTable.value) return;
     autoPickedRef.current = onlyTable.value;
     selectTable(onlyTable.value);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onlyTable, selectedTableName, selectedSchema, schemaOptions.length]);
+  }, [onlyTable, selectedTableName, selectedSchema, schemaOptions.length, connKind]);
 
   // ── Google Sheets ────────────────────────────────────────────────────────
 
@@ -730,8 +851,8 @@ const DataSourceNodeChat = ({
   };
 
   /**
-   * Selecting a sheet imports it into SQLite and re-points the connection at
-   * the imported file, exactly as the chat flow did.
+   * Selecting a sheet imports it into a local DuckDB file and re-points the
+   * connection at that file, exactly as the chat flow did.
    */
   const selectSheet = async (sheetName) => {
     setDirty(true);
@@ -741,7 +862,7 @@ const DataSourceNodeChat = ({
 
     setSheetsLoading(true);
     try {
-      const importResult = await window.electronAPI.dbConnect.importGoogleSheetToSqlite(
+      const importResult = await window.electronAPI.dbConnect.importGoogleSheetToDuckDb(
         selConn.dbConfig, selConn.id, selectedTable.name, sheetName,
       );
 
@@ -751,7 +872,7 @@ const DataSourceNodeChat = ({
       }
 
       const schema = await loadTableSchema({
-        connection: { dbType: 'sqlite', dbConfig: {} },
+        connection: { dbType: 'duckdb', dbConfig: {} },
         tableName: importResult.tableName,
         tableSchema: null,
         localPath: importResult.localPath,
@@ -760,7 +881,7 @@ const DataSourceNodeChat = ({
       if (schema) setTableSchema({ ...schema, sheetName });
 
       const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
-        'sqlite', `"${importResult.tableName}"`, 100,
+        'duckdb', `"${importResult.tableName}"`, 100,
       );
       const previewQuery = previewResult.success
         ? previewResult.previewQuery
@@ -851,14 +972,6 @@ const DataSourceNodeChat = ({
         let sql = null;
         if (fileInfo.dbType === 'lancedb') {
           // Vector sources have no SQL preview query.
-        } else if (fileInfo.dbType === 'nedb') {
-          const previewQuery = JSON.stringify({ collection: tableName, filter: {}, limit: 100 });
-          sql = {
-            sql: previewQuery,
-            previewSql: previewQuery,
-            explanation: `Selecting all documents from ${tableName}`,
-            queryDescription: `Preview data from ${tableName}`,
-          };
         } else {
           const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
             fileInfo.dbType || 'sqlite', `"${tableName}"`, 100,
@@ -974,7 +1087,6 @@ const DataSourceNodeChat = ({
   const getModalTitle = (dbType) => {
     const titleMap = {
       sqlite: 'Connect SQLite Database',
-      nedb: 'Connect NeDB Database',
       lancedb: 'Connect LanceDB Database',
       json: 'Upload JSON File',
       spreadsheet: 'Add Spreadsheet',
@@ -991,7 +1103,7 @@ const DataSourceNodeChat = ({
     if (!activeDbType) return null;
     // Same set the connector picker offers under "Local Files" — leaving
     // lancedb out here meant choosing it opened no form at all.
-    if (['sqlite', 'nedb', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'].includes(activeDbType)) {
+    if (['sqlite', 'lancedb', 'json', 'spreadsheet', 'parquet', 'avro'].includes(activeDbType)) {
       return () => (
         <LocalFileConnectionForm
           fileType={activeDbType}
@@ -1099,6 +1211,7 @@ const DataSourceNodeChat = ({
       tableName: sheetImport ? sheetImport.tableName : selectedTableName,
       table: selectedTable,
       schema: selectedSchema,
+      namespace: selectedNamespace,
       tableSchema,
       latestWithSQL,
       sheetImport,
@@ -1106,20 +1219,20 @@ const DataSourceNodeChat = ({
       ...override,
     };
 
-    // A Google Sheet is imported into SQLite; downstream nodes read that file,
-    // not the Sheets API. Keep the connection's id/name so the source is still
-    // recognisable, and swap in the local file everywhere else.
+    // A Google Sheet is imported into a local DuckDB file; downstream nodes
+    // read that file, not the Sheets API. Keep the connection's id/name so the
+    // source is still recognisable, and swap in the local file everywhere else.
     const conn = sel.sheetImport
       ? {
         ...selConnLocal,
         connectionType: 'file',
-        fileType: 'sqlite',
-        dbType: 'sqlite',
+        fileType: 'duckdb',
+        dbType: 'duckdb',
         dbConfig: {},
         fileInfo: {
           filePath: sel.sheetImport.localPath,
-          fileName: 'app-data.db',
-          dbType: 'sqlite',
+          fileName: 'google-sheets.duckdb',
+          dbType: 'duckdb',
           tables: [sel.sheetImport.tableName],
           source: 'google-sheets',
           originalSpreadsheetId: sel.spreadsheetId,
@@ -1129,7 +1242,7 @@ const DataSourceNodeChat = ({
       : selConnLocal;
 
     // For a Sheets source the picked "table" is the spreadsheet — the dataset
-    // downstream is the SQLite table it was imported into.
+    // downstream is the DuckDB table it was imported into.
     const tableName = sel.tableName;
     const tableSchemaVal = sel.tableSchema;
     const sqlVal = sel.latestWithSQL;
@@ -1148,20 +1261,20 @@ const DataSourceNodeChat = ({
       config.sourceSheetName = sel.sheetImport.sheetName;
     }
 
-    // REST API sources materialise into local NeDB and behave like any other
+    // REST API sources materialise into local DuckDB and behave like any other
     // NoSQL local source downstream. The fetch function itself is authored in
     // the chat (build_dataSource) — preserve it if it is already there.
     if (conn.dbType === 'rest-api') {
       // Only carry the previous fetch forward when this is the SAME API
       // connection being re-saved. Otherwise a node that used to point at a
-      // local NeDB file (or a different API) kept that file's sourceLocalPath,
+      // local file (or a different API) kept that file's sourceLocalPath,
       // and the preview then tried to read a collection this node never wrote —
       // surfacing as "97% of the data file is corrupt".
       const sameApi = !!initialConfig?.sourceApiConnectionId
         && initialConfig.sourceApiConnectionId === conn.id;
 
       // The node label is not unique (every dragged source is "Data Source"),
-      // so fold in the node id to keep two API nodes off the same NeDB file.
+      // so fold in the node id to keep two API nodes off the same file.
       const collection = (sameApi && initialConfig?.sourceCollection)
         || sanitizeCollectionName(
           `${node?.data?.label || 'api'}_${String(node?.id || '').slice(-6)}`,
@@ -1204,7 +1317,7 @@ const DataSourceNodeChat = ({
       if (conn.fileInfo?.filePath) config.sourceLocalPath = conn.fileInfo.filePath;
       if (conn.cloudSource) config.cloudSource = conn.cloudSource;
 
-      if (['duckdb', 'sqlite', 'nedb', 'lancedb'].includes(conn.dbType)) {
+      if (['duckdb', 'sqlite', 'lancedb'].includes(conn.dbType)) {
         config.sourceDbType = conn.dbType;
         config.sourceDbCategory = conn.dbCategory || (conn.dbType === 'lancedb' ? 'Vector' : null);
 
@@ -1220,7 +1333,6 @@ const DataSourceNodeChat = ({
           if (selected) config.sourceTableName = selected;
         }
         if (conn.dbType === 'sqlite' && tableName) config.sourceTableName = tableName;
-        if (conn.dbType === 'nedb' && tableName) config.sourceCollection = tableName;
         if (conn.dbType === 'lancedb' && tableName) {
           config.sourceIndexName = tableName;
           config.sourceTableName = tableName;
@@ -1245,7 +1357,7 @@ const DataSourceNodeChat = ({
       config.sourceSelectedTables = tableName ? [tableName] : [];
       if (tableName) config.sourceTable = tableName;
 
-      const isNoSQL = conn.dbType === 'mongodb' || conn.dbType === 'nedb';
+      const isNoSQL = conn.dbType === 'mongodb';
       const isVector = conn.dbCategory === 'Vector' || conn.dbType === 'pinecone' || conn.dbType === 'lancedb';
 
       if (isVector && tableName) {
@@ -1256,7 +1368,10 @@ const DataSourceNodeChat = ({
             config.sourceNamespace = parts.slice(1).join('/');
           } else {
             config.sourceIndexName = tableName;
-            config.sourceNamespace = sel.table?.schema || '';
+            // The namespace the user picked wins over the row's own schema: the
+            // two agree except while a namespace switch is still settling, when
+            // `sel.namespace` is the newer of the two.
+            config.sourceNamespace = sel.namespace ?? sel.table?.schema ?? '';
           }
           config.sourceTableName = config.sourceIndexName;
           config.sourceSchema = config.sourceNamespace;
@@ -1299,12 +1414,81 @@ const DataSourceNodeChat = ({
     onPreviewConfigUpdate(node.id, buildConfig(override));
   };
 
-  const handleSave = () => {
+  /**
+   * Backfill `sourceSql` / `sourcePreviewSql` for a DATABASE source that has a
+   * table selected but no query.
+   *
+   * Picking a table normally produces both, along with the schema — selectTable
+   * builds them together and commits them in one push. When that step does not
+   * complete (the picked name not matching the loaded table list, an IPC call
+   * rejecting), the SELECTION still stands: `sourceTableName`,
+   * `sourceSelectedTables` and `sourceSchema` are read straight off the
+   * selection state, so buildConfigFor happily saved a node that looks
+   * configured and carries no query at all.
+   *
+   * That is only survivable for a FILE source, which the Data Preview can read
+   * by table name (readLocalCollection takes one). A remote database has no such
+   * fallback — DataPreview requires SQL to send — so the preview failed with
+   * "No SQL query found in node configuration", and every downstream node
+   * inherited the null through copySourceFromUpstream.
+   *
+   * Derived here, at save, rather than by making buildConfigFor async: it is
+   * also called synchronously by pushPreview on every selection change.
+   */
+  const withDerivedSourceSql = async (config) => {
+    if (!config || config.sourceConnectionType !== 'database') return config;
+    if (config.sourcePreviewSql) return config;
+    // A vector index is not read with SQL — the preview goes through the vector
+    // skill — so there is nothing to derive.
+    if (config.sourceIndexName) return config;
+    const table = config.sourceTableName || config.sourceCollection;
+    if (!table) return config;
+
+    const qualified = config.sourceSchema ? `${config.sourceSchema}.${table}` : table;
+    try {
+      if (config.sourceDbType === 'mongodb') {
+        // Same envelope selectTable writes, and what DataPreview JSON.parses.
+        const query = JSON.stringify({ collection: table, filter: {}, limit: 100 });
+        return {
+          ...config,
+          sourceSql: query,
+          sourcePreviewSql: query,
+          sourceSqlExplanation: config.sourceSqlExplanation || `Selecting all documents from ${table}`,
+        };
+      }
+      if (!window.electronAPI?.dbConnect?.quoteIdentifier) return config;
+      // The connector quotes and qualifies — a BigQuery table needs its dataset,
+      // and a name containing a dot must not be split by hand.
+      const quoted = await window.electronAPI.dbConnect.quoteIdentifier(
+        config.sourceDbType, table, config.sourceSchema, config.sourceDbConfig, config.sourceConnectionId,
+      );
+      const identifier = quoted?.quotedIdentifier || table;
+      const previewResult = await window.electronAPI.dbConnect.getPreviewQuery(
+        config.sourceDbType, identifier, 100,
+      );
+      const query = previewResult?.success
+        ? previewResult.previewQuery
+        : `SELECT * FROM ${identifier} LIMIT 100`;
+      return {
+        ...config,
+        sourceSql: query,
+        sourcePreviewSql: query,
+        sourceSqlExplanation: config.sourceSqlExplanation || `Selecting all columns from ${qualified}`,
+      };
+    } catch (err) {
+      // Saving without a query is still better than losing the selection — the
+      // preview says so plainly, and this is logged rather than swallowed.
+      console.error('Could not derive preview SQL for the selected table:', err);
+      return config;
+    }
+  };
+
+  const handleSave = async () => {
     setAttempted(true);
     if (missingCount > 0) return;
     if (hasSaved && !dirty) return;
 
-    onSave(buildConfig(), []);
+    onSave(await withDerivedSourceSql(buildConfig()), []);
     setDirty(false);
     setHasSaved(true);
     setAttempted(false);
@@ -1384,7 +1568,7 @@ const DataSourceNodeChat = ({
             {datasetBusy && dbTableObjects.length === 0 ? (
               <EmptyState>Loading tables…</EmptyState>
             ) : dbTableObjects.length === 0 ? (
-              <EmptyState>No tables found. Check the connection settings.</EmptyState>
+              <DatasetEmpty error={tablesError} noun="tables" />
             ) : (
               <Fields>
                 {schemaOptions.length > 0 && (
@@ -1406,9 +1590,11 @@ const DataSourceNodeChat = ({
                   label="Table"
                   required
                   invalid={invalid('table')}
-                  hint={onlyTable
-                    ? 'The only table in this source.'
-                    : schemaOptions.length > 0 ? 'Loaded from the connection once a schema is chosen.' : null}
+                  hint={tablesError
+                    ? `Could not list tables: ${tablesError} — showing the saved table only.`
+                    : onlyTable
+                      ? 'The only table in this source.'
+                      : schemaOptions.length > 0 ? 'Loaded from the connection once a schema is chosen.' : null}
                 >
                   {onlyTable ? (
                     <StaticValue>{onlyTable.label}</StaticValue>
@@ -1435,7 +1621,7 @@ const DataSourceNodeChat = ({
             {datasetBusy && dbTableObjects.length === 0 ? (
               <EmptyState>Loading collections…</EmptyState>
             ) : dbTableObjects.length === 0 ? (
-              <EmptyState>No collections found. Check the connection settings.</EmptyState>
+              <DatasetEmpty error={tablesError} noun="collections" />
             ) : (
               <Fields>
                 <Field
@@ -1468,7 +1654,7 @@ const DataSourceNodeChat = ({
             {datasetBusy && dbTableObjects.length === 0 ? (
               <EmptyState>Loading indexes…</EmptyState>
             ) : dbTableObjects.length === 0 ? (
-              <EmptyState>No indexes found. Check the connection settings.</EmptyState>
+              <DatasetEmpty error={tablesError} noun="indexes" />
             ) : (
               <Fields>
                 <Field
@@ -1489,6 +1675,21 @@ const DataSourceNodeChat = ({
                     />
                   )}
                 </Field>
+                {selectedTableName && namespaceOptions.length > 1 && (
+                  <Field
+                    label="Namespace"
+                    required
+                    hint="Vectors live in one namespace; the rest of the index is invisible to this source."
+                  >
+                    <SearchSelect
+                      value={selectedNamespace}
+                      placeholder="Select a namespace…"
+                      searchPlaceholder="Filter namespaces…"
+                      options={namespaceOptions}
+                      onChange={selectNamespace}
+                    />
+                  </Field>
+                )}
               </Fields>
             )}
           </Card>
@@ -1620,7 +1821,17 @@ const DataSourceNodeChat = ({
 
       {/* Cloud Storage Browser */}
       {cloudStorageBrowserOpen && cloudStorageConnection && (
-        cloudStorageConnection.dbType === 'google-drive' && cloudStorageConnection.dbConfig?.accessToken ? (
+        cloudStorageConnection.dbType === 'google-sheets' ? (
+          // Google's own Picker, not the generic browser: listing a person's
+          // spreadsheets in-app needs a RESTRICTED Drive scope, while a file
+          // picked in Google's dialog is reachable under plain `drive.file`.
+          <GoogleSheetsPicker
+            connection={cloudStorageConnection}
+            mode="import"
+            onFileSelect={handleCloudFileSelect}
+            onClose={() => setCloudStorageBrowserOpen(false)}
+          />
+        ) : cloudStorageConnection.dbType === 'google-drive' && cloudStorageConnection.dbConfig?.accessToken ? (
           <GoogleDrivePicker
             connection={cloudStorageConnection}
             onFileSelect={handleCloudFileSelect}
