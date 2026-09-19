@@ -1,16 +1,18 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { SettingOutlined, EditOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter, sourceIssueLabel } from './nodeCardShared';
+import SourceChangedPopup from './SourceChangedPopup';
 
-const COLOR = '#7c3aed';
+const COLOR = NODE_COLORS.transformer;
 const MONO = "'JetBrains Mono', monospace";
 const TEXT = '#111827';
 const MUTED = '#5a6678';
 const BORDER = '#e2e6eb';
 const GREEN = '#059669';
+const RED = '#dc2626';
 
-const TransformerNode = ({ data, selected }) => {
+const TransformerNode = ({ id, data, selected }) => {
   // Matches how the Data Preview decides a transformer is configured: the
   // chat saves targetSql / nosqlOperation / transformFunction, never a bare
   // `sql`, so the old check left finished nodes reading "Click to configure".
@@ -49,17 +51,39 @@ const TransformerNode = ({ data, selected }) => {
 
   const latestCodes = extractLatestCodes(data.config?.chat);
 
+  // Fed by something other than what this transformation was written against.
+  // `sourceBuiltAgainst` names that original parent, so the card can say which
+  // source the SQL below still targets instead of showing a node id. Both are
+  // cleared when the original is re-attached or the node is regenerated.
+  const builtAgainst = (config.sourceBuiltAgainst || [])
+    .map((b) => b?.nodeLabel || b?.nodeId)
+    .filter(Boolean)
+    .join(', ');
+  // Red for either reason — the input moved, or the node is blocked from
+  // running. Only the first is answerable by "Keep as is"; see sourceIssueLabel.
+  const sourceIssue = sourceIssueLabel(config, builtAgainst);
+  const sourceChanged = !!sourceIssue;
+
   return (
+    <>
+      {/* Floats above the card, in ReactFlow's portal — the user answers the
+          change here instead of opening the node to work out what moved. */}
+      <SourceChangedPopup nodeId={id} config={config} nodeTypeLabel="transformation" />
     <div
+      className={sourceChanged ? 'wf-node-source-changed' : undefined}
       style={{
         width: 264,
         background: '#fff',
-        border: `1px solid ${selected ? COLOR : BORDER}`,
-        borderLeft: `3px solid ${COLOR}`,
+        border: `1px solid ${sourceChanged ? RED : (selected ? COLOR : BORDER)}`,
+        borderLeft: `3px solid ${sourceChanged ? RED : COLOR}`,
         borderRadius: 6,
-        boxShadow: selected
-          ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
-          : '0 1px 4px rgba(0,0,0,0.07)',
+        // The pulse owns the shadow while the input is wrong — see
+        // .wf-node-source-changed in Workflows.css.
+        boxShadow: sourceChanged
+          ? undefined
+          : (selected
+            ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
+            : '0 1px 4px rgba(0,0,0,0.07)'),
         position: 'relative',
         userSelect: 'none',
         fontFamily: "'Inter',-apple-system,sans-serif",
@@ -100,13 +124,20 @@ const TransformerNode = ({ data, selected }) => {
         }}>
           TRANSFORM
         </span>
-        <div style={{
-          marginLeft: 'auto',
-          width: 6,
-          height: 6,
-          borderRadius: '50%',
-          background: isConfigured ? GREEN : BORDER,
-        }} />
+        {/* Amber once the node feeding this one has changed: the logic below
+            was written against the previous input and needs regenerating. */}
+        <div
+          title={sourceChanged
+            ? `Built against ${builtAgainst || 'another source'} — reconnect it, or open the node to regenerate.`
+            : undefined}
+          style={{
+            marginLeft: 'auto',
+            width: 6,
+            height: 6,
+            borderRadius: '50%',
+            background: sourceChanged ? RED : (isConfigured ? GREEN : BORDER),
+          }}
+        />
       </div>
 
       {/* Body */}
@@ -122,6 +153,22 @@ const TransformerNode = ({ data, selected }) => {
         }}>
           {getDisplayName()}
         </div>
+        {sourceChanged && (
+          <div style={{
+            fontSize: 10,
+            fontFamily: MONO,
+            color: RED,
+            background: '#fef2f2',
+            border: `1px solid ${RED}33`,
+            borderRadius: 4,
+            padding: '3px 6px',
+            marginBottom: 5,
+            lineHeight: 1.4,
+            whiteSpace: 'normal',
+          }}>
+            {sourceIssue}
+          </div>
+        )}
         <div style={{
           fontSize: 11,
           color: MUTED,
@@ -137,6 +184,8 @@ const TransformerNode = ({ data, selected }) => {
 
       <ExpandableCodes codes={latestCodes} />
 
+      <DestinationFooter type="transformer" config={config} accent={COLOR} />
+
       <Handle
         type="source"
         position={Position.Right}
@@ -150,6 +199,7 @@ const TransformerNode = ({ data, selected }) => {
         }}
       />
     </div>
+    </>
   );
 };
 

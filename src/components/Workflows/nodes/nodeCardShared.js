@@ -1,11 +1,124 @@
-import React, { useState } from 'react';
-import { CodeOutlined } from '@ant-design/icons';
+import React, { useState, useEffect } from 'react';
+import { CodeOutlined, DatabaseOutlined, FolderOutlined } from '@ant-design/icons';
+import { connectionsDb } from '../../../utils/localDb';
+import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
+import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
+import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
+import { ReactComponent as MongodbIcon } from '../../ConnectorImages/Mongodb.svg';
+import { ReactComponent as SqlliteIcon } from '../../ConnectorImages/Sqllite.svg';
+import { ReactComponent as BigQueryIcon } from '../../ConnectorImages/BigQuery.svg';
+import { ReactComponent as SnowflakeIcon } from '../../ConnectorImages/Snowflake.svg';
+import { ReactComponent as SlackIcon } from '../../ConnectorImages/Slack.svg';
+import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/GoogleCloudStorage.svg';
+import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
+import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
+import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
 
 const MONO = "'JetBrains Mono', monospace";
 const MUTED = '#5a6678';
 const DIM = '#9ca3af';
 const BORDER = '#e2e6eb';
 const SURFACE = '#f7f8fa';
+
+/**
+ * What each kind of node is COLOURED, canvas-wide.
+ *
+ * One hue per node type, and this is where it is decided. The card wears it as
+ * its left edge, its icon and its title; anything else that stands for a node —
+ * the chat's build plan, its node chips — reads from here too, so a step in a
+ * plan is the same colour as the card it will become. They drifted once
+ * already, which is how the build plan ended up teal/navy/green against a
+ * canvas of blue/cyan/pink.
+ *
+ * Tints follow the cards' convention of appending an alpha suffix to the hex:
+ * `1a` for a wash you can put text on, `44` for a visible edge.
+ */
+export const NODE_COLORS = {
+  start:       '#2563eb',
+  dataSource:  '#0891b2',
+  transformer: '#7c3aed',
+  join:        '#d97706',
+  output:      '#db2777',
+};
+
+// ── Join input handles ──────────────────────────────────────────────────────
+//
+// Every other node card has ONE input dot, so ReactFlow can route an edge to it
+// without being told which one it means. A join has several, and an edge that
+// doesn't name its handle falls back to the FIRST one the card renders (see
+// getHandle in @reactflow/core) — which is why every edge the AI builder
+// derived stacked on the top-left dot and crossed the card to get there, while
+// the dot below it stayed empty.
+//
+// So the ids are defined here, in one place: the card draws them, and whoever
+// builds an edge into a join names the one it lands on.
+
+/** The handle id for a join's nth input (0-based). */
+export const joinInputHandleId = (index) => `input${index + 1}`;
+
+/** The input index a handle id stands for, or -1 when it isn't one of ours. */
+export const joinInputIndex = (handleId) => {
+  const m = /^input(\d+)$/.exec(String(handleId || ''));
+  return m ? Number(m[1]) - 1 : -1;
+};
+
+/**
+ * How many input dots a join card draws: two by default (a join needs at least
+ * two sources to mean anything), plus room for every edge that actually lands
+ * on it — a handle an edge names but the card never renders would drop that
+ * edge from the canvas entirely.
+ */
+export const joinInputHandleCount = (edges, nodeId) => {
+  let incoming = 0;
+  let highest = -1;
+  for (const e of edges || []) {
+    if (!e || e.target !== nodeId) continue;
+    incoming += 1;
+    const idx = joinInputIndex(e.targetHandle);
+    if (idx > highest) highest = idx;
+  }
+  return Math.max(2, incoming, highest + 1);
+};
+
+/**
+ * Name the input dot for every edge into a join that doesn't already name one.
+ *
+ * Edges reach the canvas from three places — the AI builder, the live build
+ * preview, and workflows saved before any of them recorded a handle — and only
+ * a hand-drawn connection carries one already. Filling the gap at render time
+ * covers all of them, and an edge that DOES name a handle keeps it: the free
+ * slots are handed out around the ones already taken.
+ *
+ * Returns the same array when nothing needed filling, so it is safe to call on
+ * every render.
+ */
+export const withJoinInputHandles = (edges, nodes) => {
+  const joinIds = new Set();
+  for (const n of nodes || []) if (n?.type === 'join' && n.id) joinIds.add(n.id);
+  if (joinIds.size === 0) return edges;
+
+  const taken = new Map(); // join node id → indices already claimed
+  for (const e of edges || []) {
+    if (!e || !joinIds.has(e.target)) continue;
+    const idx = joinInputIndex(e.targetHandle);
+    if (idx < 0) continue;
+    if (!taken.has(e.target)) taken.set(e.target, new Set());
+    taken.get(e.target).add(idx);
+  }
+
+  let changed = false;
+  const out = (edges || []).map((e) => {
+    if (!e || e.targetHandle || !joinIds.has(e.target)) return e;
+    if (!taken.has(e.target)) taken.set(e.target, new Set());
+    const used = taken.get(e.target);
+    let idx = 0;
+    while (used.has(idx)) idx += 1;
+    used.add(idx);
+    changed = true;
+    return { ...e, targetHandle: joinInputHandleId(idx) };
+  });
+  return changed ? out : edges;
+};
 
 // Fields on a chat bot message's `metadata` object that may contain a code
 // string we want to surface on the node card. Order is "primary code first,
@@ -71,9 +184,13 @@ const nonEmpty = (v) => v !== undefined && v !== null && String(v).trim() !== ''
 const qualified = (schema, name) => (nonEmpty(schema) ? `${schema}.${name}` : name);
 
 /** The dataset a node reads. Same precedence as the Data Preview header. */
-export const sourceDatasetOf = (config = {}) => {
+export const sourceDatasetOf = (config = {}, { withSchema = true } = {}) => {
   if (nonEmpty(config.sourceCollection)) return config.sourceCollection;
-  if (nonEmpty(config.sourceTableName)) return qualified(config.sourceSchema, config.sourceTableName);
+  if (nonEmpty(config.sourceTableName)) {
+    // The schema is dropped where the name has to stay short — a node title on
+    // a 264px card. Everywhere else it is part of what the dataset IS.
+    return withSchema ? qualified(config.sourceSchema, config.sourceTableName) : config.sourceTableName;
+  }
   if (nonEmpty(config.sourceIndexName)) return config.sourceIndexName;
   if (nonEmpty(config.table)) return config.table;
   if (nonEmpty(config.sourceDataset)) return config.sourceDataset;
@@ -86,6 +203,244 @@ export const targetDatasetOf = (config = {}) => {
   if (nonEmpty(config.targetCollection)) return config.targetCollection;
   if (nonEmpty(config.targetTableName)) return qualified(config.targetSchema, config.targetTableName);
   return '';
+};
+
+// ── Destination footer ──────────────────────────────────────────────────────
+//
+// Where a node's result LANDS, shown along the bottom of its card: the store's
+// logo, the connection it belongs to, and the table written there. A canvas of
+// transformers and joins otherwise says what each step does but never where the
+// data goes, which is the question being asked when someone traces a pipeline.
+
+/**
+ * Connector logo by dbType.
+ *
+ * Shared with DataSourceNode, which reads the same map for a source's badge —
+ * two copies drifted once already (Snowflake and BigQuery had SVGs sitting
+ * unused because only one map was ever updated).
+ */
+export const CONNECTOR_ICONS = {
+  postgres: PostgresIcon,
+  // Redshift disabled for now — see connections/connectorCatalog.js.
+  // redshift: PostgresIcon,   // Redshift is Postgres-derived and ships no mark of its own
+  mysql: MysqlIcon,
+  mssql: MssqlIcon,
+  mongodb: MongodbIcon,
+  sqlite: SqlliteIcon,
+  bigquery: BigQueryIcon,
+  snowflake: SnowflakeIcon,
+  slack: SlackIcon,
+  gcs: GoogleCloudStorageIcon,
+  dropbox: DropboxIcon,
+  'google-drive': GoogleDriveIcon,
+  'google-sheets': GoogleSheetsIcon,
+};
+
+export const connectorIconFor = (dbType) => CONNECTOR_ICONS[String(dbType || '').toLowerCase()] || null;
+
+/** Stores that live on disk rather than behind a connection. */
+const LOCAL_DB_TYPES = new Set(['duckdb', 'lancedb']);
+
+/**
+ * Every saved connection, keyed by id — loaded once and shared by every card.
+ *
+ * An output node records only `outputSettings.connectionId`; unlike a
+ * transformer or a join it carries no `targetDbType`, so its destination store
+ * can only be named by looking the connection up. Doing that per card would
+ * fire one read per output node on every canvas render, so the load is done
+ * once at module level and every card subscribes to the same result.
+ */
+let connectionCache = null;
+let connectionPromise = null;
+const connectionSubscribers = new Set();
+
+const loadConnections = () => {
+  if (connectionPromise) return connectionPromise;
+  connectionPromise = connectionsDb.getAll()
+    .then((rows) => {
+      connectionCache = new Map(
+        (rows || []).map((c) => [String(c.id || c._id), c]),
+      );
+      connectionSubscribers.forEach((fn) => fn(connectionCache));
+      return connectionCache;
+    })
+    .catch(() => {
+      // A card that cannot name its connection still renders — it falls back to
+      // whatever the node recorded. Never let this break the canvas.
+      connectionCache = new Map();
+      connectionSubscribers.forEach((fn) => fn(connectionCache));
+      return connectionCache;
+    });
+  return connectionPromise;
+};
+
+/** Drop the cache so the next card re-reads it (a connection was added/edited). */
+export const refreshConnectionCache = () => {
+  connectionCache = null;
+  connectionPromise = null;
+  loadConnections();
+};
+
+const useConnections = () => {
+  const [conns, setConns] = useState(connectionCache);
+  useEffect(() => {
+    if (connectionCache) { setConns(connectionCache); return undefined; }
+    const onLoad = (map) => setConns(map);
+    connectionSubscribers.add(onLoad);
+    loadConnections();
+    return () => connectionSubscribers.delete(onLoad);
+  }, []);
+  return conns;
+};
+
+/**
+ * Where this node writes: `{ store, table, dbType }`, or null when it writes
+ * nowhere yet.
+ *
+ * `store` is what the destination is CALLED (the connection's name, or the
+ * local file), `table` is the object written inside it. A transformer and a
+ * join both describe their destination with `target*`; an output keeps its own
+ * under `outputSettings` and has to resolve the connection by id.
+ */
+export const destinationOf = (type, config = {}, connections = null) => {
+  if (type === 'output') {
+    const out = config.outputSettings;
+    if (!out || !out.outputType) return null;
+
+    if (out.outputType === 'local') {
+      // A file export names the file, not a table — the format IS the store.
+      const file = nonEmpty(out.savePath) ? String(out.savePath).split(/[\\/]/).pop() : '';
+      const fmt = nonEmpty(out.format) ? String(out.format).toUpperCase() : 'FILE';
+      return { store: fmt, table: file || null, dbType: null, isLocal: true };
+    }
+
+    // The DESTINATION connection, never `sourceConnectionName` — that names
+    // where the node READS from, so an output reading LanceDB and writing MySQL
+    // used to label itself with the LanceDB end.
+    const conn = connections && out.connectionId
+      ? connections.get(String(out.connectionId))
+      : null;
+    return {
+      store: conn?.name || (out.connectionId ? 'Connection' : null),
+      table: out.tableName || null,
+      dbType: conn?.dbType || null,
+      isLocal: false,
+    };
+  }
+
+  // Transformer / join. An in-place transformer rewrites its source, so that
+  // table IS the destination.
+  const inPlace = config.transformationSettings?.operationMode === 'in_place';
+  const table = inPlace ? sourceDatasetOf(config) : targetDatasetOf(config);
+  const dbType = config.targetDbType || null;
+  const store = config.targetConnectionName || null;
+  if (!nonEmpty(table) && !nonEmpty(store)) return null;
+
+  return {
+    store: store || null,
+    table: nonEmpty(table) ? table : null,
+    dbType,
+    isLocal: LOCAL_DB_TYPES.has(String(dbType || '').toLowerCase()),
+  };
+};
+
+/**
+ * Where this node reads: `{ store, table, dbType }`, the mirror of
+ * `destinationOf` for a data source. `store` is the connection's name, `table`
+ * the object read through it — a file import that never landed a table name is
+ * still identified by the file it came from.
+ */
+export const sourceOf = (config = {}) => {
+  const store = config.sourceConnectionName || config.connectionName || null;
+  let table = sourceDatasetOf(config);
+  if (!nonEmpty(table) && nonEmpty(config.sourceLocalPath)) {
+    table = String(config.sourceLocalPath).split(/[\\/]/).pop();
+  }
+  if (!nonEmpty(table) && !nonEmpty(store)) return null;
+
+  // An imported file is READ by DuckDB and parked in the shared SQLite store,
+  // so its `sourceDbType` names the engine, not the source — badging a CSV with
+  // the SQLite logo would contradict the file glyph in the card's own header.
+  const isFile = config.sourceConnectionType === 'file';
+  const dbType = isFile ? null : (config.sourceDbType || config.dbType || null);
+  return {
+    store,
+    table: nonEmpty(table) ? table : null,
+    dbType,
+    isLocal: isFile || LOCAL_DB_TYPES.has(String(dbType || '').toLowerCase()),
+  };
+};
+
+/**
+ * The strip along the bottom of a card: a store's logo, the table, and the
+ * connection it belongs to. Shared so a source and a destination read alike.
+ */
+const EndpointFooter = ({ endpoint: dest, accent }) => {
+  const Icon = connectorIconFor(dest.dbType);
+  const Fallback = dest.isLocal ? FolderOutlined : DatabaseOutlined;
+
+  return (
+    <div
+      title={[dest.store, dest.table].filter(Boolean).join(' · ')}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '5px 10px',
+        borderTop: `1px solid ${BORDER}`,
+        background: SURFACE,
+        borderRadius: '0 0 6px 6px',
+        minWidth: 0,
+      }}
+    >
+      <span style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        width: 14, height: 14, flexShrink: 0,
+      }}>
+        {Icon
+          ? <Icon width={14} height={14} />
+          : <Fallback style={{ fontSize: 12, color: accent || MUTED }} />}
+      </span>
+
+      <span style={{
+        fontSize: 10.5, fontFamily: MONO, color: MUTED,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0,
+      }}>
+        {dest.table || dest.store}
+      </span>
+
+      {/* The store only earns its own slot when the table is already shown. */}
+      {dest.table && dest.store && (
+        <span style={{
+          marginLeft: 'auto', fontSize: 9.5, fontFamily: MONO, color: DIM,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          flexShrink: 1, minWidth: 0, paddingLeft: 6,
+        }}>
+          {dest.store}
+        </span>
+      )}
+    </div>
+  );
+};
+
+/**
+ * The strip along the bottom of a card naming where the result lands.
+ *
+ * Renders nothing at all when the node has no destination yet — an unconfigured
+ * card should not grow an empty row.
+ */
+export const DestinationFooter = ({ type, config, accent }) => {
+  const connections = useConnections();
+  const dest = destinationOf(type, config, connections);
+  if (!dest) return null;
+  return <EndpointFooter endpoint={dest} accent={accent} />;
+};
+
+/** The same strip, naming where a data source READS from. */
+export const SourceFooter = ({ config, accent }) => {
+  const src = sourceOf(config);
+  if (!src) return null;
+  return <EndpointFooter endpoint={src} accent={accent} />;
 };
 
 const describeDataSource = (config) => {
@@ -157,19 +512,30 @@ const GENERIC_LABELS = new Set(['start', 'data source', 'datasource', 'transform
 
 const isGenericLabel = (label) => GENERIC_LABELS.has(String(label || '').trim().toLowerCase());
 
+/** Whether a label is just the auto-stamped name read back off the node. */
+const isAutoLabel = (label, config = {}) => !!config.node_nameAuto
+  && nonEmpty(config.node_name)
+  && String(config.node_name).trim() === String(label || '').trim();
+
 /** The dataset a node is named after, when neither a name nor a real label exists. */
 const derivedNameOf = (type, config = {}) => {
   if (type === 'dataSource') {
-    // A source is identified by WHERE it reads from, not what it reads: the
-    // connection, the engine behind it, and the database on that engine. The
-    // table/collection is already on the card's summary line ("Reads orders"),
-    // and putting it here instead left two sources on different databases
-    // sharing one name. Segments that repeat each other (a connection named
-    // after its database, say) collapse to one.
+    // A source is identified by WHERE it reads from and WHAT it reads there:
+    // the connection, then the table/collection. The table was once left out —
+    // the card's footer already spells it out — but the title is the first
+    // thing anyone checks, and a source retargeted to another table went on
+    // announcing the old one. Segments that repeat each other (a connection
+    // named after its engine, say) collapse to one.
+    //
+    // The database is named only when there is no table to name yet, so a
+    // half-configured source still has something to go by. Known trade-off:
+    // two sources on the SAME connection but different databases, reading
+    // tables of the same name, now share a title — the footer tells them apart.
+    const dataset = sourceDatasetOf(config, { withSchema: false });
     const parts = [
-      config.sourceConnectionName || config.connectionName,
-      config.sourceDbType || config.sourceType || config.sourceConnectionType,
-      config.sourceDbConfig?.database || config.sourceDatabase,
+      config.sourceConnectionName || config.connectionName
+        || config.sourceDbType || config.sourceType || config.sourceConnectionType,
+      dataset || config.sourceDbConfig?.database || config.sourceDatabase,
     ].filter(nonEmpty).map((p) => String(p).trim());
     const seen = new Set();
     const unique = parts.filter((p) => {
@@ -224,10 +590,46 @@ export const nodeDisplayName = (type, data = {}, fallback = 'Node') => {
   const label = String(data.label || '').trim();
   const stamped = nonEmpty(config.node_name) ? String(config.node_name).trim() : '';
   if (stamped && !config.node_nameAuto) return stamped;
-  if (label && !isGenericLabel(label)) return label;
+  // Fed by something it was not built against (see syncNodeSourcesToEdges).
+  // A derived name describes the SOURCE, so following the rewire would rename
+  // the node after data its logic does not touch — and the name it earned
+  // would be gone until it is regenerated. Keep what it is called.
+  if (stamped && config.sourceChanged) return stamped;
+  // A label is a name someone CHOSE — unless it is the auto-stamp read back.
+  // The builder writes the same string to both `data.label` and `node_name`,
+  // so a label equal to an auto `node_name` is this cache wearing another hat,
+  // and ranking it above a fresh derivation is what kept a retargeted source
+  // announcing the table it no longer reads.
+  if (label && !isGenericLabel(label) && !isAutoLabel(label, config)) return label;
   const derived = derivedNameOf(type, config);
   if (derived) return derived;
   return stamped || label || fallback;
+};
+
+/**
+ * The banner a card shows while its input is wrong, or '' while it is fine.
+ *
+ * Two different things put it there, and they are cleared differently:
+ *
+ *   `sourceStale`   — the node CANNOT RUN: its statements were written for a
+ *                     source that has moved, been disconnected, or a new one
+ *                     has appeared that they never mention. The executor
+ *                     refuses it. Only a rebuild clears this, so the card stays
+ *                     red through "Keep as is" — that answer is about the
+ *                     node's logic, and no answer makes SQL written for one
+ *                     table correct for another.
+ *   `sourceChanged` — the node's input moved and its logic MAY no longer fit.
+ *                     A question, which "Keep as is" answers.
+ */
+export const sourceIssueLabel = (config = {}, builtAgainst = '') => {
+  const stale = {
+    moved: 'SOURCE MOVED — rebuild this node before running',
+    disconnected: 'SOURCE DISCONNECTED — rebuild this node before running',
+    unread: 'NEW SOURCE NOT READ — rebuild this node before running',
+  }[config.sourceStale];
+  if (stale) return stale;
+  if (config.sourceChanged) return `SOURCE CHANGED — was ${builtAgainst || 'other nodes'}`;
+  return '';
 };
 
 // ── Persisting the name ─────────────────────────────────────────────────────
@@ -250,8 +652,15 @@ export const nodeDisplayName = (type, data = {}, fallback = 'Node') => {
 export const persistedNameFor = (type, data = {}) => {
   const config = data.config || {};
   if (nonEmpty(config.node_name) && !config.node_nameAuto) return null;
+  // Same rule as nodeDisplayName: while the input is wrong, the name derived
+  // from it is wrong too, so a save must not overwrite the stored one with it.
+  if (nonEmpty(config.node_name) && config.sourceChanged) return null;
   const label = String(data.label || '').trim();
-  const name = (label && !isGenericLabel(label)) ? label : derivedNameOf(type, config);
+  // Same rule as nodeDisplayName: a label that IS the auto-stamp cannot be the
+  // authority for re-stamping it, or the stale name would write itself back.
+  const name = (label && !isGenericLabel(label) && !isAutoLabel(label, config))
+    ? label
+    : derivedNameOf(type, config);
   if (!name || name === config.node_name) return null;
   return name;
 };

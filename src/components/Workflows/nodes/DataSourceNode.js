@@ -3,41 +3,22 @@ import { Handle, Position } from 'reactflow';
 import {
   DatabaseOutlined, ApiOutlined, FileOutlined, FileTextOutlined, FileExcelOutlined,
 } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate } from './nodeCardShared';
-import { ReactComponent as PostgresIcon } from '../../ConnectorImages/Postgres.svg';
-import { ReactComponent as MysqlIcon } from '../../ConnectorImages/Mysql.svg';
-import { ReactComponent as MssqlIcon } from '../../ConnectorImages/Mssql.svg';
-import { ReactComponent as MongodbIcon } from '../../ConnectorImages/Mongodb.svg';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate, NODE_COLORS, connectorIconFor, SourceFooter } from './nodeCardShared';
 import { ReactComponent as SqlliteIcon } from '../../ConnectorImages/Sqllite.svg';
 import { ReactComponent as ParquetIcon } from '../../ConnectorImages/Parquet.svg';
 import { ReactComponent as AvroIcon } from '../../ConnectorImages/Avro.svg';
-import { ReactComponent as GoogleCloudStorageIcon } from '../../ConnectorImages/GoogleCloudStorage.svg';
-import { ReactComponent as DropboxIcon } from '../../ConnectorImages/Dropbox.svg';
-import { ReactComponent as GoogleDriveIcon } from '../../ConnectorImages/GoogleDrive.svg';
-import { ReactComponent as GoogleSheetsIcon } from '../../ConnectorImages/GoogleSheets.svg';
 
-const COLOR = '#0891b2';
+const COLOR = NODE_COLORS.dataSource;
 const MONO = "'JetBrains Mono', monospace";
 const TEXT = '#111827';
 const MUTED = '#5a6678';
 const BORDER = '#e2e6eb';
 const GREEN = '#059669';
 
-const getDbIcon = (dbType) => {
-  const iconMap = {
-    postgres: PostgresIcon,
-    mysql: MysqlIcon,
-    mssql: MssqlIcon,
-    mongodb: MongodbIcon,
-    sqlite: SqlliteIcon,
-    nedb: SqlliteIcon,
-    gcs: GoogleCloudStorageIcon,
-    dropbox: DropboxIcon,
-    'google-drive': GoogleDriveIcon,
-    'google-sheets': GoogleSheetsIcon,
-  };
-  return iconMap[dbType?.toLowerCase()] || null;
-};
+// One connector-icon map for the whole canvas — see CONNECTOR_ICONS. A second
+// copy lived here and fell behind: BigQuery, Snowflake and Slack had SVGs in
+// the tree that no source badge ever rendered.
+const getDbIcon = (dbType) => connectorIconFor(dbType);
 
 const FILE_ICONS = {
   csv: FileTextOutlined,
@@ -46,7 +27,6 @@ const FILE_ICONS = {
   parquet: ParquetIcon,
   avro: AvroIcon,
   sqlite: SqlliteIcon,
-  nedb: SqlliteIcon,
 };
 
 /**
@@ -79,15 +59,24 @@ const getSourceIcon = (config) => {
   return config.sourceConnectionType === 'file' ? FileOutlined : null;
 };
 
+/** A REST API source — no connection/table pair to name, so it reads differently. */
+const isApiSource = (config) =>
+  config.sourceConnectionType === 'api' || !!config.apiConnectionPublicConfig;
+
 const DataSourceNode = ({ data, selected }) => {
   const config = data.config || {};
   const isConfigured = config.sourceConnectionId &&
     (config.sourceType === 'csv' || config.table || config.dataset || config.sourceType);
+  // An API source has no connection/table pair to put in the footer — the
+  // endpoint is the whole story, so it keeps the prose summary and its code
+  // instead. Every other source is identified the way an output is: the
+  // connection it reads through and the table it reads there.
+  const isApi = isApiSource(config);
 
   const SourceIconComponent = getSourceIcon(config);
 
-  // Named by nodeDisplayName — the table/collection it reads beats the bare
-  // connection name, so two sources on one connection are told apart.
+  // Named by nodeDisplayName, in step with every other surface that names a
+  // node; the connection and table it reads are spelled out by the footer.
   const getDisplayName = () =>
     nodeDisplayName('dataSource', data, isConfigured ? 'Configured Data Source' : 'Data Source');
 
@@ -110,7 +99,9 @@ const DataSourceNode = ({ data, selected }) => {
     return 'Data source configured';
   };
 
-  const latestCodes = extractLatestCodes(data.config?.chat);
+  // The code dropdown belongs to the API source too: a table read has no code
+  // of its own worth unfolding on the card.
+  const latestCodes = isApi ? extractLatestCodes(data.config?.chat) : [];
 
   return (
     <div
@@ -189,20 +180,24 @@ const DataSourceNode = ({ data, selected }) => {
         }}>
           {getDisplayName()}
         </div>
-        <div style={{
-          fontSize: 11,
-          color: MUTED,
-          lineHeight: 1.5,
-          display: '-webkit-box',
-          WebkitLineClamp: 3,
-          WebkitBoxOrient: 'vertical',
-          overflow: 'hidden',
-        }}>
-          {getSummary()}
-        </div>
+        {(isApi || !isConfigured) && (
+          <div style={{
+            fontSize: 11,
+            color: MUTED,
+            lineHeight: 1.5,
+            display: '-webkit-box',
+            WebkitLineClamp: 3,
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+          }}>
+            {getSummary()}
+          </div>
+        )}
       </div>
 
       <ExpandableCodes codes={latestCodes} />
+
+      {!isApi && <SourceFooter config={config} accent={COLOR} />}
 
       <Handle
         type="source"
