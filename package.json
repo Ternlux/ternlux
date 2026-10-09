@@ -1,7 +1,11 @@
 {
-  "name": "dagflow-frontend",
+  "name": "ternlux",
+  "productName": "Ternlux",
   "version": "1.0.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Ternlux Inc",
+  "description": "Visual data workflow builder \u2014 connect databases and files, transform with SQL, and schedule pipelines.",
   "homepage": "./",
   "main": "public/electron.js",
   "dependencies": {
@@ -37,16 +41,17 @@
     "electron-dev": "concurrently \"cross-env BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3000 && electron .\"",
     "minify-dist": "node scripts/minify-dist.js",
     "electron-pack": "node scripts/fetch-duckdb-extensions.js && react-scripts build && node scripts/minify-dist.js && electron-builder",
-    "dist:mac": "node scripts/fetch-duckdb-extensions.js osx_arm64 osx_amd64 && node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
-    "dist:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && electron-builder --linux",
-    "dist:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && react-scripts build && node scripts/minify-dist.js && electron-builder --win",
+    "dist:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "dist:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { electron-builder --linux -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
+    "dist:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win; }",
     "dist:all": "node scripts/fetch-duckdb-extensions.js --all && react-scripts build && node scripts/minify-dist.js && electron-builder --mac --linux --win",
-    "pack:mac": "node scripts/fetch-duckdb-extensions.js osx_arm64 osx_amd64 && node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
-    "pack:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && node scripts/minify-dist.js && electron-builder --linux",
-    "pack:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/minify-dist.js && electron-builder --win",
+    "pack:mac": "node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "pack:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { electron-builder --linux -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
+    "pack:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win; }",
     "release:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac --publish always -c.directories.output=$HOME/Ternlux-dist; }",
-    "release:win": "react-scripts build && node scripts/minify-dist.js && electron-builder --win --publish always",
-    "release:linux": "react-scripts build && node scripts/minify-dist.js && electron-builder --linux --publish always",
+    "release:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win --publish always; }",
+    "release:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --linux --publish always -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
+    "esigner": "set -a; [ -f .env ] && . ./.env; set +a; node scripts/esigner-sign.js",
     "fetch-duckdb-extensions": "node scripts/fetch-duckdb-extensions.js",
     "postinstall": "node scripts/fetch-duckdb-extensions.js --optional"
   },
@@ -65,9 +70,11 @@
     "asarUnpack": [
       "**/*.node",
       "node_modules/sqlite3/**",
-      "node_modules/@lancedb/**"
+      "node_modules/@lancedb/**",
+      "node_modules/@duckdb/**"
     ],
     "afterPack": "scripts/after-pack.js",
+    "afterAllArtifactBuild": "scripts/notarize-dmg.js",
     "files": [
       "build/**/*",
       "!**/*.map",
@@ -75,6 +82,9 @@
       "!**/.DS_Store",
       "!**/._*",
       "!build/*.js",
+      "!build/docs/**",
+      "!build/duckdb/**",
+      "!build/image/**",
       "!build/NodeExecution/**",
       "!build/chat/**",
       "!build/ChatPrompts/**",
@@ -116,6 +126,7 @@
         }
       ],
       "icon": "assets/icon.png",
+      "identity": "Ternlux Inc (47BWJ7R87P)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "assets/entitlements.mac.plist",
@@ -131,7 +142,20 @@
           ]
         }
       ],
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.png",
+      "signtoolOptions": {
+        "sign": "./scripts/esigner-sign.js",
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "publisherName": "Ternlux Inc"
+      },
+      "extraResources": [
+        {
+          "from": "resources/duckdb-extensions",
+          "to": "duckdb-extensions"
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -153,14 +177,16 @@
         }
       ],
       "icon": "assets/icon.png",
-      "category": "Office"
-    },
-    "extraResources": [
-      {
-        "from": "resources/duckdb-extensions",
-        "to": "duckdb-extensions"
-      }
-    ]
+      "category": "Office",
+      "executableName": "ternlux",
+      "syncDesktopName": true,
+      "extraResources": [
+        {
+          "from": "resources/duckdb-extensions",
+          "to": "duckdb-extensions"
+        }
+      ]
+    }
   },
   "eslintConfig": {
     "extends": [
