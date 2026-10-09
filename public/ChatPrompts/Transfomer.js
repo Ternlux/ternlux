@@ -324,7 +324,10 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
              canvas, so it has to read as English, not as an identifier: no node
              ids, no timestamps, no "transformer_" prefix, 2-3 words at most.
            - Only for operationMode "in_place" is null right: an in-place update
-             writes back to the source, which already has a name.${defaultSchema ? `
+             writes back to the source, which already has a name.
+           - Say which it is in tableNameFromUser. A coined name gets a short
+             suffix from the node id added by the app, so it is unique; never add
+             one yourself.${defaultSchema ? `
 
         5. schema: which schema the output table lives in. The default is
            ${defaultSchema} — return that unless the user asked for another one.` : ''}
@@ -335,7 +338,7 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
         - Request: "I want to transform the data" → ask_questions (ask the user to provide the logic they want)
         - Request names a table that is not in the source data above → ask_questions (say which table you were given, and ask which one to use)${isSourceLocal ? `
         - Request: "Can you update column A in the table directly?" → generate_transformation (operationMode: in_place)
-        - Request: "Create a new table with filtered customers" → ask_questions (clear: operationMode is new_table)` : `
+        - Request: "Create a new table with filtered customers" → generate_transformation (operationMode: new_table — a local source has no storage location to ask about)` : `
         - Request: "Can you update column A in the table directly?" → generate_transformation (operationMode: in_place, storageLocation: database)
         - Request: "Create a new table with filtered customers" → ask_questions (clear: operationMode is new_table, but unclear: storage location)
         - Request: "Save filtered customers locally" → generate_transformation (operationMode: new_table, storageLocation: local - ALWAYS new_table for local storage)`}
@@ -351,7 +354,8 @@ ${skill.prompts ? skill.prompts.systemContext : ''}
         Return your response as JSON:
         {
           "action": "generate_transformation" | "ask_questions",
-          "tableName": "the table name ONLY, never schema-qualified — the user's name, or a short snake_case name you coin for a new table (null only for in_place)",${defaultSchema ? `
+          "tableName": "the table name ONLY, never schema-qualified — the user's name, or a short snake_case name you coin for a new table (null only for in_place)",
+          "tableNameFromUser": true | false (true ONLY when the user's own words name the output table; false when you coined it),${defaultSchema ? `
           "schema": "the schema the output table lives in (default ${defaultSchema})",` : ''}
           "usesSkill": false | true,
           "skillId": "skill-id-here (only if usesSkill is true)",

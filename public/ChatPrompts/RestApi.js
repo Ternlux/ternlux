@@ -177,6 +177,9 @@ const RestApiPrompts = {
     connectionBasicUser = '',
     connectionParamKeys = [],
     conversationHistory = '',
+    // The table this node already writes, when it is being rebuilt. Downstream
+    // nodes read it by name, so the model is told to keep it.
+    currentCollectionName = null,
   }) => {
     const authType = connectionAuthType || 'none';
     const paramKeys = Array.isArray(connectionParamKeys) ? connectionParamKeys : [];
@@ -221,6 +224,9 @@ related endpoints — put any looping logic inside the function itself.
 - No \`require\`, no \`import\`, no module exports, no top-level statements
   outside the function. Only the function expression itself.
 - Use standard JS only (\`let\`, \`const\`, \`while\`, \`for\`, \`await\`, etc.).
+- Let HTTP errors throw. Never set \`validateStatus\` and never catch a 4xx/5xx
+  to return \`[]\` or the error body: a wrong endpoint or a rejected key must
+  fail the fetch, not become rows. (The runtime rejects error statuses anyway.)
 
 **Placeholder vocabulary** — the ONLY tokens you may emit for this connection.
 They MUST appear only inside JS string literals or template literals, never as
@@ -242,9 +248,21 @@ Return JSON with EXACTLY this shape (no extra keys):
   "action": "ask_questions" | "create_plan",
   "followUpQuestion": "single clear question (only if action is ask_questions)",
   "code": "async function fetchData({ axios }) { /* ... */ return rows; }",
-  "explanation": "One sentence describing what the function does, including any looping behavior."
+  "explanation": "One sentence describing what the function does, including any looping behavior.",
+  "endpoint": "the method and the URL the function requests, nothing else, e.g. GET {{BASE_URL}}latest or GET https://api.example.com/todos?userId=1",
+  "collectionName": "snake_case name of the table the fetched rows are stored in"
 }
 \`\`\`
+
+**collectionName** (required with create_plan): the rows are stored as a local
+table, and this is its name. Other nodes in the workflow read the table by this
+name, so it is part of the node's identity.
+${currentCollectionName
+    ? `- This node already writes the table "${currentCollectionName}". Return exactly that
+  name unless the user explicitly asks to rename the table.`
+    : `- Name it for what the rows ARE, not for what the user typed: "exchange_rates",
+  "github_issues", "open_orders". 1-4 lowercase words joined by underscores,
+  letters, digits and underscores only.`}
 
 RULES:
 
@@ -255,10 +273,16 @@ RULES:
 2. **ask_questions** — you need one more detail before you can write the
    function, the user asked something informational, or you cannot do what was
    asked. Fill \`followUpQuestion\` — answer what they asked inside it if they
-   asked something, then say what you still need. Leave code/explanation as nulls.
+   asked something, then say what you still need. Leave code/explanation/
+   endpoint/collectionName as nulls.
 
 3. **create_plan** — you have enough to describe the exact call. Populate
-   \`code\` and \`explanation\`.
+   \`code\`, \`explanation\`, \`endpoint\` and \`collectionName\`. \`endpoint\`
+   labels the node on the canvas: the one request it makes, or the first page
+   of a paginated one. Write it as a METHOD and the full URL that request goes
+   to — the URL after any rewriting the code does, so if the code turns
+   \`{{BASE_URL}}\` into a different path, write that path out. No comments, no
+   explanation, no parentheses. Never put a credential in it — placeholders only.
 
 4. \`code\` MUST be a single async function expression. It is passed directly
    to \`new Function("return (" + code + ");")\` in the runtime, so a function
