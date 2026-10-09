@@ -66,8 +66,22 @@ function resolveTargetDb(targetLocalPath, scope) {
   return isWorkflowDb(targetLocalPath) ? targetLocalPath : resolveOutputPath(null, scope);
 }
 
-/** True when a path is a workflow database rather than a data file. */
-const isWorkflowDb = (filePath) => /\.duckdb$/i.test(String(filePath || ''));
+/**
+ * True when a path is a workflow's own database — an upstream node's output —
+ * rather than a source the user connected. A user's .duckdb file is NOT one:
+ * it is a database like a .sqlite, read by its path (see isDatabaseSource).
+ */
+const isWorkflowDb = (filePath) => duck.isWorkflowDatabase(filePath);
+
+/**
+ * True when the source is a table in a database (workflow, .duckdb, SQLite),
+ * which an in-place update changes where it is. False for a data file, which
+ * is staged under stagingTableFor and written back. The prompt (which tells the
+ * model what table to write statements against) and the executor both ask
+ * this, so the name the model uses and the table that exists cannot disagree.
+ */
+const isDatabaseSource = (filePath) => !!filePath
+  && (duck.isDatabaseFile(filePath) || duck.isSqliteFile(filePath));
 
 /**
  * What a NEW-TABLE transform reads from.
@@ -131,10 +145,10 @@ async function registerSource(sourceLocalPath, tableName, format = null, { workf
   // A non-workflow DATABASE file — .sqlite/.sqlite3/.db, read through DuckDB's
   // sqlite extension. Attached, not tableRef'd: tableRef only knows data-file
   // formats and threw "cannot read x.sqlite — supported formats are csv, json,
-  // parquet, xlsx and avro" for a source the Data Explorer browses fine. Same
-  // predicate as the connector's, so the two cannot disagree (a .duckdb source
-  // was already caught by the workflow branch above).
-  if (duck.isDatabaseFile(sourceLocalPath)) {
+  // parquet, xlsx and avro" for a source the Data Explorer browses fine. A
+  // .duckdb file the user owns lands here too: only a workflow's own database
+  // is caught by the branch above.
+  if (isDatabaseSource(sourceLocalPath)) {
     if (!tableName) {
       throw new Error(`Reading a table out of ${path.basename(sourceLocalPath)} requires the source's table name.`);
     }
@@ -245,7 +259,9 @@ async function describeResult({
     // same way the real run resolves it. The copy holds only `limit` rows, so
     // this costs the same on a 5 GB file as on a small one.
     const stagingDb = resolveOutputPath(null, { workflowId, nodeId });
-    const stageTable = isWorkflowDb(sourceLocalPath)
+    // A database table is addressed by its real name, a file by its staging
+    // name — whichever name the prompt gave the model (see isDatabaseSource).
+    const stageTable = isDatabaseSource(sourceLocalPath)
       ? sourceName
       : stagingTableFor(nodeId, sourceName);
 
@@ -255,7 +271,7 @@ async function describeResult({
         ? await duck.workflowTableRef(workflowId, sourceName)
         // A .sqlite/.db source is a real table in an attachable database —
         // tableRef only speaks data-file formats and would throw on it.
-        : duck.isDatabaseFile(sourceLocalPath)
+        : isDatabaseSource(sourceLocalPath)
           ? await duck.attachedTableRef(sourceLocalPath, sourceName)
           // The preview has to read the same sheet the real run will, or it
           // describes a shape the transform never sees.
@@ -428,7 +444,7 @@ async function inPlaceLocalUpdate({
   // no write-back. It used to fall into the file branch below, where
   // detectFormat has no answer for .sqlite and tableRef threw on a source that
   // reads fine everywhere else.
-  if (duck.isDatabaseFile(target)) {
+  if (isDatabaseSource(target)) {
     const run = async () => {
       const { tolerated } = await duck.execScriptInDb(target, sql);
       return { rowCount: await duck.tableRowCountIn(target, dbTableName), tolerated };
@@ -561,4 +577,5 @@ module.exports = {
   describeResult,
   registerSource,
   isWorkflowDb,
+  isDatabaseSource,
 };
