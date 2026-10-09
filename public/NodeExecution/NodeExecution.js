@@ -1,6 +1,6 @@
 const pluginManager = require('../pluginManager');
 const DuckDB = require('../transfomers/DuckDB');
-const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, executeLocalDuckDBJoin } = require('../joins/joinExecutionHelpers');
+const { loadSourceData, loadSQLSourceInChunks, insertDataToTempTable, resolveStagedColumns, executeLocalDuckDBJoin, writeLocalJoinRows } = require('../joins/joinExecutionHelpers');
 const localSqlite = require('../lib/sqlite');
 const { batchChunkSizeFor, DEFAULT_BATCH_CHUNK_SIZE } = require('../lib/batchChunkSize');
 const { logStep, traceCall } = require('./executionLog');
@@ -98,13 +98,91 @@ async function pullJoinSourceRows(sourceConnection, sourceConfig) {
 }
 
 /**
+ * A join step for a vector source that carries no read of its own — no
+ * `vectorFetchOperation` (and no sql / nosqlOperation). That is how the join
+ * prompt asks for a vector store the function searches itself: it gets an
+ * entry, but nothing is fetched for it. Shared with the builder's
+ * directReadSources rule so both agree on which sources are passed.
+ */
+function isDirectReadStep(step) {
+  if (!step || typeof step !== 'object') return false;
+  const conn = step.connection || step.sourceConnection;
+  if (!conn || !isVectorConnection(conn)) return false;
+  return !Object.prototype.hasOwnProperty.call(step, 'vectorFetchOperation')
+    && !String(step.sql || '').trim()
+    && !step.nosqlOperation;
+}
+
+/**
+ * Does this join write mode keep the target between runs? 'append' and
+ * 'merge' do: the target is created only when missing and never dropped (a
+ * merge differs only in its insert script, which the model wrote). 'new_table'
+ * replaces it every run.
+ */
+const keepsTarget = (mode) => mode === 'append' || mode === 'merge';
+
+/** Last name segment, unquoted, lower-cased — for comparing two table names. */
+function bareTableName(name) {
+  const parts = String(name || '').split('.');
+  return String(parts[parts.length - 1] || '').replace(/^[`"\[]+|[`"\]]+$/g, '').toLowerCase();
+}
+
+/**
+ * Does the destination already hold the join's target? Asked of the engine
+ * through lib/tableRef.resolveTableRef — the same resolver the output node
+ * uses, which knows each connector's case folding and qualifier rule (a bare
+ * name on Snowflake, a schema-qualified one on Postgres) — never by parsing
+ * SQL. null when it cannot say.
+ *
+ * `schema` is the connection's DEFAULT schema. getFullConfig returns the
+ * connection config flat, so `fullConfig.dbConfig.schema` is usually absent —
+ * reading only that made every append run ask Postgres about schema NULL,
+ * find nothing, and try to CREATE a table that was already there.
+ */
+async function destinationTableExists(destPlugin, destFullConfig, connectionId, schema, tableName) {
+  if (!destPlugin || !tableName) return null;
+  try {
+    const { resolveTableRef } = require('../lib/tableRef');
+    const ref = await resolveTableRef(destPlugin, destFullConfig, connectionId, tableName, schema || null);
+    return !!ref?.found;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** The destination connection's default schema, wherever its config keeps it. */
+function destinationDefaultSchema(destinationConnection, destFullConfig) {
+  return destinationConnection?.targetSchema
+    || destinationConnection?.dbConfig?.schema
+    || destFullConfig?.schema
+    || destFullConfig?.dbConfig?.schema
+    || null;
+}
+
+/**
  * Build a `ctx` object passed to the AI-generated join `javascriptFunction`
  * (NoSQL / vector destinations). Mirrors the surface area of
  * skills/javascript-executor's sandbox so prompts can describe a single
  * helper API across both skills.
  */
-function buildJoinCtx(helpers) {
+function buildJoinCtx(helpers, directVectorSources = []) {
   if (!helpers) return null;
+  // A similarity join's function queries its vector source itself, and the
+  // generated call often names only the connection — Pinecone then refuses it
+  // ("Index name is required"). When the call targets one of this join's own
+  // vector sources, the index and namespace that source points at are filled in.
+  const fillVectorCoordinates = (connection, query) => {
+    if (!query || typeof query !== 'object' || Array.isArray(query)) return query;
+    const conn = String(connection || '');
+    const src = directVectorSources.find((s) => conn
+      && (conn === s.connectionId || conn === s.connectionName || conn === s.dbType));
+    if (!src || src.dbType === 'lancedb') return query;
+    return {
+      ...query,
+      ...(query.indexName ? {} : (src.indexName ? { indexName: src.indexName } : {})),
+      ...(query.namespace !== undefined ? {} : (src.namespace ? { namespace: src.namespace } : {})),
+    };
+  };
   return {
     connections: (helpers.connections || []).map((c) => ({
       id: c.id || c._id,
@@ -116,7 +194,7 @@ function buildJoinCtx(helpers) {
     embeddingProviders: helpers.embeddingProviders || [],
     // Unified data access: pass `dbPath` to hit a local duckdb/sqlite/lancedb
     // file; leave it null for saved connections.
-    runQuery:    (connection, query, dbPath = null)             => helpers.runQuery(connection, query, dbPath),
+    runQuery:    (connection, query, dbPath = null)             => helpers.runQuery(connection, fillVectorCoordinates(connection, query), dbPath),
     getTables:   (connection, dbPath = null)                    => helpers.getTables(connection, dbPath),
     getColumns:  (connection, table, schema = null, dbPath = null) => helpers.getColumns(connection, table, schema, dbPath),
     askAi:       (prompt, opts = {})       => helpers.callAI(prompt, opts),
@@ -127,8 +205,80 @@ function buildJoinCtx(helpers) {
 }
 
 /**
+ * Run a JavaScript join: load every source into memory, then call the join's
+ * AI-written function over them.
+ *
+ * Shared by every destination that joins in JavaScript — a document store and a
+ * vector store always do, and a local or SQL destination does when the join
+ * needs embeddings / similarity search, which no SQL engine here can run.
+ *
+ * Throws rather than returning nothing. A missing function, one that does not
+ * compile, or one that returns something other than an array is a broken join,
+ * and every caller REPLACES its target — so reading any of those as "no rows"
+ * emptied the destination and reported success.
+ */
+async function runJoinFunction(sourcesConfig, javascriptFunction, label, directVectorSources = []) {
+  if (!javascriptFunction || !String(javascriptFunction).trim()) {
+    throw new Error(`${label} join has no javascriptFunction to run — rebuild the join from its chat.`);
+  }
+  const sourceDataArrays = [];
+  const directIds = new Set((directVectorSources || []).map((d) => d?.sourceNodeId).filter(Boolean));
+  for (const sourceConfig of sourcesConfig || []) {
+    const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
+    if (!sourceConnection) {
+      throw new Error(`Source connection not found for ${sourceConfig.sourceNodeId}`);
+    }
+    // A vector source the function searches itself (through ctx.runQuery) is
+    // not loaded and not passed: the function was written without a parameter
+    // for it. Reading it anyway shifted every argument after it — the rows
+    // landed in `ctx`, and the run died on "ctx.vectorize is not a function".
+    if (directIds.has(sourceConfig.sourceNodeId) || isDirectReadStep(sourceConfig)) continue;
+    const rows = await pullJoinSourceRows(sourceConnection, sourceConfig);
+    console.log(`[${label} Join] Loaded ${rows.length} rows from ${sourceConfig.sourceNodeId}`);
+    sourceDataArrays.push(rows);
+  }
+
+  let joinFn;
+  try {
+    joinFn = eval(`(${javascriptFunction})`);
+  } catch (err) {
+    throw new Error(`The join function does not compile: ${err.message}`);
+  }
+  if (typeof joinFn !== 'function') throw new Error('The join\'s javascriptFunction is not a function');
+
+  const ctxHelpers = buildSkillHelpers ? await buildSkillHelpers() : null;
+  const joinedRows = await joinFn(...sourceDataArrays, buildJoinCtx(ctxHelpers, directVectorSources));
+  if (!Array.isArray(joinedRows)) {
+    throw new Error(`The join function must return an array of rows; it returned ${joinedRows === null ? 'null' : typeof joinedRows}.`);
+  }
+  console.log(`[${label} Join] Join produced ${joinedRows.length} rows`);
+  return joinedRows;
+}
+
+/** Every key the rows carry, in first-seen order — the columns to insert. */
+function rowColumns(rows) {
+  const seen = new Set();
+  for (const row of rows) {
+    if (row && typeof row === 'object') for (const k of Object.keys(row)) seen.add(k);
+  }
+  return [...seen];
+}
+
+/**
  * Quote table identifier with optional schema using the plugin's quoteIdentifier method
  */
+/**
+ * Join staging tables in use right now, process-wide:
+ * `<destination connection id>|<staging name>` → the run holding it.
+ *
+ * Staging names come from node ids, and nothing about two different workflows
+ * keeps their ids apart (an imported copy kept the original's). Run
+ * concurrently, one dropped the other's staging table mid-load and the
+ * destination ended up with rows from both. The per-workflow run lock cannot
+ * see that; this does.
+ */
+const stagingClaims = new Map();
+
 function quoteTableIdentifier(dbType, tableName, schema, config) {
   if (!tableName) return tableName;
 
@@ -621,6 +771,11 @@ async function handleExecuteJoin({
     workflowId = null,
     nodeId = null
   }) {
+    // Drops the staging tables a remote SQL join created — set once they
+    // exist, so a failed run removes them too instead of leaving them for the
+    // next run's DROP (which never comes if the join is rebuilt under another
+    // name).
+    let dropStagingTables = null;
     try {
       // Rows per source read AND per temp-table batchInsert on the remote-join
       // path below. It was 1000, which made staging a large source thousands of
@@ -644,10 +799,6 @@ async function handleExecuteJoin({
       if (isVectorDestination) {
         const sourcesConfig = joinConfig.sourcesConfig || [];
         const javascriptFunction = joinConfig.transformFunction || joinConfig.javascriptFunction;
-        console.log('javascriptFunction: ', javascriptFunction)
-        if (!javascriptFunction) {
-          return { success: false, message: 'Vector destination requires a javascriptFunction (joined rows)' };
-        }
 
         const vectorDest = joinConfig.vectorDestination || {};
         if (!vectorDest.columnToEmbed || !vectorDest.embeddingProvider || !vectorDest.embeddingModel) {
@@ -657,25 +808,7 @@ async function handleExecuteJoin({
           };
         }
 
-        const sourceDataArrays = [];
-        for (const sourceConfig of sourcesConfig) {
-          const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
-          if (!sourceConnection) {
-            throw new Error(`Source connection not found for ${sourceConfig.sourceNodeId}`);
-          }
-          const rows = await pullJoinSourceRows(sourceConnection, sourceConfig);
-          console.log(`[Vector Join] Loaded ${rows.length} rows from ${sourceConfig.sourceNodeId}`);
-          sourceDataArrays.push(rows);
-        }
-
-        const ctxHelpersForVec = buildSkillHelpers ? await buildSkillHelpers() : null;
-        const ctxForVec = buildJoinCtx(ctxHelpersForVec);
-        const joinFn = eval(`(${javascriptFunction})`);
-        const joinedRows = await joinFn(...sourceDataArrays, ctxForVec);
-        if (!Array.isArray(joinedRows)) {
-          throw new Error('joinFunction must return an array of joined records');
-        }
-        console.log(`[Vector Join] Join produced ${joinedRows.length} rows`);
+        const joinedRows = await runJoinFunction(sourcesConfig, javascriptFunction, 'Vector', joinConfig.directVectorSources || []);
 
         const skill = getVectorSkill();
         if (!skill || typeof skill.embedAndUpsertJoinedRows !== 'function') {
@@ -686,6 +819,14 @@ async function handleExecuteJoin({
         const result = await skill.embedAndUpsertJoinedRows({
           joinedRows,
           columnToEmbed: vectorDest.columnToEmbed,
+          // The row's primary key the join builder named — the id each vector
+          // is upserted under. Absent: a hash of the whole row.
+          idColumn: vectorDest.idColumn || null,
+          // New-table (replace) mode: the store ends up holding exactly this
+          // run's records. Append / merge upsert by id and keep the rest. It
+          // used to upsert in every mode, so a replace whose ids changed run to
+          // run (a row hash over a float score) grew the store each time.
+          writeMode: keepsTarget(operationMode) ? 'append' : 'truncate',
           vectorDbType: vectorDest.vectorDbType || destinationConnection.dbType,
           targetTable: vectorDest.targetTable || targetTableName,
           targetLocalPath: vectorDest.targetLocalPath || destinationConnection.localPath,
@@ -714,34 +855,12 @@ async function handleExecuteJoin({
   
         const sourcesConfig = joinConfig.sourcesConfig || [];
         const javascriptFunction = joinConfig.transformFunction || joinConfig.javascriptFunction;
-        const sourceDataArrays = [];
-  
-        // Step 1: Load all source data into memory
-        console.log(`[NoSQL Join] Loading ${sourcesConfig.length} sources into memory...`);
-  
-        for (let i = 0; i < sourcesConfig.length; i++) {
-          const sourceConfig = sourcesConfig[i];
-          const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection;
-  
-          if (!sourceConnection) {
-            throw new Error(`Source connection not found for ${sourceConfig.sourceNodeId}`);
-          }
 
-          const sourceData = await pullJoinSourceRows(sourceConnection, sourceConfig);
+        // Steps 1 + 2: load every source, run the join function. Throws on a
+        // missing function or a non-array result — see runJoinFunction for why
+        // that must never read as "no rows" here, where the target is dropped.
+        const joinedResults = await runJoinFunction(sourcesConfig, javascriptFunction, 'NoSQL', joinConfig.directVectorSources || []);
 
-          console.log(`[NoSQL Join] Loaded ${sourceData.length} rows from source ${i + 1}`);
-          sourceDataArrays.push(sourceData);
-        }
-  
-        // Step 2: Execute JavaScript join function
-        console.log(`[NoSQL Join] Executing join function...`);
-        const ctxHelpersForNoSQL = buildSkillHelpers ? await buildSkillHelpers() : null;
-        const ctxForNoSQL = buildJoinCtx(ctxHelpersForNoSQL);
-        const joinFunction = eval(`(${javascriptFunction})`);
-        const joinedResults = await joinFunction(...sourceDataArrays, ctxForNoSQL);
-  
-        console.log(`Join_produced:`, destinationConnection);
-  
         // Step 3: Insert into the destination document store
         {
           if (!pluginManager.hasConnector(destinationConnection.dbType)) {
@@ -754,8 +873,8 @@ async function handleExecuteJoin({
           const fullConfig = await getFullConfig(destinationConnection.id, destinationConnection.dbConfig || {});
           const plugin = pluginManager.getConnector(destinationConnection.dbType);
   
-          // A join function is user- or AI-authored and may return anything.
-          const documents = Array.isArray(joinedResults) ? joinedResults : [];
+          // runJoinFunction has already refused anything that is not an array.
+          const documents = joinedResults;
 
           // Strip `_id` for the same reason the output node does (see
           // outputExecutionHelpers): it names a document within its OWN
@@ -864,10 +983,37 @@ async function handleExecuteJoin({
         const targetDdl = joinConfig.targetDdl || joinConfig.ddl;
         const joinSql = joinConfig.joinSql || joinConfig.sql;
         const tempTablesToCleanup = [];
-  
+        // Staging names this run has claimed (see stagingClaims), released
+        // with the tables themselves.
+        const claimedStaging = [];
+        // Identity of THIS run for the claims (an object, so two runs of one
+        // node are still told apart).
+        const stagingOwner = { label: `workflow ${workflowId || 'unknown'}, node ${nodeId || 'unknown'}` };
+
         // A local destination writes this node's own table in the workflow's
         // DuckDB database.
         const isLocalDestination = destinationConnection.dbType === 'duckdb';
+
+        // A JavaScript join into a table destination. Built when the join needs
+        // embeddings or similarity search, which no SQL engine here can run:
+        // the generator then emits a function and no joinSql. The rows it
+        // returns are written as the destination table — that is the only
+        // difference from a document destination.
+        const javascriptFunction = joinConfig.transformFunction || joinConfig.javascriptFunction;
+        const isFunctionJoin = !String(joinSql || '').trim() && !!javascriptFunction;
+
+        if (isFunctionJoin && isLocalDestination) {
+          const rows = await runJoinFunction(sourcesConfig, javascriptFunction, 'DuckDB', joinConfig.directVectorSources || []);
+          return await writeLocalJoinRows({
+            rows,
+            targetTableName,
+            targetLocalPath: joinConfig.targetLocalPath,
+            emptyColumns: joinConfig.targetColumns,
+            operationMode,
+            workflowId,
+            nodeId,
+          });
+        }
         // console.log('sourcesConfig: ', joinSql, targetDdl, sourcesConfig)
         if (isLocalDestination) {
           // Vector sources have no SQL surface, so resolve their rows via the
@@ -884,6 +1030,8 @@ async function handleExecuteJoin({
           return await executeLocalDuckDBJoin({
             sourcesConfig,
             joinSql,
+            targetDdl,
+            operationMode,
             targetTableName,
             targetLocalPath: joinConfig.targetLocalPath,
             pluginManager,
@@ -905,6 +1053,42 @@ async function handleExecuteJoin({
   
         const destFullConfig = await getFullConfig(destinationConnection.id, destinationConnection.dbConfig || {});
         const destPlugin = pluginManager.getConnector(destinationConnection.dbType);
+        dropStagingTables = async () => {
+          for (const key of claimedStaging.splice(0)) stagingClaims.delete(key);
+          for (const tempTable of tempTablesToCleanup.splice(0)) {
+            try {
+              await destPlugin.runQuery(destFullConfig, destinationConnection.id, { query: `DROP TABLE IF EXISTS ${tempTable}` });
+            } catch (err) {
+              console.error(`Failed to cleanup ${tempTable}:`, err);
+            }
+          }
+        };
+        // Sources whose read came back empty — named when the join writes 0 rows.
+        const emptySources = [];
+
+        // ── Guard: a replace (new_table) run must not drop a table it reads ──
+        // A source already on the destination is read IN PLACE by the join SQL.
+        // If that same table is the target, the DROP + CREATE below empties it
+        // before the INSERT reads it: the run "succeeds" with 0 rows and the
+        // source data is gone. Refused before anything is touched. Append mode
+        // never drops, so there it is allowed (each run reads what earlier runs
+        // added).
+        if (!keepsTarget(operationMode) && !isFunctionJoin) {
+          const clash = sourcesConfig.find((sc) => {
+            const conn = sc?.connection || sc?.sourceConnection || {};
+            const inPlace = !(sc?.ddl && sc?.tempTableName) && conn.id === destinationConnection.id;
+            return inPlace && bareTableName(sc.tableName || sc.sourceTableSchema?.tableName) === bareTableName(targetTableName);
+          });
+          if (clash) {
+            return {
+              success: false,
+              message: `Join ${targetTableName} replaces its target on every run, but "${clash.tableName}" is also one of its sources `
+                + 'on the same connection — the replace would empty it before it is read. Write to a different target table, '
+                + 'or switch the join to append mode. Nothing was changed.',
+              recordsProcessed: 0,
+            };
+          }
+        }
 
         // On the streaming path below, the SOURCE read size decides the
         // destination write size: every batch pulled from the source becomes
@@ -913,19 +1097,104 @@ async function handleExecuteJoin({
         // able to widen the read. See public/lib/batchChunkSize.js.
         const LOAD_CHUNK_SIZE = batchChunkSizeFor(destPlugin, CHUNK_SIZE);
 
-  
+        // JavaScript join into a SQL destination: no temp tables and no join
+        // SQL. The target is created from targetDdl exactly as a SQL join's is
+        // (drop, then CREATE), and the function's rows are inserted into it in
+        // batches by column name — the same batchInsert a temp table loads with.
+        if (isFunctionJoin) {
+          if (!String(targetDdl || '').trim()) {
+            return {
+              success: false,
+              message: `Join ${targetTableName} has no targetDdl, so its destination table cannot be created. Rebuild the join from its chat.`,
+            };
+          }
+          const rows = await runJoinFunction(sourcesConfig, javascriptFunction, 'SQL', joinConfig.directVectorSources || []);
+          // The schema the DROP below quotes with — unchanged; the existence
+          // check takes the connection's default schema (see destinationDefaultSchema).
+          const fnSchema = destinationConnection.targetSchema || destFullConfig?.dbConfig?.schema || null;
+          // Append keeps the target and only creates it when it is missing; a
+          // new_table run drops and recreates it.
+          const keepTarget = keepsTarget(operationMode)
+            && await destinationTableExists(destPlugin, destFullConfig, destinationConnection.id,
+              destinationDefaultSchema(destinationConnection, destFullConfig), targetTableName) === true;
+          if (!keepTarget) {
+            try {
+              const quotedTarget = quoteTableIdentifier(destinationConnection.dbType, targetTableName, fnSchema, destFullConfig);
+              await destPlugin.runQuery(destFullConfig, destinationConnection.id, { query: `DROP TABLE IF EXISTS ${quotedTarget}` });
+            } catch (err) {
+              console.log('[SQL Join] Ignoring drop error for target:', err.message);
+            }
+            await runDestStatement(
+              destPlugin, destFullConfig, destinationConnection.id,
+              targetDdl, `Creating target table ${targetTableName}`,
+            );
+          }
+          // Every key the rows carry. A key the DDL has no column for fails the
+          // insert loudly, which is what should happen — a silent drop would
+          // lose the similarity results this join exists to produce.
+          const columns = rowColumns(rows);
+          const inserted = rows.length
+            ? await insertDataToTempTable(
+              destPlugin, destFullConfig, destinationConnection.id,
+              targetTableName, columns, rows, LOAD_CHUNK_SIZE,
+            )
+            : 0;
+          return {
+            success: true,
+            warning: inserted === 0,
+            message: inserted === 0
+              ? `Join completed — 0 rows written to ${targetTableName}. The join function returned no rows.`
+              : `Join completed successfully. ${inserted} rows inserted into ${targetTableName}`,
+            rowsAffected: inserted,
+            rowCount: inserted,
+            targetTableName,
+          };
+        }
+
+
         // Step 1: Create temp tables and load source data
         for (let i = 0; i < sourcesConfig.length; i++) {
           const sourceConfig = sourcesConfig[i];
   
-          // Skip sources that don't need temp tables (already in destination)
+          // A source already on the destination connection is read in place —
+          // no temp table. Every other source MUST be staged. Missing staging
+          // fields used to mean "skip it" regardless, so a source the model
+          // forgot to stage vanished from the join and it failed later on a
+          // table that does not exist. Same test the builder uses to decide a
+          // source is in the destination (connection id equality).
           if (!sourceConfig.ddl || !sourceConfig.tempTableName) {
-            console.log(`exists: `, sourceConfig);
-            continue;
+            const srcConnId = (sourceConfig.connection || sourceConfig.sourceConnection || {}).id;
+            if (srcConnId && srcConnId === destinationConnection.id) continue;
+            throw new Error(
+              `Join source "${sourceConfig.sourceNodeId || 'unknown'}" is not on the destination connection, `
+              + 'so it has to be staged into a temp table, but it has no ddl / tempTableName. '
+              + 'Rebuild the join from its chat.',
+            );
           }
           console.log(`SOURCE_CONFIG: `, sourceConfig);
   
           const tempTableName = sourceConfig.tempTableName;
+
+          // Claim the staging name on this connection before touching it. The
+          // DROP below would otherwise remove a table another running workflow
+          // is still loading into — two workflows whose nodes share ids (an
+          // import of an export, before imports were given fresh ids) stage
+          // under the same name, and the run lock is per workflow so it does
+          // not see them. Refusing here leaves the other run untouched.
+          const claimKey = `${destinationConnection.id}|${String(tempTableName).toLowerCase()}`;
+          const claimedBy = stagingClaims.get(claimKey);
+          if (claimedBy && claimedBy !== stagingOwner) {
+            throw new Error(
+              `The staging table ${tempTableName} on ${destinationConnection.name || destinationConnection.dbType} `
+              + `is in use by another run (${claimedBy.label}). Two workflows that stage the same table cannot `
+              + 'run at once — wait for it to finish. If this workflow was imported before imports were given '
+              + 'their own node ids, re-import it so its staging names are its own.',
+            );
+          }
+          if (!claimedBy) {
+            stagingClaims.set(claimKey, stagingOwner);
+            claimedStaging.push(claimKey);
+          }
 
           // One quoted form for every statement built HERE — the DROP below and
           // the cleanup at the end — so both name the same table that
@@ -974,6 +1243,11 @@ async function handleExecuteJoin({
           if (!selectedColumns || selectedColumns.length === 0) {
             throw new Error(`No selectedColumns found for source ${sourceConfig.sourceNodeId}`);
           }
+          // The names the CREATE above actually produced (see
+          // resolveStagedColumns) — a bare DDL column is upper case on Snowflake.
+          const tableColumns = await resolveStagedColumns(
+            destPlugin, destFullConfig, destinationConnection.id, tempTableName, selectedColumns,
+          );
 
           let totalInserted = 0;
 
@@ -989,7 +1263,8 @@ async function handleExecuteJoin({
               tempTableName,
               selectedColumns,
               sourceData,
-              LOAD_CHUNK_SIZE
+              LOAD_CHUNK_SIZE,
+              tableColumns,
             );
   
             console.log(`SQL_LOADED: ${totalInserted}/${sourceData.length}`);
@@ -1012,7 +1287,8 @@ async function handleExecuteJoin({
                   tempTableName,
                   selectedColumns,
                   rows,
-                  rows.length // Don't re-chunk, already chunked by loadSQLSourceInChunks
+                  rows.length, // Don't re-chunk, already chunked by loadSQLSourceInChunks
+                  tableColumns,
                 );
               },
               // Lets a local DuckDB source be resolved by path instead of
@@ -1024,20 +1300,29 @@ async function handleExecuteJoin({
           }
   
           console.log(`[SQL Join] Finished loading source ${i + 1}: ${totalInserted} total rows`);
+          if (totalInserted === 0) emptySources.push(sourceConfig.tableName || sourceConfig.sourceNodeId);
         }
   
-        // Step 2: Create target table if needed
-        if (operationMode === 'new_table' && targetDdl) {
-          console.log(`join_new_table ${targetTableName}...`);
+        // Step 2: Create the target. new_table drops and recreates it every
+        // run; append keeps it and creates it only when it is missing.
+        // The DROP below quotes with the schema it always has; the existence
+        // check takes the connection's default schema (see destinationDefaultSchema).
+        const targetSchemaName = destinationConnection.targetSchema || destFullConfig?.dbConfig?.schema || null;
+        const appendToExisting = keepsTarget(operationMode)
+          && await destinationTableExists(destPlugin, destFullConfig, destinationConnection.id,
+            destinationDefaultSchema(destinationConnection, destFullConfig), targetTableName) === true;
+        if (targetDdl && !appendToExisting) {
+          console.log(`join_${keepsTarget(operationMode) ? 'create_missing' : 'new_table'} ${targetTableName}...`);
   
           // Drop target table if exists (for clean re-runs)
-          try {
-            const schema = destinationConnection.targetSchema || destFullConfig?.dbConfig?.schema || null;
-            const quotedTargetTableName = quoteTableIdentifier(destinationConnection.dbType, targetTableName, schema, destFullConfig);
-            await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${quotedTargetTableName}`});
-          } catch (err) {
-            console.log('destPlugin_drop_table_error: ', err)
-            // Ignore errors if table doesn't exist
+          if (!keepsTarget(operationMode)) {
+            try {
+              const quotedTargetTableName = quoteTableIdentifier(destinationConnection.dbType, targetTableName, targetSchemaName, destFullConfig);
+              await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${quotedTargetTableName}`});
+            } catch (err) {
+              console.log('destPlugin_drop_table_error: ', err)
+              // Ignore errors if table doesn't exist
+            }
           }
   
           await runDestStatement(
@@ -1061,17 +1346,19 @@ async function handleExecuteJoin({
         // Already quoted when the table was named, by the same call the CREATE
         // and the load went through — re-quoting it here would only be the
         // idempotent guard handing it back.
-        for (const tempTable of tempTablesToCleanup) {
-          try {
-            await destPlugin.runQuery(destFullConfig, destinationConnection.id, {query: `DROP TABLE IF EXISTS ${tempTable}`});
-          } catch (err) {
-            console.error(`Failed to cleanup ${tempTable}:`, err);
-          }
-        }
-  
+        await dropStagingTables();
+
+        // 0 rows is a result worth a warning, not a plain success — above all
+        // when a source read nothing, which is a wrong read far more often
+        // than a genuinely empty source (a vector store asked for the wrong
+        // namespace answered with 0 rows and the run said "completed").
         return {
           success: true,
-          message: `Join completed successfully. ${rowsAffected} rows inserted into ${targetTableName}`,
+          ...(rowsAffected === 0 ? { warning: true } : {}),
+          message: rowsAffected === 0
+            ? `Join completed — 0 rows inserted into ${targetTableName}.${emptySources.length
+              ? ` These sources returned no rows: ${emptySources.join(', ')}.` : ''}`
+            : `Join completed successfully. ${rowsAffected} rows inserted into ${targetTableName}`,
           rowsAffected,
           targetTableName
         };
@@ -1080,10 +1367,8 @@ async function handleExecuteJoin({
     } catch (error) {
       // A stop must reach the runner as an exception — see executeOutput.
       //
-      // Note the temp tables: the cleanup above is on the success path only, so
-      // a stop leaves them behind exactly as a failure already does. They are
-      // reclaimed by the DROP TABLE IF EXISTS the next run issues before
-      // recreating each one, so this leaks nothing permanently.
+      // The staging tables go either way — a failure or a stop.
+      if (dropStagingTables) await dropStagingTables().catch(() => {});
       if (isCancelledError(error)) throw error;
       console.error('Join execution error:', error);
       return {
@@ -1235,10 +1520,16 @@ async function handleExecuteBranch({
   }
 }
 
+// A node run holds the user's database files for its whole duration — see
+// holdDatabases in ../duckdb: a join registers views over an attached file,
+// then may wait on a remote source before reading them.
+const { holdDatabases } = require('../duckdb');
+const held = (fn) => (...args) => holdDatabases(() => fn(...args));
+
 module.exports = {
   initialize,
-  handleTransformSQL,
-  handleTransformNoSQL,
-  handleExecuteJoin,
-  handleExecuteBranch
+  handleTransformSQL: held(handleTransformSQL),
+  handleTransformNoSQL: held(handleTransformNoSQL),
+  handleExecuteJoin: held(handleExecuteJoin),
+  handleExecuteBranch: held(handleExecuteBranch),
 };

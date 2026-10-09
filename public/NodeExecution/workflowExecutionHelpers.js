@@ -6,9 +6,11 @@
 const path = require('path');
 const fs = require('fs');
 const { handleTransformNoSQL, handleTransformSQL, handleExecuteJoin, handleExecuteBranch } = require('./NodeExecution');
-const { handleExecuteApiFetch } = require('./ApiFetch');
+const { handleExecuteApiFetch, describeApiTable } = require('./ApiFetch');
 const { executeOutput } = require('./outputExecutionHelpers');
 const { isCancelledError } = require('./executionCancel');
+const targetShape = require('../lib/targetShape');
+const { qualifierFor } = require('../lib/tableRef');
 
 /**
  * Node types that MATERIALISE something when they run — a table, a collection,
@@ -54,6 +56,138 @@ async function markNodeExecuted(node, helpers) {
   } catch (err) {
     console.warn(`[Workflow Execution] could not flag node ${node?.id} as executed:`, err.message);
   }
+}
+
+/**
+ * Write a run's finding about a join back onto the SAVED workflow — today, a
+ * kept target that was recreated (or no longer needed to be), so the node stops
+ * asking. Saved here as well as handed to the editor, for the same reason the
+ * executed flag is: a run started by a trigger has no editor, and an editor
+ * closed without saving would otherwise bring the old "recreate pending" back
+ * and ask again about a table that already fits.
+ */
+async function persistJoinSettingsPatch(node, patch, helpers) {
+  try {
+    const workflowId = helpers?.workflowId;
+    const getDb = helpers?.getDb;
+    if (!workflowId || !node?.id || !patch?.joinSettings || typeof getDb !== 'function') return;
+    const db = getDb('workflows');
+    const workflow = await db.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+    if (!workflow || !Array.isArray(workflow.nodes)) return;
+    let changed = false;
+    const nodes = workflow.nodes.map((n) => {
+      if (n?.id !== node.id || !n.data?.config) return n;
+      changed = true;
+      return { ...n, data: { ...n.data, config: { ...n.data.config, joinSettings: patch.joinSettings } } };
+    });
+    if (changed) await db.updateAsync({ _id: workflow._id }, { $set: { nodes } }, {});
+  } catch (err) {
+    console.warn(`[Workflow Execution] could not save the run's update to node ${node?.id}:`, err.message);
+  }
+}
+
+/**
+ * Write a run's findings about a node's TABLE onto the saved workflow — the
+ * schema a REST API fetch just produced (sourceTableSchema), or the schema a
+ * transformer's table really has after it was written (targetTableSchema).
+ *
+ * Saved here, not only handed to the editor as a configPatch: a run started
+ * by a trigger has no editor, and one started from the editor kept the new
+ * schema only if the user saved afterwards. Until then the node — and every
+ * node built after it — went on describing the table with whatever the build
+ * had guessed (`unknown` types, or the transformer's INPUT columns).
+ */
+const PERSISTED_SCHEMA_KEYS = ['sourceTableSchema', 'sourceLocalPath', 'apiFetchResult', 'apiFetchPending', 'targetTableSchema'];
+async function persistNodeSchemaPatch(node, patch, helpers) {
+  try {
+    const workflowId = helpers?.workflowId;
+    const getDb = helpers?.getDb;
+    if (!workflowId || !node?.id || !patch || typeof getDb !== 'function') return;
+    const keep = Object.fromEntries(Object.entries(patch).filter(([k]) => PERSISTED_SCHEMA_KEYS.includes(k)));
+    if (!Object.keys(keep).length) return;
+    const db = getDb('workflows');
+    const workflow = await db.findOneAsync({ $or: [{ id: workflowId }, { _id: workflowId }] });
+    if (!workflow || !Array.isArray(workflow.nodes)) return;
+    let changed = false;
+    const nodes = workflow.nodes.map((n) => {
+      if (n?.id !== node.id || !n.data?.config) return n;
+      changed = true;
+      return { ...n, data: { ...n.data, config: { ...n.data.config, ...keep } } };
+    });
+    if (changed) await db.updateAsync({ _id: workflow._id }, { $set: { nodes } }, {});
+  } catch (err) {
+    console.warn(`[Workflow Execution] could not save the schema of node ${node?.id}:`, err.message);
+  }
+}
+
+/**
+ * The schema of the table a transformer just wrote, read from the workflow's
+ * own DuckDB — real types and a few sample rows — or null when its table is
+ * not there (it wrote to a database connection, or modified a user's file in
+ * place; those are described by their own engines).
+ *
+ * This is what a Python or JavaScript transformer could not declare when it
+ * was built: its code had not run, so the build recorded the INPUT columns as
+ * a stand-in. After the run the table exists and says what it holds.
+ */
+async function writtenTableSchema(node, helpers) {
+  const workflowId = helpers?.workflowId;
+  const table = nodeOutputTableName(node);
+  if (!workflowId || !table) return null;
+  try {
+    const duck = require('../duckdb');
+    const columns = await duck.describeTable(workflowId, table);
+    if (!columns || !columns.length) return null;
+  } catch (_) {
+    return null;
+  }
+  const schema = await describeApiTable({ workflowId, collection: table });
+  return schema?.columns?.length ? schema : null;
+}
+
+/**
+ * The table (or collection, or index) a node's output lives in — what every
+ * downstream node reads it by — or null when it names none.
+ *
+ * A data source's output is the object it READS; a transformer's or join's is
+ * the one it WRITES. Every kind of source records one when it is complete:
+ * a database table, a Mongo collection, a Pinecone index, a LanceDB table, a
+ * REST API's local collection, a local or downloaded cloud file's table. A node
+ * with none is unfinished — typically a data source whose connection was picked
+ * but whose table (or cloud object) never was.
+ */
+function nodeOutputTableName(node) {
+  const cfg = node?.data?.config || {};
+  if (node?.type === 'dataSource' || cfg.nodeType === 'datasource') {
+    return cfg.sourceTableName
+      || cfg.sourceCollection
+      || cfg.sourceIndexName
+      || cfg.sourceTable
+      || (Array.isArray(cfg.sourceSelectedTables) ? cfg.sourceSelectedTables[0] : null)
+      || cfg.sourceTableSchema?.tableName
+      || null;
+  }
+  if (node?.type === 'transformer' || node?.type === 'join') {
+    return cfg.targetTableName
+      || cfg.targetCollection
+      || cfg.targetTableSchema?.tableName
+      // An in-place transformer writes back to what it read.
+      || cfg.sourceTableName
+      || cfg.sourceCollection
+      || null;
+  }
+  return null;
+}
+
+/** The "this node is unfinished" result for a node with no output table. */
+function missingOutputTable(node) {
+  const label = node?.data?.config?.node_name || node?.data?.label || node?.id || 'Node';
+  return {
+    success: false,
+    message: `Node "${label}" is not configured: it names no table for its output. `
+      + 'Open it and pick the table (or, for cloud storage, the file) it should use.',
+    recordsProcessed: 0,
+  };
 }
 
 /**
@@ -207,6 +341,11 @@ async function executeDataSourceNode(node, helpers) {
     };
   }
 
+  // A source that names no table is unfinished, whatever its connection.
+  // Checked first, so it fails here — on the node that is incomplete — rather
+  // than as a "table does not exist" in whichever node reads it next.
+  if (!nodeOutputTableName(node)) return missingOutputTable(node);
+
 
   const sourceConnectionId = config.sourceConnectionId;
   console.log('config: ', config)
@@ -237,10 +376,33 @@ async function executeDataSourceNode(node, helpers) {
         };
       }
 
+      // What the node's config should now say about its table. A source built
+      // from chat is not run until the user approves it, so this run is often
+      // the first one — the node has no columns yet, and the nodes built after
+      // it need them. The caller (a single-node run from the chat or panel)
+      // writes this back onto the node.
+      const configPatch = fetchResult.rowCount
+        ? {
+          sourceLocalPath: fetchResult.localPath || null,
+          sourceTableSchema: await describeApiTable({
+            workflowId: helpers?.workflowId || null,
+            collection,
+            sampleRow: fetchResult.sampleRow,
+          }),
+          apiFetchResult: {
+            rowCount: fetchResult.rowCount,
+            localPath: fetchResult.localPath || null,
+            collection: fetchResult.collection || collection,
+          },
+          apiFetchPending: false,
+        }
+        : null;
+
       return {
         success: true,
         message: `REST API fetch completed: ${fetchResult.rowCount || 0} rows into ${collection}`,
         recordsProcessed: fetchResult.rowCount || 0,
+        configPatch,
       };
     } catch (err) {
       // A stop stays an exception all the way to the runner — see executeOutputNode.
@@ -600,9 +762,7 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
       let resolvedEmbeddingKey = config.embeddingApiKey;
       if (config.skillId === 'vector-db-executor' && !resolvedEmbeddingKey && config.embeddingProvider && skillHelpers?.apiKeys) {
         if (config.embeddingProvider === 'openai') {
-          resolvedEmbeddingKey = skillHelpers.apiKeys.chatgpt;
-        } else if (config.embeddingProvider === 'huggingface') {
-          resolvedEmbeddingKey = skillHelpers.apiKeys.huggingface;
+          resolvedEmbeddingKey = skillHelpers.apiKeys.chatgpt || skillHelpers.apiKeys.openai;
         }
       }
 
@@ -933,10 +1093,13 @@ function describeMove(moved) {
  * another's. A run allowed through on that assurance writes real rows into a
  * real database.
  */
-function staleJoinSource(sourcesConfig, parentIds, nodeMap) {
+function staleJoinSource(sourcesConfig, parentIds, nodeMap, directReadSources = []) {
   const steps = Array.isArray(sourcesConfig) ? sourcesConfig.filter(Boolean) : [];
   const wired = new Set(parentIds || []);
-  const named = new Set(steps.map((s) => s.sourceNodeId).filter(Boolean));
+  // Sources the join's function reads itself (a similarity join's vector
+  // store) have no step, but they are read all the same.
+  const direct = Array.isArray(directReadSources) ? directReadSources.filter(Boolean) : [];
+  const named = new Set([...steps.map((s) => s.sourceNodeId).filter(Boolean), ...direct]);
   const labelOf = (id) => nodeMap?.get(id)?.data?.config?.node_name
     || nodeMap?.get(id)?.data?.label
     || id;
@@ -955,9 +1118,13 @@ function staleJoinSource(sourcesConfig, parentIds, nodeMap) {
   // hand-edited outside the editor. The join SQL still names that source's
   // table, and the step still carries the connection to reach it — so the run
   // would go on reading a source the user has disconnected, and succeed.
-  const removed = steps.filter((s) => s.sourceNodeId && !wired.has(s.sourceNodeId));
+  const removed = [
+    ...steps.filter((s) => s.sourceNodeId && !wired.has(s.sourceNodeId))
+      .map((s) => s.tableName || labelOf(s.sourceNodeId)),
+    ...direct.filter((id) => !wired.has(id)).map(labelOf),
+  ];
   if (removed.length) {
-    reasons.push(`a source is no longer connected (${removed.map((s) => s.tableName || labelOf(s.sourceNodeId)).join(', ')})`);
+    reasons.push(`a source is no longer connected (${removed.join(', ')})`);
   }
 
   // ADDED — a node feeds this join that the generated SQL has never heard of.
@@ -1004,6 +1171,152 @@ function withVectorIndexCoordinates(sourcesConfig, nodeMap) {
       },
     };
   });
+}
+
+/**
+ * Coordinates of the vector sources a join's function reads itself — the
+ * connection it is addressed by, plus the index/table and namespace the source
+ * node points at.
+ */
+/**
+ * The sources a join's function reads itself: the ones the builder recorded
+ * (config.directReadSources), plus any vector source whose step carries no
+ * read of its own — the same rule the builder now applies and the executor
+ * skips by (NodeExecution's isDirectReadStep). Joins built before that rule
+ * recorded none, so their function's ctx.runQuery never got the index and
+ * namespace filled in ("Index name is required").
+ */
+function directReadIds(config, nodeMap) {
+  const ids = new Set((config.directReadSources || []).filter(Boolean));
+  for (const step of config.sourcesConfig || []) {
+    if (!step?.sourceNodeId) continue;
+    const up = nodeMap?.get(step.sourceNodeId)?.data?.config || {};
+    const dbType = String(step.connection?.dbType || up.sourceDbType || '').toLowerCase();
+    const isVector = dbType === 'pinecone' || dbType === 'lancedb'
+      || step.connection?.dbCategory === 'Vector' || up.sourceDbCategory === 'Vector';
+    const hasOwnRead = Object.prototype.hasOwnProperty.call(step, 'vectorFetchOperation')
+      || !!String(step.sql || '').trim() || !!step.nosqlOperation;
+    if (isVector && !hasOwnRead) ids.add(step.sourceNodeId);
+  }
+  return [...ids];
+}
+
+function directVectorSourcesOf(directReadSources, nodeMap) {
+  if (!Array.isArray(directReadSources) || !nodeMap) return [];
+  return directReadSources.map((id) => {
+    const up = nodeMap.get(id)?.data?.config || {};
+    return {
+      sourceNodeId: id,
+      connectionId: up.sourceConnectionId || null,
+      connectionName: up.sourceConnectionName || null,
+      dbType: up.sourceDbType || null,
+      indexName: up.sourceIndexName || up.sourceTableName || null,
+      namespace: up.sourceNamespace ?? up.sourceSchema ?? null,
+      localPath: up.sourceLocalPath || null,
+    };
+  }).filter((s) => s.connectionId || s.localPath);
+}
+
+/**
+ * A join that KEEPS its target (append / merge) whose build found the live
+ * table no longer fits what it writes (joinSettings.targetRebuild — see
+ * workflowBuilder's joinTargetRebuild). Before the join runs:
+ *
+ *   - the live table is read again. If it is gone, or it already has the shape
+ *     the join writes (someone fixed it, or an earlier approved run recreated
+ *     it), nothing needs dropping: the flag is cleared and the join runs.
+ *   - otherwise the drop needs the user's approval — given at build time (bound
+ *     to the exact CREATE statement) or for this run (the "Run this node" card,
+ *     the Execute prompt: helpers.approvedRebuilds). Without it the run is
+ *     refused and nothing is touched; a run started by a trigger never has it.
+ *   - with it, the table is dropped here, and the join's own "create when
+ *     missing" step recreates it from targetDdl.
+ *
+ * Returns { proceed, configPatch?, result? }.
+ */
+async function joinTargetRebuildGate(node, config, helpers) {
+  const settings = config.joinSettings || {};
+  const rebuild = settings.targetRebuild;
+  const mode = settings.operationMode;
+  if (!rebuild?.pending || (mode !== 'append' && mode !== 'merge')) return { proceed: true };
+
+  const table = config.targetTableName;
+  const isLocal = config.targetDbType === 'duckdb';
+  const workflowId = helpers?.workflowId || null;
+  const clear = { joinSettings: { ...settings, targetRebuild: null } };
+
+  let live = null;
+  let plugin = null;
+  let fullConfig = null;
+  let defaultSchema = null;
+  const connectionId = config.targetConnectionId;
+  if (isLocal) {
+    live = workflowId ? await targetShape.probeLocalTable(workflowId, table) : null;
+  } else {
+    plugin = helpers?.pluginManager?.getConnector?.(config.targetDbType) || null;
+    if (plugin && typeof helpers.getFullConfig === 'function') {
+      fullConfig = await helpers.getFullConfig(connectionId, config.targetDbConfig || {});
+      defaultSchema = config.targetDbConfig?.schema || fullConfig?.schema || fullConfig?.dbConfig?.schema || null;
+      live = await targetShape.probeTargetTable({
+        plugin, config: fullConfig, connectionId, tableName: table, defaultSchema,
+      });
+    }
+  }
+
+  if (live?.state === 'missing') return { proceed: true, configPatch: clear };
+  // Cannot tell what is there: run as before rather than drop on a guess.
+  if (!live || live.state !== 'exists') return { proceed: true };
+
+  const sameSet = (a = [], b = []) => {
+    const x = [...a].map((v) => String(v).toLowerCase()).sort().join(',');
+    const y = [...b].map((v) => String(v).toLowerCase()).sort().join(',');
+    return x === y;
+  };
+  const untouchedSinceBuild = sameSet(live.columns.map((c) => c.name), rebuild.liveColumns || [])
+    && sameSet(live.primaryKey, rebuild.livePrimaryKey || []);
+  const cmp = targetShape.compareTargetShape(live, {
+    columns: rebuild.newColumns || [], primaryKey: rebuild.newPrimaryKey || [],
+  });
+  if (!untouchedSinceBuild && !cmp.changed) return { proceed: true, configPatch: clear };
+
+  const fingerprint = targetShape.statementFingerprint(config.targetDdl);
+  const approved = (rebuild.approvedFingerprint && rebuild.approvedFingerprint === fingerprint)
+    || (Array.isArray(helpers?.approvedRebuilds) && helpers.approvedRebuilds.includes(node.id));
+  if (!approved) {
+    return {
+      proceed: false,
+      result: {
+        success: false,
+        needsRebuildApproval: true,
+        message: `${table} has to be dropped and recreated before this join can write to it: ${rebuild.reason}. `
+          + 'Nothing was changed. Approve it from the join\'s chat ("Run this node") or when you press Execute.',
+        recordsProcessed: 0,
+      },
+    };
+  }
+
+  if (isLocal) {
+    const duck = require('../duckdb');
+    await duck.withWorkflowLock(workflowId, async () => {
+      await duck.exec(`DROP TABLE IF EXISTS ${await duck.workflowTableRef(workflowId, table)}`);
+    });
+  } else {
+    const ref = live.resolved?.quotedRef
+      || plugin.quoteIdentifier(table, qualifierFor(table, defaultSchema), fullConfig);
+    const dropped = await plugin.runQuery(fullConfig, connectionId, { query: `DROP TABLE ${ref}` });
+    if (dropped && dropped.success === false) {
+      return {
+        proceed: false,
+        result: {
+          success: false,
+          message: `Could not drop ${table} to recreate it: ${dropped.message || 'unknown error'}. Nothing else was changed.`,
+          recordsProcessed: 0,
+        },
+      };
+    }
+  }
+  console.log(`[Workflow Execution] Join ${node.id}: dropped ${table} (approved) — it is recreated from targetDdl.`);
+  return { proceed: true, configPatch: clear, recreated: true };
 }
 
 async function executeJoinNode(node, nodeMap, edges, helpers) {
@@ -1061,9 +1374,26 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
   //   - a source ADDED that the SQL has never heard of, which the run would
   //     ignore while reporting success.
   const movedSource = staleJoinSource(
-    config.sourcesConfig, sourceEdges.map((e) => e.source), nodeMap,
+    config.sourcesConfig, sourceEdges.map((e) => e.source), nodeMap, config.directReadSources,
   );
   if (movedSource) return movedSource;
+
+  // Every input has to name its table. Checked here as well as on the source
+  // node itself, because "Run this node" runs the join alone — its inputs do
+  // not run first — and an unfinished input then surfaced as the join's own
+  // SQL failing on a missing table.
+  for (const edge of sourceEdges) {
+    const upstream = nodeMap?.get(edge.source);
+    if (upstream && !nodeOutputTableName(upstream)) {
+      const label = upstream.data?.config?.node_name || upstream.data?.label || upstream.id;
+      return {
+        success: false,
+        message: `Join input "${label}" is not configured: it names no table for its output. `
+          + 'Finish that node (pick its table, or the cloud file) and run again.',
+        recordsProcessed: 0,
+      };
+    }
+  }
 
   try {
     // Build destination connection from config. Include localPath so a local
@@ -1081,6 +1411,10 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
     // by the handler's vector branch.
     const joinConfig = {
       sourcesConfig: withVectorIndexCoordinates(config.sourcesConfig, nodeMap),
+      // The vector stores the join's function queries itself (similarity
+      // joins): where each one lives, so ctx.runQuery can fill in an index or
+      // namespace the generated code left out.
+      directVectorSources: directVectorSourcesOf(directReadIds(config, nodeMap), nodeMap),
       joinSql: config.joinSql,
       targetDdl: config.targetDdl,
       transformFunction: config.transformFunction,
@@ -1089,8 +1423,17 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
       // Carried so a local join writes to the store its readers already
       // point at, rather than falling back to a derived path.
       targetLocalPath: config.targetLocalPath,
-      vectorDestination: config.vectorDestination
+      vectorDestination: config.vectorDestination,
+      // The declared output shape — lets a JavaScript join that returned no
+      // rows still replace its local target with an empty table of the right
+      // columns.
+      targetColumns: config.targetTableSchema?.columns || null,
     };
+
+    // A kept target that no longer fits: approved → dropped here and recreated
+    // by the join; not approved → refused before anything is touched.
+    const gate = await joinTargetRebuildGate(node, config, helpers);
+    if (!gate.proceed) return gate.result;
 
     // Call the join handler directly
     const result = await handleExecuteJoin({
@@ -1106,7 +1449,13 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
       // Set by the DuckDB join when the table it wrote came out empty.
       warning: !!result.warning,
       message: result.message || (result.success ? 'Join executed successfully' : 'Join execution failed'),
-      recordsProcessed: result.rowCount || result.recordCount || result.documentsInserted || 0
+      // A SQL join reports what it wrote as `rowsAffected`; reading only the
+      // other names left every SQL join at 0 rows in the execution record.
+      recordsProcessed: result.rowsAffected ?? result.rowCount ?? result.recordCount
+        ?? result.documentsInserted ?? 0,
+      // The rebuild is done (or was no longer needed): the node stops asking.
+      ...(result.success && gate.configPatch ? { configPatch: gate.configPatch } : {}),
+      ...(gate.recreated ? { message: `${result.message || 'Join executed successfully'} (${config.targetTableName} was recreated, as approved.)` } : {}),
     };
   } catch (error) {
     // A stop stays an exception all the way to the runner — see executeOutputNode.
@@ -1126,6 +1475,36 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
  * Execute an Output node
  * Calls the output handler directly
  */
+/**
+ * The upstream Data Source (any number of nodes back) that reads the table an
+ * Output would TRUNCATE, or null. Same connection and same table name
+ * (compared without quotes, schema or case).
+ */
+function truncateTargetClash(outputNode, outputSettings, nodeMap, edges) {
+  const s = outputSettings || {};
+  if (s.writeMode !== 'truncate' || !s.connectionId || !s.tableName) return null;
+  const bare = (n) => String(n || '').split('.').pop().replace(/^[`"\[]+|[`"\]]+$/g, '').toLowerCase();
+  const target = bare(s.tableName);
+  const seen = new Set();
+  const queue = [outputNode.id];
+  while (queue.length) {
+    const id = queue.shift();
+    for (const e of edges || []) {
+      if (e.target !== id || seen.has(e.source)) continue;
+      seen.add(e.source);
+      queue.push(e.source);
+      const up = nodeMap.get(e.source);
+      if (up?.type !== 'dataSource') continue;
+      const c = up.data?.config || {};
+      const table = c.sourceTableName || c.sourceCollection || c.sourceTable;
+      if (c.sourceConnectionId === s.connectionId && bare(table) === target) {
+        return { nodeId: up.id, label: c.node_name || up.data?.label || table };
+      }
+    }
+  }
+  return null;
+}
+
 async function executeOutputNode(node, nodeMap, edges, helpers) {
   const { getFullConfig, pluginManager, getDb } = helpers;
 
@@ -1170,6 +1549,22 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
       success: false,
       message: 'Output settings not configured',
       recordsProcessed: 0
+    };
+  }
+
+  // Guard: "Truncate & insert" into a table this same workflow reads. The
+  // truncate empties the table before (or while) it is read — a Data Source
+  // wired straight to the Output streams from the table it is emptying — so
+  // the run can write nothing and the source data is gone. Append is allowed:
+  // it never empties the table (each run re-reads what earlier runs added).
+  const clash = truncateTargetClash(node, config.outputSettings, nodeMap, edges);
+  if (clash) {
+    return {
+      success: false,
+      message: `Output "${config.outputSettings.tableName}" is set to Truncate & insert, but that table is also read by `
+        + `"${clash.label}" earlier in this workflow — truncating it would empty the source before it is read. `
+        + 'Write to a different table, or switch the output to Append. Nothing was changed.',
+      recordsProcessed: 0,
     };
   }
 
@@ -1274,11 +1669,21 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
     const skillHelpers = typeof helpers.buildSkillHelpers === 'function'
       ? await helpers.buildSkillHelpers()
       : null;
+    // Which table/collection to read, and its shape. Same rule as the
+    // connection above: a stale copy describes the wrong node's output.
+    let readSchema = own.sourceTableSchema || sourceConfig.targetTableSchema || sourceConfig.sourceTableSchema;
+    // A Pinecone source is read from one NAMESPACE, which the node records as
+    // sourceNamespace / sourceSchema (a Data Source) or targetSchema (a node
+    // maintaining it in place) — not in the table schema. Without it the read
+    // went to the default namespace and an Output from Pinecone wrote 0 rows.
+    if (connection.dbType === 'pinecone' && readSchema && !readSchema.schema && !readSchema.namespace) {
+      const namespace = own.sourceNamespace || own.sourceSchema
+        || sourceConfig.targetSchema || sourceConfig.sourceNamespace || sourceConfig.sourceSchema;
+      if (namespace) readSchema = { ...readSchema, schema: namespace };
+    }
     const result = await executeOutput(
       sourceConnection,
-      // Which table/collection to read, and its shape. Same rule as the
-      // connection above: a stale copy describes the wrong node's output.
-      own.sourceTableSchema || sourceConfig.targetTableSchema || sourceConfig.sourceTableSchema,
+      readSchema,
       config.outputSettings,
       pluginManager,
       getFullConfig,
@@ -1317,8 +1722,86 @@ async function executeOutputNode(node, nodeMap, edges, helpers) {
  * @param {object} helpers - Helper functions and dependencies
  * @returns {Promise<object>} - Result of node execution
  */
+/**
+ * The saved connections a node reads or writes THROUGH, as
+ * { id, name, role }. `local-…` ids are this workflow's own storage, not saved
+ * connections, and are left out. Mirrored for the canvas by
+ * src/utils/connectionRefs.js — keep the two field lists in step.
+ */
+function connectionRefsOf(node) {
+  const c = node?.data?.config || {};
+  const refs = [];
+  const add = (id, name, role) => {
+    if (!id || typeof id !== 'string' || id.startsWith('local-')) return;
+    if (refs.some((r) => r.id === id)) return;
+    refs.push({ id, name: name || null, role });
+  };
+  switch (node?.type) {
+    case 'dataSource':
+      add(c.sourceConnectionId, c.sourceConnectionName, 'reads from');
+      add(c.sourceApiConnectionId, c.sourceApiConnectionName, 'reads from');
+      break;
+    case 'transformer':
+      add(c.sourceConnectionId, c.sourceConnectionName, 'reads from');
+      add(c.targetConnectionId, c.targetConnectionName, 'writes to');
+      break;
+    case 'join':
+      (Array.isArray(c.sources) ? c.sources : []).forEach((src) => add(src?.sourceConnectionId, src?.sourceConnectionName, 'reads from'));
+      add(c.targetConnectionId, c.targetConnectionName, 'writes to');
+      break;
+    case 'output':
+      add(c.sourceConnectionId, c.sourceConnectionName, 'reads from');
+      if (c.outputSettings?.outputType === 'connection') add(c.outputSettings.connectionId, null, 'writes to');
+      break;
+    default:
+      break;
+  }
+  return refs;
+}
+
+/**
+ * Refuse to run a node whose saved connection has been deleted.
+ *
+ * Deleting a connection used to change nothing about a run: a file source fell
+ * back to the path saved on the node, so the workflow kept reading a file the
+ * user had removed from the app, and reported success. The connection is the
+ * user's statement of what the workflow may touch — gone, the node stops.
+ *
+ * @returns {Promise<object|null>} a failed node result, or null when every
+ *   connection the node names exists.
+ */
+async function deletedConnectionFailure(node, helpers) {
+  const refs = connectionRefsOf(node);
+  if (!refs.length || typeof helpers?.getDb !== 'function') return null;
+  let saved;
+  try {
+    const connectionsDb = await helpers.getDb('connections');
+    const all = await connectionsDb.findAsync({});
+    saved = new Set((all || []).map((conn) => conn.id).filter(Boolean));
+  } catch (err) {
+    console.log('[Workflow Execution] Could not read the saved connections:', err.message || err);
+    return null; // cannot tell — do not block the run on a lookup failure
+  }
+  const gone = refs.filter((r) => !saved.has(r.id));
+  if (!gone.length) return null;
+  // The runner already names the node ("Node X failed: …"), so this names
+  // only the connection and what to do about it.
+  const list = gone.map((r) => `"${r.name || r.id}", which this node ${r.role},`).join(' and ');
+  return {
+    success: false,
+    message: `Connection ${list} no longer exists — it was deleted. `
+      + 'Open the node and pick another connection, or add the connection back.',
+    recordsProcessed: 0,
+    missingConnections: gone,
+  };
+}
+
 async function executeNode(node, nodeMap, edges, helpers) {
   let nodeResult = null;
+  if (node.type !== 'start') {
+    const refused = await deletedConnectionFailure(node, helpers);
+    if (refused) return refused;
+  }
   // console.log('node: ', node)
   switch (node.type) {
     case 'dataSource':
@@ -1350,6 +1833,23 @@ async function executeNode(node, nodeMap, edges, helpers) {
   // Transformer / join / output write a table, collection or file that nothing
   // could read until this moment. Flag it in the saved workflow so readers —
   // the Data Preview above all — know the output is really there now.
+  if (nodeResult?.success && node.type === 'join' && nodeResult.configPatch?.joinSettings) {
+    await persistJoinSettingsPatch(node, nodeResult.configPatch, helpers);
+  }
+  // A transformer that wrote a table in the workflow's DuckDB: record what
+  // that table really is (see writtenTableSchema), for the editor and on the
+  // saved workflow.
+  if (nodeResult?.success && node.type === 'transformer') {
+    const targetTableSchema = await writtenTableSchema(node, helpers);
+    if (targetTableSchema) {
+      nodeResult.configPatch = { ...(nodeResult.configPatch || {}), targetTableSchema };
+    }
+  }
+  // A REST API source's fetch, or a transformer's written table: keep the
+  // schema the run found on the saved workflow, whoever started the run.
+  if (nodeResult?.success && (node.type === 'dataSource' || node.type === 'transformer') && nodeResult.configPatch) {
+    await persistNodeSchemaPatch(node, nodeResult.configPatch, helpers);
+  }
   if (nodeResult?.success && MATERIALIZING_NODE_TYPES.has(node.type)) {
     await markNodeExecuted(node, helpers);
   }
@@ -1357,11 +1857,18 @@ async function executeNode(node, nodeMap, edges, helpers) {
   return nodeResult;
 }
 
+// Each node holds the user's database files for as long as it runs — see
+// holdDatabases in ../duckdb.
+const { holdDatabases } = require('../duckdb');
+
 module.exports = {
   addExecutionLog,
-  executeNode,
+  connectionRefsOf,
+  joinTargetRebuildGate,
+  executeNode: (...args) => holdDatabases(() => executeNode(...args)),
   executeDataSourceNode,
   executeTransformerNode,
   executeJoinNode,
-  executeOutputNode
+  executeOutputNode,
+  nodeOutputTableName,
 };

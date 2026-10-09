@@ -105,6 +105,53 @@ function substituteCode(code, map) {
   );
 }
 
+// ── The axios a fetch function is given ─────────────────────────────────────
+
+/** "GET https://host/path" — never the query string, which can carry a key. */
+function describeRequest(config = {}) {
+  const method = String(config.method || 'get').toUpperCase();
+  try {
+    const u = new URL(config.url, config.baseURL || undefined);
+    return `${method} ${u.origin}${u.pathname}`;
+  } catch (_) {
+    return `${method} ${String(config.url || '').split('?')[0]}`;
+  }
+}
+
+/**
+ * axios with HTTP errors made fatal. A 4xx/5xx is a failed fetch even when the
+ * generated function passes its own `validateStatus` to let it through — that
+ * is how a 404 used to come back as one row of its error body and build as a
+ * working source. The error names the status and the endpoint, which is what
+ * the user needs to fix it.
+ */
+function strictAxios() {
+  const instance = axios.create();
+  const fail = (status, config) => `HTTP ${status} from ${describeRequest(config)}`;
+  instance.interceptors.response.use(
+    (response) => {
+      if (response.status >= 400) {
+        const err = new Error(fail(response.status, response.config));
+        err.response = response;
+        throw err;
+      }
+      return response;
+    },
+    (error) => {
+      if (error?.response) error.message = fail(error.response.status, error.config);
+      return Promise.reject(error);
+    },
+  );
+  // Statics a function may reach for on the default export.
+  for (const k of ['isAxiosError', 'isCancel', 'all', 'spread', 'CancelToken', 'AxiosError']) {
+    if (axios[k] !== undefined) instance[k] = axios[k];
+  }
+  return instance;
+}
+
+/** An empty object is no data — e.g. `{}` from an endpoint that does not exist. */
+const isEmptyRow = (r) => !!r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r).length === 0;
+
 // ── Main runner ─────────────────────────────────────────────────────────────
 
 /**
@@ -171,12 +218,12 @@ async function handleExecuteApiFetch({
     //    pagination and returns either an array of rows or a single object.
     let rawResult;
     try {
-      rawResult = await fetchFn({ axios });
+      rawResult = await fetchFn({ axios: strictAxios() });
     } catch (err) {
       return { success: false, error: `Fetch function threw: ${err.message}` };
     }
 
-    const rows = normaliseRows(rawResult);
+    const rows = normaliseRows(rawResult).filter((r) => !isEmptyRow(r));
 
     // Fetched rows are materialised as this node's output table in the
     // workflow's database — the same place a transformer or join writes — so
@@ -223,8 +270,36 @@ function normaliseRows(value) {
   return [{ value }];
 }
 
+/**
+ * The `sourceTableSchema` of an API source's table, read back off the table a
+ * fetch just wrote: real column types (a nested object is a STRUCT) and a few
+ * sample rows. Shared by the build (when an approved fetch runs mid-plan) and
+ * the runner (the first approved "Run this node"), so both describe the table
+ * the same way. Falls back to the keys of `sampleRow` if the read fails.
+ */
+async function describeApiTable({ workflowId, collection, sampleRow = null, limit = 5 }) {
+  try {
+    const ref = await duck.workflowTableRef(workflowId, collection);
+    const { rows, columns } = await duck.query(`SELECT * FROM ${ref} LIMIT ${Number(limit) || 5}`);
+    const strip = (r) => { if (!r || typeof r !== 'object') return r; const { _id, ...rest } = r; return rest; };
+    return {
+      tableName: collection,
+      columns: (columns || []).filter((c) => c.name !== '_id').map((c) => ({ name: c.name, type: c.type || 'unknown' })),
+      sampleData: (rows || []).map(strip),
+    };
+  } catch (err) {
+    console.warn(`[ApiFetch] Could not read back "${collection}":`, err.message);
+    const keys = sampleRow && typeof sampleRow === 'object' ? Object.keys(sampleRow).filter((k) => k !== '_id') : [];
+    return {
+      tableName: collection,
+      columns: keys.map((name) => ({ name, type: 'unknown' })),
+      sampleData: sampleRow ? [sampleRow] : [],
+    };
+  }
+}
 
 module.exports = {
   initialize,
   handleExecuteApiFetch,
+  describeApiTable,
 };
