@@ -370,6 +370,13 @@ module.exports = {
   name: 'Google BigQuery',
   icon: './icon.svg',
   dbCategory: 'SQL',
+  // See postgres: how a join may merge into this database (write mode "merge").
+  mergeSupport: {
+    statements: ['MERGE'],
+    guidance: 'MERGE {{TARGET}} t USING (<the joined SELECT>) s ON t.<key> = s.<key> '
+      + 'WHEN MATCHED THEN UPDATE SET <col> = s.<col>, … WHEN NOT MATCHED THEN INSERT (<cols>) VALUES (s.<cols>). '
+      + 'Each target row may match at most one source row — de-duplicate the source on the key first.',
+  },
   authType: 'oauth2',
 
   /**
@@ -380,6 +387,20 @@ module.exports = {
    * FLOAT64 rather than INTEGER/DOUBLE, BOOL rather than BOOLEAN, one STRING
    * with no length at all.
    */
+  /**
+   * Why this engine cannot create a column with this name, or null. Checked
+   * before an Output creates a table, so a name the engine would refuse (or
+   * silently shorten) fails with the column named and the fix, not with
+   * whatever the CREATE happens to say.
+   */
+  columnNameProblem: (name) => {
+    const text = String(name);
+    // Seen refused by BigQuery itself ("Illegal field name: e.mail").
+    if (text.includes('.')) return 'contains a dot, which BigQuery does not allow in a column name';
+    const n = [...text].length;
+    return n > 300 ? `is ${n} characters long; BigQuery allows at most 300` : null;
+  },
+
   types: {
     NULL: () => 'STRING',
     // DATE, not TIMESTAMP, for a bare YYYY-MM-DD: BigQuery rejects a date-only
@@ -391,6 +412,40 @@ module.exports = {
     FLOAT: () => 'FLOAT64',
     OBJECT: () => 'STRING',
     STRING: () => 'STRING',
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js. NUMERIC holds 29 integer and 9
+    // fractional digits; BIGNUMERIC the rest. TIMESTAMP is already an instant.
+    DECIMAL: (p, s) => {
+      if (!p) return 'BIGNUMERIC';
+      const scale = s || 0;
+      if (p - scale <= 29 && scale <= 9) return `NUMERIC(${p},${scale})`;
+      if (p - scale <= 38 && scale <= 38) return `BIGNUMERIC(${p},${scale})`;
+      return null;
+    },
+    TIMESTAMPTZ: () => 'TIMESTAMP',
+    TIME: () => 'TIME',
+  },
+
+  /**
+   * This engine's type for a column (a getColumns entry) as a canonical type —
+   * what an Output writing a copy of this table elsewhere builds its column
+   * from. See public/NodeExecution/columnTypes.js for the kinds. null leaves
+   * the column to be guessed from its values.
+   */
+  toCanonicalType: (column) => {
+    if (column?.mode === 'REPEATED') return { kind: 'OBJECT' };
+    const t = String(column?.type || '').toUpperCase();
+    if (t === 'INTEGER' || t === 'INT64') return { kind: 'BIGINT' };
+    if (t === 'FLOAT' || t === 'FLOAT64') return { kind: 'DOUBLE' };
+    if (t === 'NUMERIC') return { kind: 'DECIMAL', precision: column.precision ?? 38, scale: column.scale ?? 9 };
+    if (t === 'BIGNUMERIC') return { kind: 'DECIMAL', precision: column.precision ?? null, scale: column.scale ?? null };
+    if (t === 'BOOLEAN' || t === 'BOOL') return { kind: 'BOOLEAN' };
+    if (t === 'DATE') return { kind: 'DATE_ONLY' };
+    if (t === 'TIMESTAMP') return { kind: 'TIMESTAMPTZ' };
+    if (t === 'DATETIME') return { kind: 'TIMESTAMP' };
+    if (t === 'TIME') return { kind: 'TIME' };
+    if (t === 'RECORD' || t === 'STRUCT' || t === 'JSON') return { kind: 'OBJECT' };
+    return { kind: 'STRING', length: column?.maxLength ?? null };
   },
 
   /**
@@ -466,7 +521,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[BigQuery] Token exchange error:', error);
+      console.error('[BigQuery] Token exchange error:', error.response?.data?.error_description || error.message);
       return queryError(error);
     }
   },
@@ -500,7 +555,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[BigQuery] Token refresh error:', error);
+      console.error('[BigQuery] Token refresh error:', error.response?.data?.error_description || error.message);
       return queryError(error);
     }
   },
@@ -545,6 +600,8 @@ module.exports = {
 
       return {
         success: true,
+        // The connection's dataset, listed even while it holds no tables.
+        schemas: [datasetId],
         tables: tables.map(table => ({
           schema: datasetId,
           name: table.id,
@@ -578,10 +635,25 @@ module.exports = {
           type: field.type,
           nullable: field.mode !== 'REQUIRED',
           isPrimary: false, // BigQuery doesn't enforce primary keys
-          defaultValue: null
+          defaultValue: null,
+          // Set only when the column was declared with them (NUMERIC(10,2),
+          // STRING(40)); the field metadata carries them as strings.
+          maxLength: field.maxLength != null ? Number(field.maxLength) : null,
+          precision: field.precision != null ? Number(field.precision) : null,
+          scale: field.scale != null ? Number(field.scale) : null,
+          mode: field.mode || 'NULLABLE',
         }))
       };
     } catch (error) {
+      // A table that is not there is an ANSWER — no columns — not a failed
+      // lookup. Reported as an error, the Output could not tell "missing"
+      // from "could not check": a CREATE that failed for a real reason
+      // (an illegal column name) was taken as "may already exist", and the
+      // load went on to fail three times against a table that never existed,
+      // with the real reason buried in the log.
+      if (error && (error.code === 404 || /^Not found: Table /.test(String(error.message)))) {
+        return { success: true, columns: [] };
+      }
       return queryError(error);
     }
   },
@@ -645,11 +717,29 @@ module.exports = {
         columns = Object.keys(rows[0]);
       }
 
+      // A DML statement returns no rows; how many it changed is on the job, not
+      // in the result. Without it callers reported "0 rows inserted" for a load
+      // that wrote every row. BigQuery itself says whether the job was DML —
+      // numDmlAffectedRows is only set for one — so nothing here guesses from
+      // the SQL text. Asked only when there are no rows, so a query pays nothing.
+      let affectedRows;
+      if (rows.length === 0) {
+        try {
+          const [metadata] = await job.getMetadata();
+          const n = metadata?.statistics?.query?.numDmlAffectedRows;
+          if (n != null) affectedRows = Number(n);
+        } catch (_err) {
+          // The count is reporting only — a failed lookup must not fail a
+          // statement that already succeeded.
+        }
+      }
+
       return {
         success: true,
         rows: rows,
         columns: columns,
-        rowCount: rows.length,
+        rowCount: affectedRows ?? rows.length,
+        ...(affectedRows != null ? { affectedRows } : {}),
         ...(maxRows > 0 ? { truncated: allRows.length > maxRows } : {})
       };
     } catch (error) {
@@ -741,6 +831,22 @@ module.exports = {
   /**
    * Close connection (cleanup client)
    */
+  /**
+   * Run several statements as ONE transaction: all of them land, or none do.
+   * See the PostgreSQL connector's note — the same contract.
+   *
+   * BigQuery has no session to hold a transaction open across calls; a
+   * multi-statement transaction is one SCRIPT, run as one query job. An error
+   * inside it rolls the whole transaction back before the job reports failure.
+   */
+  runInTransaction: async (config, connectionId, statements) => {
+    const script = ['BEGIN TRANSACTION', ...statements, 'COMMIT TRANSACTION']
+      .map((s) => String(s).trim().replace(/;+$/, ''))
+      .join(';\n') + ';';
+    const result = await module.exports.runQuery(config, connectionId, { query: script });
+    return result && result.success === false ? result : { success: true };
+  },
+
   closeConnection: async (connectionId) => {
     if (bigQueryClients.has(connectionId)) {
       bigQueryClients.delete(connectionId);
@@ -1152,6 +1258,18 @@ module.exports = {
    * @param {object} config - Database configuration (not used for BigQuery)
    * @returns {string} Properly quoted identifier
    */
+  /**
+   * Quote ONE column name, whatever characters it holds.
+   *
+   * quoteIdentifier is for TABLE references and reads a dot as a qualifier
+   * ("public.orders" → schema public, table orders). A column is never
+   * qualified, so a name like "e.mail" has to stay one identifier — handing it
+   * to quoteIdentifier produced "e"."mail" and every CREATE / INSERT that
+   * carried it failed. Spaces, reserved words, unicode and emoji are covered by
+   * the quoting itself.
+   */
+  quoteColumn: (name) => `\`${String(name).replace(/`/g, '\\`')}\``,
+
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
     // Already quoted — hand it back untouched. Callers pass identifiers that
