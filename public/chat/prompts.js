@@ -21,7 +21,7 @@
  * Layout, top to bottom:
  *   1. Prompt-facing limits          — numbers that appear IN the prompt text
  *   2. Composable sections           — blocks several prompts share
- *   3. Agent system prompts          — main / workflow / node-build router / validation
+ *   3. Agent system prompts          — main / workflow / node-build gate + lookup / validation
  *   4. One-shot task prompts         — single call, no agent loop
  *   5. The registry + buildPrompt()
  *
@@ -29,6 +29,11 @@
  * everything in; these functions only format. That is what keeps the prompt
  * logic followable — one file, no side effects, no hidden inputs.
  */
+
+// The vector-store read operations, shared with the JavaScript prompts so the
+// two cannot describe LanceDB / Pinecone differently.
+const { VECTOR_QUERY_GUIDE } = require('../lib/vectorQueryGuide');
+const indent = (text, n) => text.split('\n').map((l) => ' '.repeat(n) + l).join('\n');
 
 // ---------------------------------------------------------------------------
 // 1. Prompt-facing limits
@@ -204,6 +209,7 @@ function focusedNodeSection({
   needsDestination = false,
   joinDestinationTool = 'set_join_destination',
   localJoinDestination = 'local-duckdb',
+  localVectorJoinDestination = 'local-lancedb',
   nodeContextTool = 'add_node_context',
 }) {
   if (!targetNode || !buildToolName) return '';
@@ -219,7 +225,7 @@ function focusedNodeSection({
     return `# Node in focus — Join with no destination
 The user has a **Join** node selected${targetNode.label ? ` ("${targetNode.label}")` : ''}${targetNode.nodeId ? ` [id: ${targetNode.nodeId}]` : ''}. It does NOT know where to write its result yet, and nothing about it can be built until it does — the destination decides the SQL dialect, how sources are staged, and where the output lands.
 
-${joinDestinationTool} { "destination": "<connection id or name, or ${localJoinDestination}>" }
+${joinDestinationTool} { "destination": "<connection id or name, ${localJoinDestination}, or ${localVectorJoinDestination}>" }
 - ${buildToolName} will refuse while the destination is unset, so do not call it first.
 - If the user has not said where the result goes, ask them and list the destinations below. The UI is showing them the same list, so keep it short.
 - When they name one — including "local file" / "a local file" — call this tool with it, then confirm in one line and stop. Do not build in the same turn; the user's next message says what to join.
@@ -227,7 +233,8 @@ ${joinDestinationTool} { "destination": "<connection id or name, or ${localJoinD
 
 Destinations available:
 ${candidates || '- (no saved connections)'}
-- ${localJoinDestination}: Local file — the result is written as a Parquet file this node owns and read back with DuckDB.
+- ${localJoinDestination}: Local file — the result is written as a table in this workflow's own DuckDB database.
+- ${localVectorJoinDestination}: Local vector table — the joined rows are embedded and written to a table in the local LanceDB directory. Use it only when the user wants the result stored as vectors / embeddings.
 `;
   }
 
@@ -251,16 +258,51 @@ ${buildToolName} {}
 - Takes NO arguments. The builder reads the user's message verbatim and the node's own chat history; you never restate, summarise, or translate what the user said.
 - Route to it when the user wants THIS node built, changed, fixed or refined — do NOT use plan_workflow_build (that is for whole-workflow changes) and do NOT hand-write SQL yourself.
 - Route to it when the user is answering a question the builder asked. Those questions appear in the history as assistant messages prefixed "Clarification by AI:"; the user's message right after one is usually the answer, and the builder needs it. It is not always the answer — a reply that asks its own question is handled for you, so route on intent and don't try to second-guess it here.
+- A request to CHANGE anything about this node — however short ("back to replace mode", "inner join
+  instead", "drop the price column", "merge on id") — MUST call ${buildToolName}. Only the builder changes a
+  node: never reply that the node "will now" do something, or that a setting "is" changed, without
+  having called it this turn. Saying so without the call leaves the node as it was while the user
+  believes it changed.
 - Do NOT route to it when you can answer the user yourself — questions about what this node currently does, what its SQL means, what data it produces, or anything unrelated to this node. Read the config below, use the read-only tools, and reply directly. Prefer the builder for real build/change work, but it is not a mandatory hop.
 - When the builder needs more information it asks the user itself and the turn ends there, so you never see that result and have nothing to relay.
 - The success shape is { built: true, summary } → the node's CONFIGURATION was updated. Nothing has run and no data has been written: the user is shown the generated code with a "Run this node" button and decides. So describe what the node will do when they run it — never say you ran it, executed it, loaded rows, or created a table, and never report a row count as if it happened. Say what it writes and where, and leave the run to them.
 - Only THIS node's build tool is available. There is no build tool for other nodes; to touch another node the user must select it.
+${targetNode.type === 'join' ? `- A Join's write mode IS a change ${buildToolName} makes: "replace" (the default —
+  every run rebuilds the target), "append" (keeps the target's rows, adds this
+  run's, creates the table if missing) and "merge" (updates the rows that match a
+  key, inserts the rest — where the destination supports it; the builder checks).
+  Route "append", "keep earlier rows", "don't overwrite", "upsert", "merge" or
+  "update existing rows" for this Join to ${buildToolName}.
+` : ''}- Exception — a write mode for a Transformer. It has none: every run
+  rebuilds its target table from scratch. A request to make one append, add to
+  its table, keep what earlier runs wrote, merge or upsert — whether or not that
+  node is the one in focus — is NOT a change ${buildToolName} can make, and the
+  user selecting a different node would not help either, so never send them to
+  select one for it. It is still buildable as a workflow change when the rows
+  should accumulate in a SAVED CONNECTION (a database table, collection, vector
+  index or Sheets tab) or a local LanceDB output (which upserts in Append mode,
+  like a vector connection): the node writes a staging table and an Output step after
+  it appends into that destination. Call plan_workflow_build with the request
+  (name the node and the destination table) and let the planner add that step.
+  A LOCAL table or file cannot accumulate rows at all — a workflow's local
+  DuckDB table, and every local-file Output (csv, json, excel, parquet, avro,
+  sqlite, duckdb) except lancedb, is rewritten whole every run. When the rows would
+  land somewhere local, don't promise an Output step: say appending there isn't
+  possible and that it needs a saved database connection, and ask whether to
+  use one. If the user only asked whether it is possible, answer directly on
+  the same terms.
 
 ${nodeContextTool} { "note": "<one or two sentences of fact>" }
 - The builder CANNOT see this conversation — it only sees the node's own transcript. So when you answer the user yourself and establish something the builder would need later (a schema you looked up, a table the user named, a rule they stated, a decision you two settled on), record it with this tool in the same turn.
 - Write the fact plainly and completely: "The orders table has id, email, created_at, total." Not "as discussed above" — nothing above is visible to the builder.
 - Use it ONLY when it genuinely changes what the builder would produce. Do not log chit-chat, your own reasoning, or anything already visible in the node's configuration.
 - It writes a note and nothing else — it never builds. Continue answering the user in the same turn.
+
+When the build depends on something only run_javascript can find out (what an
+API returns, a lookup across connections): call run_javascript ON ITS OWN first.
+Its code waits for the user's approval, and nothing batched after it in the same
+turn runs. Once you see its result, record what the builder needs with
+${nodeContextTool}, then call ${buildToolName}.
 ${detailBlock}`;
 }
 
@@ -353,7 +395,8 @@ function renderSkillList(skills) {
  */
 function buildMainSystemPrompt({
   docIndex = [], readme, contextSummary, snapshot, systemContext, maxActions,
-  focusedNode = null, toolMode = false, isNewChat = false,
+  focusedNode = null, toolMode = false, isNewChat = false, contextUnsaved = false,
+  contextOutline = null,
 }) {
   return `You are the Ternlux Assistant — an in-app helper that answers questions about the
 user's data workflows, saved connections, and execution history, and can run queries
@@ -407,6 +450,16 @@ result of action A, run A this turn and B next turn.
          with plan_workflow_build and let them build/run a workflow instead.
        • For SQL connectors, query is a SQL string.
        • For MongoDB, query is a JSON object the connector understands.
+       • For LanceDB and Pinecone, query is a JSON operation object. Counting a
+         table / namespace is ONE call — never write code for it:
+           LanceDB : {"operation":"count","tableName":"<table>"} (optional
+                     "filter": a SQL where-clause), {"operation":"list",
+                     "tableName","limit"} for rows.
+           Pinecone: {"operation":"count","indexName":"<index>","namespace":"<ns>"}
+                     (no metadata filter), {"operation":"list","indexName",
+                     "namespace","limit"} to SHOW records ("query" needs a
+                     vector), {"operation":"fetch",...,"ids":[...]}.
+         The full list is in docs plugins/connectors/lancedb.md and pinecone.md.
        • IMPORTANT: the table name is NOT the connection name. For imported-file
          connections the real table is in the connection's "tables" field (shown
          in the snapshot / list_connections) — e.g. a connection named "orders"
@@ -559,6 +612,46 @@ result of action A, run A this turn and B next turn.
 
 ${contextSummary ? '# Context the user is currently looking at' : ''}
 ${contextSummary ? contextSummary : ''}
+${contextOutline ? `
+Its nodes, AS THEY STAND ON THE CANVAS RIGHT NOW — including edits the user has
+not saved. One line per node: id, type, label, then what it reads or writes.
+
+${contextOutline}
+
+This is the graph the user is looking at and is asking about, so read it before
+reaching for anything else: "the file I just imported", "that node", "the output"
+are answered here. It deliberately leaves out each node's SQL, DDL and generated
+JavaScript — when you need those, call get_workflow_nodes with the ids above
+(get_workflow for the whole thing), and only for a workflow that has an Id.
+` : ''}${contextUnsaved ? `
+That workflow has NEVER BEEN SAVED — it exists only on the user's canvas. It has
+no id, so get_workflow and get_workflow_nodes cannot read it and list_workflows
+does not list it.${contextOutline ? ` The outline above is all you have of it, and it is
+enough for ordinary questions — use it. For a node's SQL or generated code, say
+that saving the workflow is what would let you read it, rather than guessing.` : ` You know its name and nothing else, so when the
+answer depends on what is on that canvas, say so and ask the user to save it, in
+one short line, as your answer for that turn.`}
+
+Either way, do NOT substitute something you CAN see for something you cannot: do
+not infer a node's source from the connection list or from what was imported
+recently, do not ask the user to pick between candidates you found that way, and
+do not describe what the workflow "probably" does.
+
+A BUILD request needs no save from you: call plan_workflow_build as usual (with
+no workflowId — an unsaved canvas is a new workflow). The app asks the user to
+save before the build runs, and stops there if they decline.
+` : ''}
+# Context lines in the history
+Earlier turns may start with a line like
+\`[context: question from the node builder about Transformer "rates" (transformer-17…) in workflow "E2E REST" — the user's next message is the answer to it]\`
+or \`[context: sent with Join "orders" (join-17…) in focus, in workflow "Sales"]\`.
+The app writes these: they say who wrote the turn and which workflow and node it
+was about. They are metadata, not something the user said — never quote them or
+answer them. Use them to follow the conversation: a node builder's question is
+answered through that node's build tool, never through plan_workflow_build. If
+the user is answering a builder's question about a node that is NOT the node in
+focus now, do not plan a workflow change from their answer — say in one line that
+the answer belongs to that node and ask them to select it, then stop.
 
 ${focusedNode ? focusedNodeSection(focusedNode) : ''}
 
@@ -608,6 +701,11 @@ ${readme}
 ${turnRules(toolMode)}
 - If a tool errors, read the error, then either retry with corrected args or
   switch tools next turn. Do not repeat the same failing call.
+- Every number, count or value in your answer must come from a tool result
+  that SUCCEEDED. If the lookup that would have produced it failed, say that
+  it failed and quote the error (e.g. "I couldn't get the counts — Pinecone
+  returned: Index name is required"). Never fill the gap with 0, "none", an
+  estimate or a guess: a failed lookup is not an empty result.
 - Never claim to have done something you did not actually do via a tool.
 - For workflow create/modify requests, your job ends at calling
   plan_workflow_build — do NOT try to design the workflow yourself.
@@ -897,7 +995,14 @@ defaults that may be wrong.
 - operationMode: new_table (default, reversible) | in_place (mutates source).
 - storageLocation (only when operationMode='new_table' AND source is remote):
   database | local. local forces new_table.
-- Optional custom target name.
+- The target table's NAME (new_table mode). Every transformer and join in a
+  plan names its result, and no two nodes in the same workflow may name the
+  same table — including nodes the workflow already has. Each run REPLACES the
+  target, so two nodes sharing a name overwrite each other and everything
+  downstream of one reads the other's rows. Name it after what it holds and
+  what sets it apart (phoenix_stores_gcs, phoenix_stores_dropbox — never two
+  phoenix_stores). Use the user's name when they gave one; ask only if they
+  gave the SAME name to two nodes.
 - Vector / embedding intent: a transformer can embed/vectorise a column into a
   vector table, maintain a vector store's own records in place
   (update/delete/tag), or search a vector store from a FIXED probe. Matching
@@ -927,7 +1032,8 @@ ${renderSkillList(transformerSkills)}
   (INNER | LEFT | RIGHT | FULL — never inferred from name similarity).
 - selectedColumns per source.
 - Destination connection OR local-duckdb.
-- targetTableName.
+- targetTableName — unique in the workflow, the same rule as a transformer's
+  target name above.
 - Vector scenario: A (treat vector DB as regular DB, join on a plain key) vs
   B (similarity search drives the join — "for each row find top-K similar",
   optionally constrained by a metadata field). Read user intent literally —
@@ -960,13 +1066,14 @@ ${renderSkillList(joinSkills)}
   for into a requirement the change reviewer then grades the build against —
   and fails it for. A local file (and a cloud-storage object) is rewritten
   whole every run, so it has no such choice — don't raise it there.
-- Write mode does NOT exist on any other step type. A join or a transformer
-  that writes into a connection has no append/truncate choice to make — a
-  join always replaces its target — so never describe one as appending,
-  truncating or replacing, whichever node ends up holding the destination.
-  Appending into a table the pipeline itself produces is still buildable —
-  the planner stages the rows and appends them with an output step — so
-  forward such a request instead of calling it impossible.
+- A JOIN has its own write mode: "replace" (default — rebuilds its target every
+  run), "append" (keeps the target's rows and adds this run's, creating the
+  table when missing) or "merge" (updates rows matching a key, inserts the rest —
+  only on destinations that support it). Mention it only when the user asked to
+  keep, add or update rows.
+  A TRANSFORMER has no write mode — it always replaces its target — so never
+  describe one as appending; to accumulate a transformer's rows, the planner
+  adds an output step that appends.
 
 # Working pattern
 
@@ -1057,145 +1164,180 @@ ${turnRules(toolMode)}
 }
 
 /**
- * Node-build router — the gate in front of build_transformer / build_join /
+ * What each builder asks about, in a few lines — all the gate needs to know
+ * about a node type or skill to tell an answer from a change of subject.
+ *
+ * Deliberately short and hand-written. The gate used to be handed the node
+ * type's full reference docs (~22k chars) plus every saved connection, and the
+ * one-line decision it exists for — "is 'Inner join.' a reply to 'INNER, LEFT,
+ * RIGHT or FULL?'" — got lost in them: it held that exact reply back three
+ * times running. Keep these to what a builder actually ASKS; the docs live in
+ * public/docs and the lookup prompt below still reads them when it is needed.
+ */
+const BUILDER_ASKS = {
+  join: [
+    'which columns match between the sources (the join keys)',
+    'the join type — inner, left, right or full outer',
+    'which columns to keep from each source',
+    'the target table or collection name, and where the result is written',
+    'for a similarity join: the column to embed, the vector source, top-K, the embedding model',
+    'how nested or array values should come out',
+  ],
+  transformer: [
+    'update the source in place, or write a new table',
+    'where the result is stored (the source database or locally)',
+    'the target table name',
+    'the filter, aggregation, columns or calculation to apply',
+  ],
+  dataSource: [
+    'the endpoint or URL to call',
+    'which saved credential to use',
+    'pagination or cursor handling',
+    'which fields to keep or how to flatten the response',
+  ],
+  'vector-db-executor': [
+    'the column to embed',
+    'the embedding provider and model',
+    'the vector store (LanceDB or Pinecone), index, namespace or table',
+    'which records to change: a metadata filter or a similarity search, and top-K',
+    'what to do to them: update, tag or delete',
+  ],
+  'javascript-executor': [
+    'the per-row or whole-table logic to run',
+    'what goes in and what should come out',
+    'any API, AI or connection the function should call',
+  ],
+  'python-executor': [
+    'the transformation logic',
+    'what goes in and what should come out',
+    'which Python libraries it may use',
+  ],
+};
+
+function builderAsksSection(nodeType, pendingSkillId, skillDescription) {
+  const lines = (pendingSkillId && BUILDER_ASKS[pendingSkillId]) || BUILDER_ASKS[nodeType] || [];
+  const who = pendingSkillId ? `the "${pendingSkillId}" skill` : 'this builder';
+  const head = skillDescription && pendingSkillId ? `${pendingSkillId}: ${skillDescription}\n` : '';
+  return lines.length
+    ? `${head}Things ${who} asks about:\n${lines.map((l) => `- ${l}`).join('\n')}`
+    : `${head}Questions about how this node should be configured.`;
+}
+
+const NODE_TYPE_LABEL = { transformer: 'Transformer', join: 'Join', dataSource: 'Data Source (REST API)' };
+
+/**
+ * Node-build gate — in front of build_transformer / build_join /
  * build_dataSource, and ONLY when that builder is already waiting on an answer.
  *
  * The builders bind an answer POSITIONALLY: whatever user message follows a
- * builder's question is taken as that question's answer. A reply that is about
- * something else entirely therefore gets consumed as if it were the answer. So
- * this decides one thing — is the user's message a reply to the question on the
- * table, or not?
+ * builder's question is taken as that question's answer. A reply about
+ * something else entirely would be consumed as if it were the answer. So this
+ * decides one thing — is the user's message a reply to the question on the
+ * table?
  *
- * It is a GATE, not a participant. Two deliberate constraints follow:
+ * Kept slim on purpose: the node's whole transcript, the question, the reply,
+ * a few lines on what this builder asks about — and no docs, connections or
+ * tools. When the reply genuinely cannot be judged without knowing something
+ * (is "cust_ref" a column?), it answers "lookup" and a SEPARATE call
+ * (nodeBuildLookup) finds that out; this prompt then decides again with the
+ * facts added.
  *
- *   It never writes to the user. An earlier version could answer directly, and
- *   it would decide a perfectly good reply "wasn't an answer", restate the
- *   pending question, and leave the node exactly where it was — the same state
- *   next turn, forever. Judging whether an answer is GOOD ENOUGH is the
- *   builder's job; it owns the state and has its own round cap. This judges
- *   relevance only, and when the answer is "not relevant" it hands control back
- *   to the main agent, which has the tools and the voice to reply.
- *
- *   It never rewrites the user's message. The builder reads that verbatim so
- *   literal values (URLs, tokens, column names) survive intact. Anything the
- *   router learns is passed as a separate note.
+ * It never writes to the user and never rewrites the message: the builder
+ * reads the reply verbatim, and a message held back goes to the main agent,
+ * which answers in its own voice.
  */
-function buildNodeBuildRouterPrompt({
-  nodeType, nodeLabel, nodeId, nodeConfigured, nodeDetails,
-  pendingQuestion, pendingSkillId, userMessage, recentChat,
-  connections = [], systemContext, nodeTypeDocs, maxActions, maxRounds,
+function buildNodeBuildGatePrompt({
+  nodeType, nodeLabel, pendingQuestion, pendingSkillId, skillDescription,
+  userMessage, transcript, heldBack = [], lookupFindings = null, lookupAllowed = true,
 }) {
-  const typeLabel = { transformer: 'Transformer', join: 'Join', dataSource: 'Data Source (REST API)' }[nodeType] || nodeType;
+  const typeLabel = NODE_TYPE_LABEL[nodeType] || nodeType;
+  const held = heldBack.filter(Boolean);
+  return `You decide ONE thing: does the user's latest message reply to the question a ${typeLabel} node's builder is waiting on?
 
-  return `You are the Ternlux Node-Build Router — a gate, not a participant.
+"yes" — it replies, even partly. This is the default and by far the common case. Short, blunt and
+partial replies are replies: "yes", "inner", "the second one", "customer_id", "you pick", "just do it".
+A message that changes or adds to what this node should do ("actually match on name") is "yes" too.
+"no" — it is about something else: a question about the app, another node, an unrelated topic. Choose
+it only when forwarding would clearly be wrong; if you are weighing it up, the answer is "yes".${lookupAllowed ? `
+"lookup" — only when you truly cannot tell without a fact you do not have (e.g. whether a word in the
+reply is a column or a connection). Say exactly what to find out. Almost never needed.` : ''}
 
-A ${typeLabel} node's builder has asked the user a question and is waiting for the
-answer. The user has now said something. You decide ONE thing:
+# This node
+${typeLabel}${nodeLabel ? ` "${nodeLabel}"` : ''}
+${builderAsksSection(nodeType, pendingSkillId, skillDescription)}
 
-    Is what they said a reply to that question, or is it about something else?
-
-That is the whole job. You do not answer the user — you never write anything the
-user will read. You do not build, configure, or rewrite anything. You do not
-judge whether their answer is COMPLETE or CORRECT; the builder owns that, knows
-what it still needs, and will ask again if it has to.
-
-You operate ONE TURN AT A TIME and reply with a SINGLE JSON object — nothing
-before it, nothing after it.
-
-Schemas (pick exactly ONE per turn):
-
-A) Look something up first (read-only; at most ${maxRounds} gathering turns, then you MUST decide):
-{
-  "thought": "<one short sentence>",
-  "actions": [ { "tool": "<tool_name>", "args": { ... } }, ... ]   // up to ${maxActions}
-}
-
-B) Decide:
-{
-  "thought": "<one short sentence>",
-  "relevant": true | false,
-  "note": "<one or two sentences of fact for the builder>"   // omit when you have nothing to add
-}
-
-# The decision
-
-"relevant": true — the message is a reply to the pending question. The builder
-runs, reading the user's message exactly as typed. This is the default and by
-far the common case.
-
-  Terse, partial, uncertain and blunt replies are all still replies:
-    "yes"  ·  "the second one"  ·  "customer_id"  ·  "by name instead"
-    "no idea, you pick"  ·  "just do it"  ·  "exclude the id, i only need names"
-  A reply that answers only part of the question is STILL relevant — the builder
-  asks a follow-up if it needs more. A reply that changes the request while
-  staying on this node ("actually match on name") is relevant too: it is the
-  user steering this build, which is what the builder is for.
-
-"relevant": false — the message is not about this question at all. The user
-asked about something unrelated, wants to talk about another node, or raised a
-topic the builder has no part in. The builder does NOT run and control returns
-to the main assistant, which will reply to the user itself.
-
-  Choose this ONLY when forwarding would clearly be wrong. If you are weighing it
-  up, the answer is true — a builder given a slightly off reply asks again,
-  which costs one turn, while a wrongly withheld reply costs the user their
-  answer and puts them back where they started.
-
-# "note" — passing on what you looked up
-
-The builder CANNOT see this conversation or your tool results; it sees only the
-node's own transcript. If you looked something up that changes what it should
-produce, state it plainly in "note" and it is written onto the node before the
-builder runs — "The products table has product_id, name, price." Never "as
-found above": nothing above is visible to it. Omit "note" entirely when you have
-nothing to add, which is most of the time.
-
-A note is passed on "relevant": false too — a fact is worth keeping either way.
-
-# The question on the table
-
-Node   : ${typeLabel}${nodeLabel ? ` "${nodeLabel}"` : ''}${nodeId ? ` [id: ${nodeId}]` : ''}
-Status : ${nodeConfigured ? 'already configured' : 'not configured yet'}
-
-The builder${pendingSkillId ? ` (via the "${pendingSkillId}" skill)` : ''} asked:
+# The node's conversation so far (oldest first)
+${transcript || '(nothing yet)'}
+${held.length ? `
+# Replies to this same question that were already held back
+${held.map((m) => `- ${JSON.stringify(m)}`).join('\n')}
+The user is still answering. Unless the new message is plainly about something else, it is "yes".
+` : ''}${lookupFindings ? `
+# What a lookup found
+${lookupFindings}
+` : ''}
+# The question the builder is waiting on
 ${JSON.stringify(pendingQuestion)}
 
-The user's latest message, verbatim:
+# The user's latest message, verbatim
 ${JSON.stringify(userMessage)}
 
-${recentChat ? `Recent turns on this node (oldest first):\n${recentChat}\n` : ''}
-${nodeDetails ? `Current configuration of this node:\n${nodeDetails}\n` : 'This node is NOT configured yet.\n'}
-# How this node type works
+Reply with ONE JSON object and nothing else:
+{ "thought": "<one short sentence>", "decision": "yes" | "no"${lookupAllowed ? ' | "lookup"' : ''}${lookupAllowed ? ', "lookup": "<what to find out — only with decision lookup>"' : ''} }`;
+}
 
-Read this before deciding. A reply that looks like noise out of context is often
-a precise answer once you know what this node is configured with — join keys,
-join types, similarity scenarios, operation modes, storage locations and the
-rest are all things a user answers in a few words.
-${nodeTypeDocs || '(no reference docs available for this node type)'}
+/**
+ * Node-build lookup — the gate's "find this out first", as its own call.
+ *
+ * Runs only when the gate asked for it. Read-only tools, the node type's
+ * reference docs, the saved connections and the system context: everything the
+ * slim gate leaves out. It does not decide relevance; it returns facts, which
+ * go back to the gate, and optionally a note written onto the node so the
+ * builder has them too.
+ */
+function buildNodeBuildLookupPrompt({
+  nodeType, nodeLabel, nodeId, lookupRequest, pendingQuestion, userMessage, transcript,
+  nodeDetails, connections = [], systemContext, nodeTypeDocs, maxActions, maxRounds,
+}) {
+  const typeLabel = NODE_TYPE_LABEL[nodeType] || nodeType;
+  return `You look one thing up for the Ternlux node-build gate, then report what you found.
 
-# Tool catalogue
+The gate is deciding whether a user's message replies to a ${typeLabel} builder's question, and it
+needs a fact first. You do NOT decide that, answer the user, or change anything.
 
+# What to find out
+${lookupRequest}
+
+# Context
+Node: ${typeLabel}${nodeLabel ? ` "${nodeLabel}"` : ''}${nodeId ? ` [id: ${nodeId}]` : ''}
+The builder asked: ${JSON.stringify(pendingQuestion)}
+The user replied: ${JSON.stringify(userMessage)}
+${transcript ? `\nThe node's conversation so far (oldest first):\n${transcript}\n` : ''}${nodeDetails ? `\nCurrent configuration of this node:\n${nodeDetails}\n` : ''}
+# One turn at a time — reply with ONE JSON object
+
+A) Look something up (at most ${maxRounds} turns of this, then you MUST report):
+{ "thought": "<one short sentence>", "actions": [ { "tool": "<tool_name>", "args": { ... } } ] }   // up to ${maxActions}
+
+B) Report:
+{ "thought": "<one short sentence>", "findings": "<the facts, plainly>", "note": "<one or two sentences the builder should know — omit if nothing>" }
+
+The builder CANNOT see this conversation; "note" is written onto the node for it. State facts
+("The orders table has a cust_ref column"), never "as found above". Never put credentials in either field.
+Never invent column, table or connection names — report only what a tool returned.
+
+# Tools
 ${INFO_TOOLS_SECTION}
 
-These are the ONLY tools you have. You cannot build, write, execute or modify
-anything.
+These are the ONLY tools you have. You cannot build, write, execute or modify anything.
 
-# Available connections (refer to them by NAME)
+# How this node type works
+${nodeTypeDocs || '(no reference docs available)'}
+
+# Available connections (by NAME)
 ${JSON.stringify(connections, null, 2)}
 
 # System & file-path context
-${systemContext}
-
-# Rules
-- Output ONLY the single JSON object. No prose, no backticks, no second turn.
-- Keep "thought" short (≤ 20 words) — it is shown live to the user.
-- Nothing you write is shown to the user as an answer. If the user needs a
-  reply, that is what "relevant": false is for — the main assistant writes it.
-- Do not gather when you do not need to. Most messages are decidable on sight,
-  and you sit in front of every build — a lookup you did not need is pure delay.
-- Never invent column names, table names or connection ids. Look them up or
-  leave them out.
-- Never put credentials, tokens, API keys or passwords in "note".`;
+${systemContext}`;
 }
 
 /**
@@ -1269,8 +1411,9 @@ B) Finish — emit the finished validation function:
      duckdb : ctx.runQuery('duckdb', 'SELECT COUNT(*) AS c FROM ' + TABLE, dbPath)
               ({ operation:'find', filter, sort?, skip?, limit? } returns docs;
                'aggregate' takes a Mongo-style { pipeline: [...] })
-     lancedb: ctx.runQuery('lancedb', { operation: 'list', tableName, limit }, dbPath)
-              ({ operation:'query', queryVector, topK?, filter? } for similarity)
+     lancedb / pinecone: an operation object, exactly as below — count with
+              'count', never by listing every row:
+${indent(VECTOR_QUERY_GUIDE, 6)}
   What to name in the query depends on what dbPath points at: a source data
   file (.csv/.json/.parquet) is addressable by its own base name, while a
   node's local output is a *.duckdb database — there, use the node's
@@ -1390,7 +1533,7 @@ function buildValidationDriftPrompt({ goal, validationFunction, workflowSummary 
  * PRODUCED DATA at the end of a run, this inspects the PIPELINE against the
  * conversation, before anything executes.
  */
-function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine, requestHistory, workflowSummary, priorActions = [], priorFixRounds = 0, impactedDownstream = [] }) {
+function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine, requestHistory, workflowSummary, priorActions = [], priorFixRounds = 0, impactedDownstream = [], outputCollisions = [] }) {
   // What the agent looked up before building. Requests routinely open with
   // "check X first" / "make sure Y doesn't already exist" — preconditions the
   // agent settles by CALLING A TOOL during planning. They cannot be nodes: no
@@ -1469,6 +1612,25 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     'outside the reviewed node is still out of scope.',
   ] : [];
 
+  // Found from the config, not inferred: several nodes naming one target table
+  // on one connection. It is listed whether or not the user's words touch it,
+  // because it breaks the pipeline itself — and a node review cannot otherwise
+  // see the sibling it collides with.
+  const collisions = (outputCollisions || []).length ? [
+    '',
+    '# Output tables written by more than one node',
+    'These nodes all write the SAME table in the same place. A transformer or join',
+    'replaces its target every run, so whichever runs last wins and every node reading',
+    'the others\' result gets its rows instead — silently, with no error:',
+    ...outputCollisions.map((g) => `- "${g.table}" on ${g.connection}: ${g.nodes.map((n) => `${n.label} [${n.id}]`).join(', ')}`),
+    '',
+    'This is ALWAYS invalid, whatever the user said or did not say about names — it is',
+    'not a preference but a pipeline that cannot produce what it was built to. Report it',
+    'in `issues`, and in `remediation` name the node to change and give it a target table',
+    'name no other node in this workflow uses (derive it from what that node produces',
+    'and what sets it apart, e.g. phoenix_stores_gcs vs phoenix_stores_dropbox).',
+  ] : [];
+
   return [
     'You are reviewing a data pipeline that was just built or edited by an AI builder,',
     'BEFORE it runs. Decide whether it actually does what the user asked for.',
@@ -1485,6 +1647,7 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     JSON.stringify(workflowSummary),
     ...checks,
     ...impact,
+    ...collisions,
     '',
     // The one job, stated in full before any of the machinery below. The
     // reviewer's worst failure mode is grading the build against PROSE — the
@@ -1512,7 +1675,9 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '   reads: connections, tables, collections, columns, join keys and join type,',
     '   filters, the SQL/operations, destinations, write mode, wiring.',
     '',
-    'A mismatch between (1) and (2) is the ONLY thing you report. A mismatch between',
+    'A mismatch between (1) and (2) is the ONLY thing you report — apart from the one',
+    'listed under "Output tables written by more than one node", when that section is',
+    'present. A mismatch between',
     'the TEXT and the config is not a mismatch at all — if it does not change what',
     'runs, ignore it. Never quote a builderPrompt, a step prompt or a restated brief',
     'as the requirement that was missed: check the user\'s own words first, and if the',
@@ -1522,23 +1687,53 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     'builder\'s to choose, and whatever it chose is correct. Do not fill the gap with',
     'a default, a convention, or what you would have done.',
     '',
+    // A node review faulted a correct join for reading `e2e_products_store`
+    // because the user had once typed "products_store", and offered a "Fix it"
+    // that would have re-pointed the join at a different table. The builder
+    // cannot pick a node's sources at all — they are the nodes wired into it —
+    // so a source "mismatch" is never the builder's to fix.
+    ...(isNode ? [
+      '# Where this node\'s sources come from',
+      '',
+      'A transformer or join reads exactly the nodes wired into it on the canvas.',
+      'The user chose them by drawing the connections; the AI builder cannot pick,',
+      'add or swap a source. So:',
+      '- Table or collection names the user TYPED are informal references to those',
+      '  wired sources. "products_store", "the stores table" or "orders" mean the',
+      '  wired source whose table is e2e_products_store, stores_2024, sales.orders —',
+      '  a prefix, suffix, schema or dataset qualifier, letter case or quoting that',
+      '  differs is NOT a mismatch.',
+      '- Never report that the node reads the wrong source table, collection or',
+      '  connection, and never put a change to sources, sourcesConfig, table names',
+      '  or connections in `remediation`. Re-pointing a source is the user\'s job on',
+      '  the canvas, not something a fix can do.',
+      '- The one source fault you may report is internal: the node\'s own SQL or',
+      '  code reading a table that NONE of its configured sources provides.',
+      '',
+    ] : []),
     // The executor's contract, stated because the reviewer keeps inferring
     // runtime failures from it that cannot happen — and "fixing" them breaks
     // working nodes. Every claim here is what the code does; keep it in step
     // with NodeExecution.js, joins/joinExecutionHelpers.js and transfomers/DuckDB.js.
     '# How this app runs a node (not defects when you see them)',
     '',
-    'Re-runs and stale data — a node in "new_table" mode REPLACES its target every run,',
-    'and a JOIN is ALWAYS in that mode (it has no append mode; the builder forces it):',
-    '- Transform or join to a DATABASE: the executor runs DROP TABLE IF EXISTS <target>,',
-    '  then the node\'s targetDdl (CREATE TABLE), then its SQL. So an INSERT-only',
-    '  targetSql / joinSql is CORRECT and complete. Do NOT ask for a TRUNCATE, DELETE,',
-    '  upsert, MERGE, "full refresh", or a duplicate-key guard before it — the table did',
-    '  not exist a moment earlier. Stale rows and duplicate keys across runs are not',
-    '  possible here, so never raise them.',
-    '- Transform or join to LOCAL storage: the result is written with',
-    '  CREATE OR REPLACE TABLE, which replaces it just the same.',
-    '- Join to a document store: "new_table" drops the collection, then inserts.',
+    'Re-runs and stale data — a node in "new_table" mode REPLACES its target every run:',
+    '- Transform or join to a DATABASE or to LOCAL storage: the executor runs DROP TABLE',
+    '  IF EXISTS <target>, then the node\'s targetDdl (CREATE TABLE), then its SQL. So an',
+    '  INSERT-only targetSql / joinSql is CORRECT and complete. Do NOT ask for a TRUNCATE,',
+    '  DELETE, upsert, MERGE, "full refresh", or a duplicate-key guard before it — the',
+    '  table did not exist a moment earlier. Stale rows and duplicate keys across runs are',
+    '  not possible here, so never raise them. (An older local join with no targetDdl is',
+    '  written with CREATE OR REPLACE TABLE — the same replace.)',
+    '- A JOIN in "append" or "merge" mode (joinSettings.operationMode) keeps its target:',
+    '  the CREATE runs only when the table is missing and there is no drop. Append\'s',
+    '  INSERT adds rows — accumulating across runs is what append MEANS, not a defect.',
+    '  Merge\'s joinSql is a MERGE / upsert on joinSettings.mergeKeys — correct as written.',
+    '  Only flag the mode when the user asked for a different one.',
+    '- Join to a document store: "new_table" drops the collection, then inserts;',
+    '  "append" keeps it.',
+    '- {{TARGET}} and {{SOURCE_n}} in a LOCAL join\'s saved SQL are filled in by the',
+    '  executor at run time — they are correct as written.',
     '- An OUTPUT node writing to a database connection creates the table only if',
     '  missing, then follows its own outputSettings.writeMode: "truncate" empties the',
     '  table (TRUNCATE, falling back to DELETE) before loading, so the run REPLACES the',
@@ -1549,8 +1744,8 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '  as "replace" and needs no change to do so. Judge repeat-run behaviour only for',
     '  output nodes, and only when the USER\'S OWN WORDS said something about replacing',
     '  or appending. A restated brief, a step prompt or a node explanation mentioning',
-    '  append/truncate is not the user saying it — a join or transformer has no such',
-    '  setting at all, so wording like that describes nothing and requires nothing.',
+    '  append/truncate is not the user saying it. A transformer has no such setting at',
+    '  all; a join\'s is joinSettings.operationMode — judge it only against the user\'s words.',
     '',
     'Where a new table from a FILE source goes — a connection with connectionType',
     '"file" (csv, json, parquet, a workbook) is a file read in place, not a database,',
@@ -1660,26 +1855,38 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '  picker, set_join_destination, or an earlier build — and silence is not a request',
     '  to move it. Never fail a join for choosing local-duckdb over a saved connection,',
     '  or the reverse, on a request that never mentioned storage.',
-    '- The ONE destination rule that binds regardless of what the user said is the join',
-    '  KIND. A similarity / embedding join (the node carries vectorRequired: true — "find',
-    '  the most similar", per-row embed + vector search) runs its match as a JS function',
-    '  that the executor ONLY runs for a NoSQL or VECTOR destination. Such a join MUST',
-    '  write to local-lancedb or a saved vector connection; on a plain relational target',
-    '  it silently degrades to a static SQL join and the similarity columns come back',
-    '  NULL. Fail that and say so. A plain keyed / equality join (vectorRequired false)',
-    '  has no such constraint and may write anywhere — never impose a vector destination',
-    '  on one. If the user wants the matches as a FILE, local-lancedb plus an Output node',
-    '  is the correct shape; a vector destination is not a defect just because they asked',
-    '  for a CSV.',
+    '- The ONE rule that binds regardless of what the user said is the join KIND. A',
+    '  join SQL cannot express — an embedding / similarity join (vectorRequired: true),',
+    '  or one the analyser marked requiresFunction: true (values inside arrays or nested',
+    '  documents going to a SQL table, a match SQL has no form for) — MUST carry a',
+    '  JavaScript join function (transformFunction) and NO joinSql. It may write to ANY',
+    '  destination: the executor runs the function and writes its rows as a collection,',
+    '  vector table, local table, or SQL table created from targetDdl. A node of that',
+    '  kind carrying SQL instead of a function is a defect — the SQL would run as a plain',
+    '  key join with the similarity or nested step missing. Fail that and say so. A plain',
+    '  keyed / equality join is SQL for SQL and local destinations; never demand a',
+    '  function, or a particular destination, for one.',
+    '- A join over nested or array values must shape them the way the user said (one',
+    '  row per element, the value kept as JSON text, …). A shape the user never chose',
+    '  is a defect; name what they asked for.',
     '',
-    'In-place transform on a FILE — the file has no table of its own, so the executor',
+    'In-place transform on a data FILE (CSV, JSON, Parquet, Excel, Avro) — the file has',
+    'no table of its own, so the executor',
     'copies it into a per-run staging table named "transformer_" + the node id with',
     'non-alphanumerics as underscores, runs the SQL against THAT, and writes the result',
     'back over the file. targetSql addressing e.g. "transformer_transformer_1234" while',
     'targetTableName is the file\'s logical table (e.g. "orders") is CORRECT and expected:',
     'the builder and the executor derive that name from the same function, so they cannot',
-    'disagree. An in-place transform on a table that already lives in a database',
-    'addresses that table by its real name instead.',
+    'disagree. An in-place transform on a table that already lives in a database —',
+    'a .duckdb or SQLite (.sqlite / .db) file, or a remote database — addresses that',
+    'table by its real name instead; a staging name there is the defect, not the real one.',
+    '',
+    'Column coverage — what a source HAS is its sourceTableSchema (a transformer) or the',
+    'sourceColumns on its sourcesConfig entry (a join); the SQL only shows what was',
+    'selected. "All columns of X" is met by X.* OR by an explicit list naming every one of',
+    'those columns, in any order. Judge "keeps all / drops some" against that list,',
+    'never against how many columns the SELECT happens to name. When a source\'s columns',
+    'are not shown, do not fail the node for missing columns you cannot see.',
     '',
     '# What to check',
     // A node review judges ONE node's config. Workflow-shape checks belong to a
@@ -1823,6 +2030,18 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '  spelling the builder recorded is the one the engine answered to. Report a',
     '  naming problem only when a genuinely DIFFERENT object was used — another',
     '  table, another connection — never a re-spelling of the same one.',
+    // A CSV/Excel/Parquet import is a saved connection of type "file". Its
+    // config carries the file's path, and the reviewer read that as "reads the
+    // CSV file instead of the products table on the products connection" —
+    // failing a node that read exactly the connection the user named.
+    '- A FILE connection (`sourceConnectionType` "file": an imported CSV, Excel,',
+    '  Parquet or JSON file) IS a saved connection. Its `sourceFilePath` /',
+    '  `sourceLocalPath` is where that connection keeps its data, and its table is',
+    '  `sourceTableName`. A node whose `sourceConnectionName` is the connection the',
+    '  request names reads that connection — "the products connection", "the products',
+    '  table", "the products CSV" and "the products file" are all the same thing',
+    '  when that connection is a file. Never report it as reading "the file instead',
+    '  of the connection / table".',
     // A local file export has no append-vs-truncate switch: exportToLocalFile
     // writes the file whole, every run. `writeMode` still sits in those output
     // settings carrying its default "append", which this reviewer read as an
@@ -1837,6 +2056,16 @@ function buildChangeReviewPrompt({ isNode, kindLine, changeSummary, historyLine,
     '  is NEVER an issue and never something to change. A request to make outputs',
     '  truncate-and-load is satisfied, for the file outputs, by their existing',
     '  configuration.',
+    // A join switched to append/merge on a table that no longer fits (a key
+    // left by an earlier merge, a missing column) records joinSettings.targetRebuild.
+    // The reviewer read the pending drop as a contradiction of "append" and
+    // blocked the run card — the one place the user approves that drop.
+    '- `joinSettings.targetRebuild` with `pending: true` is EXPECTED, never an issue:',
+    '  the join keeps its target (append / merge) but the table already there no',
+    '  longer fits what it writes (its reason says why — e.g. a PRIMARY KEY left by an',
+    '  earlier merge that appended rows would violate). Nothing is dropped until the',
+    '  user approves it when the node runs; after that one recreate the join appends',
+    '  or merges as asked. Do not report it, and do not ask to remove it.',
     // "Do the same as the other node" is resolved for the builder BEFORE it runs
     // and the resolution is recorded in the transcript. Re-deriving it from some
     // other node's config second-guesses a decision that was already settled.
@@ -1911,6 +2140,8 @@ const PROMPTS = {
       maxActions: p.maxActions ?? null,
       isNewChat: !!p.isNewChat,
       hasContextSummary: !!p.contextSummary,
+      contextUnsaved: !!p.contextUnsaved,
+      contextOutlineChars: len(p.contextOutline),
       focusedNodeType: p.focusedNode?.targetNode?.type || null,
       focusedBuildTool: p.focusedNode?.buildToolName || null,
       joinNeedsDestination: !!p.focusedNode?.needsDestination,
@@ -1935,15 +2166,28 @@ const PROMPTS = {
     }),
   },
 
+  // The gate. Kind name kept so dev-log history stays comparable.
   nodeBuildRouter: {
-    build: buildNodeBuildRouterPrompt,
+    build: buildNodeBuildGatePrompt,
     describe: (p) => ({
       nodeType: p.nodeType || null,
-      nodeId: p.nodeId || null,
-      nodeConfigured: !!p.nodeConfigured,
       pendingSkillId: p.pendingSkillId || null,
       pendingQuestionChars: len(p.pendingQuestion),
       userMessageChars: len(p.userMessage),
+      transcriptChars: len(p.transcript),
+      heldBack: Array.isArray(p.heldBack) ? p.heldBack.length : 0,
+      withLookupFindings: !!p.lookupFindings,
+      lookupAllowed: p.lookupAllowed !== false,
+    }),
+  },
+
+  nodeBuildLookup: {
+    build: buildNodeBuildLookupPrompt,
+    describe: (p) => ({
+      nodeType: p.nodeType || null,
+      nodeId: p.nodeId || null,
+      lookupRequestChars: len(p.lookupRequest),
+      transcriptChars: len(p.transcript),
       nodeTypeDocChars: len(p.nodeTypeDocs),
       connectionCount: Array.isArray(p.connections) ? p.connections.length : 0,
       maxRounds: p.maxRounds ?? null,
@@ -1986,6 +2230,7 @@ const PROMPTS = {
       hasChangeSummary: !!p.changeSummary,
       requestHistoryChars: len(p.requestHistory),
       workflowSummaryChars: len(p.workflowSummary),
+      outputCollisions: (p.outputCollisions || []).length,
       // A verdict faulting a "missing" precondition step reads very differently
       // depending on whether the reviewer was shown the lookup that settled it.
       priorActions: (p.priorActions || []).length,
