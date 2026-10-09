@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 const duck = require('../duckdb');
+const xlsx = require('../duckdb/xlsx');
 
 /**
  * Describe one table, or explain why it can't be read.
@@ -30,8 +31,30 @@ const duck = require('../duckdb');
 async function describeTable(table, format) {
   const schema = await duck.fileSchema(table.path, { format, sheet: table.sheet });
   schema.tableName = table.name;
-  return { ...table, schema };
+  return { ...table, schema, ...(format === 'xlsx' ? headerWarning(table, schema) : {}) };
 }
+
+/**
+ * A warning when a sheet read FEWER columns than its used range spans — the
+ * shape of a title above the header: DuckDB takes the title row as the header
+ * and stops at its first empty cell, so the columns after it are not read.
+ * Compares two facts (the column count DuckDB returned, the sheet's dimension);
+ * nothing is guessed from the cell contents.
+ */
+function headerWarning(table, schema) {
+  const used = xlsx.usedRange(table.path, table.sheet);
+  if (!used) return {};
+  const span = colNumber(used.endCol) - colNumber(used.startCol) + 1;
+  const read = Array.isArray(schema?.columns) ? schema.columns.length : 0;
+  if (read === 0 || read >= span) return {};
+  return {
+    warning: `"${table.name}" spans ${span} columns but only ${read} could be read from its first row. `
+      + 'If there is a title or notes above the header, edit this connection and set this sheet\'s '
+      + '"Header row" to the row that holds the column names.',
+  };
+}
+
+const colNumber = (letters) => String(letters).split('').reduce((n, ch) => n * 26 + (ch.charCodeAt(0) - 64), 0);
 
 /**
  * Everything the app needs to record a local file as a connection.
