@@ -40,7 +40,13 @@ const MAX_ROWS = 5000;
  */
 async function readCapped({ connector, fullConfig, connectionId, payload, cap }) {
   if (connector.explorer && connector.explorer.maxRowsOption) {
-    const res = await connector.runQuery(fullConfig, connectionId, payload, { maxRows: cap });
+    const res = await connector.runQuery(fullConfig, connectionId, payload, {
+      maxRows: cap,
+      // Array rows keep two result columns with the same name apart; as
+      // objects the second overwrote the first (`SELECT 1 AS x, 2 AS x` showed
+      // 2 and 2). See rowsToObjects.
+      ...(connector.explorer.rowsAsArrays ? { rowsAsArrays: true } : {}),
+    });
     return { res, capped: Boolean(res && res.success) };
   }
 
@@ -48,6 +54,23 @@ async function readCapped({ connector, fullConfig, connectionId, payload, cap })
   // slice at the call site at least keeps it off IPC.
   const res = await connector.runQuery(fullConfig, connectionId, payload);
   return { res, capped: false };
+}
+
+/**
+ * Array rows → objects, with a repeated column name made unique the way DuckDB
+ * names them (`x`, `x:1`, `x:2`) so every engine reads the same in the grid.
+ */
+function rowsToObjects(columnNames, rows) {
+  const seen = new Map();
+  const names = columnNames.map((name) => {
+    const n = seen.get(name) || 0;
+    seen.set(name, n + 1);
+    return n === 0 ? name : `${name}:${n}`;
+  });
+  return {
+    names,
+    rows: rows.map((arr) => Object.fromEntries(names.map((name, i) => [name, arr[i]]))),
+  };
 }
 
 /** How the tree groups what getTables() reports. */
@@ -283,6 +306,13 @@ function registerDatabaseIpc({ ipcMain, pluginManager, getFullConfig, getUserDat
       }
 
       const grouped = new Map();
+      // Schemas the connector lists on their own, so one with nothing in it yet
+      // (a fresh database's PUBLIC) is still in the tree. Built from tables
+      // alone, an empty schema simply did not exist.
+      for (const name of res.schemas || []) {
+        if (!name || grouped.has(name)) continue;
+        grouped.set(name, { name, primary: false, label: null, objects: { tables: [], views: [], collections: [] } });
+      }
       for (const t of res.tables || []) {
         const schemaName = t.schema || '(default)';
         if (!grouped.has(schemaName)) {
@@ -475,11 +505,17 @@ function registerDatabaseIpc({ ipcMain, pluginManager, getFullConfig, getUserDat
         return { success: false, message: (res && res.message) || 'Query failed', ms };
       }
 
-      const allRows = sanitizeRows(res.rows);
+      let rawRows = res.rows;
+      let arrayNames = null;
+      if (res.rowsAreArrays && Array.isArray(res.columns)) {
+        const converted = rowsToObjects(res.columns, rawRows || []);
+        rawRows = converted.rows;
+        arrayNames = converted.names;
+      }
+      const allRows = sanitizeRows(rawRows);
       const rows = allRows.slice(0, cap);
-      const names = Array.isArray(res.columns) && res.columns.length
-        ? res.columns
-        : Object.keys(rows[0] || {});
+      const names = arrayNames
+        || (Array.isArray(res.columns) && res.columns.length ? res.columns : Object.keys(rows[0] || {}));
 
       return {
         success: true,
