@@ -1,4 +1,6 @@
 const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification, dialog, Menu } = require('electron');
+// First, before any module can log a config object carrying a key.
+require('./lib/logRedaction').installConsoleRedaction();
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
@@ -26,6 +28,27 @@ const {
 // what ships; override it to run against a local backend:
 //   BACKEND_URL=http://localhost:8000 npm run electron-dev
 const BACKEND_URL = process.env.BACKEND_URL || 'https://api.ternlux.com';
+
+// Linux keeps secrets in the desktop's keyring (libsecret, kwallet). A server,
+// a minimal window manager, or any session Chromium can't identify the desktop
+// of has none, and safeStorage.isEncryptionAvailable() is then false — which
+// made saving an API key or a DB credential fail outright with "safeStorage is
+// not available on this system", with no way forward.
+//
+// This falls back to an in-memory key in exactly that case. Where a real
+// keyring IS found — GNOME, KDE — Electron keeps using it and this call changes
+// nothing. It has to run before the `ready` event: that is when the backend is
+// chosen, and afterwards getSelectedStorageBackend() has already settled. No-op
+// on Windows and macOS.
+//
+// The trade-off is real. Under the fallback the key is not the user's, so
+// llm-config.dat and db-credentials.dat are readable by anything that can open
+// them — hence writeSecretFile() keeping them 0600, and 'secret-storage:status'
+// telling the renderer which backend is live so the UI can say so out loud
+// rather than quietly pretending the keys are protected.
+if (process.platform === 'linux') {
+  safeStorage.setUsePlainTextEncryption(true);
+}
 
 // Patch ipcMain.handle FIRST so every IPC handler registered below is
 // automatically wrapped with anonymous analytics tracking (channel name,
@@ -117,8 +140,45 @@ function getConfigPath() {
 }
 
 /**
+ * Which store safeStorage settled on, on Linux: 'gnome_libsecret', a 'kwallet'
+ * variant, or 'basic_text' — the in-memory-key fallback enabled at the top of
+ * this file. 'unknown' if asked before the app is ready, since the backend is
+ * not chosen until then. Null off Linux, where the OS store is never in doubt.
+ */
+function secretStorageBackend() {
+  if (process.platform !== 'linux') return null;
+  try {
+    return safeStorage.getSelectedStorageBackend();
+  } catch (err) {
+    console.error('[secretStorageBackend]', err);
+    return 'unknown';
+  }
+}
+
+/** Secrets are encrypted, but with a key that is not the user's keyring's. */
+const isSecretStorageWeak = () => secretStorageBackend() === 'basic_text';
+
+/**
+ * Write a file holding secrets, readable only by its owner.
+ *
+ * This matters most under the basic_text fallback: the encryption key is no
+ * longer private to the user, so file permissions are the only thing left
+ * between the ciphertext and anyone else with an account on the machine.
+ * writeFileSync's mode is ignored when the file already exists — the usual
+ * case, since these are rewritten on every save — so chmod has to follow it.
+ */
+function writeSecretFile(filePath, contents) {
+  fs.writeFileSync(filePath, contents, { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch (err) {
+    console.warn('[writeSecretFile] could not tighten permissions:', err.message);
+  }
+}
+
+/**
  * Load all API keys from encrypted storage
- * @returns {Object|null} - Object with provider keys { claude, gemini, chatgpt, openai, huggingface } or null
+ * @returns {Object|null} - Object with provider keys { claude, gemini, chatgpt, openai } or null
  */
 function loadApiKeys() {
   try {
@@ -155,17 +215,10 @@ function loadAiPrefs() {
   }
 }
 
-function loadDefaultProvider() {
-  return loadAiPrefs().defaultProvider || null;
-}
-
-// The persisted model for the default provider (or null). Native providers
-// (openai/claude/gemini) store only the API key in llm-config.dat, so the
-// chosen model lives here — backend-internal calls read it to avoid falling
-// back to a hardcoded DEFAULT_MODELS entry (which may be a retired model).
-function loadDefaultModel() {
-  return loadAiPrefs().defaultModel || null;
-}
+// Native providers (openai/claude/gemini) store only the API key in
+// llm-config.dat, so the chosen model lives in ai-prefs.json as `defaultModel` —
+// backend-internal calls read it to avoid falling back to a hardcoded
+// DEFAULT_MODELS entry (which may be a retired model).
 
 // Fill provider + model from the persisted defaults when the caller didn't
 // specify them, so backend-internal AI calls (assistant, workflow builder,
@@ -207,12 +260,12 @@ function writeApiKeys(allKeys) {
     throw new Error('safeStorage is not available on this system');
   }
   const encrypted = safeStorage.encryptString(JSON.stringify(allKeys));
-  fs.writeFileSync(getConfigPath(), encrypted.toString('base64'), 'utf8');
+  writeSecretFile(getConfigPath(), encrypted.toString('base64'));
 }
 
 /**
  * Check if an API key exists for a specific provider
- * @param {string} provider - Provider name (openai, huggingface, claude, gemini, chatgpt)
+ * @param {string} provider - Provider name (openai, claude, gemini, chatgpt)
  * @returns {boolean}
  */
 function hasApiKeyForProvider(provider) {
@@ -225,7 +278,6 @@ function hasApiKeyForProvider(provider) {
     'gemini': 'gemini',
     'claude': 'claude',
     'openai': 'chatgpt', // OpenAI uses chatgpt key
-    'huggingface': 'huggingface'
   };
 
   const normalizedProvider = providerMap[provider.toLowerCase()] || provider.toLowerCase();
@@ -266,7 +318,7 @@ ipcMain.handle('api-key:save', (_event, { provider, key }) => {
     // Encrypt and save all keys
     const payload = JSON.stringify(allKeys);
     const encrypted = safeStorage.encryptString(payload);
-    fs.writeFileSync(configPath, encrypted.toString('base64'), 'utf8');
+    writeSecretFile(configPath, encrypted.toString('base64'));
 
     return { success: true };
   } catch (err) {
@@ -295,6 +347,21 @@ ipcMain.handle('api-key:load', () => {
     return null;
   }
 });
+
+/**
+ * How well this system can protect stored secrets.
+ *
+ * For a UI that should tell the user rather than let them assume. `weak` is the
+ * one that matters: on a Linux box with no keyring the keys are still saved,
+ * but recoverable by anything that can read the file, and a user trusting it
+ * with a production API key deserves to know that before they paste one in.
+ */
+ipcMain.handle('secret-storage:status', () => ({
+  platform: process.platform,
+  available: safeStorage.isEncryptionAvailable(),
+  backend: secretStorageBackend(),
+  weak: isSecretStorageWeak(),
+}));
 
 /**
  * Deletes llm-config.dat so the setup screen is shown again on next launch.
@@ -343,6 +410,71 @@ ipcMain.handle('terms:save', (_event, record = {}) => {
 });
 
 // ---------------------------------------------------------------------------
+// Renderer store — localStorage that actually survives a restart
+//
+// A packaged window is loaded with loadFile(), so the renderer's origin is
+// file://, and Chromium treats that as opaque for storage: whatever the UI
+// writes to localStorage lives exactly as long as the window does. In dev the
+// renderer is served from http://localhost:3000 — a real origin — which is why
+// this only ever shows up once packaged, and why terms acceptance was moved to
+// a file above. Anything else the UI remembered (the signed-in session, the
+// chosen model) came back to defaults on every launch.
+//
+// Roughly twenty modules read localStorage synchronously, so rather than
+// convert them all to async IPC, the renderer mirrors the whole store here
+// after each change and reloads it at startup — see
+// src/utils/persistentLocalStorage.js. Call sites keep using localStorage and
+// stop losing it.
+//
+// The mirror holds the auth token, so it is written 0600 like the other secret
+// files. It is NOT encrypted: localStorage was plaintext on disk too, so this
+// changes nothing about how exposed the token is, and encrypting it would tie
+// the user's session to a keyring that half these Linux boxes do not have.
+// ---------------------------------------------------------------------------
+
+function getRendererStorePath() {
+  return path.join(app.getPath('userData'), 'renderer-store.json');
+}
+
+// A whole-store rewrite on every change is only cheap while the store is small.
+// localStorage's own budget is ~5MB; past this something is being cached there
+// that has no business surviving a restart, and silently writing it every few
+// hundred ms would be worse than not persisting it.
+const MAX_RENDERER_STORE_BYTES = 4 * 1024 * 1024;
+
+ipcMain.handle('store:load', () => {
+  try {
+    const p = getRendererStorePath();
+    if (!fs.existsSync(p)) return {};
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (err) {
+    console.error('[store:load]', err);
+    return {};
+  }
+});
+
+ipcMain.handle('store:save', (_event, entries) => {
+  try {
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+      return { success: false, error: 'entries must be an object' };
+    }
+    const payload = JSON.stringify(entries);
+    if (payload.length > MAX_RENDERER_STORE_BYTES) {
+      console.warn(
+        `[store:save] ${payload.length} bytes exceeds the ${MAX_RENDERER_STORE_BYTES} byte cap — not persisted`
+      );
+      return { success: false, error: 'renderer store too large' };
+    }
+    writeSecretFile(getRendererStorePath(), payload);
+    return { success: true };
+  } catch (err) {
+    console.error('[store:save]', err);
+    return { success: false, error: err.message };
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Secure database credential storage
 // Stores sensitive database credentials (passwords, hosts, etc.) encrypted
 // using OS-level safeStorage (Keychain on macOS, Credential Store on Windows)
@@ -384,7 +516,7 @@ function saveAllCredentials(credentials) {
 
     const payload = JSON.stringify(credentials);
     const encrypted = safeStorage.encryptString(payload);
-    fs.writeFileSync(getCredentialsPath(), encrypted.toString('base64'), 'utf8');
+    writeSecretFile(getCredentialsPath(), encrypted.toString('base64'));
     return { success: true };
   } catch (err) {
     console.error('[saveAllCredentials]', err);
@@ -491,7 +623,11 @@ const VALID_COLLECTIONS = ['workflows', 'connections', 'executions', 'chatSessio
 // encode "." → "||" in keys on write and decode "||" → "." on read, for every
 // collection (see getDb). Values are never touched, only object keys, so what a
 // caller stores is what it reads back.
+// NeDB also forbids keys that START with "$" ("Field names cannot begin with
+// the $ character"), and configs carry them too: a Pinecone metadata filter is
+// `{ tier: { $eq: 'premium' } }`. A leading "$" is stored as DOLLAR_TOKEN.
 const DOT_TOKEN = '||';
+const DOLLAR_TOKEN = '__dollar__';
 const _dbWrappers = {};
 
 function encodeDotKeys(value) {
@@ -499,7 +635,8 @@ function encodeDotKeys(value) {
   if (value && typeof value === 'object' && !(value instanceof Date)) {
     const out = {};
     for (const k of Object.keys(value)) {
-      const nk = k.indexOf('.') !== -1 ? k.split('.').join(DOT_TOKEN) : k;
+      let nk = k.indexOf('.') !== -1 ? k.split('.').join(DOT_TOKEN) : k;
+      if (nk.startsWith('$')) nk = DOLLAR_TOKEN + nk.slice(1);
       out[nk] = encodeDotKeys(value[k]);
     }
     return out;
@@ -512,7 +649,8 @@ function decodeDotKeys(value) {
   if (value && typeof value === 'object' && !(value instanceof Date)) {
     const out = {};
     for (const k of Object.keys(value)) {
-      const nk = k.indexOf(DOT_TOKEN) !== -1 ? k.split(DOT_TOKEN).join('.') : k;
+      let nk = k.indexOf(DOT_TOKEN) !== -1 ? k.split(DOT_TOKEN).join('.') : k;
+      if (nk.startsWith(DOLLAR_TOKEN)) nk = '$' + nk.slice(DOLLAR_TOKEN.length);
       out[nk] = decodeDotKeys(value[k]);
     }
     return out;
@@ -908,101 +1046,31 @@ ipcMain.handle('db:read-local-collection', async (_event, { filePath, limit = 10
     const isSqlite = storageType === 'sqlite';
 
     if (isSqlite) {
-      // Read SQLite database
-      const sqlite3 = require('sqlite3').verbose();
-      const db = new sqlite3.Database(filePath, sqlite3.OPEN_READONLY);
-
-      return new Promise((resolve) => {
-        // If sqlPreview is provided, use it directly
+      // Read SQLite database — through DuckDB's sqlite extension (lib/sqlite).
+      try {
         if (sqlPreview) {
-          db.all(sqlPreview, (selectErr, rows) => {
-            db.close();
-            if (selectErr) {
-              resolve({
-                success: false,
-                message: `Failed to execute preview query: ${selectErr.message}`,
-                tables: []
-              });
-            } else {
-              resolve({
-                success: true,
-                rows: rows,
-                rowCount: rows.length,
-                json: false,
-                tables: [],
-                currentTable: tableName || null
-              });
-            }
-          });
-        } else if (tableName) {
-          // If tableName is provided, query that specific table
-          db.all(`SELECT * FROM "${tableName}" LIMIT ${limit}`, (selectErr, rows) => {
-            db.close();
-
-            if (selectErr) {
-              resolve({
-                success: false,
-                message: `Failed to read from table "${tableName}": ${selectErr.message}`
-              });
-            } else {
-              resolve({
-                success: true,
-                rows: rows,
-                rowCount: rows.length,
-                json: false,
-                tables: [tableName],
-                currentTable: tableName
-              });
-            }
-          });
-        } else {
-          // Default behavior: Get list of tables and read from the first one
-          db.all("SELECT name FROM sqlite_master WHERE type='table'", (err, tables) => {
-            if (err) {
-              db.close();
-              resolve({
-                success: false,
-                message: `Failed to read SQLite tables: ${err.message}`
-              });
-              return;
-            }
-
-            if (tables.length === 0) {
-              db.close();
-              resolve({
-                success: true,
-                rows: [],
-                rowCount: 0,
-                json: false,
-                tables: []
-              });
-              return;
-            }
-
-            // Read from the first table
-            const firstTableName = tables[0].name;
-            db.all(`SELECT * FROM "${firstTableName}" LIMIT ${limit}`, (selectErr, rows) => {
-              db.close();
-
-              if (selectErr) {
-                resolve({
-                  success: false,
-                  message: `Failed to read from table: ${selectErr.message}`
-                });
-              } else {
-                resolve({
-                  success: true,
-                  rows: rows,
-                  rowCount: rows.length,
-                  json: false,
-                  tables: tables.map(t => t.name),
-                  currentTable: firstTableName
-                });
-              }
-            });
-          });
+          const rows = await localSQLite.runQuery({ dbPath: filePath, query: sqlPreview });
+          return {
+            success: true, rows, rowCount: rows.length, json: false, tables: [], currentTable: tableName || null,
+          };
         }
-      });
+        const tables = tableName ? [tableName] : await localSQLite.getTables({ dbPath: filePath });
+        const table = tableName || tables[0];
+        if (!table) return { success: true, rows: [], rowCount: 0, json: false, tables: [] };
+        const rows = await localSQLite.runQuery({
+          dbPath: filePath,
+          query: `SELECT * FROM "${String(table).replace(/"/g, '""')}" LIMIT ${Number(limit) || 100}`,
+        });
+        return { success: true, rows, rowCount: rows.length, json: false, tables, currentTable: table };
+      } catch (error) {
+        return {
+          success: false,
+          message: sqlPreview
+            ? `Failed to execute preview query: ${error.message}`
+            : `Failed to read ${path.basename(filePath)}: ${error.message}`,
+          tables: [],
+        };
+      }
     }
 
     // Every local store is read by DuckDB or SQLite above. A storageType that
@@ -1177,8 +1245,15 @@ ipcMain.handle('file:read-rows', async (_event, { filePath, limit = 1000 }) => {
  *
  * Returns { success, format, tables: [{ name, path, sheet, schema }] }
  */
-ipcMain.handle('file:register-local', async (_event, { filePath, importId = null }) => {
+ipcMain.handle('file:register-local', async (_event, {
+  filePath, importId = null, headerRow = 1, headerRows = null,
+}) => {
   try {
+    // Saved BEFORE the file is described, so its columns come from the header
+    // row the user named (see duckdb/readOptions.js). A workbook's rows are
+    // per sheet (`headerRows`): a title above one sheet's header says nothing
+    // about the others. Replaces whatever was recorded for the file before.
+    require('./duckdb/readOptions').replaceHeaderRows(filePath, headerRow, headerRows);
     return await registerLocalFile(filePath, app.getPath('userData'), {
       onProgress: makeImportProgressReporter(_event, importId),
     });
@@ -2342,24 +2417,71 @@ ipcMain.handle('ai:listProviders', async () => {
  * { success, models: [{ value, label }] } or { success: false, error }.
  */
 ipcMain.handle('ai:listModels', async (_event, { provider } = {}) => {
+  // Logged end to end because an empty model dropdown has several possible
+  // causes that look identical in the UI: the wrong provider id, no key on
+  // file, a key the provider rejects, or a list that arrives without the
+  // token limits the Max Tokens ladder is built from. Key NAMES only —
+  // never the values.
   try {
-    if (!provider) return { success: false, error: 'provider is required' };
+    if (!provider) {
+      console.warn('[ai:listModels] called with no provider');
+      return { success: false, error: 'provider is required' };
+    }
     const apiKeys = loadApiKeys() || {};
     const entry = aiProviders.resolveProviderEntry(provider, apiKeys);
-    if (!entry) return { success: false, error: 'No API key configured for this provider' };
+    console.log(
+      `[ai:listModels] provider="${provider}" | providers with a key on file: `
+      + `[${Object.keys(apiKeys).join(', ') || 'none'}] | resolved a key: ${!!entry}`
+      + `${entry?.baseURL ? ` | baseURL=${entry.baseURL}` : ''}`
+    );
+    if (!entry) {
+      console.warn(`[ai:listModels] no key for "${provider}" — the dropdown will be empty`);
+      return { success: false, error: 'No API key configured for this provider' };
+    }
+
     const models = await aiProviders.listModels(provider, { apiKey: entry.apiKey, baseURL: entry.baseURL });
-    return { success: true, models };
+    const list = Array.isArray(models) ? models : [];
+    console.log(`[ai:listModels] "${provider}" returned ${list.length} model(s)`);
+    list.slice(0, 10).forEach((m, i) => {
+      console.log(
+        `[ai:listModels]   ${i + 1}. ${m.value}`
+        + ` | label="${m.label}"`
+        + ` | maxOutputTokens=${m.maxOutputTokens ?? 'null'}`
+        + ` | maxInputTokens=${m.maxInputTokens ?? 'null'}`
+      );
+    });
+    if (list.length > 10) console.log(`[ai:listModels]   … ${list.length - 10} more`);
+    if (list.length === 0) console.warn('[ai:listModels] empty list — the provider returned no models');
+
+    return { success: true, models: list };
   } catch (err) {
-    console.error('[ai:listModels]', err);
+    console.error(`[ai:listModels] FAILED for "${provider}":`, err?.message || err);
+    console.error(err);
     return { success: false, error: err.message };
   }
 });
 
 /**
- * ai:getDefaultProvider — the persisted "Default AI Provider" choice (or null).
+ * ai:getDefaultProvider — the persisted "Default AI Provider" choice: provider,
+ * its model and Max Tokens (each null when unset).
+ *
+ * ai-prefs.json is the ONLY store for these. Settings and onboarding read them
+ * here and write them through ai:setDefaultProvider / ai:setMaxTokens; the
+ * renderer keeps no copy, because a second copy is what let Settings show one
+ * model while every call sent another.
  */
 ipcMain.handle('ai:getDefaultProvider', async () => {
-  return { success: true, provider: loadDefaultProvider(), model: loadDefaultModel() };
+  const prefs = loadAiPrefs();
+  return {
+    success: true,
+    provider: prefs.defaultProvider || null,
+    model: prefs.defaultModel || null,
+    // Which provider `model` was chosen for — the same owner rule
+    // withPersistedAiDefaults applies, so the renderer can tell whether this is
+    // the model backend calls will actually send.
+    modelProvider: prefs.defaultModelProvider || prefs.defaultProvider || null,
+    maxTokens: prefs.defaultMaxTokens || null,
+  };
 });
 
 /**
@@ -2419,9 +2541,9 @@ ipcMain.handle('ai:saveCompatProvider', async (_event, { provider, config = {} }
 });
 
 /**
- * ai:setMaxTokens — persist the user's Max Tokens choice so backend-internal AI
- * calls (chat, planner, node builders) use it, not just renderer calls. Stored
- * alongside the default provider/model in the same prefs file.
+ * ai:setMaxTokens — persist the user's Max Tokens choice, which every AI call
+ * (chat, planner, node builders) uses. Stored alongside the default
+ * provider/model in the same prefs file — the only copy there is.
  */
 ipcMain.handle('ai:setMaxTokens', async (_event, { maxTokens } = {}) => {
   try {
@@ -2753,6 +2875,10 @@ ipcMain.handle('workflow:executeBuild', async (event, { plan } = {}) => {
         // rounds }. The renderer parks it on plan.pendingSkills[stepIndex] so the
         // resumed build continues that skill dialog instead of restarting it.
         pendingSkill: err.context?.skill || null,
+        // Set when the build paused for the user to APPROVE generated code
+        // before it runs (ApprovalNeeded): what to show on the Run / Don't run
+        // card, and the calls to replay so the approved code is what runs.
+        approval: err.isApprovalNeeded ? (err.context?.approval || null) : null,
         // Nodes already built this pass — the renderer passes them back so the
         // resumed build skips them instead of rebuilding from step 0.
         builtSteps: err.builtSteps || null,
@@ -3346,14 +3472,12 @@ async function buildSkillHelpers(defaultDbPath = null) {
   /** Generate embeddings using the shared vector-embeddings library. */
   async function vectorize(texts, options = {}) {
     if (!Array.isArray(texts) || texts.length === 0) return [];
-    const provider = options.provider || (apiKeys.chatgpt || apiKeys.openai ? 'openai' : 'huggingface');
-    const apiKey = provider === 'openai'
-      ? (apiKeys.chatgpt || apiKeys.openai)
-      : apiKeys.huggingface;
-    if (!apiKey) throw new Error(`No API key configured for embedding provider "${provider}"`);
-    const model = options.model || (provider === 'openai'
-      ? 'text-embedding-3-small'
-      : 'sentence-transformers/all-MiniLM-L6-v2');
+    // OpenAI is the only embedding provider.
+    const provider = options.provider || 'openai';
+    if (provider !== 'openai') throw new Error(`Unsupported embedding provider "${provider}". Only "openai" is supported.`);
+    const apiKey = apiKeys.chatgpt || apiKeys.openai;
+    if (!apiKey) throw new Error('No OpenAI API key is configured for embeddings. Add one in Settings.');
+    const model = options.model || 'text-embedding-3-small';
     const data = texts.map((t, idx) => ({ __idx: idx, text: typeof t === 'string' ? t : String(t) }));
     const result = await vectorEmbeddings.generateEmbeddings({ data, columnToEmbed: 'text', provider, model, apiKey });
     return result.map((r) => r.vector);
@@ -3362,10 +3486,7 @@ async function buildSkillHelpers(defaultDbPath = null) {
   return {
     apiKeys,                                   // raw map (read-only use; do NOT echo to renderer)
     aiProviders: aiProviders.listAvailableProviders(apiKeys),
-    embeddingProviders: [
-      ...(apiKeys.chatgpt || apiKeys.openai ? ['openai'] : []),
-      ...(apiKeys.huggingface ? ['huggingface'] : [])
-    ],
+    embeddingProviders: (apiKeys.chatgpt || apiKeys.openai) ? ['openai'] : [],
     connections,                               // [{ _id/id, name, dbType, dbCategory, dbConfig, ... }]
     getConnection: requireConnection,
     callAI,
@@ -3507,8 +3628,7 @@ ipcMain.handle('skills:execute', async (_event, { skillId, params }) => {
     let embeddingApiKey = params.embeddingApiKey;
     if (skillId === 'vector-db-executor' && !embeddingApiKey && params.embeddingProvider) {
       const apiKeys = helpers.apiKeys;
-      if (params.embeddingProvider === 'openai') embeddingApiKey = apiKeys.chatgpt;
-      else if (params.embeddingProvider === 'huggingface') embeddingApiKey = apiKeys.huggingface;
+      if (params.embeddingProvider === 'openai') embeddingApiKey = apiKeys.chatgpt || apiKeys.openai;
     }
 
     const enhancedParams = {
@@ -3761,7 +3881,6 @@ ipcMain.handle('dbconn:transform-nosql', async (_event, params) => {
 
 // SQL transformation handler (for PostgreSQL, MySQL, MSSQL, SQLite, CSV, Excel)
 ipcMain.handle('dbconn:transform-sql', async (_event, params) => {
-  console.log('params: ', params)
   return await nodeExecution.handleTransformSQL(params);
 });
 
@@ -3833,7 +3952,7 @@ ipcMain.handle('dbconn:execute-output', async (_event, sourceConnection, sourceT
  * `singleNode: true` and `trigger.type: 'node'` mark these rows for any reader
  * that wants to tell one node's run apart from a whole workflow's.
  */
-ipcMain.handle('workflow:executeNode', async (_event, { workflowId, nodeId, nodes, edges } = {}) => {
+ipcMain.handle('workflow:executeNode', async (_event, { workflowId, nodeId, nodes, edges, approvedRebuilds = [] } = {}) => {
   if (!nodeId || !Array.isArray(nodes)) {
     return { success: false, message: 'nodeId and nodes are required.' };
   }
@@ -3900,6 +4019,9 @@ ipcMain.handle('workflow:executeNode', async (_event, { workflowId, nodeId, node
       appSqliteDbPath,
       buildSkillHelpers,
       workflowId,
+      // Nodes whose kept target the user approved dropping and recreating for
+      // this run (the "Run this node" card). See joinTargetRebuildGate.
+      approvedRebuilds: Array.isArray(approvedRebuilds) ? approvedRebuilds : [],
     };
 
     let result = null;
@@ -3996,6 +4118,10 @@ ipcMain.handle('workflow:executeNode', async (_event, { workflowId, nodeId, node
       warning: !!result?.warning,
       recordsProcessed: succeeded ? recordsProcessed : 0,
       duration,
+      // Config the run learned and the node should now carry — a REST API
+      // source's columns after its first approved fetch. The editor merges it
+      // onto the node.
+      configPatch: succeeded ? (result?.configPatch || null) : null,
     };
   } catch (err) {
     // The record itself could not be kept up to date — the run is over either
@@ -4090,7 +4216,7 @@ ipcMain.handle('workflow:cancel', async (_event, { executionId } = {}) => {
   }
 });
 
-ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, nodes, edges, executionSteps }) => {
+ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, nodes, edges, executionSteps, approvedRebuilds = [] }) => {
   const executionsDb = getDb('executions');
   const startTime = new Date().toISOString();
 
@@ -4174,7 +4300,10 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       getDb,
       appSqliteDbPath,
       buildSkillHelpers,         // available for output / vector skill calls
-      workflowId                 // scopes local output per workflow/node
+      workflowId,                // scopes local output per workflow/node
+      // Approved in the Execute prompt — see joinTargetRebuildGate. A run
+      // started by a trigger passes none, so a pending rebuild refuses there.
+      approvedRebuilds: Array.isArray(approvedRebuilds) ? approvedRebuilds : [],
     };
 
     // Set when the user stopped the run — see cancelRequests above. Checked at
@@ -4489,7 +4618,13 @@ ipcMain.handle('workflow:execute', async (_event, { workflowId, workflowName, no
       success: true,
       executionId,
       message: 'Workflow executed successfully',
-      results: executionRecord.results
+      results: executionRecord.results,
+      // What the run learned about its nodes (a join whose target was
+      // recreated, a REST source's first fetch) — written back onto the
+      // canvas by the editor, same as a single-node run's configPatch.
+      configPatches: Object.fromEntries([...nodeResults.entries()]
+        .filter(([, r]) => r && r.success && r.configPatch && typeof r.configPatch === 'object')
+        .map(([id, r]) => [id, r.configPatch])),
     };
 
   } catch (error) {
@@ -5277,6 +5412,12 @@ function setupAutoUpdates() {
 }
 
 app.whenReady().then(async () => {
+  // The keyring is only resolved once the app is ready, so this is the first
+  // point it can be reported. basic_text means the fallback took over.
+  if (process.platform === 'linux') {
+    console.log(`[safeStorage] backend: ${secretStorageBackend()}`);
+  }
+
   // Initialize SQLite connection pool
   await initializeAppDatabase();
 
