@@ -18,10 +18,34 @@
  * If the bundled file is missing — a build made before the fetch script ran, or
  * a platform nobody packaged for — the network install is still tried, so the
  * feature degrades to "needs a connection once" rather than breaking.
+ *
+ * macOS DELIBERATELY ships none, and that fallback is the whole plan there.
+ * `mac.extraResources: []` in package.json keeps them out of the .app, because
+ * a notarized app cannot contain one:
+ *
+ *   - A DuckDB extension is a Mach-O dylib with DuckDB's metadata appended PAST
+ *     the end of the Mach-O structure. codesign rejects trailing data it cannot
+ *     account for ("main executable failed strict validation"), so the file
+ *     cannot carry a Developer ID signature.
+ *   - Stripping the trailer does let codesign sign it — and then DuckDB refuses
+ *     the result outright: "The file is not a DuckDB extension. The metadata at
+ *     the end of the file is..." `allow_unsigned_extensions` does not help,
+ *     because it is the METADATA in those bytes that is missing, not a
+ *     signature. The two requirements are mutually exclusive.
+ *   - Shipping it gzipped does not hide it either: Apple's notary service
+ *     unpacks archives and reported the path
+ *     `…/excel.duckdb_extension.gz/excel.duckdb_extension`, rejecting the
+ *     ad-hoc, linker-signed binary inside as unsigned and un-timestamped.
+ *
+ * Extensions installed at runtime land in userData, outside the app bundle,
+ * where none of this applies. Windows and Linux still bundle theirs — neither
+ * platform notarizes, and there the offline-first install is free.
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 
 /** node platform+arch → the platform string DuckDB names its builds with. */
 const DUCKDB_PLATFORMS = {
@@ -69,10 +93,65 @@ function bundleDir() {
   return candidates.find((dir) => fs.existsSync(dir)) || candidates[candidates.length - 1];
 }
 
-/** The bundled binary for one extension on one platform, if it is there. */
+/**
+ * Where a bundled extension is decompressed to before DuckDB installs it.
+ *
+ * Deliberately NOT the extension directory below: DuckDB owns that layout
+ * (`<version>/<platform>/…`) and dropping our own files into it invites a
+ * collision. A sibling directory keeps the staged copy clearly ours.
+ */
+function stagingDir() {
+  const dir = extensionDirectory();
+  if (dir) return path.join(path.dirname(dir), `${BUNDLE_DIRNAME}-staged`);
+  return path.join(os.tmpdir(), `${BUNDLE_DIRNAME}-staged`); // outside Electron
+}
+
+/**
+ * The bundled binary for one extension on one platform, if it is there.
+ *
+ * Ships gzipped (see scripts/fetch-duckdb-extensions.js): uncompressed, the
+ * file is a Mach-O dylib with DuckDB's 256-byte signature appended past the end
+ * of the Mach-O structure, and macOS codesign rejects that trailing data with
+ * "main executable failed strict validation" — which fails the whole mac build.
+ * Compressed, it is inert data nothing tries to sign.
+ *
+ * So the archive is expanded on first use and the expanded path returned.
+ * DuckDB needs a real file to INSTALL from either way; this only moves where
+ * that file comes into existence — from build time to first use.
+ */
 function bundledPath(platform, name) {
-  const file = path.join(bundleDir(), platform, `${name}.duckdb_extension`);
-  return fs.existsSync(file) ? file : null;
+  const dir = path.join(bundleDir(), platform);
+
+  // An uncompressed binary still wins if one is present — a working tree from
+  // before this change, or a platform staged by hand.
+  const plain = path.join(dir, `${name}.duckdb_extension`);
+  if (fs.existsSync(plain)) return plain;
+
+  const archive = path.join(dir, `${name}.duckdb_extension.gz`);
+  if (!fs.existsSync(archive)) return null;
+
+  const staged = path.join(stagingDir(), platform, `${name}.duckdb_extension`);
+  try {
+    // Re-use an earlier expansion, but only if it is no older than the archive:
+    // an app update ships new extensions under the same names.
+    if (fs.statSync(staged).mtimeMs >= fs.statSync(archive).mtimeMs) return staged;
+  } catch (_err) {
+    // not staged yet
+  }
+
+  fs.mkdirSync(path.dirname(staged), { recursive: true });
+  // Expand to a temporary name and rename into place. A crash or a full disk
+  // mid-write would otherwise leave a truncated binary that DuckDB refuses to
+  // load, and the mtime check above would happily hand it back forever.
+  const partial = `${staged}.${process.pid}.partial`;
+  try {
+    fs.writeFileSync(partial, zlib.gunzipSync(fs.readFileSync(archive)));
+    fs.renameSync(partial, staged);
+  } catch (err) {
+    fs.rmSync(partial, { force: true });
+    throw err;
+  }
+  return staged;
 }
 
 /**

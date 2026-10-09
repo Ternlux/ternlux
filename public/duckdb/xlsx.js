@@ -61,6 +61,35 @@ function listSheets(filePath) {
 }
 
 /**
+ * The used range of a sheet as { startCol, endCol, endRow } (letters, letters,
+ * 1-based row), or null when it cannot be read. `sheet` null means the first.
+ *
+ * Read with `sheetRows` so only a few rows are parsed; `!fullref` still carries
+ * the sheet's whole dimension. Used to tell DuckDB where a table starts when its
+ * header is not on row 1 (see readOptions.js).
+ */
+function usedRange(filePath, sheet = null) {
+  try {
+    // eslint-disable-next-line global-require
+    const XLSX = require('xlsx');
+    const name = sheet || listSheets(filePath)[0];
+    if (!name) return null;
+    const wb = XLSX.readFile(filePath, { sheets: [name], sheetRows: 2 });
+    const ws = wb.Sheets[name];
+    const ref = ws && (ws['!fullref'] || ws['!ref']);
+    if (!ref) return null;
+    const r = XLSX.utils.decode_range(ref);
+    return {
+      startCol: XLSX.utils.encode_col(r.s.c),
+      endCol: XLSX.utils.encode_col(r.e.c),
+      endRow: r.e.r + 1,
+    };
+  } catch (_err) {
+    return null;
+  }
+}
+
+/**
  * A cell value a spreadsheet can hold.
  *
  * Rows arrive from DuckDB already reduced to JSON-safe values, which still
@@ -258,6 +287,7 @@ function writeSheet(filePath, sheetName, rows, columns) {
 }
 
 module.exports = {
+  usedRange,
   LEGACY_EXTENSIONS,
   WORKBOOK_EXTENSIONS,
   isLegacyWorkbook,
