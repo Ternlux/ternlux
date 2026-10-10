@@ -48,6 +48,86 @@ const sanitizeIndexName = (name) => String(name || '')
   .replace(/--+/g, '-')          // Replace multiple hyphens with single
   .replace(/^-|-$/g, '');        // Remove leading/trailing hyphens
 
+/**
+ * Whether a record's metadata satisfies a Pinecone metadata filter — the same
+ * operators Pinecone evaluates server-side ($eq $ne $gt $gte $lt $lte $in $nin
+ * $exists $and $or, and a bare value meaning $eq). Used where records are
+ * enumerated by id (listing), which Pinecone cannot filter.
+ */
+function matchesPineconeFilter(metadata, filter) {
+  if (!filter || typeof filter !== 'object') return true;
+  return Object.entries(filter).every(([key, cond]) => {
+    if (key === '$and') return Array.isArray(cond) && cond.every((f) => matchesPineconeFilter(metadata, f));
+    if (key === '$or') return Array.isArray(cond) && cond.some((f) => matchesPineconeFilter(metadata, f));
+    const value = metadata[key];
+    const ops = (cond && typeof cond === 'object' && !Array.isArray(cond)) ? cond : { $eq: cond };
+    return Object.entries(ops).every(([op, target]) => {
+      switch (op) {
+        case '$eq': return Array.isArray(value) ? value.includes(target) : value === target;
+        case '$ne': return Array.isArray(value) ? !value.includes(target) : value !== target;
+        case '$gt': return typeof value === 'number' && value > target;
+        case '$gte': return typeof value === 'number' && value >= target;
+        case '$lt': return typeof value === 'number' && value < target;
+        case '$lte': return typeof value === 'number' && value <= target;
+        case '$in': return Array.isArray(target) && (Array.isArray(value) ? value.some((v) => target.includes(v)) : target.includes(value));
+        case '$nin': return Array.isArray(target) && (Array.isArray(value) ? !value.some((v) => target.includes(v)) : !target.includes(value));
+        case '$exists': return target ? value !== undefined : value === undefined;
+        default: return false; // an operator we do not know never matches
+      }
+    });
+  });
+}
+
+/**
+ * The metadata fields of a namespace, from a sample of its records: one column
+ * per key seen, typed from the first non-null value. Keys that only some
+ * records carry (a tag set on a few) are included. Returns [] when the
+ * namespace is empty or cannot be listed, and the caller falls back to a
+ * single JSON `metadata` column.
+ */
+async function sampleMetadataColumns(index, namespace, sampleSize = 50) {
+  try {
+    const ns = namespace ? index.namespace(namespace) : index;
+    const listFn = typeof ns.listPaginated === 'function'
+      ? ns.listPaginated.bind(ns)
+      : (typeof ns.list === 'function' ? ns.list.bind(ns) : null);
+    if (!listFn) return [];
+    const listed = await listFn({ limit: sampleSize });
+    const ids = (listed?.vectors || []).map((v) => v.id).filter(Boolean);
+    if (ids.length === 0) return [];
+    const fetched = await ns.fetch(ids);
+    const typeOf = (v) => {
+      if (typeof v === 'number') return 'DOUBLE';
+      if (typeof v === 'boolean') return 'BOOLEAN';
+      if (Array.isArray(v)) return 'LIST';
+      return 'TEXT';
+    };
+    const types = new Map();
+    for (const record of Object.values(fetched?.records || {})) {
+      for (const [key, value] of Object.entries(record?.metadata || {})) {
+        // The record's own columns are listed by the caller; a metadata field
+        // of the same name (a source row's `id`) would list twice.
+        if (key === 'id' || key === 'values' || key === 'namespace') continue;
+        if (value === null || value === undefined) {
+          if (!types.has(key)) types.set(key, null);
+        } else if (!types.get(key)) {
+          types.set(key, typeOf(value));
+        }
+      }
+    }
+    return [...types].map(([name, type]) => ({
+      name,
+      type: type || 'TEXT',
+      nullable: true,
+      isPrimary: false,
+      description: 'Metadata field',
+    }));
+  } catch (error) {
+    console.warn(`[pinecone] could not sample metadata fields: ${error.message}`);
+    return [];
+  }
+}
+
 module.exports = {
   type: 'connector',
   id: 'pinecone',
@@ -134,7 +214,9 @@ module.exports = {
               metadata: {
                 dimension: stats.dimension || indexInfo.dimension,
                 metric: indexInfo.metric,
-                vectorCount: namespaceStats.vectorCount || 0,
+                // SDK v3 reports `recordCount`; older builds `vectorCount`.
+                // Reading only the old name reported 0 for every namespace.
+                vectorCount: namespaceStats.recordCount ?? namespaceStats.vectorCount ?? 0,
                 pods: indexInfo.spec?.pod?.pods || 0,
                 replicas: indexInfo.spec?.pod?.replicas || 1,
                 podType: indexInfo.spec?.pod?.podType || 'p1.x1'
@@ -184,6 +266,14 @@ module.exports = {
       // Get index stats to find namespaces
       const stats = await index.describeIndexStats();
 
+      // The metadata FIELDS, sampled from the namespace — not one opaque
+      // `metadata` column. Joins and the JavaScript skill hand generated code
+      // each record with its metadata fields at top level, so that is the shape
+      // the builder (and the checker after it) must be shown. Listed as a single
+      // JSON column, the builder asked which key held a field and the checker
+      // "fixed" working `record.tier` code to `record.metadata.tier`.
+      const metadataColumns = await sampleMetadataColumns(index, schema);
+
       const columns = [
         {
           name: 'id',
@@ -192,19 +282,19 @@ module.exports = {
           isPrimary: true,
           description: 'Vector ID'
         },
+        ...(metadataColumns.length ? metadataColumns : [{
+          name: 'metadata',
+          type: 'JSON',
+          nullable: true,
+          isPrimary: false,
+          description: 'Vector metadata (no records to sample its fields from)'
+        }]),
         {
           name: 'values',
           type: 'VECTOR',
           nullable: false,
           isPrimary: false,
           description: `Vector embeddings (dimension: ${stats.dimension || 'unknown'})`
-        },
-        {
-          name: 'metadata',
-          type: 'JSON',
-          nullable: true,
-          isPrimary: false,
-          description: 'Vector metadata'
         },
         {
           name: 'namespace',
@@ -220,7 +310,7 @@ module.exports = {
         columns,
         metadata: {
           dimension: stats.dimension,
-          totalVectorCount: stats.totalVectorCount,
+          totalVectorCount: stats.totalRecordCount ?? stats.totalVectorCount,
           namespaces: Object.keys(stats.namespaces || {})
         }
       };
@@ -239,7 +329,8 @@ module.exports = {
    * @param {String} connectionId - Connection ID
    * @param {Object} queryObj - Query object with:
    *   - indexName: Index to query
-   *   - operation: 'query' | 'fetch' | 'delete' | 'upsert' | 'update'
+   *   - operation: 'list' | 'query' | 'fetch' | 'count' | 'delete' | 'upsert' | 'update'
+   *   - limit: Records to return for 'list' (default 10, at most 1000)
    *   - vector: Query vector for similarity search
    *   - topK: Number of results
    *   - namespace: Namespace to search
@@ -253,9 +344,13 @@ module.exports = {
       const { indexName, operation, namespace = '', ...params } = queryObj;
 
       if (!indexName) {
+        // Name what was expected and what arrived: a caller that sent `index`
+        // (as the chat assistant did) can correct itself from this message.
         return {
           success: false,
-          message: 'Index name is required'
+          message: 'Index name is required: pass "indexName" (got: '
+            + `${Object.keys(queryObj || {}).join(', ') || 'nothing'}). `
+            + 'Supported operations: list, query, fetch, count, upsert, update, delete.'
         };
       }
 
@@ -276,7 +371,7 @@ module.exports = {
           if (!queryVector || !Array.isArray(queryVector)) {
             return {
               success: false,
-              message: 'Query vector is required for similarity search'
+              message: 'Query vector is required for similarity search. To read records without a search vector, use operation "list" (with limit).'
             };
           }
 
@@ -309,6 +404,57 @@ module.exports = {
             rows,
             columns: ['id', 'score', 'values', 'metadata', 'namespace'],
             rowCount: rows.length
+          };
+        }
+
+        case 'list': {
+          // Browse records — no query vector, no ids. Without this there was
+          // no way to LOOK at a namespace: the chat tried 'fetch' with no ids
+          // and 'query' with no vector, both refused, and the builder's sample
+          // read (a SQL string to every non-LanceDB store) failed with "Index
+          // name is required". Values are left out: a sample is for reading
+          // fields, and a 1536-wide array per row is noise. Same enumeration
+          // the join executor uses (fetchAllVectors).
+          const res = await module.exports.fetchAllVectors(config, connectionId, {
+            indexName,
+            namespace,
+            filter: params.filter || {},
+            includeValues: false,
+            includeMetadata: true,
+            limit: Math.min(Math.max(Number(params.limit) || 10, 1), 1000),
+          });
+          if (!res.success) return res;
+          return {
+            success: true,
+            rows: res.rows,
+            columns: res.columns,
+            rowCount: res.rows.length,
+          };
+        }
+
+        case 'count': {
+          // Record count of the namespace (or the whole index when none is
+          // given), from the index stats — no records are read. Stats cannot
+          // be filtered by metadata on serverless indexes, so a filtered count
+          // is refused rather than answered with the unfiltered total.
+          if (params.filter && Object.keys(params.filter).length > 0) {
+            return {
+              success: false,
+              message: 'count does not take a metadata filter: Pinecone index stats only count a whole namespace.'
+            };
+          }
+          const stats = await index.describeIndexStats();
+          // SDK v3 reports `recordCount` / `totalRecordCount`; older ones
+          // `vectorCount` / `totalVectorCount`.
+          const nsStats = namespace ? stats.namespaces?.[namespace] : null;
+          const count = namespace
+            ? (nsStats?.recordCount ?? nsStats?.vectorCount ?? 0)
+            : (stats.totalRecordCount ?? stats.totalVectorCount ?? 0);
+          return {
+            success: true,
+            rows: [{ count }],
+            columns: ['count'],
+            rowCount: 1
           };
         }
 
@@ -414,7 +560,7 @@ module.exports = {
         default:
           return {
             success: false,
-            message: `Unknown operation: ${operation}. Supported: query, fetch, upsert, update, delete`
+            message: `Unknown operation: ${operation}. Supported: list, query, fetch, count, upsert, update, delete`
           };
       }
     } catch (error) {
@@ -495,6 +641,7 @@ module.exports = {
       // Pinecone doesn't have a direct "list all" API
       // Strategy: Use listPaginated if available in newer SDK, otherwise use query with pagination
       const allRecords = [];
+      const hasFilter = !!parsedFilter && typeof parsedFilter === 'object' && Object.keys(parsedFilter).length > 0;
 
       // SDK v3 names this `listPaginated`; other versions expose `list`. Probing
       // only for `list` sent every v3 install down the query fallback below,
@@ -523,6 +670,10 @@ module.exports = {
 
               if (fetchResult.records) {
                 Object.entries(fetchResult.records).forEach(([id, record]) => {
+                  // Listing cannot filter by metadata, so the filter is applied
+                  // here. Without it a "price over 100" update matched every
+                  // record in the namespace and changed all of them.
+                  if (hasFilter && !matchesPineconeFilter(record.metadata || {}, parsedFilter)) return;
                   allRecords.push({
                     id,
                     values: includeValues ? record.values : null,
@@ -937,7 +1088,6 @@ module.exports = {
         includeValues = true,
         includeMetadata = true
       } = params;
-      console.log('params: ', params)
       // Parse filter if it's a string
       let parsedFilter = filter;
       if (typeof filter === 'string') {
