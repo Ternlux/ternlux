@@ -74,12 +74,35 @@ module.exports = {
   name: 'PostgreSQL',
   icon: './icon.svg',
   dbCategory: 'SQL',
+  // How a join may write "update the rows that match, insert the rest" here
+  // (join write mode "merge"). Read by the join builder and shown to the model
+  // that writes the statement; nothing here is executed.
+  mergeSupport: {
+    statements: ['MERGE', 'INSERT … ON CONFLICT … DO UPDATE'],
+    guidance: 'Prefer MERGE INTO {{TARGET}} AS t USING (<the joined SELECT>) AS s ON t.<key> = s.<key> '
+      + 'WHEN MATCHED THEN UPDATE SET <col> = s.<col>, … WHEN NOT MATCHED THEN INSERT (<cols>) VALUES (s.<cols>) '
+      + '(PostgreSQL 15+). INSERT INTO {{TARGET}} (<cols>) SELECT … ON CONFLICT (<key>) DO UPDATE SET <col> = EXCLUDED.<col> '
+      + 'also works, but only when the key has a PRIMARY KEY or UNIQUE constraint — declare it in targetDdl.',
+  },
 
   /**
    * Column types for a CREATE TABLE this app generates. See the note on
    * `types` in plugins/connectors/snowflake/index.js — the caller decides what
    * a column HOLDS, this decides what it is called here.
    */
+  /**
+   * Why this engine cannot create a column with this name, or null. Checked
+   * before an Output creates a table, so a name the engine would refuse (or
+   * silently shorten) fails with the column named and the fix, not with
+   * whatever the CREATE happens to say.
+   */
+  columnNameProblem: (name) => {
+    // 63 BYTES, not characters — and a longer name is not refused but cut,
+    // so the column would silently get a different name.
+    const n = Buffer.byteLength(String(name), 'utf8');
+    return n > 63 ? `is ${n} bytes long; Postgres keeps only the first 63 and would rename it` : null;
+  },
+
   types: {
     NULL: () => 'TEXT',
     DATE_ONLY: () => 'DATE',
@@ -91,6 +114,39 @@ module.exports = {
     // Past 255 characters an unbounded TEXT is cheaper to live with than a
     // VARCHAR(n) guessed from a sample — Postgres stores them identically.
     STRING: (maxLen) => (maxLen > 255 ? 'TEXT' : `VARCHAR(${varcharFor(maxLen)})`),
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js. A missing key falls back
+    // (BIGINT → INTEGER, DOUBLE → FLOAT, …).
+    BIGINT: () => 'BIGINT',
+    // Unconstrained NUMERIC when the source gave no precision: it holds any
+    // exact value, which is the point of copying an exact type.
+    DECIMAL: (p, s) => (p ? `NUMERIC(${Math.min(p, 1000)},${s || 0})` : 'NUMERIC'),
+    TIMESTAMPTZ: () => 'TIMESTAMPTZ',
+    TIME: () => 'TIME',
+  },
+
+  /**
+   * This engine's type for a column (a getColumns entry) as a canonical type —
+   * what an Output writing a copy of this table elsewhere builds its column
+   * from. See public/NodeExecution/columnTypes.js for the kinds. null leaves
+   * the column to be guessed from its values.
+   */
+  toCanonicalType: (column) => {
+    const t = String(column?.type || '').toLowerCase();
+    if (t === 'smallint' || t === 'integer') return { kind: 'INTEGER' };
+    if (t === 'bigint') return { kind: 'BIGINT' };
+    if (t === 'real' || t === 'double precision') return { kind: 'DOUBLE' };
+    if (t === 'numeric' || t === 'money') {
+      return { kind: 'DECIMAL', precision: column.precision ?? null, scale: column.scale ?? null };
+    }
+    if (t === 'boolean') return { kind: 'BOOLEAN' };
+    if (t === 'date') return { kind: 'DATE_ONLY' };
+    if (t === 'timestamp with time zone') return { kind: 'TIMESTAMPTZ' };
+    if (t === 'timestamp without time zone') return { kind: 'TIMESTAMP' };
+    if (t.startsWith('time')) return { kind: 'TIME' };
+    if (t === 'json' || t === 'jsonb' || t === 'array') return { kind: 'OBJECT' };
+    // character varying, character, text, uuid, user-defined (enums), bytea…
+    return { kind: 'STRING', length: column?.maxLength ?? null };
   },
 
   /**
@@ -123,9 +179,18 @@ module.exports = {
         WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
         ORDER BY table_schema, table_name
       `);
+      // Every schema this login can use, empty ones included — the explorer
+      // builds its tree from this list as well as from the tables.
+      const schemaResult = await pool.query(`
+        SELECT nspname AS name FROM pg_namespace
+        WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'
+          AND has_schema_privilege(nspname, 'USAGE')
+        ORDER BY nspname
+      `);
 
       return {
         success: true,
+        schemas: schemaResult.rows.map((row) => row.name),
         tables: result.rows.map(row => ({
           schema: row.schema,
           name: row.name,
@@ -165,6 +230,8 @@ module.exports = {
       const result = await pool.query(`
       SELECT c.column_name AS name, c.data_type AS type,
       c.is_nullable AS nullable,
+      c.character_maximum_length AS max_length,
+      c.numeric_precision AS precision, c.numeric_scale AS scale,
       CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END AS "isPrimary"
 FROM information_schema.columns c
 LEFT JOIN (
@@ -186,8 +253,14 @@ ORDER BY c.ordinal_position
           name: row.name,
           type: row.type,
           nullable: row.nullable === 'YES',
-          isPrimary: row.is_primary,
-          defaultValue: row.default_value
+          // The query aliases it "isPrimary" (quoted, so the case is kept).
+          isPrimary: row.isPrimary === true,
+          defaultValue: row.default_value,
+          // Size and precision, so a copy elsewhere can keep them (see
+          // toCanonicalType). null where the type has none.
+          maxLength: row.max_length,
+          precision: row.precision,
+          scale: row.scale,
         }))
       };
     } catch (error) {
@@ -243,7 +316,12 @@ ORDER BY c.ordinal_position
     return new Promise((resolve) => {
       let cursor;
       try {
-        cursor = client.query(new Cursor(sqlQuery));
+        // rowsAsArrays: the Data Explorer asks for array rows so two result
+        // columns with the same name (SELECT 1 AS x, 2 AS x) don't collapse
+        // into one object key; it names the duplicates itself.
+        cursor = client.query(options.rowsAsArrays
+          ? new Cursor(sqlQuery, null, { rowMode: 'array' })
+          : new Cursor(sqlQuery));
       } catch (error) {
         client.release();
         resolve(queryError(error));
@@ -270,6 +348,7 @@ ORDER BY c.ordinal_position
           // its command tag is the only count there is, so report that.
           rowCount: capped.length || (result && result.rowCount) || 0,
           truncated: all.length > maxRows,
+          ...(options.rowsAsArrays ? { rowsAreArrays: true } : {}),
         });
       });
     });
@@ -384,7 +463,9 @@ ORDER BY c.ordinal_position
           // temp_datasource_x, and the load failed with `relation does not
           // exist` after reading every row of the source.
           const insertSql = `INSERT INTO ${module.exports.quoteIdentifier(tableName)} `
-            + `(${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+            // Columns quoted one by one — bare, a column called `order` or
+            // `first name` was a syntax error, and a capital was folded away.
+            + `(${columns.map((c) => module.exports.quoteColumn(c)).join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
 
           // Flatten all values into a single array
           const allValues = slice.flatMap(row =>
@@ -415,6 +496,38 @@ ORDER BY c.ordinal_position
       }
     } catch (error) {
       return queryError(error);
+    }
+  },
+
+  /**
+   * Run several statements as ONE transaction on one connection: all of them
+   * land, or none do.
+   *
+   * runQuery takes a pooled connection per call, so two calls are two
+   * transactions and a failure in the second cannot undo the first. A
+   * truncate-and-load that has to replace a table's contents without ever
+   * leaving it empty needs the delete and the insert committed together — this
+   * is that primitive. Returns { success, message } like runQuery; on failure
+   * the transaction has been rolled back.
+   */
+  runInTransaction: async (config, connectionId, statements) => {
+    let client;
+    try {
+      const pool = await getPool(config, connectionId);
+      client = await pool.connect();
+    } catch (error) {
+      return queryError(error);
+    }
+    try {
+      await client.query('BEGIN');
+      for (const sql of statements) await client.query(sql);
+      await client.query('COMMIT');
+      return { success: true };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return queryError(error);
+    } finally {
+      client.release();
     }
   },
 
@@ -725,6 +838,18 @@ ORDER BY c.ordinal_position
    * @param {object} config - Database configuration (not used for PostgreSQL)
    * @returns {string} Properly quoted identifier
    */
+  /**
+   * Quote ONE column name, whatever characters it holds.
+   *
+   * quoteIdentifier is for TABLE references and reads a dot as a qualifier
+   * ("public.orders" → schema public, table orders). A column is never
+   * qualified, so a name like "e.mail" has to stay one identifier — handing it
+   * to quoteIdentifier produced "e"."mail" and every CREATE / INSERT that
+   * carried it failed. Spaces, reserved words, unicode and emoji are covered by
+   * the quoting itself.
+   */
+  quoteColumn: (name) => `"${String(name).replace(/"/g, '""')}"`,
+
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
     // Already quoted — hand it back untouched. Callers pass identifiers that
@@ -777,6 +902,9 @@ ORDER BY c.ordinal_position
    * distinctly PostgreSQL belongs here.
    */
   explorer: {
+    // runQuery returns array rows on request ({ rowsAsArrays }), so the explorer
+    // can keep same-named result columns apart.
+    rowsAsArrays: true,
     language: 'sql',
     sqlDialect: 'PostgreSQL',
     formatter: 'postgresql',
