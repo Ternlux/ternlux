@@ -95,6 +95,17 @@ module.exports = {
    * names — is accepted and silently means VARCHAR(256), truncating every
    * longer value on load. Every string here carries an explicit length.
    */
+  /**
+   * Why this engine cannot create a column with this name, or null. Checked
+   * before an Output creates a table, so a name the engine would refuse (or
+   * silently shorten) fails with the column named and the fix, not with
+   * whatever the CREATE happens to say.
+   */
+  columnNameProblem: (name) => {
+    const n = Buffer.byteLength(String(name), 'utf8');
+    return n > 127 ? `is ${n} bytes long; Redshift allows at most 127` : null;
+  },
+
   types: {
     NULL: () => 'VARCHAR(65535)',
     DATE_ONLY: () => 'DATE',
@@ -106,6 +117,11 @@ module.exports = {
     FLOAT: () => 'DOUBLE PRECISION',
     OBJECT: () => 'VARCHAR(65535)',
     STRING: (maxLen) => (maxLen > 255 ? 'VARCHAR(65535)' : `VARCHAR(${varcharFor(maxLen)})`),
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js.
+    DECIMAL: (p, s) => (p && p <= 38 ? `DECIMAL(${p},${s || 0})` : null),
+    TIMESTAMPTZ: () => 'TIMESTAMPTZ',
+    TIME: () => 'TIME',
   },
 
   /**
