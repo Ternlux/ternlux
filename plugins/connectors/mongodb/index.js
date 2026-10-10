@@ -339,6 +339,25 @@ const queryError = (error) => ({
   codeName: error.codeName,
 });
 
+// A schema scan reads at most this many documents, for at most this long.
+const SCHEMA_SCAN_LIMIT = 1000000;
+const SCHEMA_SCAN_MS = 120000;
+
+/** The BSON type name for a JS value — the fallback when the scan cannot run. */
+function jsBsonType(v) {
+  if (v === null || v === undefined) return 'null';
+  if (v instanceof Date) return 'date';
+  if (Array.isArray(v)) return 'array';
+  if (typeof v === 'boolean') return 'bool';
+  if (typeof v === 'number') return Number.isInteger(v) ? 'int' : 'double';
+  if (typeof v === 'string') return 'string';
+  if (v && v._bsontype === 'ObjectId') return 'objectId';
+  if (v && v._bsontype === 'Long') return 'long';
+  if (v && v._bsontype === 'Decimal128') return 'decimal';
+  if (typeof v === 'object') return 'object';
+  return 'string';
+}
+
 module.exports = {
   type: 'connector',
   id: 'mongodb',
@@ -442,26 +461,143 @@ module.exports = {
 
       const coll = db.collection(table);
 
-      const docs = await coll
-        .find({})
-        .limit(100)
-        .toArray();
+      // Field ORDER comes from the first documents (the $group below has
+      // none); every field the scan finds that they lack follows, A→Z.
+      const firstDocs = await coll.find({}).limit(100).toArray();
+      const order = [];
+      firstDocs.forEach((doc) => Object.keys(doc).forEach((k) => { if (!order.includes(k)) order.push(k); }));
 
-      const fields = new Set();
-      docs.forEach(doc => {
-        Object.keys(doc).forEach(key => fields.add(key));
+      // The schema is computed BY MongoDB, over the collection: one row per
+      // (field, BSON type) with its count. Nothing but those rows comes back,
+      // so the cost here does not grow with the collection — and a field that
+      // first appears on document 6,000, or holds a number in some documents
+      // and text in others, is seen. It used to be the keys of the first 100
+      // documents, every one typed 'mixed'.
+      //
+      // Past SCHEMA_SCAN_LIMIT documents only that many are scanned, and the
+      // columns say so (`scannedDocuments`, `sampled`), rather than a schema
+      // scan quietly taking minutes on a very large collection.
+      let types = null;
+      let total = null;
+      try {
+        total = await coll.estimatedDocumentCount();
+        const pipeline = [
+          ...(total > SCHEMA_SCAN_LIMIT ? [{ $limit: SCHEMA_SCAN_LIMIT }] : []),
+          { $project: { kv: { $objectToArray: '$$ROOT' } } },
+          { $unwind: '$kv' },
+          { $group: { _id: { k: '$kv.k', t: { $type: '$kv.v' } }, n: { $sum: 1 } } },
+        ];
+        types = await coll.aggregate(pipeline, { allowDiskUse: true, maxTimeMS: SCHEMA_SCAN_MS }).toArray();
+      } catch (scanError) {
+        console.log(`[mongodb] Schema scan of ${table} failed (${scanError.message}) — using its first documents`);
+        types = null;
+      }
+
+      const byField = new Map();
+      if (types) {
+        for (const row of types) {
+          const k = row._id.k;
+          if (!byField.has(k)) byField.set(k, {});
+          byField.get(k)[row._id.t] = row.n;
+        }
+      } else {
+        // Fallback: the first documents, their JS types.
+        firstDocs.forEach((doc) => Object.entries(doc).forEach(([k, v]) => {
+          if (!byField.has(k)) byField.set(k, {});
+          const t = jsBsonType(v);
+          byField.get(k)[t] = (byField.get(k)[t] || 0) + 1;
+        }));
+      }
+      const names = [
+        ...order.filter((k) => byField.has(k)),
+        ...[...byField.keys()].filter((k) => !order.includes(k)).sort(),
+      ];
+      const scanned = types ? Math.min(total ?? 0, SCHEMA_SCAN_LIMIT) : firstDocs.length;
+      const sampled = types ? (total ?? 0) > SCHEMA_SCAN_LIMIT : true;
+
+      const columns = names.map((field) => {
+        const bsonTypes = byField.get(field);
+        const present = Object.keys(bsonTypes).filter((t) => t !== 'null');
+        const seen = Object.values(bsonTypes).reduce((a, b) => a + b, 0);
+        return {
+          name: field,
+          // One BSON type, or 'mixed' when the documents disagree.
+          type: present.length === 1 ? present[0] : (present.length === 0 ? 'null' : 'mixed'),
+          bsonTypes,
+          // Missing from some documents, or null in some.
+          nullable: (bsonTypes.null || 0) > 0 || seen < scanned ? 'YES' : 'NO',
+          isPrimary: field === '_id',
+          scannedDocuments: scanned,
+          sampled,
+        };
       });
-
-      const columns = Array.from(fields).map(field => ({
-        name: field,
-        type: 'mixed',
-        nullable: 'YES',
-        isPrimary: field === '_id'
-      }));
 
       return { success: true, columns };
     } catch (error) {
       return { success: false, message: error.message, columns: [] };
+    }
+  },
+
+  /**
+   * A field's BSON types (a getColumns entry) as a canonical type — see
+   * public/NodeExecution/columnTypes.js. A field whose documents disagree
+   * takes the type that holds every value: int + long → BIGINT, any number
+   * with a double → DOUBLE, anything else mixed → text.
+   */
+  toCanonicalType: (column) => {
+    const present = Object.keys(column?.bsonTypes || {}).filter((t) => t !== 'null' && t !== 'undefined');
+    if (present.length === 0) return { kind: 'NULL' };
+    const set = new Set(present);
+    const only = (...allowed) => present.every((t) => allowed.includes(t));
+    if (only('int')) return { kind: 'INTEGER' };
+    if (only('int', 'long')) return { kind: 'BIGINT' };
+    if (only('int', 'long', 'decimal') && set.has('decimal')) return { kind: 'DECIMAL', precision: null, scale: null };
+    if (only('int', 'long', 'double', 'decimal')) return { kind: 'DOUBLE' };
+    if (only('bool')) return { kind: 'BOOLEAN' };
+    // A BSON date is an instant (UTC); a BSON timestamp is too.
+    if (only('date', 'timestamp')) return { kind: 'TIMESTAMPTZ' };
+    if (only('object', 'array')) return { kind: 'OBJECT' };
+    // string, objectId, binData, regex… and every mixed case.
+    return { kind: 'STRING', length: null };
+  },
+
+  /**
+   * Stream a find, a batch at a time — the contract every SQL connector's
+   * streamQuery has (see public/lib/pluginRowStream.js): `onBatch` is awaited
+   * before the cursor reads on, and a rejected `onBatch` stops the read and
+   * closes the cursor. `query` is a JSON string, `{ collection, filter,
+   * database? }`, since this connector does not speak SQL.
+   *
+   * An Output used to read a whole collection into one array before writing a
+   * row of it; now at most one batch is in memory.
+   */
+  streamQuery: async (config, connectionId, query, onBatch, batchSize = 1000) => {
+    let cursor = null;
+    try {
+      const params = typeof query === 'string' ? JSON.parse(query) : (query || {});
+      if (!params.collection) return { success: false, message: 'A stream needs a collection' };
+      const connection = await getConnection(config, connectionId);
+      const db = params.database ? connection.useDb(params.database).db : connection.db;
+      cursor = db.collection(params.collection).find(params.filter || {}).batchSize(batchSize);
+      let batch = [];
+      let totalRows = 0;
+      for await (const doc of cursor) {
+        batch.push(doc);
+        if (batch.length >= batchSize) {
+          totalRows += batch.length;
+          await onBatch(batch);
+          batch = [];
+        }
+      }
+      if (batch.length > 0) {
+        totalRows += batch.length;
+        await onBatch(batch);
+      }
+      return { success: true, totalRows };
+    } catch (error) {
+      return { success: false, message: error.message };
+    } finally {
+      if (cursor) await cursor.close().catch(() => {});
     }
   },
 
