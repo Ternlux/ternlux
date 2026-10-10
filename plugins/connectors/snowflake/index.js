@@ -301,6 +301,13 @@ module.exports = {
   name: 'Snowflake',
   icon: './icon.svg',
   dbCategory: 'SQL',
+  // See postgres: how a join may merge into this database (write mode "merge").
+  mergeSupport: {
+    statements: ['MERGE'],
+    guidance: 'MERGE INTO {{TARGET}} t USING (<the joined SELECT>) s ON t.<key> = s.<key> '
+      + 'WHEN MATCHED THEN UPDATE SET <col> = s.<col>, … WHEN NOT MATCHED THEN INSERT (<cols>) VALUES (s.<cols>). '
+      + 'Each target row may match at most one source row — de-duplicate the source on the key first.',
+  },
 
   /**
    * Column types for a CREATE TABLE this app generates.
@@ -313,6 +320,17 @@ module.exports = {
    * because REAL and TEXT happen to be aliases on this engine; a boolean column
    * would have landed as INTEGER and a timestamp as a string.
    */
+  /**
+   * Why this engine cannot create a column with this name, or null. Checked
+   * before an Output creates a table, so a name the engine would refuse (or
+   * silently shorten) fails with the column named and the fix, not with
+   * whatever the CREATE happens to say.
+   */
+  columnNameProblem: (name) => {
+    const n = [...String(name)].length;
+    return n > 255 ? `is ${n} characters long; Snowflake allows at most 255` : null;
+  },
+
   types: {
     NULL: () => 'VARCHAR',
     DATE_ONLY: () => 'DATE',
@@ -328,6 +346,39 @@ module.exports = {
     OBJECT: () => 'VARIANT',
     // VARCHAR with no length is the full 16MB here, so there is nothing to size.
     STRING: () => 'VARCHAR',
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js.
+    DECIMAL: (p, s) => (p && p <= 38 ? `NUMBER(${p},${s || 0})` : null),
+    TIMESTAMPTZ: () => 'TIMESTAMP_TZ',
+    TIME: () => 'TIME',
+  },
+
+  /**
+   * This engine's type for a column (a getColumns entry) as a canonical type —
+   * what an Output writing a copy of this table elsewhere builds its column
+   * from. See public/NodeExecution/columnTypes.js for the kinds. null leaves
+   * the column to be guessed from its values.
+   */
+  toCanonicalType: (column) => {
+    const t = String(column?.type || '').toUpperCase();
+    if (t === 'NUMBER' || t === 'DECIMAL' || t === 'NUMERIC') {
+      const p = column.precision ?? 38;
+      const s = column.scale ?? 0;
+      // A whole number that fits 64 bits reads better as BIGINT elsewhere;
+      // NUMBER(38,0) — Snowflake's INTEGER — can exceed it, so stays exact.
+      if (s === 0 && p <= 18) return { kind: 'BIGINT' };
+      return { kind: 'DECIMAL', precision: p, scale: s };
+    }
+    if (t === 'FLOAT' || t === 'DOUBLE' || t === 'REAL') return { kind: 'DOUBLE' };
+    if (t === 'BOOLEAN') return { kind: 'BOOLEAN' };
+    if (t === 'DATE') return { kind: 'DATE_ONLY' };
+    if (t === 'TIMESTAMP_TZ' || t === 'TIMESTAMP_LTZ') return { kind: 'TIMESTAMPTZ' };
+    if (t.startsWith('TIMESTAMP')) return { kind: 'TIMESTAMP' };
+    if (t === 'TIME') return { kind: 'TIME' };
+    if (t === 'VARIANT' || t === 'OBJECT' || t === 'ARRAY') return { kind: 'OBJECT' };
+    // TEXT's default length is the 16MB maximum — that is no length at all.
+    const len = Number(column?.maxLength);
+    return { kind: 'STRING', length: len > 0 && len < 16777216 ? len : null };
   },
 
   /**
@@ -439,9 +490,15 @@ module.exports = {
         FROM "${database}".INFORMATION_SCHEMA.TABLES
         ORDER BY table_schema, table_name
       `, []));
+      // Every schema, not just those holding a table — a fresh database's
+      // PUBLIC is empty, and the explorer builds its tree from this list.
+      const { rows: schemaRows } = await withReadRetry(config, connectionId, (connection) => executeAsync(connection, `
+        SELECT schema_name AS name FROM "${database}".INFORMATION_SCHEMA.SCHEMATA ORDER BY schema_name
+      `, []));
 
       return {
         success: true,
+        schemas: schemaRows.map((row) => row.NAME),
         tables: rows.map(row => ({
           schema: row.SCHEMA,
           name: row.NAME,
@@ -484,7 +541,10 @@ module.exports = {
           column_name AS name,
           data_type AS type,
           is_nullable AS nullable,
-          column_default AS default_value
+          column_default AS default_value,
+          character_maximum_length AS max_length,
+          numeric_precision AS precision,
+          numeric_scale AS scale
         FROM "${database}".INFORMATION_SCHEMA.COLUMNS
         WHERE table_schema = ? AND table_name = ?
         ORDER BY ordinal_position
@@ -497,7 +557,10 @@ module.exports = {
           type: row.TYPE,
           nullable: row.NULLABLE === 'YES',
           isPrimary: false, // Snowflake doesn't enforce primary keys by default
-          defaultValue: row.DEFAULT_VALUE
+          defaultValue: row.DEFAULT_VALUE,
+          maxLength: row.MAX_LENGTH,
+          precision: row.PRECISION,
+          scale: row.SCALE,
         }))
       };
     } catch (error) {
@@ -542,6 +605,8 @@ module.exports = {
         connection.execute({
           sqlText: sqlQuery,
           streamResult: true,
+          // rowsAsArrays: see the PostgreSQL connector.
+          ...(options.rowsAsArrays ? { rowMode: 'array' } : {}),
           complete: (err, stmt) => {
             if (err) {
               resolve(queryError(err));
@@ -560,6 +625,7 @@ module.exports = {
               columns,
               rowCount: Math.min(rows.length, maxRows),
               truncated: rows.length > maxRows,
+              ...(options.rowsAsArrays ? { rowsAreArrays: true } : {}),
             }));
           }
         });
@@ -702,6 +768,32 @@ module.exports = {
       // Writes and arbitrary SQL never retry — re-running a statement to work
       // around a dead connection is how an INSERT gets applied twice. Forget the
       // terminated connection so the NEXT call reconnects, and report this one.
+      evictIfDead(config, connectionId, error);
+      return queryError(error);
+    }
+  },
+
+  /**
+   * Run several statements as ONE transaction: all of them land, or none do.
+   * See the PostgreSQL connector's note — the same contract. Same connection
+   * handling as batchInsert. DML only: Snowflake commits DDL (TRUNCATE
+   * included) implicitly, which would end the transaction early.
+   */
+  runInTransaction: async (config, connectionId, statements) => {
+    let connection;
+    try {
+      connection = await acquire(config, connectionId);
+      await executeAsync(connection, 'BEGIN TRANSACTION');
+    } catch (error) {
+      evictIfDead(config, connectionId, error);
+      return queryError(error);
+    }
+    try {
+      for (const sql of statements) await executeAsync(connection, sql);
+      await executeAsync(connection, 'COMMIT');
+      return { success: true };
+    } catch (error) {
+      await executeAsync(connection, 'ROLLBACK').catch(() => {});
       evictIfDead(config, connectionId, error);
       return queryError(error);
     }
@@ -1020,6 +1112,18 @@ module.exports = {
    * @param {object} config - Database configuration (not used for Snowflake)
    * @returns {string} Properly quoted identifier
    */
+  /**
+   * Quote ONE column name, whatever characters it holds.
+   *
+   * quoteIdentifier is for TABLE references and reads a dot as a qualifier
+   * ("public.orders" → schema public, table orders). A column is never
+   * qualified, so a name like "e.mail" has to stay one identifier — handing it
+   * to quoteIdentifier produced "e"."mail" and every CREATE / INSERT that
+   * carried it failed. Spaces, reserved words, unicode and emoji are covered by
+   * the quoting itself.
+   */
+  quoteColumn: (name) => `"${String(name).replace(/"/g, '""')}"`,
+
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
     // Already quoted — hand it back untouched. Callers pass identifiers that
@@ -1062,6 +1166,9 @@ module.exports = {
    * distinctly Snowflake belongs here.
    */
   explorer: {
+    // runQuery returns array rows on request ({ rowsAsArrays }), so the explorer
+    // can keep same-named result columns apart.
+    rowsAsArrays: true,
     language: 'sql',
     sqlDialect: 'Snowflake',
     formatter: 'snowflake',
