@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Form, Input, Button, Space, message, Upload, Card, Typography, Progress } from 'antd';
+import { Form, Input, InputNumber, Button, Space, message, Upload, Card, Typography, Progress } from 'antd';
 import {
   InboxOutlined,
   FileTextOutlined,
@@ -67,6 +67,17 @@ const LocalFileConnectionForm = ({
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   // Live counters from the streaming import in the main process.
   const [importStatus, setImportStatus] = useState(null);
+
+  // A workbook being edited gets one Header row per sheet: a title above one
+  // sheet's header says nothing about the others, and a single file-wide row
+  // would cut the first row off every sheet that has none. A new upload has
+  // no sheets yet — it gets the single field, and a sheet that needs its own
+  // row is flagged when it is added.
+  const editingSheets = [...new Set(Object.values(editingConnection?.fileInfo?.tableSheets || {}))];
+  const sheetHeaderRows = (values) => {
+    if (fileType !== 'spreadsheet' || editingSheets.length === 0) return null;
+    return Object.fromEntries(editingSheets.map((sheet) => [sheet, Number(values.headerRows?.[sheet]) || 1]));
+  };
 
   // Initialize form with editing data
   React.useEffect(() => {
@@ -330,7 +341,12 @@ const LocalFileConnectionForm = ({
 
         let result;
         try {
-          result = await window.electronAPI.registerLocalFile({ filePath, importId });
+          // The header row is saved before the file is described, so the
+          // columns recorded for it are read from the right row.
+          const headerRow = fileType === 'spreadsheet' ? (Number(values.headerRow) || 1) : 1;
+          result = await window.electronAPI.registerLocalFile({
+            filePath, importId, headerRow, headerRows: sheetHeaderRows(values),
+          });
         } finally {
           unsubscribe();
         }
@@ -353,6 +369,10 @@ const LocalFileConnectionForm = ({
         const sheeted = result.tables.filter((t) => t.sheet);
         tableSheets = sheeted.length ? Object.fromEntries(sheeted.map((t) => [t.name, t.sheet])) : null;
         schemas = result.tables.map((t) => t.schema).filter(Boolean);
+
+        // A sheet that looks like it has a title above its header: say so, with
+        // the fix, rather than let it load with columns missing.
+        result.tables.filter((t) => t.warning).forEach((t) => message.warning(t.warning, 10));
 
         if (result.tables.length > 1) {
           message.success(
@@ -429,6 +449,10 @@ const LocalFileConnectionForm = ({
           tablePaths, // table name -> path, when a connection spans several files
           tableSheets, // table name -> sheet, for a multi-sheet workbook
           schemas: schemas, // Schema(s) reported by DuckDB
+          // Row the header is on (1 = first). Applied by the reader itself —
+          // see public/duckdb/readOptions.js — recorded here so the form shows it.
+          ...(fileType === 'spreadsheet' ? { headerRow: Number(values.headerRow) || 1 } : {}),
+          ...(sheetHeaderRows(values) ? { headerRows: sheetHeaderRows(values) } : {}),
         },
         status: 'ready',
         createdAt: editingConnection?.createdAt || new Date().toISOString(),
@@ -483,9 +507,9 @@ const LocalFileConnectionForm = ({
       duckdb: 'Connect to an existing DuckDB database file on your computer',
       lancedb: 'Connect to a local LanceDB vector database directory',
       json: 'Add a JSON file — queried where it is, no import step',
-      spreadsheet: 'Upload a CSV or Excel file to import into a local SQLite database',
-      parquet: 'Upload a Parquet file to import into a local SQLite database',
-      avro: 'Upload an Avro file to import into a local SQLite database'
+      spreadsheet: 'Add a CSV or Excel file — queried where it is, no import step',
+      parquet: 'Add a Parquet file — queried where it is, no import step',
+      avro: 'Add an Avro file — queried where it is, no import step'
     };
     return descriptions[fileType] || 'Select a file to use as a data source';
   };
@@ -495,10 +519,10 @@ const LocalFileConnectionForm = ({
       sqlite: 'Click or drag SQLite database file to this area',
       duckdb: 'Click or drag DuckDB database file to this area',
       lancedb: 'Click to select LanceDB directory (contains .lance table folders)',
-      json: 'Click or drag JSON file to this area to import',
-      spreadsheet: 'Click or drag CSV or Excel file to this area to import',
-      parquet: 'Click or drag Parquet file to this area to import',
-      avro: 'Click or drag Avro file to this area to import'
+      json: 'Click or drag a JSON file to this area',
+      spreadsheet: 'Click or drag a CSV or Excel file to this area',
+      parquet: 'Click or drag a Parquet file to this area',
+      avro: 'Click or drag an Avro file to this area'
     };
     return texts[fileType] || 'Click or drag file to this area';
   };
@@ -586,6 +610,29 @@ const LocalFileConnectionForm = ({
             disabled={uploading}
           />
         </Form.Item>
+
+        {fileType === 'spreadsheet' && editingSheets.length > 0 && editingSheets.map((sheet) => (
+          <Form.Item
+            key={sheet}
+            name={['headerRows', sheet]}
+            label={`Header row — ${sheet}`}
+            initialValue={editingConnection?.fileInfo?.headerRows?.[sheet] || 1}
+            help="The row that holds this sheet's column names. Set it when the sheet has a title or notes above the header (e.g. 2 when row 1 is a title)."
+          >
+            <InputNumber min={1} max={1000} disabled={uploading} />
+          </Form.Item>
+        ))}
+
+        {fileType === 'spreadsheet' && editingSheets.length === 0 && (
+          <Form.Item
+            name="headerRow"
+            label="Header row"
+            initialValue={editingConnection?.fileInfo?.headerRow || 1}
+            help="The row that holds the column names. Set it when the sheet has a title or notes above the header (e.g. 2 when row 1 is a title)."
+          >
+            <InputNumber min={1} max={1000} disabled={uploading} />
+          </Form.Item>
+        )}
 
         <Form.Item
           name="description"

@@ -3,6 +3,7 @@ import { Form, Input, InputNumber, Switch, Button, Space, message, Alert, Select
 import { LinkOutlined, CheckCircleOutlined } from '@ant-design/icons';
 import KeyValueFields, { MAX_PAIRS, normalisePairs } from './KeyValueFields';
 import { uniqueNameRule } from './connectionNameRule';
+import SecretStorageWarning from '../../SecretStorageWarning/SecretStorageWarning';
 
 /**
  * Dynamic Connection Form
@@ -422,6 +423,9 @@ const DynamicConnectionForm = ({
         {/* Scrolls when the connector has more fields than the window fits.
             The right padding keeps the scrollbar off the inputs. */}
         <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 4 }}>
+        {/* Every password/keyValue field below is written to db-credentials.dat.
+            Says so up front when this machine cannot actually protect it. */}
+        <SecretStorageWarning />
         {/* Connection metadata fields */}
         <Form.Item
           name="connectionName"

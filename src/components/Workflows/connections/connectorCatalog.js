@@ -18,7 +18,7 @@ export const CONNECTION_TYPES = [
   { key: 'sqlite',      title: 'SQLite',          description: 'Connect to an existing SQLite database file',           category: 'file', letters: 'SQ', tone: '#0f80cc', fileBased: true },
   { key: 'lancedb',     title: 'LanceDB',         description: 'Connect to local LanceDB vector database',             category: 'file', img: LOGO_PREFIX + 'LanceDB.png', tone: '#7c3aed', fileBased: true },
   { key: 'parquet',     title: 'Parquet',         description: 'Query Parquet files in place, no import step',          category: 'file', letters: 'PQ', tone: '#9254de', fileBased: true },
-  { key: 'avro',        title: 'Avro',            description: 'Import Avro files, converted to Parquet once',          category: 'file', letters: 'AV', tone: '#eb2f96', fileBased: true },
+  { key: 'avro',        title: 'Avro',            description: 'Query Avro files in place, no import step',            category: 'file', letters: 'AV', tone: '#eb2f96', fileBased: true },
 
   // Databases
   { key: 'postgres',  title: 'PostgreSQL',      description: 'Connect to a PostgreSQL database',                category: 'database', img: LOGO_PREFIX + 'PostgreSQL.png',           tone: '#336791' },
