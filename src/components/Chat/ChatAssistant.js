@@ -3,7 +3,8 @@ import { C, SANS, MONO, I, MoreMenu } from '../Workflows/_designShared';
 import DataVisualization from './DataVisualization';
 import { loadJoinDestinations, hasJoinDestination } from '../Workflows/joinDestinations';
 // One hue per node type, decided by the canvas cards — see NODE_COLORS.
-import { NODE_COLORS } from '../Workflows/nodes/nodeCardShared';
+import { NODE_COLORS, targetIsSourceWarning } from '../Workflows/nodes/nodeCardShared';
+import { hasRequiredInputs, nodeRequirementMessage } from '../../utils/workflowUtils';
 
 const MAX_STEPS_PER_QUESTION = 8;
 // Consecutive "Fix it" clicks on a review verdict before the button stops being
@@ -24,9 +25,9 @@ const INVALID_RESPONSE_MESSAGE = 'The AI responded with an invalid response. Cli
  *
  * A build plans against the SAVED workflow, so unsaved canvas edits are both
  * invisible to it and about to be overwritten by whatever it writes back. The
- * editor answers this event with a promise: it resolves immediately when there
- * is nothing uncommitted, and otherwise after the user has either saved
- * (through the Execution Steps review) or cancelled.
+ * editor answers at once: ok when there is nothing uncommitted, otherwise not
+ * ok. The chat never waits on a save; it says why it stopped, and the user
+ * presses Retry once the workflow is saved (Save is one click).
  *
  * The editor lives in a different subtree, so this goes over a window event
  * rather than props — the same bridge the Settings request uses. Nothing
@@ -44,6 +45,22 @@ async function requestWorkflowSaveGate() {
     // Never let the gate itself be the reason a build cannot run.
     return { ok: true, reason: 'gate-error' };
   }
+}
+
+// What the chat says when the save gate stops a build. `again` names the
+// button that picks the request back up once the workflow is saved.
+function saveGateRefusal(gate, again) {
+  const name = gate.workflowName ? `"${gate.workflowName}"` : 'The open workflow';
+  if (gate.reason === 'unnamed-workflow') {
+    return 'This workflow has never been saved, so there is nothing for me to build on yet. '
+      + `Give it a name and save it, then press ${again} — I'll extend what you have instead of starting a separate workflow.`;
+  }
+  if (gate.reason === 'invalid-workflow') {
+    return `${name} has unsaved changes that can't be saved yet: ${
+      String(gate.detail || 'the editor reported a problem with it').replace(/\.\s*$/, '')}. Fix that, save, then press ${again}.`;
+  }
+  return `${name} has unsaved changes, so I haven't started — the workflow builder works from the saved version. `
+    + `Save it (Save, above the canvas), then press ${again}.`;
 }
 
 // NeDB refuses any field whose key starts with `$` (it reserves them for
@@ -138,9 +155,29 @@ const nodeChatToReviewHistory = (chat, fallbackConfig = null) => {
       const prefix = meta.clarification ? CLARIFICATION_PREFIX
         : meta.context ? 'Context from the chat: '
           : '';
-      return { role: 'assistant', text: `${prefix}${body}` };
+      return { role: 'assistant', text: `${prefix}${body}`, clarification: !!meta.clarification };
     });
-  if (rows.length) return rows;
+  if (rows.length) {
+    // The transcript outlives conversations: it holds every build this node has
+    // had. Only the newest request — and the clarification answers that follow
+    // it — is the brief for THIS change; older turns describe what the node did
+    // before. Judging a refine ("make it an inner join") against the original
+    // request's loose wording failed correct builds, so each row says which it
+    // is. A user turn that answers the AI's question belongs to the request it
+    // was asked about, not a new one.
+    let start = -1;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].role !== 'user') continue;
+      const prev = rows[i - 1];
+      if (prev && prev.role === 'assistant' && prev.clarification) continue;
+      start = i;
+      break;
+    }
+    return rows.map(({ clarification: _c, ...r }, i) => ({
+      ...r,
+      phase: start >= 0 && i < start ? 'earlier' : 'current',
+    }));
+  }
   // Legacy / hand-edited nodes carry no chat. Fall back to the request slot the
   // builder would have used, so the reviewer still has a goal to judge against
   // rather than silently reviewing against nothing.
@@ -185,7 +222,14 @@ const planToReviewHistory = (plan) => {
       text: `The request as FIRST TYPED, superseded by anything clarified below: ${original.trim()}`,
     });
   }
-  for (const c of Array.isArray(p.clarifications) ? p.clarifications : []) {
+  // Both kinds, in the order they were asked: the conversation's own Q&A from
+  // before the plan (propose_plan keeps those apart so the build does not seed
+  // them into every node's chat), then the questions builders asked mid-build.
+  const clarifications = [
+    ...(Array.isArray(p.conversationClarifications) ? p.conversationClarifications : []),
+    ...(Array.isArray(p.clarifications) ? p.clarifications : []),
+  ];
+  for (const c of clarifications) {
     if (!c) continue;
     const question = stripClarificationPrefix(c.question);
     if (question) rows.push({ role: 'assistant', text: `${CLARIFICATION_PREFIX}${question}` });
@@ -460,7 +504,25 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false, blockedReas
         </span>
       </div>
       <ol style={{ margin: 0, padding: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {plan.steps.map((raw, i) => {
+        {(() => {
+          // A step's `sources` are 0-based indices into this plan, or ids of
+          // nodes already in the workflow — never what the reader sees, which
+          // is the 1-based number in front of each step and the node's name.
+          // An id that a kept/modified step stands for shows as that step's
+          // number, so "← 2, 3" reads the same whether the input is new or not.
+          const stepNoById = new Map();
+          plan.steps.forEach((s, idx) => {
+            const id = typeof s === 'string' ? s : s?.existingNodeId;
+            if (id) stepNoById.set(id, idx + 1);
+          });
+          const labels = plan.nodeLabels || {};
+          const nameOf = (id) => labels[id] || id;
+          const sourceRef = (ref) => {
+            if (typeof ref === 'number') return String(ref + 1);
+            if (stepNoById.has(ref)) return String(stepNoById.get(ref));
+            return nameOf(ref);
+          };
+          return plan.steps.map((raw, i) => {
           // Each step entry is either a string (id of an existing node to
           // keep as-is) or an object (modify when it has existingNodeId,
           // add otherwise). Normalize before rendering.
@@ -472,8 +534,8 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false, blockedReas
             ? badgeFor(stepType)
             : { label: 'KEEP', color: C.muted, bg: C.s2 };
           const titleSuffix = isShorthand
-            ? `Keep ${raw}`
-            : (raw.existingNodeId ? `Modify ${raw.existingNodeId}` : (raw.label || stepType));
+            ? `Keep ${nameOf(raw)}`
+            : (raw.existingNodeId ? `Modify ${nameOf(raw.existingNodeId)}` : (raw.label || stepType));
           const sources = !isShorthand && Array.isArray(raw.sources) ? raw.sources : null;
           const prompt = isShorthand ? null : (raw.prompt || '');
           return (
@@ -495,7 +557,7 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false, blockedReas
                 </span>
                 {sources && sources.length > 0 && (
                   <span style={{ fontSize: 9, fontFamily: MONO, color: C.muted }}>
-                    ← {sources.map(String).join(', ')}
+                    ← {sources.map(sourceRef).join(', ')}
                   </span>
                 )}
               </div>
@@ -506,7 +568,8 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false, blockedReas
               )}
             </li>
           );
-        })}
+          });
+        })()}
       </ol>
       {plan.mode === 'modify' && Array.isArray(plan.deletedNodes) && plan.deletedNodes.length > 0 && (
         <div style={{
@@ -514,7 +577,7 @@ const PlanCard = ({ plan, status, onAccept, onCancel, stale = false, blockedReas
           fontSize: 10, fontFamily: MONO, color: C.red,
           background: C.rD, border: '1px solid #fecaca',
         }}>
-          Deletes: {plan.deletedNodes.join(', ')}
+          Deletes: {plan.deletedNodes.map((id) => (plan.nodeLabels || {})[id] || id).join(', ')}
         </div>
       )}
       {shown ? (
@@ -662,8 +725,13 @@ const FocusNodeChip = ({ node, typeLabel, onClear }) => {
         fontSize: 9, fontFamily: MONO, fontWeight: 700, letterSpacing: '0.08em',
         textTransform: 'uppercase', color,
       }}>{typeLabel}</span>
-      <span style={{ fontWeight: 600, color: C.text, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {node.label}
+      {/* A node nobody has configured or named yet is still called by its type,
+          which the badge already says — "Join Join". Say what it is instead. */}
+      <span style={{ fontWeight: 600, color: C.text, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        title={node.label}>
+        {String(node.label || '').trim().toLowerCase() === String(typeLabel || '').trim().toLowerCase()
+          ? <span style={{ fontWeight: 400, color: C.muted, fontStyle: 'italic' }}>not configured yet</span>
+          : node.label}
       </span>
       {onClear && (
         <button type="button" onClick={onClear} aria-label="Remove node from chat context"
@@ -754,7 +822,7 @@ const AgentChip = ({ label, onClear, disabled }) => (
 // `live` is what makes the buttons real — it's true only while the agent loop
 // is actually parked on THIS approval. A bubble that was superseded still
 // renders its record, but can never offer a button that does nothing.
-const ApprovalPanel = ({ approval, live, onApprove, onDecline }) => {
+const ApprovalPanel = ({ approval, live, onApprove, onDecline, approveLabel = 'Run this code', note = 'Runs locally and read-only. Sending a new message cancels it.' }) => {
   // Collapsed by default. The explanation is what the approval decision turns
   // on; the source is there for whoever wants to read it before allowing the
   // run, and the toggle says how many lines are waiting. Matches the code panel
@@ -787,6 +855,11 @@ const ApprovalPanel = ({ approval, live, onApprove, onDecline }) => {
       {approval.explanation && (
         <div style={{ color: C.text, fontSize: 12, lineHeight: 1.5, fontFamily: SANS }}>
           {approval.explanation}
+        </div>
+      )}
+      {approval.warning && (
+        <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, background: '#fef2f2', border: '1px solid #fca5a5', color: '#b91c1c', fontSize: 11.5, lineHeight: 1.45, fontFamily: SANS }}>
+          ⚠ {approval.warning}
         </div>
       )}
 
@@ -824,7 +897,7 @@ const ApprovalPanel = ({ approval, live, onApprove, onDecline }) => {
                 background: C.accent, color: '#fff', cursor: 'pointer',
                 fontSize: 11, fontWeight: 600, fontFamily: SANS,
               }}>
-              Run this code
+              {approveLabel}
             </button>
             <button type="button" onClick={onDecline}
               style={{
@@ -836,9 +909,11 @@ const ApprovalPanel = ({ approval, live, onApprove, onDecline }) => {
               Don't run
             </button>
           </div>
-          <div style={{ marginTop: 5, fontSize: 9.5, color: C.dim, fontFamily: SANS }}>
-            Runs locally and read-only. Sending a new message cancels it.
-          </div>
+          {note && (
+            <div style={{ marginTop: 5, fontSize: 9.5, color: C.dim, fontFamily: SANS }}>
+              {note}
+            </div>
+          )}
         </>
       )}
     </div>
@@ -941,9 +1016,39 @@ const ReviewFixPanel = ({ fix, onFix, onLeave, busy = false, stale = false }) =>
   );
 };
 
-const NodeRunPanel = ({ run, onRun, onSkip, stale = false }) => {
+// What the history list shows under a conversation's title. Most turns end on
+// a node-run card (build → "Approve before this runs" → "Ran — data written"),
+// which carries no `text` of its own, so reading only the last message's text
+// labelled every such conversation "No messages yet".
+const NODE_RUN_PREVIEW = {
+  pending: 'Awaiting approval',
+  running: 'Running',
+  ran: 'Ran',
+  failed: 'Run failed',
+  skipped: 'Not run',
+};
+const conversationPreview = (messages) => {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m) continue;
+    if (m.kind === 'nodeRun' && m.run) {
+      const what = [NODE_RUN_PREVIEW[m.run.state || 'pending'], m.run.nodeLabel].filter(Boolean).join(' · ');
+      const res = m.run.result;
+      const outcome = typeof res === 'string' ? res : res?.message;
+      return (outcome ? `${what} — ${outcome}` : what).slice(0, 80);
+    }
+    const text = typeof m.text === 'string' ? m.text.trim() : '';
+    if (text) return text.slice(0, 80);
+  }
+  return '';
+};
+
+const NodeRunPanel = ({ run, onRun, onSkip, stale = false, blockedReason = null }) => {
   const [showCode, setShowCode] = useState(false);
   const sections = useMemo(() => nodeCodeSections(run.config), [run.config]);
+  // A join whose kept target must be dropped and recreated first (append /
+  // merge into a table that no longer fits). Run is the approval.
+  const rebuild = run.config?.joinSettings?.targetRebuild || null;
   // A run offered but never answered, with the conversation moved on, reads as
   // "not run" — the same as Skip. Keeping the button live would let a click
   // execute code against a node the later turns may have rebuilt.
@@ -987,6 +1092,18 @@ const NodeRunPanel = ({ run, onRun, onSkip, stale = false }) => {
           {run.destination ? ` in ${run.destination}` : ''}.
         </div>
       )}
+      {rebuild?.pending && (
+        <div style={{ marginTop: 5, fontSize: 11.5, lineHeight: 1.45, color: '#b91c1c', fontFamily: SANS }}>
+          Drops <strong>{rebuild.table}</strong>
+          {Number.isFinite(rebuild.rowCount) ? ` (${rebuild.rowCount} row${rebuild.rowCount === 1 ? '' : 's'})` : ''}
+          {' '}and recreates it — {rebuild.reason}. The rows in it now are deleted.
+        </div>
+      )}
+      {rebuild?.pending && targetIsSourceWarning(rebuild) && (
+        <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, background: '#fef2f2', border: '1px solid #fca5a5', color: '#b91c1c', fontSize: 11.5, lineHeight: 1.45, fontFamily: SANS }}>
+          ⚠ {targetIsSourceWarning(rebuild)}
+        </div>
+      )}
 
       {sections.length > 0 && (
         <>
@@ -1020,10 +1137,14 @@ const NodeRunPanel = ({ run, onRun, onSkip, stale = false }) => {
       {state === 'pending' && (
         <>
           <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-            <button type="button" onClick={onRun}
+            <button type="button" onClick={blockedReason ? undefined : onRun}
+              disabled={!!blockedReason}
+              title={blockedReason || undefined}
               style={{
                 padding: '4px 10px', borderRadius: 4, border: 'none',
-                background: C.accent, color: '#fff', cursor: 'pointer',
+                background: blockedReason ? C.s2 : C.accent,
+                color: blockedReason ? C.dim : '#fff',
+                cursor: blockedReason ? 'not-allowed' : 'pointer',
                 fontSize: 11, fontWeight: 600, fontFamily: SANS,
               }}>
               Run this node
@@ -1038,9 +1159,8 @@ const NodeRunPanel = ({ run, onRun, onSkip, stale = false }) => {
               Not now
             </button>
           </div>
-          <div style={{ marginTop: 5, fontSize: 9.5, color: C.dim, fontFamily: SANS }}>
-            The configuration is already saved on the canvas. Running it writes data — only this
-            node runs, using whatever its sources last produced.
+          <div style={{ marginTop: 5, fontSize: 9.5, color: blockedReason ? '#b45309' : C.dim, fontFamily: SANS }}>
+            {blockedReason || 'The configuration is already saved on the canvas. Running it writes data — only this node runs, using whatever its sources last produced.'}
           </div>
         </>
       )}
@@ -1115,9 +1235,40 @@ const BUILD_STEP_LABEL = {
   start: 'Start', dataSource: 'Data source', transformer: 'Transformer',
   join: 'Join', output: 'Output', branch: 'Branch',
 };
+// What a running step is waiting on, keyed by the stage id the builder reports
+// (workflowBuilder's reportStage). An unlisted stage shows its id rather than
+// nothing: a new builder stage should read oddly, not vanish.
+const BUILD_STAGE_LABEL = {
+  'skillDocs:pick': 'choosing which docs to read',
+  'join:readSchema': 'reading the source tables',
+  'join:analysis': 'working out how to join the sources',
+  'join:gen': 'writing the join',
+  'join:skill': 'running the join skill',
+  'transformer:analysis': 'working out the transformation',
+  'transformer:gen': 'writing the transformation',
+  'transformer:skill': 'running the transform skill',
+  'dataSource:pickTable': 'picking the table',
+  'dataSource:gen': 'configuring the source',
+  'output:gen': 'configuring the output',
+  'branch:gen': 'writing the conditions',
+  'connection:pick': 'picking the connection',
+};
+
+// Re-render once a second while `active`, so the elapsed time on a running
+// build step counts up. Off when nothing is running: a finished build log is a
+// static list and has no business holding a timer.
+const useSecondTick = (active) => {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return undefined;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+};
 // The step lines themselves, shared by the pinned panel (build in flight) and
 // the history bubble (build finished) so both read identically.
 const BuildLogLines = ({ logs }) => {
+  useSecondTick(logs.some((l) => l.status !== 'done'));
   if (!logs.length) {
     return <div style={{ fontSize: 11, color: C.dim, fontFamily: SANS }}>Preparing…</div>;
   }
@@ -1141,7 +1292,14 @@ const BuildLogLines = ({ logs }) => {
           </span>
         )}
         {!isDone && (
-          <span style={{ color: C.dim, fontSize: 10, fontStyle: 'italic' }}>working…</span>
+          // What it is waiting on, and for how long. A step that reports no
+          // stage yet still says "working…", but a step stuck on one model call
+          // now names the call and counts — which is the difference between a
+          // build that looks frozen and one you can see is still waiting.
+          <span style={{ color: C.dim, fontSize: 10, fontStyle: 'italic' }}>
+            {l.stage ? BUILD_STAGE_LABEL[l.stage] || l.stage : 'working'}
+            {l.stageAt ? ` — ${Math.max(0, Math.round((Date.now() - l.stageAt) / 1000))}s` : '…'}
+          </span>
         )}
       </div>
     );
@@ -1569,6 +1727,24 @@ const AGENT_LABELS = {
   // message isn't an answer to the builder's pending question it hands back to
   // the main agent, and the main agent's own label applies.
 };
+/**
+ * Is a node's builder still waiting on the user? True when the newest reply in
+ * the conversation (tool steps, build logs and run cards skipped; the user's own
+ * messages skipped, so it stays true while their answer is being handled) is a
+ * question that builder asked about THAT node.
+ */
+const awaitingBuilderAnswer = (messages, nodeId) => {
+  if (!nodeId || !Array.isArray(messages)) return false;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (!m || m.role !== 'assistant') continue;
+    if (m.kind === 'step' || m.kind === 'buildLog' || m.kind === 'nodeRun') continue;
+    const fromBuilder = m.agentSource === 'builder' || String(m.agentSource || '').startsWith('skill:');
+    return !!(m.clarification && fromBuilder && m.context?.nodeId === nodeId);
+  }
+  return false;
+};
+
 const agentLabel = (source) => {
   if (!source) return null;
   const s = String(source);
@@ -1576,7 +1752,7 @@ const agentLabel = (source) => {
   return AGENT_LABELS[s] || s;
 };
 
-const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDeclineCode, onRunNode, onSkipNode, activeApprovalMsgId = null, isEditing, onSaveEdit, onCancelEdit, busy = false, stale = false, retryable = true, planBlockedReason = null }) => {
+const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDeclineCode, onRunNode, onSkipNode, onBuildApproval, runBlockedReason = null, activeApprovalMsgId = null, isEditing, onSaveEdit, onCancelEdit, busy = false, stale = false, retryable = true, planBlockedReason = null }) => {
   const isUser = m.role === 'user';
   const plan = !isUser && !m.error && m.workflowPlan && Array.isArray(m.workflowPlan.steps)
     ? m.workflowPlan
@@ -1626,6 +1802,7 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
           <NodeRunPanel
             run={m.run || {}}
             stale={stale}
+            blockedReason={runBlockedReason ? runBlockedReason(m.run || {}) : null}
             onRun={() => onRunNode && onRunNode(m)}
             onSkip={() => onSkipNode && onSkipNode(m)}
           />
@@ -1724,6 +1901,34 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
           {m.error
             ? <span style={{ color: C.red }}>{m.text}</span>
             : <Markdown text={bodyText} />}
+          {/* A plan build parked on generated code it wants to run (a REST API
+              fetch whose columns the next steps are built from). Nothing runs
+              until Run is clicked; Don't run stops the build. */}
+          {m.buildApproval && (m.buildApproval.kind === 'target_rebuild' ? (
+            <ApprovalPanel
+              approval={m.buildApproval}
+              live={m.buildApproval.state === 'pending' && !stale}
+              approveLabel="Approve drop and recreate"
+              note="Nothing is dropped now: the table is recreated on this join's next run, then appended or merged into as usual. Don't run stops the build."
+              onApprove={() => onBuildApproval && onBuildApproval(m, true)}
+              onDecline={() => onBuildApproval && onBuildApproval(m, false)}
+            />
+          ) : (
+            <ApprovalPanel
+              approval={{
+                ...m.buildApproval,
+                explanation: [
+                  m.buildApproval.endpoint ? `Calls ${m.buildApproval.endpoint}` : null,
+                  m.buildApproval.explanation || null,
+                ].filter(Boolean).join(' — '),
+              }}
+              live={m.buildApproval.state === 'pending' && !stale}
+              approveLabel="Run this call"
+              note="It calls the API once with the connection's saved credentials and stores the rows in this workflow, so the next steps can be built from its columns. Don't run stops the build."
+              onApprove={() => onBuildApproval && onBuildApproval(m, true)}
+              onDecline={() => onBuildApproval && onBuildApproval(m, false)}
+            />
+          ))}
           {plan && (
             <PlanCard
               plan={plan}
@@ -1981,10 +2186,9 @@ const HistorySidebar = ({
         {sorted.map((c) => {
           const isActive = c.id === activeId;
           const isBusy = !!busyIds?.has(c.id);
-          const last = c.messages[c.messages.length - 1];
           const preview = isBusy
             ? 'Working…'
-            : (last?.text?.slice(0, 80) || 'No messages yet');
+            : (conversationPreview(c.messages) || 'No messages yet');
           return (
             <div key={c.id} onClick={() => onSelect(c.id)}
               style={{
@@ -2561,18 +2765,23 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   //     it would turn "the workflow you have open" into "Workflow not found".
   //     Without an id a build request is planned as a new workflow, which is
   //     exactly what an unsaved canvas is.
+  //   • unsaved — kept on the payload rather than folded into `summary`. The
+  //     backend turns it into a RULE (see the unsaved-workflow block in the main
+  //     prompt), because knowing there is no stored copy is not the same as
+  //     knowing what to do about it: told only that the canvas was unreadable,
+  //     the model answered a question about a node it could not see by guessing
+  //     between two similarly-named connections instead of asking the user to
+  //     save. The fix is to say "ask them to save", where the model reads rules.
   const effectiveContext = useMemo(() => {
     if (pinnedContext === 'cleared') return null;
     const ctx = pinnedContext || incomingContext;
     if (!ctx || ctx.kind !== 'workflow') return ctx;
-    const { unsaved, ...rest } = ctx;
-    if (!unsaved) return { ...rest, name: ctx.name || ctx.id || null };
+    if (!ctx.unsaved) return { ...ctx, unsaved: false, name: ctx.name || ctx.id || null };
     return {
-      ...rest,
+      ...ctx,
       name: ctx.name || ctx.id || null,
       id: null,
-      summary: `${ctx.summary ? `${ctx.summary} · ` : ''}open in the editor but never saved — `
-        + 'there is no stored copy to read or modify, so treat any build as a new workflow',
+      unsaved: true,
     };
   }, [pinnedContext, incomingContext]);
 
@@ -2590,11 +2799,59 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // the canvas selection as context.
   const [focusDismissed, setFocusDismissed] = useState(false);
   const focusNodeRef = useRef(null);
+  // What the canvas has selected right now, as opposed to `canvasFocusNode`,
+  // which can outlive a deselect (below).
+  const canvasSelectionRef = useRef(null);
   useEffect(() => {
-    const handler = (e) => setCanvasFocusNode(e.detail || null);
+    const handler = (e) => {
+      const detail = e.detail || null;
+      // The workflow closed: whatever was focused is gone with the canvas.
+      if (detail && detail.closed) {
+        canvasSelectionRef.current = null;
+        setCanvasFocusNode(null);
+        return;
+      }
+      canvasSelectionRef.current = detail;
+      if (detail) { setCanvasFocusNode(detail); return; }
+      // Deselected — the node panel closed, or the canvas was clicked. If this
+      // node's builder asked a question that is still waiting for its answer,
+      // keep the node in the conversation: the question is on screen, and the
+      // reply has to reach that builder. Dropping the focus here is what used
+      // to hand the answer to the main agent with only the workflow in view,
+      // which read it as a request to change the workflow and planned one.
+      setCanvasFocusNode((prev) => (
+        prev && awaitingBuilderAnswer(messagesRef.current, prev.nodeId) ? prev : null
+      ));
+    };
     window.addEventListener('ternlux:node-focus', handler);
     return () => window.removeEventListener('ternlux:node-focus', handler);
   }, []);
+  // The workflow the editor has open right now (WorkflowEditor broadcasts it,
+  // and null when it closes). A node's run card only works on that workflow's
+  // canvas: the editor is what runs a node.
+  const [openWorkflowId, setOpenWorkflowId] = useState(null);
+  useEffect(() => {
+    const handler = (e) => setOpenWorkflowId(e.detail?.workflowId || null);
+    window.addEventListener('ternlux:workflow-open', handler);
+    return () => window.removeEventListener('ternlux:workflow-open', handler);
+  }, []);
+  // Why a "Run this node" card can't run right now — its workflow is not the
+  // one open — or null when it can. A card from before the workflow id was
+  // recorded is checked only for "is any workflow open".
+  const runBlockedReason = useCallback((run) => {
+    if (!run) return null;
+    const name = run.workflowName ? `"${run.workflowName}"` : 'its workflow';
+    if (run.workflowId) {
+      return run.workflowId === openWorkflowId ? null : `Open ${name} to run this node.`;
+    }
+    return openWorkflowId ? null : 'Open the workflow this node belongs to, to run it.';
+  }, [openWorkflowId]);
+  // A node kept in focus only because its builder was waiting is released once
+  // that question has been answered and nothing on the canvas is selected.
+  useEffect(() => {
+    if (canvasSelectionRef.current || !canvasFocusNode) return;
+    if (!awaitingBuilderAnswer(messages, canvasFocusNode.nodeId)) setCanvasFocusNode(null);
+  }, [messages, canvasFocusNode]);
   // Clicking a different node always brings it into the conversation, even if
   // the previous one had been dismissed.
   useEffect(() => { setFocusDismissed(false); }, [canvasFocusNode?.nodeId]);
@@ -2610,6 +2867,27 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   const focusNode = focusDismissed ? null : canvasFocusNode;
   // The send loop reads the ref, so keep it in step with the dismissal.
   focusNodeRef.current = focusNode;
+
+  // What a message was ABOUT, recorded on it when it is written: the workflow
+  // in view and the node in focus. It travels with the chat history to the
+  // model (see the [context] lines in public/chat/chatAssistant.js), so a turn
+  // read later still says which node's builder asked a question, or which
+  // workflow a reply was about — even after the focus has moved on.
+  const effectiveContextRef = useRef(null);
+  effectiveContextRef.current = effectiveContext;
+  const snapshotContext = useCallback(() => {
+    const ctx = effectiveContextRef.current;
+    const node = focusNodeRef.current;
+    const wf = ctx && ctx.kind === 'workflow' ? ctx : null;
+    const out = {
+      workflowId: wf?.id || node?.workflowId || null,
+      workflowName: wf?.name || null,
+      nodeId: node?.nodeId || null,
+      nodeType: node?.type || null,
+      nodeLabel: node ? (String(node.label || '').trim() || null) : null,
+    };
+    return (out.workflowId || out.workflowName || out.nodeId) ? out : null;
+  }, []);
 
   // ── Join destination ─────────────────────────────────────────────────────
   // A focused Join with nowhere to write can't be built at all, so the picker
@@ -2659,14 +2937,8 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     setRestartedConvoIds(new Set());
   }, [activeId]);
 
-  // Closing the panel also discards the soft-restart override so reopening
-  // shows the persisted conversation, not a transient empty view.
-  useEffect(() => {
-    if (!open) {
-      setRestartedConvoIds(new Set());
-      setEditingMsgId(null);
-    }
-  }, [open]);
+  // Closing the panel keeps everything as it was — the panel is hidden, not
+  // unmounted (see `launcher` below), and nothing is reset on the way out.
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -2924,7 +3196,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       role: 'assistant', kind: 'final', ts: nowTs(),
       text: `Destination set: **${config.targetConnectionName}**${
         isLocal
-          ? ' — the joined rows are written as a Parquet file this node owns, read back with DuckDB.'
+          ? (config.targetDbType === 'lancedb'
+            ? ' — the joined rows are embedded and written to a table in the local LanceDB directory.'
+            : ' — the joined rows are written as a table in this workflow\'s own DuckDB database.')
           : ` (${config.targetDbType})`
       }\n\nNow tell me how the sources should be joined.`,
     });
@@ -2953,6 +3227,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   const handleRunNode = useCallback(async (m) => {
     const run = m.run || {};
     if (run.state && run.state !== 'pending') return;
+    if (runBlockedReason(run)) return;
     patchMessage(m.id, { run: { ...run, state: 'running' } });
 
     const result = await new Promise((resolve) => {
@@ -2962,13 +3237,27 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         () => resolve({ success: false, message: 'No open workflow could run that node.' }),
         120000,
       );
-      window.dispatchEvent(new CustomEvent('ternlux:execute-node', {
-        detail: {
-          nodeId: run.nodeId,
-          resolve: (r) => { clearTimeout(timer); resolve(r); },
-        },
-      }));
+      const detail = {
+        nodeId: run.nodeId,
+        // The card showed the drop-and-recreate warning, so Run approves it.
+        approveRebuild: !!run.config?.joinSettings?.targetRebuild?.pending,
+        resolve: (r) => { clearTimeout(timer); resolve(r); },
+      };
+      window.dispatchEvent(new CustomEvent('ternlux:execute-node', { detail }));
+      // The editor marks the event as taken synchronously. Nobody took it: no
+      // workflow is open, so say so now instead of waiting out the timer.
+      if (!detail.handled) {
+        clearTimeout(timer);
+        resolve({ notOpen: true });
+      }
     });
+
+    // Nothing ran — the card goes back to waiting, runnable once the workflow
+    // is open again, rather than ending as a failure the user cannot retry.
+    if (result?.notOpen) {
+      patchMessage(m.id, { run: { ...run, state: 'pending' } });
+      return;
+    }
 
     patchMessage(m.id, {
       run: {
@@ -2979,7 +3268,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           : (result?.message || 'The node failed to run.'),
       },
     });
-  }, [patchMessage]);
+  }, [patchMessage, runBlockedReason]);
 
   const handleSkipNode = useCallback((m) => {
     const run = m.run || {};
@@ -3015,7 +3304,23 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // status. Events arriving with no build pinned are dropped — there is nothing
   // in flight for them to belong to.
   const applyBuildProgress = useCallback((evt) => {
-    if (!evt || evt.phase !== 'step') return;
+    if (!evt) return;
+    // A 'stage' event names the call a running step is waiting on right now
+    // (workflowBuilder's reportStage). It carries no step fields of its own, so
+    // it only ever annotates a line the 'step' events above already created —
+    // and a step with no line yet is a build we aren't showing.
+    if (evt.phase === 'stage') {
+      setPin((prev) => {
+        if (!prev) return prev;
+        const idx = prev.logs.findIndex((l) => l.stepIndex === evt.stepIndex);
+        if (idx < 0) return prev;
+        const logs = prev.logs.slice();
+        logs[idx] = { ...logs[idx], stage: evt.stage, stageAt: Date.now() };
+        return { ...prev, logs };
+      });
+      return;
+    }
+    if (evt.phase !== 'step') return;
     setPin((prev) => {
       if (!prev) return prev;
       const logs = prev.logs.slice();
@@ -3222,19 +3527,14 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
 
     // The build reads the workflow from the DATABASE. If the editor is open
     // with unsaved canvas edits, it would plan against the older saved version
-    // and then write its result over those edits. Ask first — the editor puts
-    // the user through the Execution Steps review and saves, or the user
-    // cancels and the workflow is left exactly as it is.
+    // and then write its result over those edits. Ask first — with unsaved
+    // edits nothing is built: the card says to save, then accept again.
     const gate = await requestWorkflowSaveGate();
     if (!gate.ok) {
       patchMessage(msgId, {
         planStatus: {
           kind: 'idle',
-          message: gate.reason === 'save-failed'
-            ? 'The workflow could not be saved, so nothing was built. Fix the reported problem and accept the plan again.'
-            : gate.reason === 'unnamed-workflow'
-              ? 'This workflow has never been saved. Give it a name and save it, then accept the plan again.'
-              : 'Cancelled — your unsaved changes are untouched. Save the workflow, then accept the plan again.',
+          message: saveGateRefusal(gate, 'Accept plan'),
         },
       });
       return;
@@ -3264,6 +3564,36 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       if (resp?.builtSteps) carried.builtSteps = { ...(plan.builtSteps || {}), ...resp.builtSteps };
       if (resp?.buildWorkflowId) carried.buildWorkflowId = resp.buildWorkflowId;
       const planForResume = Object.keys(carried).length ? { ...plan, ...carried } : plan;
+      // Parked on APPROVAL rather than a question: a step generated code it has
+      // to run before the build can go on (a REST API fetch whose columns the
+      // following steps are built from). Same parking as a question — the
+      // steps already built are kept — but the user answers with Run / Don't
+      // run on the card, not by typing. See handleBuildApproval.
+      if (resp?.needsClarification && resp.approval) {
+        const stepIndex = Number.isInteger(resp.stepIndex) ? resp.stepIndex : null;
+        updateConvo(activeId, { pendingBuild: { msgId, plan: planForResume } });
+        setPin((prev) => ({
+          ...prev,
+          logs: prev?.logs || [],
+          status: 'waiting',
+          note: 'Waiting for your approval — the build resumes from here.',
+        }));
+        patchMessage(msgId, {
+          planStatus: {
+            kind: 'running',
+            message: resp.approval?.kind === 'target_rebuild'
+              ? `Waiting for your approval to recreate ${resp.approval.table}.`
+              : 'Waiting for your approval to run an API call.',
+          },
+        });
+        appendMessage({
+          role: 'assistant', kind: 'final', ts: nowTs(),
+          text: resp.question,
+          agentSource: 'builder',
+          buildApproval: { ...resp.approval, stepIndex, state: 'pending' },
+        });
+        return;
+      }
       if (resp?.needsClarification) {
         // Park the build, ask the user, keep the plan card in "running"
         // state with a clarifying-message status. A question raised by a SKILL
@@ -3422,6 +3752,56 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // calls commitBuildPin itself.
   }, [appendMessage, patchMessage, updateConvo, activeId, onWorkflowBuilt, reviewChange, setPin, commitBuildPin]);
 
+  // Run / Don't run on a build parked for approval (see runBuild). Run resumes
+  // the build with that step's function marked approved and its analysis call
+  // replayed, so the code that runs is exactly the code on the card. Don't run
+  // ends the build: the next steps cannot be built without the columns, and
+  // nothing is saved.
+  const handleBuildApproval = useCallback(async (m, approve) => {
+    const ba = m?.buildApproval;
+    if (!ba || ba.state !== 'pending') return;
+    const pending = activeConvo?.pendingBuild || null;
+    patchMessage(m.id, { buildApproval: { ...ba, state: approve ? 'approved' : 'declined' } });
+    if (!pending) return;
+    if (!approve) {
+      const isRebuild = ba.kind === 'target_rebuild';
+      patchMessage(pending.msgId, {
+        planStatus: {
+          kind: 'error',
+          message: isRebuild
+            ? `Stopped — recreating ${ba.table} was not approved, so nothing was built.`
+            : 'Stopped — the API call was not approved, so nothing was built.',
+        },
+      });
+      commitBuildPin();
+      updateConvo(activeId, { pendingBuild: null });
+      appendMessage({
+        role: 'assistant', kind: 'final', ts: nowTs(), agentSource: 'builder',
+        text: isRebuild
+          ? `Not approved. The build stopped, nothing was saved, and ${ba.table} was left as it is. `
+            + 'Write to a different table, use replace mode, or accept the plan again to be asked again.'
+          : 'Not run. The build stopped before calling the API, and nothing was saved. '
+            + 'Change the request, or accept the plan again to be asked again.',
+      });
+      return;
+    }
+    const plan = pending.plan || {};
+    const i = Number.isInteger(ba.stepIndex) ? ba.stepIndex : null;
+    if (i == null) return;
+    const prevCalls = plan.resumedCalls || {};
+    const nextPlan = {
+      ...plan,
+      apiFetchApprovals: { ...(plan.apiFetchApprovals || {}), [i]: ba.code },
+      resumedCalls: { ...prevCalls, [i]: { ...(prevCalls[i] || {}), ...(ba.resumedCalls || {}) } },
+    };
+    setConvoBusy(activeId, true, 'Building workflow…');
+    try {
+      await runBuild(nextPlan, pending.msgId);
+    } finally {
+      setConvoBusy(activeId, false);
+    }
+  }, [activeConvo, activeId, patchMessage, updateConvo, appendMessage, commitBuildPin, runBuild, setConvoBusy]);
+
   // ─────────────────────────────────────────────────────────────────────────
   // DISABLED — the skill subagent no longer exists as a separate channel. A
   // skill that needs input now raises an ordinary build clarification, so the
@@ -3507,8 +3887,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       agentMode: m,
       workflowSession: ws,
       ...(m === 'workflow' ? { workflowBuilder: true } : {}),
+      context: snapshotContext(),
     };
-  }, [activeConvo]);
+  }, [activeConvo, snapshotContext]);
 
   /**
    * The user's answer to "want me to make those changes?".
@@ -3717,7 +4098,12 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     const target = msgs[userIdx];
     const trimmed = msgs.slice(0, userIdx);
     const { tagMode, targetSession } = resumeRouting(target);
-    const userMsg = makeUserMsg(target.text || '', tagMode, targetSession);
+    // A retried "Fix it" turn is still a Fix it turn: it keeps the flag that
+    // routes it at workflow level (and counts it as a remediation round).
+    const userMsg = {
+      ...makeUserMsg(target.text || '', tagMode, targetSession),
+      ...(target.fromReviewFix ? { fromReviewFix: true } : {}),
+    };
     updateConvo(activeConvo.id, {
       agentMode: tagMode,
       workflowSession: targetSession,
@@ -3865,6 +4251,29 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       return;
     }
 
+    // A "Fix it" click runs at WORKFLOW level, never through the focused node's
+    // builder. The fix names the node and spells out edits to its generated
+    // code; a node builder regenerates a node from a description and cannot
+    // apply such edits (it refused them — the "can only create a new-table
+    // join" answer). The workflow planner rebuilds the named node with the
+    // corrections as part of its brief, which is what works. So the canvas
+    // focus is left out of this turn's request.
+    const dropNodeFocus = !!userMsg.fromReviewFix;
+    const turnFocusNode = () => (dropNodeFocus ? null : focusNodeRef.current);
+
+    // A focused Transformer/Join with nothing wired into it has no input to
+    // build against. Say so plainly, the same words the canvas uses when it is
+    // clicked, rather than letting the model wander off to plan the workflow.
+    const focused = turnFocusNode();
+    if (focused && (focused.type === 'transformer' || focused.type === 'join')
+        && !hasRequiredInputs(focused.type, (focused.upstreamNodes || []).length)) {
+      appendMessage({
+        role: 'assistant', kind: 'final', ts: nowTs(),
+        text: `${nodeRequirementMessage(focused.type)}. Wire ${focused.type === 'join' ? 'its inputs' : 'its source'} into it on the canvas, then ask me again.`,
+      });
+      return;
+    }
+
     setConvoBusy(turnConvoId, true, 'Thinking…');
     agentLoopRef.current.add(turnConvoId);
     cancelledRef.current.delete(turnConvoId);
@@ -3891,11 +4300,13 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
               role: m.role,
               text: m.text,
               ...(m.clarification ? { clarification: true } : {}),
+              // Who wrote it and what it was about — becomes the [context] line
+              // the model reads with each turn.
+              ...(m.agentSource ? { agentSource: m.agentSource } : {}),
+              ...(m.context ? { context: m.context } : {}),
             }
       ));
-    // Not const: the save gate below can turn an unsaved canvas into a saved
-    // workflow mid-turn, and the context has to start pointing at it.
-    let ctx = effectiveContext;
+    const ctx = effectiveContext;
     const scratchpad = [];
     // Seed the agent mode + session from the user message's own stamps —
     // Edit/Retry pass the target message's session so the re-run resumes
@@ -3954,29 +4365,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           if (!gate.ok) {
             appendMessage({
               role: 'assistant', kind: 'final', ts: nowTs(),
-              text: gate.reason === 'unnamed-workflow'
-                ? 'This workflow has never been saved, so there is nothing for me to build on yet. Give it a name, save it, and ask me again — then I can extend what you have instead of starting a separate workflow.'
-                : gate.reason === 'invalid-workflow'
-                  ? 'I left the workflow alone — it has unsaved changes that can\'t be saved yet (check the workflow name). Fix that, save, and ask me again.'
-                  : 'Left the workflow untouched — your unsaved changes are still on the canvas. Save it and ask me again, and I\'ll plan against what you see now.',
+              text: saveGateRefusal(gate, 'Retry'),
             });
             break;
-          }
-          // The gate just turned an unsaved canvas into a saved workflow.
-          //
-          // The build target was resolved back on the FIRST turn, from a
-          // context that deliberately carries no id while the workflow is
-          // unsaved (see effectiveContext) — so it currently reads "create a
-          // new workflow", which would strand the nodes the user just saved in
-          // a workflow the build ignores. Point both the context and the
-          // in-flight session at the record that now exists.
-          if (gate.workflowId) {
-            if (!ctx || ctx.kind !== 'workflow' || !ctx.id) {
-              ctx = { ...(ctx || {}), kind: 'workflow', id: gate.workflowId };
-            }
-            if (workflowSession && !workflowSession.workflowId) {
-              workflowSession = { ...workflowSession, workflowId: gate.workflowId };
-            }
           }
         }
 
@@ -3994,7 +4385,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             // node via its workflowBuilder builder (build_transformer/join/
             // dataSource). Follow-ups are handled through the node's chat
             // history, not a side clarifications structure.
-            targetNode: withAppliedConfig(focusNodeRef.current, appliedNodeConfig),
+            targetNode: withAppliedConfig(turnFocusNode(), appliedNodeConfig),
             // Asks the main prompt to name this conversation with its answer.
             // Stays true for every step of this turn — the model only produces
             // the title when it finally answers, which may be several steps in.
@@ -4095,6 +4486,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
               explanation: cfg.targetSqlExplanation || cfg.explanation || cfg.joinDescription || '',
               writesTo: cfg.targetTableName || cfg.targetCollection || null,
               destination: cfg.targetConnectionName || null,
+              // The workflow the node lives in. Running it needs that canvas
+              // open — the card stays disabled until it is (runBlockedReason).
+              workflowId: focusNodeRef.current?.workflowId || null,
+              workflowName: snapshotContext()?.workflowName || null,
               state: 'pending',
             };
           }
@@ -4308,6 +4703,8 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             clarification: !!resp.clarification,
             // Who actually produced this reply (hover note on the bubble).
             agentSource: resp.agentSource || null,
+            // What it was about — the node in focus and its workflow.
+            context: snapshotContext(),
             // Raw text of a reply that broke the JSON contract — rendered as the
             // collapsible "raw response" panel under the message. Retry stays
             // available because this is a normal final message, not an error one.
@@ -4362,7 +4759,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
       agentLoopRef.current.delete(turnConvoId);
       cancelledRef.current.delete(turnConvoId);
     }
-  }, [input, messages, effectiveContext, activeId, activeConvo, restartedConvoIds, updateConvo, appendMessage, patchMessage, runBuild, reviewChange, settleApproval, setConvoBusy, setConvoStage, isConvoBusy]);
+  }, [input, messages, effectiveContext, snapshotContext, activeId, activeConvo, restartedConvoIds, updateConvo, appendMessage, patchMessage, runBuild, reviewChange, settleApproval, setConvoBusy, setConvoStage, isConvoBusy]);
 
   // Edit / Retry reach send through this — see sendRef's declaration.
   sendRef.current = send;
@@ -4400,12 +4797,18 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   }, [seededRequest, send, makeUserMsg]);
 
   // ── Floating launcher button ─────────────────────────────────────────────
-  if (!open) {
-    return (
+  //
+  // Closing the assistant HIDES it; it never unmounts. The panel below stays in
+  // the tree with display:none, so everything in it — the scroll position, a
+  // half-typed message, an expanded code block, an approval card — is exactly
+  // as it was when it is opened again.
+  const launcher = open ? null : (
       <button type="button" onClick={() => setOpen(true)}
         title={focusNode ? `Edit the focused ${focusTypeLabel} node — ${focusNodeLabel}` : 'Open Ternlux Assistant'}
         style={{
-          position: 'fixed', bottom: 24, right: 24, height: 46,
+          // Raised clear of the node side panel's footer, whose Save
+          // configuration / Cancel buttons sit in the bottom-right corner.
+          position: 'fixed', bottom: 80, right: 24, height: 46,
           padding: '0 16px 0 14px', borderRadius: 23,
           background: C.accent, border: 'none',
           boxShadow: '0 12px 32px rgba(37,99,235,0.32), 0 4px 12px rgba(0,0,0,0.08)',
@@ -4423,8 +4826,8 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           {focusNode ? `Edit ${focusNodeLabel}` : 'Ask Ternlux'}
         </span>
       </button>
-    );
-  }
+  );
+  const hiddenWhenClosed = open ? null : { display: 'none' };
 
   // ── Header ───────────────────────────────────────────────────────────────
   const Header = (
@@ -4622,6 +5025,8 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
               onDeclineCode={handleDeclineCode}
               onRunNode={handleRunNode}
               onSkipNode={handleSkipNode}
+              runBlockedReason={runBlockedReason}
+              onBuildApproval={handleBuildApproval}
               activeApprovalMsgId={awaitingApproval}
               isEditing={editingMsgId === m.id}
               onSaveEdit={handleSaveEdit}
@@ -4684,6 +5089,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           ...panelStyle,
           background: '#fff',
           display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          ...hiddenWhenClosed,
           // Pinned, the panel is in flow (it reserves its own space) but keeps
           // the same stacking rank, so app modals still open beside it rather
           // than over it.
@@ -4715,17 +5121,20 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             </div>
           )}
         </div>
+        {launcher}
       </>
     );
   }
 
   // ── Expanded mode (with history sidebar) ─────────────────────────────────
   return (
+    <>
     <div onClick={(e) => { if (e.target === e.currentTarget) setExpanded(false); }}
       style={{
         position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.42)',
         backdropFilter: 'blur(3px)', zIndex: CHAT_Z, padding: 24, display: 'flex',
         fontFamily: SANS,
+        ...hiddenWhenClosed,
       }}>
       <div style={{
         margin: 'auto', width: '100%', maxWidth: 1100, height: '100%',
@@ -4746,6 +5155,8 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         {Body}
       </div>
     </div>
+    {launcher}
+    </>
   );
 };
 
