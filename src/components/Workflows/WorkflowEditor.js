@@ -11,7 +11,7 @@ import ReactFlow, {
   useReactFlow,
   Panel,
 } from 'reactflow';
-import { Button, Space, Input, message, Typography, Modal, Spin, Dropdown, Menu, Collapse } from 'antd';
+import { Button, Space, Input, message, Typography, Modal, Spin, Dropdown, Menu } from 'antd';
 import { SaveOutlined, UndoOutlined, SettingOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, ExportOutlined, MoreOutlined, CloseOutlined, HistoryOutlined } from '@ant-design/icons';
 import 'reactflow/dist/style.css';
 
@@ -32,15 +32,16 @@ import WorkflowStepsEditor from './WorkflowStepsEditor';
 import WorkflowHistory from './WorkflowHistory';
 import {
   generateStepsFromNodes,
-  hydrateSteps,
   resolveExecutionSteps,
   sanitizeExecutionSteps,
   sourceChangeRequestText,
   syncNodeSourcesToEdges,
+  hasRequiredInputs,
+  nodeRequirementMessage,
 } from '../../utils/workflowUtils';
-import { persistedNameFor, withPersistedNodeNames, withJoinInputHandles } from './nodes/nodeCardShared';
-import ExecutionStepsReorder from './ExecutionStepsReorder';
-import { connectionsDb, workflowHistoryDb } from '../../utils/localDb';
+import { persistedNameFor, withPersistedNodeNames, withJoinInputHandles, nodeDisplayName, targetIsSourceWarning } from './nodes/nodeCardShared';
+import { connectionsDb, workflowHistoryDb, CONNECTIONS_CHANGED_EVENT } from '../../utils/localDb';
+import { relinkReaddedConnections } from '../../utils/connectionRefs';
 import { stripNodeBookkeeping } from '../../utils/workflowHistory';
 import {
   MATERIALIZING_NODE_TYPES, markPending, prunedExecutedNodes,
@@ -232,18 +233,18 @@ const WorkflowEditor = ({
   const nodesRef = useRef([]);
   const edgesRef = useRef([]);
   const [editorLoading, setEditorLoading] = useState(!!workflow?.id);
-  const [saveAfterStepsEditor, setSaveAfterStepsEditor] = useState(false);
   // Temp-state save: auto-save persists work-in-progress but marks the record
-  // as "temp" (tempStateSave: true). The user must click Save and verify the
-  // Execution Steps to commit a real save (which clears the flag). Execute and
+  // as "temp" (tempStateSave: true). The user must click Save to commit a real
+  // save (which clears the flag). Execute and
   // Close are gated on this so unverified changes aren't run or lost silently.
   const [tempStateSave, setTempStateSave] = useState(false);
   // Controlled 3-button "unsaved changes" prompt shown on Execute/Close when
   // there are uncommitted changes. intent = 'close' | 'execute'.
   const [unsavedPrompt, setUnsavedPrompt] = useState({ open: false, intent: null });
-  // After an explicit save completes (via the steps editor), perform this
-  // deferred action: 'close' | 'execute' | null.
-  const [pendingAction, setPendingAction] = useState(null);
+  // Joins whose kept target must be dropped and recreated before they can run
+  // (append / merge into a table that no longer fits) — listed for approval
+  // when Execute is pressed. See startExecution.
+  const [rebuildPrompt, setRebuildPrompt] = useState({ open: false, items: [] });
   // Version history drawer (see WorkflowHistory).
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   // What the NEXT save should be recorded as in the history. A revert loads an
@@ -251,8 +252,8 @@ const WorkflowEditor = ({
   // following save creates is the one that has to be labelled — set here, read
   // by the save paths, and cleared once it has been used.
   const pendingHistoryMetaRef = useRef(null);
-  // Resolver for an in-flight assistant save gate — see requestSaveGate.
-  const saveGateResolveRef = useRef(null);
+  // Why the last validateWorkflow() refused, for callers that report it.
+  const validationFailureRef = useRef(null);
 
   // Latest signals the on-disk code watcher reads to decide whether a
   // 'workflow:codeChanged' event should reload the canvas. `suppressUntil`
@@ -544,9 +545,12 @@ const WorkflowEditor = ({
   // reconfigured under a child. syncNodeSourcesToEdges returns the same array
   // when nothing moved, so this settles in one pass and does not loop.
   useEffect(() => {
-    const { nodes: synced, repointed } = syncNodeSourcesToEdges(nodes, edges);
+    const { repointed } = syncNodeSourcesToEdges(nodes, edges);
     if (!repointed.length) return;
-    setNodes(synced);
+    // Re-derived from the latest nodes rather than set from this render's copy:
+    // an update queued since this render (a config the chat just applied) would
+    // otherwise be overwritten by the older array.
+    setNodes((prev) => syncNodeSourcesToEdges(prev, edges).nodes);
 
     // A flagged transformer/join says so on the canvas — SourceChangedPopup
     // floats over the card with what moved and the two answers to it — so a
@@ -1102,6 +1106,66 @@ const WorkflowEditor = ({
     setTriggerSidebarSave(true);
   }, [setNodes, mergeConfigWithName, markNodesPending]);
 
+  // ── Chat-assistant canvas graph ──────────────────────────────────────────
+  //
+  // The canvas as the chat's context: node ids, types, labels and the config
+  // fields that say what each node reads and writes. The assistant renders one
+  // line per node from this (workflowHeadline in public/chat/chatAssistant.js).
+  //
+  // It is sent because the DATABASE is not what the user is looking at. A
+  // never-saved canvas has no row at all, and a saved one with unsaved edits has
+  // a row describing the last save — either way the chat used to see only
+  // "6 nodes on the canvas" and had to guess the rest.
+  //
+  // Pruned here, before IPC, for three reasons: schema sample rows are by far the
+  // largest thing on a node (a single imported-JSON source carries ~13k chars of
+  // them), SQL and generated code are fetched on demand by node id instead, and
+  // live node objects are not structured-cloneable — that is what `toCloneable`
+  // guards, and sending them raw is what previously failed with "object could not
+  // be cloned".
+  const canvasGraph = useMemo(() => {
+    // Statements and generated code: named, never sent. Whether a node HAS one is
+    // the part that belongs in a summary ("SQL" / "JS" / "not configured yet");
+    // the code itself is what get_workflow_nodes is for. Dropping them silently
+    // made a configured join read as unconfigured, so the names travel as
+    // `hasLogic` — see logicLabel in public/chat/chatAssistant.js.
+    const LOGIC = [
+      'transformFunction', 'apiFetchCode', 'targetSql', 'joinSql',
+      'targetDdl', 'insertSql', 'nosqlOperation', 'vectorFetchOperation',
+    ];
+    const DROP = new Set([
+      'chat',
+      ...LOGIC,
+      'sourceSql', 'sourcePreviewSql', 'targetPreviewSql',
+      // Restates every source's schema and connection, all of it already here.
+      'sources', 'sourcesConfig', 'executed',
+    ]);
+    const slimSchema = (s) => (s && typeof s === 'object'
+      ? { tableName: s.tableName || null, columns: (s.columns || []).map((c) => ({ name: c?.name, type: c?.type })) }
+      : undefined);
+    try {
+      return toCloneable({
+        nodes: (nodes || []).map((n) => {
+          const cfg = n.data?.config || {};
+          const out = {};
+          for (const [k, v] of Object.entries(cfg)) {
+            if (DROP.has(k) || v == null || v === '') continue;
+            if (k === 'sourceTableSchema' || k === 'targetTableSchema') out[k] = slimSchema(v);
+            else out[k] = typeof v === 'string' ? v.slice(0, 400) : v;
+          }
+          const hasLogic = LOGIC.filter((k) => cfg[k] != null && cfg[k] !== '');
+          if (hasLogic.length) out.hasLogic = hasLogic;
+          return { id: n.id, type: n.type, data: { label: n.data?.label || null, config: out } };
+        }),
+        edges: (edges || []).map((e) => ({ source: e.source, target: e.target })),
+      }, 'canvasGraph');
+    } catch (err) {
+      // Context is a nicety; never let it break a turn.
+      console.warn('[WorkflowEditor] could not build the canvas graph for chat context:', err);
+      return null;
+    }
+  }, [nodes, edges]);
+
   // ── Chat-assistant node targeting ────────────────────────────────────────
   // Build the payload the ChatAssistant sends to chat:step as `targetNode`, so
   // the main prompt can route to the transformer/join (or REST-API dataSource)
@@ -1124,7 +1188,10 @@ const WorkflowEditor = ({
         workflowId: workflowScopeIdRef.current || currentWorkflowId || null,
         nodeId: node.id,
         type,
-        label: node.data?.label || type,
+        // The name the CARD shows, not `data.label`: that is the type label
+        // ("Join", "Transformer") until someone renames the node, so the chat
+        // chip read "Join Join" and could not tell two joins apart.
+        label: nodeDisplayName(type, node.data || {}, node.data?.label || type),
         config: toCloneable(node.data?.config || {}, 'targetNode.config'),
         upstreamNodes: toCloneable(upstreamNodes, 'targetNode.upstream'),
         connectionId: isApiDS ? (cfg.sourceApiConnectionId || cfg.sourceConnectionId || null) : null,
@@ -1177,7 +1244,72 @@ const WorkflowEditor = ({
     [runningExecution, latestExecution],
   );
 
+  // The ids of the saved connections, so a data source whose connection has
+  // been deleted can say so on its card — the same red banner a transformer
+  // shows when its parent moves. null until the first read: nothing is
+  // flagged on a guess. Re-read whenever a connection is saved or deleted
+  // (connectionsDb announces it) and when the window regains focus.
+  const [savedConnections, setSavedConnections] = useState(null);
+  const savedConnectionIds = useMemo(
+    () => (savedConnections ? new Set(savedConnections.map((c) => c.id).filter(Boolean)) : null),
+    [savedConnections],
+  );
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const all = await connectionsDb.getAll();
+        if (alive) setSavedConnections(all || []);
+      } catch (_) { /* keep the last answer */ }
+    };
+    load();
+    window.addEventListener(CONNECTIONS_CHANGED_EVENT, load);
+    window.addEventListener('focus', load);
+    return () => {
+      alive = false;
+      window.removeEventListener(CONNECTIONS_CHANGED_EVENT, load);
+      window.removeEventListener('focus', load);
+    };
+  }, [currentWorkflowId]);
+
+  // A deleted connection that has been added back is a new record with a new
+  // id. When exactly one saved connection is plainly the same one (same type,
+  // and the same name or file path), every node that named the old id is
+  // pointed at it — no red card, no re-picking it node by node. Anything less
+  // certain stays red for the user to choose. See utils/connectionRefs.
+  useEffect(() => {
+    if (!savedConnections) return;
+    const { nodes: next, relinked } = relinkReaddedConnections(nodesRef.current || nodes, savedConnections);
+    if (!relinked.length) return;
+    setNodes(next);
+    setHasUnsavedChanges(true);
+    message.info(
+      `Reconnected to ${relinked.map((r) => `"${r.name}"`).join(', ')} — the connection was added back. Save to keep it.`,
+      6,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedConnections, currentWorkflowId]);
+
+  // Nodes with the derived `connectionMissing` flag on each data source whose
+  // saved connection no longer exists. Derived for display only — never
+  // saved — so restoring the connection clears it. `local-…` ids are
+  // placeholders for the workflow's own storage, not saved connections.
+  const nodesWithConnectionState = useMemo(() => {
+    if (!savedConnectionIds) return nodes;
+    let changed = false;
+    const next = nodes.map((n) => {
+      if (n.type !== 'dataSource') return n;
+      const id = n.data?.config?.sourceConnectionId;
+      const missing = !!id && !String(id).startsWith('local-') && !savedConnectionIds.has(id);
+      if (!!n.data?.connectionMissing === missing) return n;
+      changed = true;
+      return { ...n, data: { ...n.data, connectionMissing: missing } };
+    });
+    return changed ? next : nodes;
+  }, [nodes, savedConnectionIds]);
+
   const displayNodes = useMemo(() => {
+    const nodes = nodesWithConnectionState;
     if ((!liveSteps || liveSteps.length === 0) && runClasses.size === 0) return nodes;
     const stepById = new Map((liveSteps || []).map((s) => [s.id, s]));
     const withGlow = nodes.map((n) => {
@@ -1206,7 +1338,7 @@ const WorkflowEditor = ({
         deletable: false,
       }));
     return placeholders.length ? withGlow.concat(placeholders) : withGlow;
-  }, [nodes, liveSteps, ghostIds, runClasses]);
+  }, [nodesWithConnectionState, liveSteps, ghostIds, runClasses]);
 
   // Drop ReactFlow's changes for placeholder nodes: they aren't in `nodes`, so
   // applyNodeChanges can only discard them anyway — but it returns a fresh
@@ -1352,20 +1484,40 @@ const WorkflowEditor = ({
   // Broadcast the focused node to the ChatAssistant. It re-fires when the
   // node's config changes (e.g. right after a build) so the chat always has
   // the current SQL/JS for refinement. Clears focus when nothing is selected.
+  // Its inputs too: the payload carries the node's upstream nodes, and the chat
+  // decides from them whether the node can be built yet.
+  const selectedInputs = selectedNode
+    ? edges.filter((e) => e.target === selectedNode.id).map((e) => e.source).join('|')
+    : '';
   useEffect(() => {
     const payload = selectedNode ? buildTargetNodePayload(selectedNode) : null;
     window.dispatchEvent(new CustomEvent('ternlux:node-focus', { detail: payload }));
-    // Fire only when the selection or its config changes (not on every canvas
-    // drag/highlight). buildTargetNodePayload is intentionally excluded — it
-    // reads the current nodes/edges at call time.
+    // Fire only when the selection, its config or its wiring changes (not on
+    // every canvas drag/highlight). buildTargetNodePayload is intentionally
+    // excluded — it reads the current nodes/edges at call time.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNode?.id, selectedNode?.data?.config]);
+  }, [selectedNode?.id, selectedNode?.data?.config, selectedInputs]);
 
   // Closing the workflow takes the canvas — and therefore the focused node —
   // away with it. The assistant outlives this editor, so drop the focus on the
   // way out or it keeps offering to edit a node that is no longer on screen.
+  // Tell the assistant which workflow is open, so a "Run this node" card for a
+  // node of another (or a closed) workflow is disabled until this one is open.
+  // Same id the node-focus payload carries (the scope id a first save adopts).
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('ternlux:workflow-open', {
+      detail: { workflowId: workflowScopeIdRef.current || currentWorkflowId || null },
+    }));
+  }, [currentWorkflowId]);
   useEffect(() => () => {
-    window.dispatchEvent(new CustomEvent('ternlux:node-focus', { detail: null }));
+    window.dispatchEvent(new CustomEvent('ternlux:workflow-open', { detail: { workflowId: null } }));
+  }, []);
+
+  // `closed` tells the assistant this is the canvas going away, not a node
+  // being deselected — a deselect can leave a node in the conversation while
+  // its builder waits for an answer, a closed workflow never does.
+  useEffect(() => () => {
+    window.dispatchEvent(new CustomEvent('ternlux:node-focus', { detail: { closed: true } }));
   }, []);
 
   // Tell the ChatAssistant whether this canvas has uncommitted work.
@@ -1415,9 +1567,14 @@ const WorkflowEditor = ({
       unsaved: !currentWorkflowId,
       summary: workflowDescription
         || `${nodes.length} node${nodes.length === 1 ? '' : 's'} on the canvas`,
+      // What the assistant describes the workflow FROM — see canvasGraph. In the
+      // deps below rather than `nodes.length`, so a node whose config changed
+      // (renamed, retargeted, pointed at another file) re-reports; the memo
+      // returns a new object only when the nodes or edges actually change.
+      graph: canvasGraph,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflow, editorLoading, currentWorkflowId, workflowName, workflowDescription, nodes.length, onContextChange]);
+  }, [workflow, editorLoading, currentWorkflowId, workflowName, workflowDescription, canvasGraph, onContextChange]);
 
   // Read through a ref so the cleanup below can stay mount-only: a changed
   // callback identity must not clear the context mid-life, since the effect
@@ -1543,12 +1700,25 @@ const WorkflowEditor = ({
           const result = await window.electronAPI.workflow.executeNode({
             workflowId: workflowScopeIdRef.current || currentWorkflowId || null,
             nodeId,
+            // The run card showed the drop-and-recreate warning: Run approves it.
+            approvedRebuilds: e.detail?.approveRebuild ? [nodeId] : [],
             // Same sanitization the full-run path needs: live nodes carry Arrow
             // vectors and circular refs that cannot cross IPC.
             nodes: toCloneable(nodesRef.current, 'nodes'),
             edges: toCloneable(edgesRef.current, 'edges'),
           });
           if (result?.success) {
+            // What the run learned about the node — a REST API source's columns
+            // after its first approved fetch. Written onto the node like any
+            // config change (so the nodes built after it can read them, and the
+            // save keeps them).
+            if (result.configPatch && typeof result.configPatch === 'object') {
+              const patch = result.configPatch;
+              const apply = (n) => ({ ...n, data: { ...n.data, config: { ...(n.data?.config || {}), ...patch } } });
+              setNodes((prev) => prev.map((n) => (n.id === nodeId ? apply(n) : n)));
+              setSelectedNode((prev) => (prev && prev.id === nodeId ? apply(prev) : prev));
+              setHasUnsavedChanges(true);
+            }
             // Before the refresh: the preview decides what it may query from
             // this flag, so it must be on the node when the refresh arrives.
             markNodesExecuted((n) => n.id === nodeId);
@@ -1743,44 +1913,11 @@ const WorkflowEditor = ({
     }
   }, []);
 
-  const canNodeOpenSidebar = (node, allNodes, allEdges) => {
-    switch (node.type) {
-      case 'start':
-        return true; // Start node can always be configured
-      case 'dataSource':
-        return true; // Data source can always open
-      case 'transformer':
-        // Needs one input connection
-        return allEdges.some(edge => edge.target === node.id);
-      case 'join':
-        // Needs two input connections
-        const inputConnections = allEdges.filter(edge => edge.target === node.id);
-        return inputConnections.length >= 2;
-      case 'branch':
-        // Needs at least one input connection
-        return allEdges.some(edge => edge.target === node.id);
-      case 'output':
-        // Needs one input connection
-        return allEdges.some(edge => edge.target === node.id);
-      default:
-        return true;
-    }
-  };
+  const canNodeOpenSidebar = (node, allNodes, allEdges) => (
+    hasRequiredInputs(node.type, allEdges.filter((edge) => edge.target === node.id).length)
+  );
 
-  const getNodeRequirementMessage = (node) => {
-    switch (node.type) {
-      case 'transformer':
-        return 'Transformer node requires a source connection to configure';
-      case 'join':
-        return 'Join node requires two input connections to configure';
-      case 'branch':
-        return 'Branch node requires at least one input connection to configure';
-      case 'output':
-        return 'Output node requires an input connection to configure';
-      default:
-        return 'Node cannot be configured';
-    }
-  };
+  const getNodeRequirementMessage = (node) => nodeRequirementMessage(node.type);
 
   const onCloseSidebar = () => {
     setIsSidebarOpen(false);
@@ -1788,28 +1925,31 @@ const WorkflowEditor = ({
   };
 
   const validateWorkflow = () => {
-    if (!workflowName.trim()) {
-      message.error('Please enter a workflow name');
+    validationFailureRef.current = null;
+    // Shown to the user, and kept for callers that report why (the save gate).
+    const fail = (msg) => {
+      message.error(msg);
+      validationFailureRef.current = msg;
       return false;
+    };
+    if (!workflowName.trim()) {
+      return fail('Please enter a workflow name');
     }
 
     if (nodes.length === 0) {
-      message.error('Workflow must contain at least one node');
-      return false;
+      return fail('Workflow must contain at least one node');
     }
 
     // Check if there's a start node
     const hasStart = nodes.some(node => node.type === 'start');
     if (!hasStart) {
-      message.error('Workflow must contain a start node');
-      return false;
+      return fail('Workflow must contain a start node');
     }
 
     // Check if there's at least one data source node
     const hasDataSource = nodes.some(node => node.type === 'dataSource');
     if (!hasDataSource) {
-      message.error('Workflow must contain at least one data source node');
-      return false;
+      return fail('Workflow must contain at least one data source node');
     }
 
     // Check if start node is connected to at least one data source
@@ -1817,16 +1957,14 @@ const WorkflowEditor = ({
     if (startNode) {
       const startConnections = edges.filter(edge => edge.source === startNode.id);
       if (startConnections.length === 0) {
-        message.error('Start node must be connected to at least one data source');
-        return false;
+        return fail('Start node must be connected to at least one data source');
       }
       
       // Verify all connections from start are to data sources
       for (const connection of startConnections) {
         const connectedNode = nodes.find(node => node.id === connection.target);
         if (!connectedNode || connectedNode.type !== 'dataSource') {
-          message.error('Start node can only connect to data source nodes');
-          return false;
+          return fail('Start node can only connect to data source nodes');
         }
       }
     }
@@ -1834,8 +1972,9 @@ const WorkflowEditor = ({
     // Check if all nodes are properly configured
     for (const node of nodes) {
       if (!canNodeOpenSidebar(node, nodes, edges)) {
-        message.error(`Node "${node.data.label}" is not properly connected`);
-        return false;
+        const label = nodeDisplayName(node.type, node.data || {}, node.data?.label || node.type);
+        const reason = `${getNodeRequirementMessage(node)} ("${label}" is not wired to its input).`;
+        return fail(reason);
       }
     }
 
@@ -1851,10 +1990,17 @@ const WorkflowEditor = ({
    * result. Rather than guess, the build asks here first.
    *
    * Resolves { ok: true } when there is nothing uncommitted (the common case,
-   * and no prompt is shown). Otherwise the user is asked to save through the
-   * Execution Steps editor — the same route Execute takes — and the answer
-   * decides: a committed save resolves { ok: true }, cancelling resolves
-   * { ok: false } and the caller abandons the build.
+   * and no prompt is shown). Otherwise it answers { ok: false } AT ONCE and
+   * opens the Execution Steps editor — the same route Execute takes — so the
+   * user can save. Nothing reaches the builder until the workflow is saved,
+   * and the chat is never left waiting on a dialog: it says what happened and
+   * the user asks again (Retry) once the save is done.
+   *
+   * It used to hold the chat open until the dialog closed. That stalled the
+   * assistant on "Workflow builder…" behind a modal it never mentioned, and a
+   * successful save still reported "untouched": the steps editor calls onSave
+   * and then onClose in the same tick, and the close settled the gate as
+   * cancelled before the save had finished.
    */
   const requestSaveGate = useCallback(() => new Promise((resolve) => {
     // This canvas is a build in progress — very likely one opened by that
@@ -1887,29 +2033,21 @@ const WorkflowEditor = ({
       resolve({ ok: true, reason: 'clean' });
       return;
     }
-    // Only one gate can be open at a time; a second request while the editor
-    // is already up is answered by the same decision.
-    if (saveGateResolveRef.current) {
-      resolve({ ok: false, reason: 'already-prompting' });
-      return;
-    }
+    const name = (workflowName || '').trim() || null;
     if (!validateWorkflow()) {
-      // e.g. missing name — the steps editor cannot commit, so don't open it.
-      resolve({ ok: false, reason: needsFirstSave ? 'unnamed-workflow' : 'invalid-workflow' });
+      // The steps editor cannot commit, so don't open it. `detail` is what the
+      // validator found, so the assistant can say it rather than guess.
+      resolve({
+        ok: false,
+        reason: needsFirstSave ? 'unnamed-workflow' : 'invalid-workflow',
+        detail: validationFailureRef.current,
+      });
       return;
     }
-    saveGateResolveRef.current = resolve;
-    // Straight into the Execution Steps editor — the user sees the steps the
-    // assistant is about to plan against, and saving from there is what
-    // releases the build. No intermediate confirm: the only useful answers are
-    // "save" and "cancel", and both live in this editor.
-    message.info(needsFirstSave
-      ? 'Name and save this workflow first — the assistant builds on the saved version.'
-      : 'Save your workflow first — the assistant plans against the saved version.');
-    setPendingAction('aiBuild');
-    setSaveAfterStepsEditor(true);
-    setIsStepsEditorOpen(true);
-  }), [buildInFlight, nodes, currentWorkflowId, hasUnsavedChanges, tempStateSave, validateWorkflow]);
+    // No dialog: Save is one click on the toolbar, and the chat says so.
+    message.info('Save the workflow, then press Retry in the chat.');
+    resolve({ ok: false, reason: 'needs-save', workflowName: name });
+  }), [buildInFlight, nodes, currentWorkflowId, hasUnsavedChanges, tempStateSave, validateWorkflow, workflowName]);
 
   // The assistant lives outside this tree entirely (App renders it beside
   // Workflows), so the gate is offered through a window event rather than
@@ -1928,23 +2066,6 @@ const WorkflowEditor = ({
     window.addEventListener('ternlux:workflow-save-gate', handler);
     return () => window.removeEventListener('ternlux:workflow-save-gate', handler);
   }, []);
-
-  // Settle whatever the gate is waiting on. Called from every path that ends
-  // the prompt so a caller is never left awaiting a promise that never
-  // resolves — including an editor unmount mid-decision.
-  const settleSaveGate = useCallback((ok, reason) => {
-    const resolve = saveGateResolveRef.current;
-    saveGateResolveRef.current = null;
-    // Report the id the save landed under, so a caller waiting on a FIRST save
-    // can retarget its build at the workflow that now exists — otherwise the
-    // build still points at "create a new one" and strands what was just saved.
-    // workflowScopeIdRef is what autoSave writes as the record's id, and unlike
-    // currentWorkflowId it is already correct on this render (setState from the
-    // save has not committed by the time this runs).
-    if (resolve) resolve({ ok, reason, workflowId: ok ? workflowScopeIdRef.current : null });
-  }, []);
-
-  useEffect(() => () => settleSaveGate(false, 'editor-closed'), [settleSaveGate]);
 
   /**
    * Load a stored version onto the canvas.
@@ -2393,8 +2514,28 @@ const WorkflowEditor = ({
   };
 
   const handleOpenStepsEditor = () => {
-    setSaveAfterStepsEditor(false);
     setIsStepsEditorOpen(true);
+  };
+
+  /**
+   * The one-click save behind every Save button: the toolbar, the
+   * unsaved-changes prompt, and anything else that commits the canvas. The run
+   * order is the saved one with any new nodes placed by the graph — the same
+   * order the Edit Steps editor would open on — so saving never needs that
+   * editor; reordering is its own action. Resolves true when the save landed.
+   */
+  const commitSave = async () => {
+    if (!validateWorkflow()) return false;
+    let steps = null;
+    try {
+      steps = resolveExecutionSteps(executionSteps, nodes, edges)
+        .map((st, i) => ({ nodeId: st.nodeId, order: i }));
+    } catch (_) { /* autoSave derives an order when none is given */ }
+    if (steps) setExecutionSteps(steps);
+    const priorFn = outputValidation?.validationFunction || null;
+    const ok = await autoSave({ explicit: true, executionStepsOverride: steps });
+    if (ok && steps) maybeOfferRevalidation(outputValidation, steps, priorFn);
+    return ok;
   };
 
   const handleSaveWorkflow = () => {
@@ -2411,15 +2552,9 @@ const WorkflowEditor = ({
       message.warning('A save is already in progress. Please wait…');
       return;
     }
-    if (!validateWorkflow()) {
-      // validateWorkflow shows a specific message (e.g. "Please enter a
-      // workflow name") — nothing more to do.
-      return;
-    }
-    // Open steps editor first, then commit an explicit save after the user
-    // verifies the Execution Steps.
-    setSaveAfterStepsEditor(true);
-    setIsStepsEditorOpen(true);
+    // validateWorkflow (inside commitSave) shows a specific message, e.g.
+    // "Please enter a workflow name" — nothing more to do on a refusal.
+    commitSave();
   };
 
   const handleExportJSON = () => {
@@ -2452,13 +2587,6 @@ const WorkflowEditor = ({
 
   const handleStepsEditorClose = () => {
     setIsStepsEditorOpen(false);
-    setSaveAfterStepsEditor(false);
-    // Cancelling the steps editor abandons any deferred close/execute action.
-    const action = pendingAction;
-    setPendingAction(null);
-    // Closing without saving is the assistant gate's "cancel": the build is
-    // abandoned and the canvas is left exactly as the user had it.
-    if (action === 'aiBuild') settleSaveGate(false, 'cancelled');
   };
 
   // Lightweight goal-drift check after an explicit save. Only fires when the
@@ -2516,45 +2644,25 @@ const WorkflowEditor = ({
 
     console.log('Execution steps saved to workflow state:', savedExecutionSteps);
 
-    if (saveAfterStepsEditor) {
-      setSaveAfterStepsEditor(false);
-      setIsStepsEditorOpen(false);
-      // Commit an EXPLICIT save now that the user has verified the steps. This
-      // clears the temp-state flag. Pass the just-saved steps directly to avoid
-      // reading stale state.
-      const ok = await autoSave({
-        explicit: true,
-        executionStepsOverride: savedExecutionSteps,
-        outputValidation: savedValidation,
-      });
-      const action = pendingAction;
-      setPendingAction(null);
-      if (!ok) {
-        // Save failed or failed validation — stay in the editor, and release a
-        // waiting build rather than leaving it hanging on a save that never
-        // landed.
-        if (action === 'aiBuild') settleSaveGate(false, 'save-failed');
-        return;
-      }
-      // Goal-drift check: if we just saved a PRE-EXISTING validation function the
-      // user did not regenerate, verify it still fits the (possibly edited)
-      // workflow and offer to regenerate. Non-blocking; the deferred action still
-      // proceeds below.
-      maybeOfferRevalidation(savedValidation, savedExecutionSteps, priorValidationFn);
-      // Perform any action the user deferred behind the save (close/execute).
-      if (action === 'close') {
-        onCancel();
-      } else if (action === 'execute') {
-        doExecuteWorkflow();
-      } else if (action === 'aiBuild') {
-        // The workflow on disk now matches the canvas, so the build can read it.
-        settleSaveGate(true, 'saved');
-      }
-    } else {
-      // Steps edited without an immediate save request — mark as unsaved so the
-      // change is picked up by the next save/close.
+    // "Save Steps" commits — the same one-click save as the toolbar's Save,
+    // with the order and validation the user just set. Nothing else opens this
+    // editor as a step of saving any more.
+    setIsStepsEditorOpen(false);
+    if (!validateWorkflow()) {
+      // Not savable yet (e.g. no name): keep the steps in state for the next save.
       setHasUnsavedChanges(true);
+      return;
     }
+    const ok = await autoSave({
+      explicit: true,
+      executionStepsOverride: savedExecutionSteps,
+      outputValidation: savedValidation,
+    });
+    if (!ok) return;
+    // Goal-drift check: if we just saved a PRE-EXISTING validation function the
+    // user did not regenerate, verify it still fits the (possibly edited)
+    // workflow and offer to regenerate. Non-blocking.
+    maybeOfferRevalidation(savedValidation, savedExecutionSteps, priorValidationFn);
   };
 
   /**
@@ -2575,14 +2683,39 @@ const WorkflowEditor = ({
       setUnsavedPrompt({ open: true, intent: 'execute' });
       return;
     }
-    doExecuteWorkflow();
+    startExecution();
   };
 
   /**
    * Execute the entire workflow (no save-gate — call only after the gate).
    * Iterates through nodes in order and executes each one.
    */
-  const doExecuteWorkflow = async () => {
+  /**
+   * The last stop before a run: a join whose kept target has to be dropped and
+   * recreated (joinSettings.targetRebuild, not already approved at build time)
+   * needs a yes first. Nothing is asked when there is none.
+   */
+  const startExecution = () => {
+    const items = (nodesRef.current || nodes || [])
+      .filter((n) => n.type === 'join')
+      .map((n) => ({ node: n, rb: n.data?.config?.joinSettings?.targetRebuild }))
+      .filter(({ rb }) => rb?.pending && !(rb.approvedFingerprint && rb.approvedFingerprint === rb.ddlFingerprint))
+      .map(({ node, rb }) => ({
+        nodeId: node.id,
+        label: node.data?.label || node.data?.config?.targetTableName || node.id,
+        table: rb.table,
+        rowCount: rb.rowCount,
+        reason: rb.reason,
+        warning: targetIsSourceWarning(rb),
+      }));
+    if (items.length) {
+      setRebuildPrompt({ open: true, items });
+      return;
+    }
+    doExecuteWorkflow();
+  };
+
+  const doExecuteWorkflow = async ({ approvedRebuilds = [] } = {}) => {
     if (!nodes || nodes.length === 0) {
       message.warning('No nodes to execute');
       return;
@@ -2652,8 +2785,23 @@ const WorkflowEditor = ({
         // targetDdl, stale SELECT — against the new connection.
         nodes: toCloneable(withPersistedNodeNames(nodesRef.current), 'nodes'),
         edges: toCloneable(edgesRef.current, 'edges'),
-        executionSteps: toCloneable(finalExecutionSteps, 'executionSteps')
+        executionSteps: toCloneable(finalExecutionSteps, 'executionSteps'),
+        // Joins whose target the user just approved dropping and recreating.
+        approvedRebuilds,
       });
+
+      // What the run learned about its nodes (a join whose target was
+      // recreated stops asking) — written onto the canvas like a single-node
+      // run's configPatch.
+      const patches = result?.configPatches && typeof result.configPatches === 'object' ? result.configPatches : null;
+      if (patches && Object.keys(patches).length) {
+        const apply = (n) => (patches[n.id]
+          ? { ...n, data: { ...n.data, config: { ...(n.data?.config || {}), ...patches[n.id] } } }
+          : n);
+        setNodes((prev) => prev.map(apply));
+        setSelectedNode((prev) => (prev ? apply(prev) : prev));
+        setHasUnsavedChanges(true);
+      }
 
       if (result.success) {
         message.success(`Workflow executed successfully! Execution ID: ${result.executionId}`);
@@ -2720,25 +2868,7 @@ const WorkflowEditor = ({
   // ── Unsaved-changes prompt (Save / Don't save / Cancel) ──────────────────
   // Shown from Execute and Close when there are uncommitted changes.
 
-  // The order shown in the prompt, reorderable there. Seeded when it opens from
-  // what was saved, or from what a save would derive.
-  const [promptSteps, setPromptSteps] = useState([]);
-
-  useEffect(() => {
-    if (!unsavedPrompt.open) return;
-    let seeded = [];
-    try {
-      seeded = resolveExecutionSteps(executionSteps, nodes, edges);
-    } catch (_) { /* an unseedable graph still gets a prompt */ }
-    // Hydrated for the list — it draws each row from the node, and hands back
-    // the same shape, so the save below reduces them to { nodeId, order }.
-    setPromptSteps(hydrateSteps(seeded, nodes));
-    // Seeded on open only — reordering must not be undone by a re-render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [unsavedPrompt.open]);
-
-  // Saves with the order shown in the prompt, then runs the deferred action.
-  // The steps are verified here, so the full editor is not opened.
+  // Saves (one click — see commitSave), then runs the deferred action.
   const handlePromptSave = async () => {
     const intent = unsavedPrompt.intent;
     setUnsavedPrompt({ open: false, intent: null });
@@ -2746,20 +2876,14 @@ const WorkflowEditor = ({
       message.warning('A save is already in progress. Please wait…');
       return;
     }
-    if (!validateWorkflow()) {
-      // e.g. missing name — user must fix, then retry close/execute.
-      return;
-    }
-
-    const steps = promptSteps.map((s, i) => ({ nodeId: s.nodeId, order: i }));
-    setExecutionSteps(steps);
-    const ok = await autoSave({ explicit: true, executionStepsOverride: steps });
+    // e.g. missing name — validateWorkflow says so; the user fixes it and retries.
+    const ok = await commitSave();
     if (!ok) return;
 
     if (intent === 'close') {
       onCancel();
     } else if (intent === 'execute') {
-      doExecuteWorkflow();
+      startExecution();
     }
   };
 
@@ -2769,7 +2893,7 @@ const WorkflowEditor = ({
     if (intent === 'close') {
       onCancel();
     } else if (intent === 'execute') {
-      doExecuteWorkflow();
+      startExecution();
     }
   };
 
@@ -3146,15 +3270,56 @@ const WorkflowEditor = ({
         onClose={() => setIsHistoryOpen(false)}
       />
 
-      {/* Unsaved-changes prompt (Save / Don't save / Cancel). Save commits with
-          the step order shown here. */}
+      {/* Drop-and-recreate approval for joins whose kept target no longer
+          fits what they write. Run approves every table listed. */}
+      <Modal
+        open={rebuildPrompt.open}
+        title="Recreate tables before running?"
+        onCancel={() => setRebuildPrompt({ open: false, items: [] })}
+        maskClosable={false}
+        footer={[
+          <Button key="cancel" onClick={() => setRebuildPrompt({ open: false, items: [] })}>
+            Cancel
+          </Button>,
+          <Button
+            key="run"
+            type="primary"
+            danger
+            onClick={() => {
+              const ids = rebuildPrompt.items.map((it) => it.nodeId);
+              setRebuildPrompt({ open: false, items: [] });
+              doExecuteWorkflow({ approvedRebuilds: ids });
+            }}
+          >
+            Drop, recreate and run
+          </Button>,
+        ]}
+      >
+        <div style={{ marginBottom: 8 }}>
+          These tables already exist and no longer fit what their join writes. Running drops each one
+          and recreates it — the rows in it now are deleted. Later runs append or merge into it as usual.
+        </div>
+        {rebuildPrompt.items.map((it) => (
+          <div key={it.nodeId} style={{ marginBottom: 6 }}>
+            <strong>{it.table}</strong>
+            {Number.isFinite(it.rowCount) ? ` (${it.rowCount} row${it.rowCount === 1 ? '' : 's'})` : ''}
+            {' '}— {it.label}: {it.reason}
+            {it.warning && (
+              <div style={{ marginTop: 4, padding: '6px 8px', borderRadius: 4, background: '#fef2f2', border: '1px solid #fca5a5', color: '#b91c1c', fontSize: 12.5, lineHeight: 1.45 }}>
+                ⚠ {it.warning}
+              </div>
+            )}
+          </div>
+        ))}
+      </Modal>
+
+      {/* Unsaved-changes prompt (Save / Don't save / Cancel). Save is the
+          one-click commitSave; the run order is edited with Edit Steps. */}
       <Modal
         open={unsavedPrompt.open}
         title="Unsaved changes"
         onCancel={handlePromptCancel}
         maskClosable={false}
-        // A long step list must not push the footer off screen.
-        styles={{ body: { maxHeight: '60vh', overflowY: 'auto' } }}
         footer={[
           <Button key="cancel" onClick={handlePromptCancel}>
             Cancel
@@ -3167,35 +3332,11 @@ const WorkflowEditor = ({
           </Button>,
         ]}
       >
-        <div style={{ marginBottom: 12 }}>
+        <div>
           {unsavedPrompt.intent === 'execute'
-            ? 'You have unsaved changes. Save and verify the Execution Steps before running, or run without saving?'
+            ? 'You have unsaved changes. Save before running, or run without saving?'
             : 'You have unsaved changes. Save before closing, or discard them?'}
         </div>
-
-        {/* Collapsed by default; drag to reorder, and Save commits this order. */}
-        <Collapse
-          ghost
-          size="small"
-          items={[{
-            key: 'steps',
-            label: (
-              <span style={{ fontSize: 13, fontWeight: 600 }}>
-                Edit Execution Steps
-                <span style={{ marginLeft: 8, fontWeight: 400, color: '#8c8c8c' }}>
-                  {promptSteps.length} step{promptSteps.length === 1 ? '' : 's'} · drag to reorder
-                </span>
-              </span>
-            ),
-            children: (
-              <ExecutionStepsReorder
-                steps={promptSteps}
-                edges={edges}
-                onChange={setPromptSteps}
-              />
-            ),
-          }]}
-        />
       </Modal>
     </div>
   );
