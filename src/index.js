@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
+import hydrateLocalStorage from './utils/persistentLocalStorage';
 
 // ── ResizeObserver: deliver notifications on the next frame ────────────────
 // "ResizeObserver loop completed with undelivered notifications" is what the
@@ -28,8 +29,15 @@ if (typeof window !== 'undefined' && typeof window.ResizeObserver === 'function'
 }
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+
+// A packaged window runs from file://, whose localStorage Chromium discards
+// when the window closes. Restore the mirrored copy BEFORE mounting: the
+// signed-in session and the saved AI model are read during the first render,
+// and a component that reads them too early decides the user is logged out.
+hydrateLocalStorage().finally(() => {
+  root.render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
+  );
+});
