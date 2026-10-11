@@ -14,6 +14,7 @@ const TEXT = '#111827';
 const MUTED = '#5a6678';
 const BORDER = '#e2e6eb';
 const GREEN = '#059669';
+const RED = '#dc2626';
 
 // One connector-icon map for the whole canvas — see CONNECTOR_ICONS. A second
 // copy lived here and fell behind: BigQuery, Snowflake and Slack had SVGs in
@@ -75,6 +76,13 @@ const DataSourceNode = ({ data, selected }) => {
 
   const SourceIconComponent = getSourceIcon(config);
 
+  // The saved connection this source reads through has been deleted (set by
+  // the editor from the live connection list — see nodesWithConnectionState).
+  // Red like a transformer whose parent moved: the node cannot run until it
+  // is pointed at a connection that exists.
+  const connectionMissing = !!data.connectionMissing;
+  const connectionName = config.sourceConnectionName || config.connectionName || null;
+
   // Named by nodeDisplayName, in step with every other surface that names a
   // node; the connection and table it reads are spelled out by the footer.
   const getDisplayName = () =>
@@ -105,15 +113,20 @@ const DataSourceNode = ({ data, selected }) => {
 
   return (
     <div
+      className={connectionMissing ? 'wf-node-source-changed' : undefined}
       style={{
         width: 264,
         background: '#fff',
-        border: `1px solid ${selected ? COLOR : BORDER}`,
-        borderLeft: `3px solid ${COLOR}`,
+        border: `1px solid ${connectionMissing ? RED : (selected ? COLOR : BORDER)}`,
+        borderLeft: `3px solid ${connectionMissing ? RED : COLOR}`,
         borderRadius: 6,
-        boxShadow: selected
-          ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
-          : '0 1px 4px rgba(0,0,0,0.07)',
+        // The pulse owns the shadow while the connection is missing — see
+        // .wf-node-source-changed in Workflows.css.
+        boxShadow: connectionMissing
+          ? undefined
+          : (selected
+            ? `0 0 0 3px ${COLOR}1a, 0 4px 16px rgba(0,0,0,0.12)`
+            : '0 1px 4px rgba(0,0,0,0.07)'),
         position: 'relative',
         userSelect: 'none',
         fontFamily: "'Inter',-apple-system,sans-serif",
@@ -158,13 +171,16 @@ const DataSourceNode = ({ data, selected }) => {
         }}>
           DATA SOURCE
         </span>
-        <div style={{
-          marginLeft: 'auto',
-          width: 6,
-          height: 6,
-          borderRadius: '50%',
-          background: isConfigured ? GREEN : BORDER,
-        }} />
+        <div
+          title={connectionMissing ? 'The connection this source reads through was deleted.' : undefined}
+          style={{
+            marginLeft: 'auto',
+            width: 6,
+            height: 6,
+            borderRadius: '50%',
+            background: connectionMissing ? RED : (isConfigured ? GREEN : BORDER),
+          }}
+        />
       </div>
 
       {/* Body */}
@@ -180,6 +196,22 @@ const DataSourceNode = ({ data, selected }) => {
         }}>
           {getDisplayName()}
         </div>
+        {connectionMissing && (
+          <div style={{
+            fontSize: 10,
+            fontFamily: MONO,
+            color: RED,
+            background: '#fef2f2',
+            border: `1px solid ${RED}33`,
+            borderRadius: 4,
+            padding: '3px 6px',
+            marginBottom: 5,
+            lineHeight: 1.4,
+            whiteSpace: 'normal',
+          }}>
+            CONNECTION DELETED{connectionName ? ` — ${connectionName}` : ''} — pick another connection, or add it back (it reconnects on its own)
+          </div>
+        )}
         {(isApi || !isConfigured) && (
           <div style={{
             fontSize: 11,
