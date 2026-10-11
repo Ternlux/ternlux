@@ -45,7 +45,9 @@ export const loadTableSchema = async ({
         namespace: tableSchema || '',
         dbConfig: connection.dbConfig || {},
         connectionId: connection.id,
-        targetLocalPath: localPath
+        targetLocalPath: localPath,
+        // Enough records to find metadata fields only some of them carry.
+        limit: Math.max(limit || 0, 50),
       });
       console.log('result: ', result)
       if (!result.success || !result.data) {
@@ -53,10 +55,27 @@ export const loadTableSchema = async ({
         return null;
       }
 
-      const sampleData = result.data.slice(0, limit);
-      const columns = sampleData.length > 0
-        ? Object.keys(sampleData[0]).map(name => {
-            const value = sampleData[0][name];
+      // A Pinecone record is { id, values, metadata: {...}, namespace }, but
+      // joins and the JavaScript skill hand generated code its metadata fields
+      // at top level. Describe it that way, or the builder sees one JSON
+      // `metadata` column and cannot tell which fields exist. Keys are the
+      // union over the sample: a tag set on a few records is still a column.
+      const flatten = (row) => {
+        if (connection.dbType !== 'pinecone' || !row || typeof row !== 'object') return row;
+        const { metadata, ...rest } = row;
+        const meta = metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {};
+        return { id: rest.id, ...meta, ...rest };
+      };
+      const rows = result.data.map(flatten);
+      const sampleData = rows.slice(0, limit);
+      const firstValue = (name) => {
+        const row = rows.find((r) => r[name] !== undefined && r[name] !== null);
+        return row ? row[name] : null;
+      };
+      const columnNames = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+      const columns = rows.length > 0
+        ? columnNames.map(name => {
+            const value = firstValue(name);
             let type = 'unknown';
             if (typeof value === 'number') type = 'number';
             else if (typeof value === 'boolean') type = 'boolean';

@@ -90,6 +90,31 @@ export async function resendVerification(email) {
   }
 }
 
+/** Ask the backend to email a 6-digit password reset code. */
+export async function requestPasswordReset(email) {
+  try {
+    const { data } = await api.post('/forgot-password', { email });
+    return data;
+  } catch (err) {
+    return { success: false, error: errorMessage(err, 'Could not send the reset code. Please try again.') };
+  }
+}
+
+/** Set a new password with the emailed code. Signs in (stores the JWT) on success. */
+export async function resetPassword({ email, code, password }) {
+  try {
+    const { data } = await api.post('/reset-password', { email, code, password });
+    if (data.success && data.token) persistSession(data);
+    return data;
+  } catch (err) {
+    return {
+      success: false,
+      error: errorMessage(err, 'Could not reset the password. Please try again.'),
+      code: err.response?.data?.code
+    };
+  }
+}
+
 /**
  * Google sign-in: the Electron main process runs the browser OAuth flow,
  * then the backend exchanges the code and issues our JWT.

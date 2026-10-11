@@ -181,6 +181,16 @@ export const workflowsDb = {
 // connectionsDb
 // ---------------------------------------------------------------------------
 
+/**
+ * Tell the open screens the saved connections changed. The canvas listens so a
+ * data source whose connection was just deleted turns red at once, without
+ * the workflow having to be reopened.
+ */
+export const CONNECTIONS_CHANGED_EVENT = 'ternlux:connections-changed';
+const announceConnectionsChanged = () => {
+  try { window.dispatchEvent(new Event(CONNECTIONS_CHANGED_EVENT)); } catch (_) { /* no window (tests) */ }
+};
+
 export const connectionsDb = {
   /**
    * Insert a new connection.
@@ -193,7 +203,9 @@ export const connectionsDb = {
       id: connection.id || uuid(),
       createdAt: connection.createdAt || new Date().toISOString(),
     };
-    return dbInsert('connections', doc);
+    const saved = await dbInsert('connections', doc);
+    announceConnectionsChanged();
+    return saved;
   },
 
   /**
@@ -220,7 +232,9 @@ export const connectionsDb = {
    * @returns {Promise<object>}
    */
   async update(id, data) {
-    return dbUpdate('connections', { id }, { $set: data });
+    const result = await dbUpdate('connections', { id }, { $set: data });
+    announceConnectionsChanged();
+    return result;
   },
 
   /**
@@ -229,7 +243,9 @@ export const connectionsDb = {
    * @returns {Promise<number>}
    */
   async delete(id) {
-    return dbRemove('connections', { id });
+    const removed = await dbRemove('connections', { id });
+    announceConnectionsChanged();
+    return removed;
   },
 };
 

@@ -142,37 +142,3 @@ export async function hasAnyApiKey() {
     return false;
   }
 }
-
-/**
- * Get the active/selected provider name from settings (NOT from stored keys).
- * This is the provider the user has chosen to use in the settings UI.
- *
- * @returns {Promise<string|null>} - The provider name ('claude' | 'gemini' | 'chatgpt') or null
- */
-export async function getConfiguredProviderName() {
-  try {
-    // Read from ai-provider-settings (localStorage)
-    const savedSettings = localStorage.getItem('ai-provider-settings');
-    if (savedSettings) {
-      const settings = JSON.parse(savedSettings);
-      return settings.defaultProvider || settings.provider || null;
-    }
-
-    // Fallback: if no settings, return first provider that has a key
-    if (isElectron()) {
-      const allKeys = await window.electronAPI.loadApiKey();
-      if (allKeys && Object.keys(allKeys).length > 0) {
-        return Object.keys(allKeys)[0];
-      }
-    } else {
-      // Browser fallback
-      const provider = localStorage.getItem(LS_PROVIDER);
-      return provider || null;
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Error getting configured provider name:', error);
-    return null;
-  }
-}
