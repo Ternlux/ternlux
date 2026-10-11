@@ -250,15 +250,6 @@ const sanitizeCollectionName = (raw, fallback) => {
   return base || 'api_response';
 };
 
-const inferColumnType = (value) => {
-  if (value === null || value === undefined) return 'string';
-  if (typeof value === 'number') return 'number';
-  if (typeof value === 'boolean') return 'boolean';
-  if (Array.isArray(value)) return 'array';
-  if (typeof value === 'string' && value.includes('[') && value.includes('dims]')) return 'vector';
-  return 'string';
-};
-
 const DataSourceNodeChat = ({
   node,
   initialConfig,
@@ -684,29 +675,20 @@ const DataSourceNodeChat = ({
     }
   };
 
+  // The shared reader (utils/tableSchemaUtils) — it describes a Pinecone record
+  // the way joins and the JavaScript skill receive it (metadata fields at top
+  // level, from a sample big enough to find fields only some records carry).
+  // This used to keep its own copy, which took the columns from the first
+  // record and left `metadata` as one opaque column.
   const loadVectorTableSchema = async (table) => {
     try {
-      const result = await window.electronAPI.skills.queryVectorPreview({
-        vectorDbType: selConn.dbType,
+      const schema = await loadTableSchema({
+        connection: selConn,
         tableName: table.name,
-        namespace: table.schema || '',
-        dbConfig: selConn.dbConfig || {},
-        connectionId: selConn.id,
-        targetLocalPath: selConn.localPath || selConn.fileInfo?.filePath,
+        tableSchema: table.schema || '',
+        localPath: selConn.localPath || selConn.fileInfo?.filePath,
       });
-
-      if (result.success && result.data?.length > 0) {
-        const sampleRecord = result.data[0];
-        const schema = {
-          tableName: table.name,
-          columns: Object.keys(sampleRecord).map((key) => ({
-            name: key,
-            type: inferColumnType(sampleRecord[key]),
-            nullable: true,
-          })),
-          sampleData: result.data.slice(0, 5),
-          recordCount: result.totalRows || result.recordCount,
-        };
+      if (schema && schema.columns?.length) {
         setTableSchema(schema);
         return schema;
       }
@@ -1137,6 +1119,15 @@ const DataSourceNodeChat = ({
     if (connKind === 'sql' || connKind === 'nosql' || connKind === 'vector') {
       if (schemaOptions.length > 0 && !selectedSchema && connKind === 'sql') out.schema = true;
       if (!selectedTableName) out.table = true;
+      // A table-backed source has to carry its columns: downstream nodes name
+      // their input from it and the join/transform builders list it. The read
+      // only comes back empty on an error (an empty table still has columns),
+      // so this blocks a save that raced the read or followed a failed one —
+      // never a valid table. REST API and cloud sources have no schema until
+      // they are fetched, so they are not asked for one — nor is a file just
+      // imported from cloud storage, whose import step reads (or, for a LanceDB
+      // folder, deliberately skips) the schema itself.
+      else if (!tableSchema && !importedFile) out.tableSchema = true;
     } else if (connKind === 'sheets') {
       // A restored import is already complete, even if the spreadsheet list
       // hasn't been re-fetched yet.
@@ -1148,14 +1139,20 @@ const DataSourceNodeChat = ({
       out.cloudFile = true; // A cloud connection is replaced by its import.
     }
     return out;
-  }, [selConn, connKind, schemaOptions, selectedSchema, selectedTableName, selectedSheet, sheetImport]);
+  }, [selConn, connKind, schemaOptions, selectedSchema, selectedTableName, selectedSheet, sheetImport, tableSchema, importedFile]);
 
   const missingCount = Object.keys(missing).length;
   const invalid = (key) => attempted && !!missing[key];
 
+  // The columns are read after the table is picked, and a slow engine (BigQuery
+  // takes a second or two) left a window where Save stored the source without
+  // them. Named on its own because it is not a field the user can fill in.
+  const schemaPending = !!missing.tableSchema && tablesLoading;
   const gateMessage = missing.cloudFile
     ? 'Pick a file to enable Save'
-    : attempted && missingCount > 0
+    : missing.tableSchema && !tablesLoading && missingCount === 1
+      ? "Couldn't read this table's columns — pick the table again to retry."
+      : attempted && missingCount > 0
       ? `${missingCount} field${missingCount === 1 ? '' : 's'} still needed`
       : null;
 
@@ -1194,6 +1191,7 @@ const DataSourceNodeChat = ({
     sourceApiConnectionName: null,
     apiFetchPrompt: null,
     apiFetchExplanation: '',
+    apiEndpoint: '',
     apiFetchCode: '',
     cloudSource: null,
   };
@@ -1295,6 +1293,7 @@ const DataSourceNodeChat = ({
         sourceLocalPath: sameApi ? (initialConfig.sourceLocalPath || null) : null,
         apiFetchPrompt: sameApi ? (initialConfig.apiFetchPrompt || null) : null,
         apiFetchExplanation: sameApi ? (initialConfig.apiFetchExplanation || '') : '',
+        apiEndpoint: sameApi ? (initialConfig.apiEndpoint || '') : '',
         apiFetchCode: sameApi ? (initialConfig.apiFetchCode || '') : '',
         apiConnectionPublicConfig: {
           baseUrl: conn.dbConfig?.baseUrl || '',
@@ -1813,10 +1812,12 @@ const DataSourceNodeChat = ({
         // Nothing edited, nothing to save — the button stays disabled until
         // something changes, rather than sitting active the moment the node is
         // opened. The first edit makes it live.
-        saveDisabled={!!missing.cloudFile || !dirty}
+        saveDisabled={!!missing.cloudFile || schemaPending || !dirty}
         saveDisabledReason={missing.cloudFile
           ? 'Open the storage browser and pick a file to import first.'
-          : 'Nothing has changed yet.'}
+          : schemaPending
+            ? "Reading the table's columns…"
+            : 'Nothing has changed yet.'}
       />
 
       {/* Cloud Storage Browser */}
