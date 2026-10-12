@@ -184,6 +184,10 @@ verifying your project does not cover theirs.
   only.
 - Generated AI prompts for BigQuery suggest partitioning and
   clustering when a new table is being created.
+- Writes go in larger batches than other engines. Each batch insert is a
+  BigQuery load job, and load jobs are capped per table per day, so the
+  connector asks for bigger chunks — small ones would cap a table at a
+  fraction of a day's data however much there was to write.
 - Permission errors are about the *signed-in user's* IAM roles, not
   about the OAuth client — re-authorising will not fix them.
 - Connections saved before the move to OAuth, which stored a service

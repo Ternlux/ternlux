@@ -1,18 +1,20 @@
 # Google Sheets connector
 
-Treats a Google Sheets spreadsheet as a database — each spreadsheet
-is a "schema" and each sheet inside it is a "table".
+Reads and writes Google Sheets. It is registered as a **cloud-storage**
+connector — the spreadsheet is the container and its tabs are the
+objects — while also speaking enough of the database surface (tables,
+columns, queries) for a tab to be read like a table.
 
 ## What it lets you do
 
 - Test that Ternlux can reach Google Sheets with your authorised
   account.
-- List the sheets inside any spreadsheet you have access to.
-- Inspect the columns of a sheet (Ternlux infers them from the first
-  rows of the sheet).
-- Run a row-fetch query against any sheet.
-- Stream large sheets in batches.
-- Upload data back to a new sheet.
+- Browse your spreadsheets and the tabs inside them, through the same
+  picker the other cloud-storage connectors use.
+- List the sheets inside a spreadsheet, and infer a sheet's columns from
+  its first rows (the first row is treated as the header).
+- Fetch a sheet's rows, streamed in batches for a large sheet.
+- Download a tab as CSV, and write rows back into a tab.
 
 ## Connection form
 
@@ -145,11 +147,13 @@ verifying your project does not cover theirs.
   sheet name.
 - Schema is inferred from the first few rows of the sheet (the first
   row is treated as the header).
-- When you point a Data Source node at a Google Sheet, Ternlux
-  imports the data into the local SQL workspace at run time so
-  downstream nodes can query it like any other table. Column names
-  are sanitised; duplicates are disambiguated; types are inferred
-  from the values.
-- Bucket / sheet name is used as a prefix when Ternlux creates the
-  local table, so importing the same sheet from different
-  spreadsheets doesn't collide.
+- A Sheets connection is browsed like cloud storage: the spreadsheet is
+  the container and its tabs are the files. Picking a tab needs that
+  picker, so a Sheets source or destination cannot be configured from
+  chat.
+- When you point a Data Source node at a tab, the tab is downloaded as
+  CSV to the path you chose and read in place by DuckDB, and it is
+  re-downloaded on every run — so the data is never a frozen snapshot.
+- As an Output destination a tab keeps its rows between runs, so it is
+  one of the destinations that offers a write mode: append, or clear the
+  tab first.

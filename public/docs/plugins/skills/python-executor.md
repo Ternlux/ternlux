@@ -1,40 +1,45 @@
 # Python Executor skill
 
-A transformer-only skill that runs AI-authored Python code for
-transformations that vanilla SQL or NoSQL operations can't express
+A transformer-only skill that runs AI-authored Python for
+transformations that plain SQL or document operations can't express
 cleanly.
 
-## When the AI picks this skill
+## When the analysis picks this skill
 
-The assistant offers this skill when your transformation request:
-
-- Needs computational logic that doesn't translate well to SQL —
-  rolling windows, statistical calculations, data science
-  transformations, fuzzy text processing.
-- Benefits from a real Python ecosystem (pandas, numpy, scikit-learn,
-  etc.).
-- Mixes data shaping with analytical computation in a way SQL would
+- The logic doesn't translate well to SQL — rolling windows, statistical
+  calculations, data-science transformations, fuzzy text processing.
+- It benefits from the Python ecosystem (pandas, numpy, scikit-learn).
+- It mixes data shaping with analytical computation in a way SQL would
   obscure.
 
-For pure data movement and reshaping, the assistant prefers vanilla
-SQL or NoSQL because they're cheaper to run and easier to read.
+For pure data movement and reshaping the analysis prefers SQL or document
+operations.
 
 ## How it works at run time
 
-The skill loads the source data, runs the AI-written Python code
-against it inside a managed Python environment, and writes the
-returned result to the chosen destination — either back into a
-database, into the local SQL workspace, or into a local document
-collection, depending on what you picked.
+1. The source is loaded — a local file or an upstream node's table is
+   read through DuckDB; a remote source through its connector.
+2. The rows and the AI-written script are handed to a Python process,
+   which returns the transformed rows.
+3. The result is written as a **table in the workflow's own DuckDB
+   database**, under the name the builder gave the node — the same name
+   its preview query selects from and every downstream node reads.
 
-The Python environment is set up by the skill's installer script
-(`setup.sh` on macOS / Linux, `setup.bat` on Windows) which creates a
-virtual environment and installs the required packages.
+Like the JavaScript skill, its output is **local only**: it cannot write
+back to a SQL or document server. A request that needs Python *and* a
+result living in a database is two steps — this node, then an Output
+node.
+
+The generated code is stored on the node like any other generated code,
+as a `.py` file on disk (see
+[Externalized node code](../../architecture/workflow-code.md)).
 
 ## Prerequisites
 
-- Python is installed on your machine.
-- The setup script has been run once after installing the skill.
+- Python installed on your machine.
+- The skill's setup script run once after installing it (`setup.sh` on
+  macOS and Linux, `setup.bat` on Windows). It creates a virtual
+  environment and installs the packages the skill needs.
 
-If Python isn't found, the skill returns a clear error pointing you
-to the setup instructions.
+If Python isn't found, the skill returns a clear error pointing at those
+setup instructions.

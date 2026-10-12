@@ -74,7 +74,28 @@ Pinecone supports the full set of vector operations:
 
 - **Similarity search** — find the most similar vectors to a query
   vector, with optional metadata filtering and result count.
+- **List** — browse records in a namespace (no vector, no ids needed),
+  up to `limit` (default 10, at most 1000), with an optional metadata filter.
+  Values are left out.
 - **Fetch by id** — pull specific records when you know their ids.
+- **Count** — the record count of a namespace (or of the whole index),
+  read from the index stats, so no records are fetched. It takes no
+  metadata filter: Pinecone's stats count a whole namespace only.
+
+From code (`ctx.runQuery`) and from the chat's `run_query` these are
+operation objects:
+
+```
+{ operation: 'list', indexName, namespace?, limit?, filter? }  -> [{ id, metadata, namespace }]
+{ operation: 'count', indexName, namespace? }                 -> [{ count }]
+{ operation: 'query', indexName, namespace?, queryVector, topK?, filter? }
+                                                              -> [{ id, score, values, metadata, namespace }]
+{ operation: 'fetch', indexName, namespace?, ids: [...] }     -> [{ id, values, metadata, namespace }]
+```
+
+`filter` is a Pinecone metadata filter (`{ price: { $gt: 100 } }`). Use
+`list` to look at records and `count` to count them; `query` needs a vector
+and `fetch` needs ids.
 - **Upsert** — insert or update one or many vectors.
 - **Update** — modify a single vector's values or metadata.
 - **Delete** — by id list, by metadata filter, or "delete all in this
