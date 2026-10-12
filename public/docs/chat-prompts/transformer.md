@@ -1,84 +1,127 @@
-# Transformer chat
+# Transformer generation
 
-The Transformer chat helps you describe how a single source should be
-reshaped, then generates the operation. The exact shape of the
-generated operation depends on the source's type and the storage
-location and operation mode you chose.
+The transformer templates turn a description of how one source should be
+reshaped into the operation that does it. The shape of that operation
+depends on the source's engine, the storage location, and the operation
+mode.
 
-## Information the assistant must gather
+## Phase 1 — analysis
 
-The assistant analyses your request and figures out:
+The source's columns and a few sample rows are re-read first (unless the
+upstream is a transformer or join, which declares its own output shape).
+Without columns the analyser would invent them, so a source that still
+has none becomes a question — "which table or collection should it
+transform?" — rather than a guess.
 
-- **Operation mode** — new table or in place. If your description is
-  ambiguous, the assistant asks one specific question.
-- **Storage location** — database (same as the source) or local. If
-  ambiguous, the assistant asks. If the source is already local, this
-  isn't asked. If the storage location is local, the operation mode is
-  forced to new table — you can't do an in-place update on a remote
-  database while storing the result locally.
-- **Target name** — if you mentioned a specific output table or
-  collection name, the assistant captures it; otherwise a default is
-  used.
-- **Skill choice** — if a skill (Python, JavaScript, vector ops) is a
-  better fit than vanilla SQL or NoSQL, the assistant returns a skill
-  choice and the skill takes over.
+The analyser then reads the request against that schema and settles:
 
-The assistant never imposes questions about output format or
-post-transformation steps — it stays focused on the single
-transformation step you asked for.
+- **Operation mode** — `new_table` or `in_place`. Never inferred beyond
+  what the request says; if it is ambiguous, that becomes the question.
+- **Storage location** — `database` (the source's own connection) or
+  `local`. Not asked at all when the source is already local (a file, a
+  REST API source, or another node's local output) — that is always
+  `local`. When it is
+  `local`, the operation mode is forced to `new_table` — you cannot
+  update a remote database in place while storing the result locally.
+- **Target name** — the table or collection the result is called. If you
+  named one, it is used verbatim, stripped of any schema qualifier (the
+  schema is its own field). If you didn't, the analyser coins a short
+  snake_case name describing what the result *contains* —
+  `denied_stores`, `orders_2024` — because that name becomes the node's
+  label on the canvas. The app then adds the last 6 digits of the node's
+  id (`denied_stores_713683`), so a coined name never collides with
+  another node's table or with one already in the destination database.
+  A rebuild keeps the node's existing name unless you give a new one. For
+  `in_place` there is no name to coin: the result goes back to the source.
+- **Skill choice** — whether a skill (Python, JavaScript, vector
+  operations) fits better than plain SQL or document operations.
 
-## How the operation is generated
+There are exactly two outcomes: `generate_transformation`, or
+`ask_questions` with what it needs — and routing to a skill counts as
+building. Anything else is treated as a question, so a reply the
+analyser did not intend as an approval can never be saved as a finished
+node.
 
-Once the assistant has every required piece of information, it
-generates the operation using a prompt tuned for the source's database:
+It only asks about settings the request left genuinely open, and never
+about output formats or steps beyond this single transformation. Where
+several settings are unclear it can raise them together, as one question
+listing each.
 
-### Relational sources
+What it does **not** re-decide is the node's identity. The output
+table's name is kept across a refinement — downstream nodes were built
+to read it — unless the analyser explicitly names a new one, which is
+how a rename is asked for. A full rebuild (you gave a new instruction)
+takes the analyser's settings as they stand; a cascade rebuild (an
+upstream's shape moved, with no new instruction) keeps the node's own.
 
-- **New table, in the same database** — produces a `CREATE TABLE`,
-  an `INSERT INTO ... SELECT`, and a preview query.
-- **New table, stored locally** — produces a remote `SELECT` to fetch
-  and transform, plus a local `CREATE TABLE` and parameterised insert
-  for the local workspace.
-- **In place** — produces an `ALTER TABLE`, an `UPDATE` / `DELETE`, or
-  both. Filtering intent like "keep only X" becomes a delete of rows
-  that don't match.
+## Phase 2 — generation
 
-### Document sources
+### Local sources (DuckDB)
 
-- **New collection** — picks the right approach automatically:
-  - **Aggregation pipeline** for filtering, projection, grouping,
-    lookups, and computed fields. Ternlux automatically appends the
-    final stage that writes the result to the target collection.
-  - **Filter operation** for simple subset queries.
-  - **Custom JavaScript** for logic that can't be expressed as
-    aggregation.
-- **In place** — picks update, delete, or in-place JavaScript. In-place
-  JavaScript transformations are processed in batches of ten thousand
-  documents at a time.
+A source is local when it is a file or another node's table. Both modes
+read the source by name — a file by its own name, an upstream node's
+table by the table's name, and a file staged for an in-place update by a
+per-node staging name that the template and the executor derive the same
+way.
 
-### Local sources
+- **New table** — one `SELECT` that produces the transformed result. No
+  `CREATE TABLE`, no `INSERT`: the rows the `SELECT` returns *become* the
+  table. The target is replaced wholesale on every run, so the `SELECT`
+  always describes the whole table — nothing is merged, de-duplicated, or
+  filtered out "because an earlier run handled it".
+- **In place** — the `ALTER` / `UPDATE` / `DELETE` statements that make
+  the change, separated by semicolons and run as one unit. Adding a
+  column and populating it is the common two-statement case. A `SELECT`
+  is explicitly not acceptable: it changes nothing while reporting
+  success.
 
-- **Local SQL source, new table** — produces a `CREATE TABLE` and an
-  `INSERT` against the local SQL workspace.
-- **Local SQL source, in place** — produces an `UPDATE`, `DELETE`,
-  `ALTER TABLE`, or any combination thereof.
-- **Local document source, new collection** — produces a filter or
-  custom JavaScript transformation that writes into a new local
-  document collection.
-- **Local document source, in place** — produces an update, delete, or
-  in-place JavaScript transformation.
+Both replies carry an explanation, a preview `SELECT` limited to 100
+rows, and `targetColumns` — the columns the result actually has, aliases
+included, because downstream nodes are configured from that list. For an
+in-place change that leaves the shape alone, `targetColumns` is `*`.
 
-## Placeholders
+The templates also carry the DuckDB specifics the model needs: it is
+PostgreSQL-flavoured with `SELECT * EXCLUDE`, `REPLACE`, `QUALIFY` and
+`GROUP BY ALL`; nested values read as `STRUCT`, `LIST` or `MAP` and are
+reached with dot notation, 1-based indexing and bracket-by-key
+respectively; and a nested field cannot be assigned to — the whole value
+has to be rebuilt with its siblings carried forward.
 
-Generated operations may include named placeholders like
-`{{current_date}}` and `{{current_timestamp}}`. Ternlux substitutes
-them with the actual runtime values when the workflow executes, so
-"set archived_date to today" works for every future run without
-modification.
+### Remote sources
 
-## Output format
+Every other engine's prompt comes from its own connector, so what is
+generated follows that dialect:
 
-The generated operation includes a brief explanation in plain language
-(what's about to happen and why), the operation itself, and a preview
-query that the interactive layer uses to show you a sample of the
-result before you save.
+- **New table in the same database** — a `CREATE TABLE`, an
+  `INSERT INTO … SELECT`, and a preview query. The executor drops the
+  target first, so the DDL never has to.
+- **New table stored locally** — a `SELECT` that runs on the source
+  through its connector; the rows are streamed into the local table.
+- **In place** — an `ALTER TABLE`, an `UPDATE` / `DELETE`, or both.
+  Filtering intent like "keep only X" becomes a delete of the rows that
+  don't match.
+- **Document source** — an aggregation pipeline, a filter, an update, a
+  delete, or a JavaScript transformation, whichever fits; in-place
+  JavaScript is applied in batches.
+
+## Statement rules
+
+- Each SQL field is handed to the driver as **one statement**.
+  Multi-statement strings and transaction wrappers are not supported —
+  transactions are the executor's concern. The exception is an in-place
+  transform on local DuckDB storage, where semicolon-separated statements
+  are expected.
+- At most one structural statement and one data statement per node. A
+  node with only a data statement is the normal shape for an in-place
+  change whose columns already exist.
+- DDL is not written defensively. A second run's `ADD COLUMN` failing
+  with "column already exists" is handled by the executor, which lets the
+  data statement decide the node and reports the skipped statement as a
+  warning.
+
+## Output
+
+Every reply is a single JSON object carrying the operation, a short
+plain-language explanation (which may use `**bold**` and `\n`), a
+preview query the editor uses to show a sample, and the target column
+list.
