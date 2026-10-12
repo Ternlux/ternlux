@@ -15,8 +15,9 @@
  *   node scripts/fetch-duckdb-extensions.js --all        # every platform
  *   node scripts/fetch-duckdb-extensions.js osx_arm64 windows_amd64
  *
- * Output: resources/duckdb-extensions/<platform>/<name>.duckdb_extension
- * Roughly 7 MB per extension per platform, so builds fetch only what they ship.
+ * Output: resources/duckdb-extensions/<platform>/<name>.duckdb_extension.gz
+ * Kept gzipped as served (see fetchOne); the runtime decompresses on first use.
+ * Roughly 4 MB per extension per platform, so builds fetch only what they ship.
  */
 
 const fs = require('fs');
@@ -29,7 +30,9 @@ const {
   ALL_PLATFORMS, BUNDLE_DIRNAME, extensionUrl, platformFor,
 } = require('../public/duckdb/extensions');
 
-const EXTENSIONS = ['excel', 'avro'];
+// `sqlite_scanner` is how DuckDB reads SQLite files (public/duckdb attachDb).
+// Its canonical name, not the `sqlite` alias: the download URL uses it.
+const EXTENSIONS = ['excel', 'avro', 'sqlite_scanner'];
 const OUT_ROOT = path.join(__dirname, '..', 'resources', BUNDLE_DIRNAME);
 
 /** The DuckDB version the installed bindings speak, as DuckDB tags it. */
@@ -52,7 +55,7 @@ function isSatisfied(version, platforms) {
     return false; // no marker — treat as empty
   }
   return platforms.every((platform) => EXTENSIONS.every((name) =>
-    fs.existsSync(path.join(OUT_ROOT, platform, `${name}.duckdb_extension`))));
+    fs.existsSync(path.join(OUT_ROOT, platform, `${name}.duckdb_extension.gz`))));
 }
 
 function download(url) {
@@ -78,15 +81,32 @@ function download(url) {
 
 async function fetchOne(version, platform, name) {
   const outDir = path.join(OUT_ROOT, platform);
-  const outFile = path.join(outDir, `${name}.duckdb_extension`);
+  const outFile = path.join(outDir, `${name}.duckdb_extension.gz`);
   const url = extensionUrl(version, platform, name);
 
+  // Stored STILL COMPRESSED, exactly as the repository serves it.
+  //
+  // An uncompressed extension is a Mach-O dylib with DuckDB's own 256-byte
+  // signature appended past the end of the Mach-O structure. On macOS,
+  // electron-builder signs every Mach-O it finds in the bundle, and codesign
+  // rejects that trailing data:
+  //
+  //   avro.duckdb_extension: main executable failed strict validation
+  //
+  // Gzipped, the file is just data — codesign and the notary service have
+  // nothing to object to, and the bundle is about half the size. The runtime
+  // (public/duckdb/extensions.js) decompresses into DuckDB's extension
+  // directory the first time an extension is needed.
   const gz = await download(url);
-  // The repository serves gzip; DuckDB installs the uncompressed binary.
-  const binary = zlib.gunzipSync(gz);
   fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(outFile, binary);
-  return { outFile, bytes: binary.length };
+  fs.writeFileSync(outFile, gz);
+
+  // A previous build may have left the uncompressed binary beside it; it would
+  // still be picked up and packaged, reintroducing the signing failure.
+  const legacy = path.join(outDir, `${name}.duckdb_extension`);
+  if (fs.existsSync(legacy)) fs.rmSync(legacy, { force: true });
+
+  return { outFile, bytes: gz.length, rawBytes: zlib.gunzipSync(gz).length };
 }
 
 async function main() {
