@@ -1,107 +1,93 @@
 # Data Source node
 
-A Data Source node points at exactly one input. At execution time it
-makes sure that input is materialised into a form downstream nodes can
-read from — usually by writing into the local workspace.
+A Data Source node points at exactly one input. It is the only node type
+that brings external data into a workflow, and it is configured with a
+form: pick a saved connection, then pick what to read from it.
+
+The source is picked, not queried. There is no filter step and no load
+options — narrowing the data is a transformer's job.
 
 ## What you can point it at
 
-You select a saved connection. The connection's category determines how
-the node behaves:
+The connection's category decides the second step:
 
-- **Database connection** — the node references a specific table,
-  collection, or index inside that database. No re-import is needed at
-  execution time; downstream nodes read from the live database.
-- **Vector database connection** — the node references a specific
-  index (and namespace, for Pinecone). For LanceDB, the available
-  tables are read directly from the file. For Pinecone, you can
-  enumerate indexes / namespaces from the picker.
-- **Local file connection** — the node references a file you've
-  added as local files (CSV, Excel, Parquet, Avro, JSON, DuckDB, SQLite,
-  LanceDB). At execution time the file is re-imported into the local
-  workspace so downstream nodes see fresh data.
-- **Cloud storage connection** — the node references a specific object
-  in a bucket. At execution time the object is downloaded and imported
-  into the local workspace. The native cloud picker (or the platform's
-  own file picker, for Drive) is used to select the file.
-- **Spreadsheet service connection** (Google Sheets) — the node
-  references a specific sheet. At execution time the sheet is fetched
-  and imported into the local workspace.
-- **REST API connection** — the node carries an AI-generated fetch
-  function. At execution time the function runs (with credentials
-  substituted in by the background engine) and the resulting rows are
-  written into a local document collection.
+- **Relational database** — pick a schema and a table. Downstream nodes
+  read the live database.
+- **Document database (MongoDB)** — pick a collection.
+- **Vector database** — pick an index or table (plus a namespace, for
+  Pinecone).
+- **Local file** — pick the table the connection owns. A CSV, JSON,
+  Parquet, Excel or Avro file is read where it lies by DuckDB; a
+  workbook offers one table per sheet; a `.duckdb` or `.sqlite` file
+  offers the tables inside it.
+- **Cloud storage** — browse the bucket and pick an object, then choose
+  where the downloaded copy is kept on disk.
+- **Google Sheets** — browsed like cloud storage: the spreadsheet is the
+  container and its tabs are the files.
+- **REST API** — the form saves the connection choice and hands off to
+  the chat assistant, which authors the fetch request.
 
-## Sample data and schema preview
+## Sample data and schema
 
-When you select a table, collection, or index, Ternlux fetches a
-small sample (typically five rows) and the inferred column / field
-list. This is shown in the chat panel so the AI assistant has
-concrete context for any follow-up question (e.g. "what's in this
-table?", "summarise the columns"). For sources that don't expose
-schema directly, the AI infers it from the sampled rows.
+When you select a table, collection or index, Ternlux reads its columns
+and a small sample of rows and stores them on the node. Downstream
+builders read that schema to write their SQL, so a source whose schema
+could not be read is reported rather than silently left empty.
+
+If a list of tables comes back empty, the form shows the connector's own
+message — the file that moved, the extension that would not load, the
+port that is closed — rather than a bare "none found".
+
+## What the node does at run time
+
+- **Local file** — nothing is imported. The node checks the file is still
+  there and reports its row count; downstream nodes query it in place. A
+  missing file fails the node with the path that is gone.
+- **Cloud storage / Google Sheets** — the object is downloaded and
+  written over the local path you chose, then read in place. A Sheets tab
+  downloads as CSV. A node recorded before cloud files were kept on disk
+  has no path to refresh and says so, asking you to re-pick a save
+  location.
+- **REST API** — the saved fetch function runs again, with credentials
+  substituted in by the background engine, and the rows it returns are
+  written as this node's table in the workflow's DuckDB database.
+- **Database, document store, vector store** — nothing to do. The node
+  validates its configuration; downstream nodes read the live source.
 
 ## The REST API path
 
-When you point a Data Source at a REST API connection, you describe
-in plain language what data you want and the AI assistant generates a
-custom fetch function. The function:
+You describe in plain language what data you want, and the assistant
+generates a single asynchronous JavaScript function that:
 
 - Receives an HTTP client.
 - Loops over pages, cursor tokens, or related endpoints as the API
   requires.
 - Returns rows as an array of plain objects.
 
-Once the function is generated, it's saved into the node and is
-"clean" — the node can be reopened without Ternlux re-asking the AI.
-If you refine your request (e.g. "also include items from the archive
-endpoint"), the function is marked dirty and regenerated on the next
-save. This avoids unnecessary regeneration on every reopen and keeps
-generated code stable.
+The function references the connection through placeholder tokens —
+`{{BASE_URL}}`, plus one per saved key/value parameter — never literal
+credentials. The placeholders are filled in inside the background engine
+in the moment before the function runs.
 
-The function itself uses placeholder tokens, never literal
-credentials, when referencing the connection's base URL or auth
-header. The placeholders are filled in with real values only inside
-the background engine, just before the function runs.
-
-## The cloud storage path
-
-When the source is a cloud bucket file, Ternlux:
-
-1. Downloads the object using the cloud connection.
-2. Detects the file type from its extension and shows the appropriate
-   icon.
-3. Imports the file into the local workspace — spreadsheets, CSVs,
-   Parquet, and Avro go into the local SQL workspace; JSON files go
-   into a local document collection.
-4. Container / bucket names are used as a prefix on the table or
-   collection name to avoid collisions when you import the same
-   filename from different buckets.
-
-For Excel files with multiple sheets, the chat lets you choose which
-sheet (or sheets) to import.
-
-## The local file path
-
-When the source is a local file connection:
-
-- For local SQL files, the original file is re-imported into the
-  local workspace so downstream nodes see fresh data.
-- For local JSON files, the file is parsed and the documents are
-  loaded into a local document collection. Existing documents in the
-  same collection are cleared before insert.
-- For local LanceDB directories, the table list is read directly from
-  the directory and exposed to downstream nodes as-is.
+**The function only runs once you approve it.** A REST endpoint is the
+one source whose shape cannot be looked up, so its columns come from a
+real call — but that call is generated code using your credentials, so it
+waits for you. Built from the node's chat, the first **Run this node**
+makes the call, writes the table and records the node's columns. Built in
+a workflow plan, the build pauses on a **Run this call** card (the steps
+after it need the columns) and carries on once you approve. A call that
+fails, returns an HTTP error, returns nothing, or returns rows with no
+readable columns fails and says why — the endpoint, the credentials, or
+the parameters.
 
 ## Idempotency
 
-Re-importing always drops the existing target table or collection
-first, so re-running a workflow gives a deterministic result.
+A refreshed cloud object replaces the file it was saved to. A REST API
+fetch replaces this node's table. Re-running a workflow therefore gives a
+deterministic result.
 
-## NoSQL and SQL routing
+## Where the data lives afterwards
 
-When the source is a remote document store (MongoDB), the chat uses
-collection / filter terminology and routes through the document path.
-When it's a SQL database, table / query terminology is used. The
-underlying difference is hidden from you — the same node config flow
-covers both.
+- A file source stays a file, in its own format, read in place.
+- A database source stays in its database.
+- A REST API source becomes a table in `workflow-data/<workflow>.duckdb`.
