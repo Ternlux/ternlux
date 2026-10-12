@@ -8,6 +8,41 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 
+/**
+ * The JSON object in a model reply.
+ *
+ * The skill turn is not made in JSON mode, so models routinely wrap the object
+ * in a ```json fence or put a sentence in front of it. A bare JSON.parse turned
+ * every one of those into "I had trouble understanding", and the builder then
+ * re-asked the same thing round after round. Take the fenced body when there
+ * is one, else the first balanced {...} (string-aware, so braces inside the
+ * Python code do not end it early).
+ */
+function parseModelJson(text) {
+  if (text && typeof text === 'object') return text;
+  const raw = String(text || '').trim();
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = fenced ? fenced[1].trim() : raw;
+  try { return JSON.parse(body); } catch (_) { /* fall through to extraction */ }
+  let depth = 0; let start = -1; let inString = false; let escape = false;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') { if (depth === 0) start = i; depth++; }
+    else if (ch === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) return JSON.parse(body.slice(start, i + 1));
+    }
+  }
+  throw new Error('No JSON object found in the response');
+}
+
 module.exports = {
   type: 'skill',
   id: 'python-executor',
@@ -156,7 +191,7 @@ Return your response in JSON format:
   processSkillResponse: (aiResponse, operationType = 'sql') => {
     let analysis;
     try {
-      analysis = JSON.parse(aiResponse);
+      analysis = parseModelJson(aiResponse);
     } catch (e) {
       console.error('[Python Executor] Failed to parse response:', e);
       return {
@@ -412,20 +447,12 @@ Otherwise use standard SQL/NoSQL transformation.
           );
           console.log(`[Python Executor] Loaded ${sourceData.length} rows from ${tableName}`);
         } else if (sourceConnection.dbType === 'sqlite') {
-          const sqlite3 = require('sqlite3').verbose();
-          const db = new sqlite3.Database(sourceConnection.localPath);
-
-          // For SQLite, use the original table name (no schema quoting needed for local files)
+          // Read through the app's SQLite helper (DuckDB's sqlite extension),
+          // the same route the JavaScript executor takes.
           const tableName = sourceTableSchema.originalTableName || sourceTableSchema.tableName;
-          const query = `SELECT * FROM ${tableName}`;
-          sourceData = await new Promise((resolve, reject) => {
-            db.all(query, (err, rows) => {
-              if (err) reject(err);
-              else resolve(rows);
-            });
-          });
-
-          db.close();
+          sourceData = await helpers.runQuery(
+            'sqlite', { query: `SELECT * FROM "${String(tableName).replace(/"/g, '""')}"` }, sourceConnection.localPath,
+          );
           console.log(`[Python Executor] Loaded ${sourceData.length} rows from local SQLite`);
         }
       } else {

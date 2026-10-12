@@ -196,6 +196,20 @@ function openSourcePages({
 
   // A NoSQL connector prefers `query` when present and tries to JSON.parse it,
   // so it must never be handed SQL.
+  //
+  // One that can stream (MongoDB's cursor) is read a batch at a time, like a
+  // SQL source — the JSON envelope is its query, as for Sheets below. Only a
+  // connector without streamQuery still reads the collection whole.
+  if (isNoSQL && typeof plugin?.streamQuery === 'function') {
+    const envelope = JSON.stringify({ collection: sourceTableSchema.tableName, filter: {} });
+    return {
+      pagesAreStreamed: true,
+      pages: (async function* () {
+        const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
+        yield* pageRows(streamPluginRows(plugin, fullConfig, sourceConnection.id, envelope, pageSize), pageSize);
+      })(),
+    };
+  }
   if (isNoSQL) {
     return {
       pagesAreStreamed: false,
@@ -301,7 +315,54 @@ async function* flatten(pages) {
   }
 }
 
+/**
+ * The source's column types, as canonical types (see columnTypes.js), for
+ * exactly what openSourcePages reads — or null when the source cannot say.
+ *
+ * Asked of the same place each branch above reads from: DuckDB describes the
+ * same ref for a local source; a SQL connector's getColumns describes the
+ * table its `SELECT *` reads. A schemaless source (Mongo, Sheets, a vector
+ * store) has no types to give and answers null, and so does a lookup that
+ * fails — the caller then guesses from values, as it always did.
+ */
+async function readSourceSchema({ sourceConnection, sourceTableSchema, pluginManager, getFullConfig }) {
+  const { canonicalFromDuckType, canonicalSchema } = require('./columnTypes');
+  try {
+    // A vector store has no column types to give: its rows are typed from
+    // their values (all of them — the read is buffered).
+    const sourcePlugin = pluginManager.getConnector(sourceConnection.dbType);
+    if (sourcePlugin?.dbCategory === 'Vector' || ['pinecone', 'lancedb'].includes(sourceConnection.dbType)) {
+      return null;
+    }
+    if (sourceConnection.localPath) {
+      const tableName = sourceTableSchema?.tableName || sourceConnection.tableName;
+      const duck = require('../duckdb');
+      const columns = await duck.describeLocalSource(sourceConnection.localPath, tableName, {
+        format: sourceConnection.fileInfo?.format || sourceConnection.dbConfig?.format || null,
+        sheet: duck.sheetFor(sourceConnection.localPath, tableName),
+      });
+      return canonicalSchema(columns, (col) => canonicalFromDuckType(col.type));
+    }
+
+    const plugin = pluginManager.getConnector(sourceConnection.dbType);
+    if (!plugin || typeof plugin.getColumns !== 'function' || typeof plugin.toCanonicalType !== 'function') {
+      return null;
+    }
+    const table = sourceTableSchema?.tableName;
+    if (!table) return null;
+    const fullConfig = await getFullConfig(sourceConnection.id, sourceConnection.dbConfig || {});
+    const qualifier = qualifierFor(table, sourceConnection.dbConfig?.schema);
+    const result = await plugin.getColumns(fullConfig, sourceConnection.id, qualifier, table);
+    if (!result || result.success === false) return null;
+    return canonicalSchema(result.columns, (col) => plugin.toCanonicalType(col));
+  } catch (err) {
+    console.log(`[Output] Could not read the source's column types (${err.message}) — guessing them from values`);
+    return null;
+  }
+}
+
 module.exports = {
   openSourcePages,
+  readSourceSchema,
   DEFAULT_PAGE_SIZE,
 };

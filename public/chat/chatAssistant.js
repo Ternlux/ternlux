@@ -211,6 +211,15 @@ function summarizeConnection(c) {
   // imports share one app-wide SQLite db. Surface the owned table names so the
   // AI queries the right table instead of guessing the connection name and
   // hitting "no such table".
+  //
+  // Not for a LanceDB folder: `fileInfo.tables` is a snapshot from when the
+  // connection was added, and Outputs, Transformers and Joins add tables to the
+  // folder afterwards. Shown as the list, it made the assistant report one
+  // table of two. get_tables reads the folder itself.
+  if (String(c.dbType || '').toLowerCase() === 'lancedb') {
+    out.tables = 'not listed here — the folder gains tables over time; call get_tables';
+    return out;
+  }
   const tables = Array.isArray(c.fileInfo?.tables)
     ? c.fileInfo.tables.map((t) => (typeof t === 'string' ? t : t?.name)).filter(Boolean)
     : null;
@@ -244,7 +253,12 @@ function addTargetDetails(out, cfg) {
   return out;
 }
 
-function nodeOutline(node) {
+// `details: false` leaves out TARGET_DETAIL_KEYS — the DDL, SQL, generated JS and
+// destination ids. The get_workflow path wants them (that is the whole point of an
+// outline it can act on without a second round trip); the always-on context block
+// does not, because they are the largest part of a node and the model can fetch
+// them with get_workflow_nodes the moment it needs them.
+function nodeOutline(node, { details = true } = {}) {
   const id    = node?.id || null;
   const type  = node?.type || node?.data?.type || null;
   const label = node?.data?.label || null;
@@ -279,24 +293,226 @@ function nodeOutline(node) {
       out.targetConnection = cfg.targetConnectionName || null;
       out.target           = cfg.targetTable || cfg.targetCollection || null;
       out.description      = String(cfg.transformationRequest || cfg.builderPrompt || cfg.targetSqlExplanation || '').slice(0, 400) || null;
-      addTargetDetails(out, cfg);
+      if (details) addTargetDetails(out, cfg);
       break;
     case 'join':
-      out.joinType         = cfg.joinType || null;
+      // `joinType` is written inside joinSettings, never at the top level — 0 of
+      // the 67 join nodes in this app's database have cfg.joinType, 54 have
+      // cfg.joinSettings.joinType. Same shape of miss as the output branch below.
+      out.joinType         = cfg.joinType || cfg.joinSettings?.joinType || null;
       out.targetConnection = cfg.targetConnectionName || null;
       out.target           = cfg.targetTableName || cfg.targetTable || cfg.targetCollection || null;
       out.description      = String(cfg.builderPrompt || cfg.targetSqlExplanation || '').slice(0, 400) || null;
-      addTargetDetails(out, cfg);
+      if (details) addTargetDetails(out, cfg);
       break;
     case 'output':
-      out.outputType = cfg.outputType || null;
-      out.target     = cfg.targetTable || cfg.targetCollection || cfg.savePath || null;
-      out.format     = cfg.format || null;
-      addTargetDetails(out, cfg);
+      // An output node's destination lives in `outputSettings`
+      // ({ outputType, connectionId, tableName, writeMode, format, savePath }) —
+      // set on every output node the editor and the builder write. Reading
+      // `cfg.outputType` / `cfg.targetTable` / `cfg.savePath` off the top level
+      // instead outlined EVERY output node as three nulls; the destination only
+      // reached the reader at all because `outputSettings` happens to be in
+      // TARGET_DETAIL_KEYS, so it was dumped raw and left out entirely from any
+      // details-free outline. Read it where it is written.
+      out.outputType = cfg.outputSettings?.outputType || cfg.outputType || null;
+      out.target     = cfg.outputSettings?.tableName
+        || cfg.outputSettings?.savePath
+        || cfg.targetTable
+        || cfg.targetCollection
+        || cfg.savePath
+        || null;
+      out.format     = cfg.outputSettings?.format || cfg.format || null;
+      if (cfg.outputSettings?.writeMode) out.writeMode = cfg.outputSettings.writeMode;
+      if (details) addTargetDetails(out, cfg);
       break;
     default:
       if (cfg.builderPrompt) out.description = String(cfg.builderPrompt).slice(0, 400);
-      addTargetDetails(out, cfg);
+      if (details) addTargetDetails(out, cfg);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Workflow headline — the focused workflow, as text, in the system prompt.
+//
+// Why this exists: the context block used to say "Kind: workflow, Name: X,
+// Summary: 6 nodes on the canvas" and nothing else, so anything about the actual
+// graph cost a get_workflow call — and for an UNSAVED canvas there was no id to
+// call it with, which is how a question about "the json file I imported" got
+// answered by guessing between two similarly-named connections.
+//
+// Why not reuse ultraSlimWorkflow here: measured over the 124 workflows in this
+// app's own database, its JSON runs a median of 1.8k chars but a maximum of 24k —
+// and it is not the SQL that does it, it is per-node JSON overhead times node
+// count (dropping every statement still left 24k). The same graphs as text lines
+// come to a median of 820 and a worst case of 3.6k under the budget below. The
+// field SELECTION is shared with that path (nodeOutline), only the rendering and
+// the caps are new.
+const HEADLINE_BUDGET_CHARS = 2500;
+
+const clipText = (v, n) => {
+  const t = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+};
+
+/**
+ * One line per node: `- <id> [<type>] "<label>" — <what it reads / writes>`,
+ * then the edge chain. `columns` and `descriptions` are the two things dropped
+ * when a big graph runs over budget, in that order, because they are the biggest
+ * and the most recoverable — the ids stay, so the model can always drill in.
+ */
+function headlineLines(graph, { columns = true, descriptions = true, maxNodes = 30, maxEdges = 40 } = {}) {
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+
+  // Which kind of logic a node carries, without the logic itself. A workflow read
+  // from the database still has the statements on it; a canvas arrives with them
+  // pruned out and the names listed in `hasLogic` instead (see canvasGraph in
+  // WorkflowEditor.js), so both shapes have to answer this.
+  const carries = (cfg, keys) => keys.some((k) => (
+    (cfg[k] !== undefined && cfg[k] !== null && cfg[k] !== '')
+    || (Array.isArray(cfg.hasLogic) && cfg.hasLogic.includes(k))
+  ));
+  const logicLabel = (cfg) => {
+    if (carries(cfg, ['transformFunction', 'apiFetchCode'])) return 'JS';
+    if (carries(cfg, ['targetSql', 'joinSql', 'insertSql', 'nosqlOperation'])) return 'SQL';
+    return 'not configured yet';
+  };
+
+  // What feeds each node, read off the edges. A node's own config names its
+  // source only once it has been built, so an unconfigured transformer used to
+  // be listed as just "not configured yet" — nothing on its line said which
+  // table it reads, and two transformers on one canvas were told apart only by
+  // the one that had a config.
+  const byId = new Map(nodes.map((n) => [n?.id, n]));
+  const inputsOf = (id) => edges
+    .filter((e) => e.target === id)
+    .map((e) => {
+      const src = byId.get(e.source);
+      const so = src ? nodeOutline(src, { details: false }) : null;
+      const what = so && (so.source || so.target);
+      return what ? `${e.source} (${what})` : e.source;
+    });
+
+  const line = (node) => {
+    const o = nodeOutline(node, { details: false });
+    const cfg = node?.data?.config || {};
+    const bits = [];
+    switch (o.type) {
+      case 'start':
+        if (o.triggerType) bits.push(`${o.triggerType} trigger`);
+        // Every start node's description is a restatement of its trigger
+        // ("Manual trigger" on 114 of the 124 in this app), so it is dropped
+        // below rather than printed twice.
+        o.description = null;
+        break;
+      case 'dataSource': {
+        if (o.connection) bits.push(`from ${o.connection}`);
+        if (o.source) bits.push(`reads ${o.source}`);
+        const file = cfg.sourceLocalPath || cfg.sourceFilePath;
+        if (file) bits.push(`file ${file}`);
+        if (cfg.cloudSource?.objectPath) {
+          bits.push(`cloud ${cfg.cloudSource.connectionName || cfg.cloudSource.dbType || 'object'}: ${cfg.cloudSource.objectPath}`);
+        }
+        if (columns) {
+          const cols = (cfg.sourceTableSchema?.columns || []).map((c) => c?.name).filter(Boolean);
+          if (cols.length) bits.push(`cols: ${cols.slice(0, 8).join(', ')}${cols.length > 8 ? `, +${cols.length - 8}` : ''}`);
+        }
+        break;
+      }
+      case 'transformer': {
+        const from = cfg.sourceNodeLabel || cfg.sourceConnectionName;
+        if (from) bits.push(`from ${from}`);
+        const writes = cfg.targetTableName || o.target;
+        if (writes) bits.push(`writes ${writes}`);
+        if (o.targetConnection) bits.push(`into ${o.targetConnection}`);
+        bits.push(logicLabel(cfg));
+        break;
+      }
+      case 'join': {
+        if (o.joinType) bits.push(`${o.joinType} join`);
+        if (o.target) bits.push(`writes ${o.target}`);
+        if (o.targetConnection) bits.push(`into ${o.targetConnection}`);
+        if (logicLabel(cfg) === 'not configured yet') bits.push('not configured yet');
+        break;
+      }
+      case 'output': {
+        if (o.outputType) bits.push(o.outputType === 'connection' ? 'to a connection' : `to ${o.outputType}`);
+        if (o.target) bits.push(String(o.target));
+        if (o.format) bits.push(o.format);
+        if (o.writeMode) bits.push(`${o.writeMode} mode`);
+        break;
+      }
+      default:
+        break;
+    }
+    if (['transformer', 'join', 'output'].includes(o.type)) {
+      const ins = inputsOf(o.id);
+      if (ins.length) bits.push(`input: ${ins.join(' + ')}`);
+    }
+    if (descriptions && o.description) bits.push(`"${clipText(o.description, 80)}"`);
+    const label = clipText(o.label, 40);
+    const head = `- ${o.id} [${o.type || 'node'}]${label ? ` "${label}"` : ''}`;
+    return bits.length ? `${head} — ${bits.join('; ')}` : head;
+  };
+
+  const lines = nodes.slice(0, maxNodes).map(line);
+  if (nodes.length > maxNodes) {
+    lines.push(`- … ${nodes.length - maxNodes} more node(s) — call get_workflow for the full graph`);
+  }
+  const flow = edges.slice(0, maxEdges).map((e) => `${e.source}→${e.target}`).join(' , ');
+  if (flow) lines.push(`Edges: ${flow}${edges.length > maxEdges ? ' , …' : ''}`);
+  return lines.join('\n');
+}
+
+/** The richest rendering that fits HEADLINE_BUDGET_CHARS. */
+function workflowHeadline(graph) {
+  if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length === 0) return null;
+  const steps = [
+    {},
+    { columns: false },
+    { columns: false, descriptions: false },
+    { columns: false, descriptions: false, maxNodes: 15, maxEdges: 20 },
+  ];
+  let text = '';
+  for (const opts of steps) {
+    text = headlineLines(graph, opts);
+    if (text.length <= HEADLINE_BUDGET_CHARS) return text;
+  }
+  return text;   // last step is the floor; a very wide graph can still exceed it
+}
+
+// Past this many columns a node's schema is summarised in get_workflow_nodes.
+const WIDE_SCHEMA_COLUMNS = 60;
+// Sample rows kept per schema; none when the table is wide.
+const SAMPLE_ROWS_KEPT = 2;
+
+/**
+ * A copy of a node with every wide column list cut down to its first
+ * WIDE_SCHEMA_COLUMNS entries, and sample rows cut to SAMPLE_ROWS_KEPT (none
+ * for a wide table).
+ *
+ * One 1,100-column source made a get_workflow_nodes answer ~95k characters — its
+ * column list plus sample rows carrying every column — and the model, wading
+ * through that, answered about the wrong node. The count of what was left out
+ * stays, and get_columns returns the full list when a step really needs it.
+ */
+function trimWideSchemas(value) {
+  if (Array.isArray(value)) return value.map(trimWideSchemas);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  const wide = Array.isArray(value.columns) && value.columns.length > WIDE_SCHEMA_COLUMNS;
+  for (const [k, v] of Object.entries(value)) {
+    if (k === 'columns' && wide) {
+      out.columns = v.slice(0, WIDE_SCHEMA_COLUMNS);
+      out.columnsOmitted = v.length - WIDE_SCHEMA_COLUMNS;
+      out.columnsNote = `${v.length} columns in all; only the first ${WIDE_SCHEMA_COLUMNS} are listed. `
+        + 'Call get_columns for the full list.';
+    } else if (k === 'sampleData' && Array.isArray(v)) {
+      if (!wide) out.sampleData = v.slice(0, SAMPLE_ROWS_KEPT);
+    } else {
+      out[k] = trimWideSchemas(v);
+    }
   }
   return out;
 }
@@ -352,6 +568,9 @@ function summarizeExecution(e) {
 // Resolve a connection reference to its dbType, purely to give the classifier
 // context (e.g. "this is a Mongo JSON query, not SQL"). Best-effort: returns
 // null when it can't be determined.
+// Stores whose run_query query is an operation object ({ operation, ... }).
+const VECTOR_QUERY_DB_TYPES = new Set(['lancedb', 'pinecone']);
+
 function resolveDbType(helpers, ref) {
   const LOCAL = new Set(['duckdb', 'lancedb']);
   if (typeof ref === 'string' && LOCAL.has(ref)) return ref;
@@ -478,7 +697,9 @@ const SHARED_TOOLS = {
     if (!wf) throw new Error(`Workflow not found: ${args.workflowId}`);
     const slim = workflowBuilder.slimWorkflowForPrompt(wf);
     const wanted = new Set(args.nodeIds.map(String));
-    const matched = (slim.nodes || []).filter((n) => wanted.has(String(n.id)));
+    const matched = (slim.nodes || [])
+      .filter((n) => wanted.has(String(n.id)))
+      .map((n) => trimWideSchemas(n));
     const found   = new Set(matched.map((n) => String(n.id)));
     const missing = args.nodeIds.filter((id) => !found.has(String(id)));
     return {
@@ -591,6 +812,24 @@ const SHARED_TOOLS = {
     // through — never this tool. Classify the query and refuse anything that
     // isn't a pure read.
     const dbType = resolveDbType(helpers, args.connection);
+    // A vector store takes an operation OBJECT, not text. The model may send it
+    // as JSON text; a string reaching the store would be read as "list
+    // everything" and the query itself ignored, so parse it here and refuse
+    // what does not parse.
+    if (VECTOR_QUERY_DB_TYPES.has(dbType) && typeof args.query === 'string') {
+      let parsed;
+      try { parsed = JSON.parse(args.query); } catch (_) { parsed = null; }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(
+          `A ${dbType} query is a JSON object, not text — e.g. `
+          + (dbType === 'pinecone'
+            ? '{"operation":"count","indexName":"<index>","namespace":"<ns>"}'
+            : '{"operation":"count","tableName":"<table>"}')
+          + '. See the connector doc for the operations.',
+        );
+      }
+      args = { ...args, query: parsed };
+    }
     const verdict = await classifyQueryReadOnly({ helpers, provider, dbType, query: args.query });
     // The check could not run. Still refuse — an unchecked query never executes
     // — but say that is what happened. Reporting it as data-modifying would send
@@ -737,18 +976,51 @@ function discardPendingJavascript(runToken) {
   return pendingJsRuns.delete(runToken);
 }
 
+/**
+ * What a generated function needs to know about one connection in order to read
+ * it: the name to pass to ctx.runQuery, what kind of store it is, which tables it
+ * owns, its absolute path when it is a local file, and — for an API connection —
+ * the NAMES the user saved their parameters under.
+ *
+ * Names only, never values: `apiParamKeys` is the same key-name-only view
+ * `get_connection` hands the model, and credential values are resolved inside the
+ * running function by ctx.apiCredentials. The path is included because the chat
+ * often asks about a specific imported file; reading it still goes through the
+ * connection NAME, which resolves the path itself (see resolveLocalConnection in
+ * electron.js), so the path here is context, not an instruction.
+ */
+function describeConnectionForCode(c) {
+  const out = summarizeConnection(c);
+  const localPath = c.fileInfo?.filePath || c.localPath || c.dbConfig?.dbPath || null;
+  if (localPath) out.localPath = localPath;
+  const keys = Array.isArray(c.dbConfig?.apiParams)
+    ? c.dbConfig.apiParams.map((p) => p && p.key).filter(Boolean)
+    : (Array.isArray(c.dbConfig?.apiParamKeys) ? c.dbConfig.apiParamKeys : null);
+  if (keys && keys.length) out.apiParamKeys = keys;
+  return out;
+}
+
 // run_javascript — generate a one-off async transform(records, ctx) function
-// using the javascript-executor skill (buildFunctionPrompt → callAI), then
+// using the javascript-executor skill (buildChatFunctionPrompt → callAI), then
 // STOP. The function is not run here: it is parked for the user to read and
 // approve, and `runApprovedJavascript` executes it if they do. Nothing is
 // persisted either way; on approval the returned array goes back to the chat
 // so the AI can answer / visualise it.
+//
+// The prompt is the skill's CHAT builder, not the workflow one. A chat run has no
+// source node, writes nothing, and reads through saved connections — so the
+// generator is handed the connection catalogue, the configured AI/embedding
+// providers, and any schema this call fetched, instead of the workflow path's
+// "source node + output destination" framing. Passing a stub plan to the workflow
+// builder instead is what produced prompts claiming `Connection: Unknown` while
+// demanding absolute dbPaths that were never supplied, which the generator could
+// only answer with a question.
 async function runJavascriptTool({ helpers, provider }, args) {
   const request = args && typeof args.request === 'string' ? args.request.trim() : '';
   if (!request) throw new Error('request is required');
 
   const skill = helpers?.pluginManager?.getSkill?.('javascript-executor');
-  if (!skill || typeof skill.buildFunctionPrompt !== 'function'
+  if (!skill || typeof skill.buildChatFunctionPrompt !== 'function'
       || typeof skill.runTransformFunction !== 'function') {
     throw new Error('javascript-executor skill is not available');
   }
@@ -791,22 +1063,23 @@ async function runJavascriptTool({ helpers, provider }, args) {
     }
   }
 
-  // Minimal plan envelope — buildFunctionPrompt only reads summary/outputType/
-  // provider hints. We always run inline to plain-JSON output;
-  // the function can still emit a `vector` field if the user asked for one.
-  const plan = {
-    summary: request,
-    outputType: 'duckdb',
-    aiProvider: null,
-    embeddingProvider: null,
-    connectionsNeeded: [],
-  };
-  const prompt = skill.buildFunctionPrompt({
+  // Everything the generator needs to write against this app: every connection it
+  // may read, the providers ctx.askAi / ctx.vectorize can actually reach, and the
+  // row cap its output is subject to. Columns and samples are only included for a
+  // table this call loaded — reading them for every connection would be two
+  // round trips each — so the prompt tells the function to call ctx.getTables /
+  // ctx.getColumns at run time when it needs more than the catalogue.
+  const prompt = skill.buildChatFunctionPrompt({
     userRequest: request,
-    plan,
+    connections: (helpers.connections || []).map(describeConnectionForCode),
+    aiProviders: helpers.aiProviders || [],
+    embeddingProviders: helpers.embeddingProviders || [],
     schemaContext: [],
     sourceConnection,
     sourceTableSchema,
+    sourceRecordCount: Array.isArray(records) ? records.length : 0,
+    rowCap: MAX_QUERY_ROWS,
+    vectorGuide: require('../lib/vectorQueryGuide').VECTOR_QUERY_GUIDE,
   });
 
   const raw = await helpers.callAI(prompt, {});
@@ -904,9 +1177,11 @@ const BUILD_TOOL_NAMES = new Set(['build_transformer', 'build_join', 'build_data
 // tables, and where the output file lands. Until it is set, build_join refuses
 // and this tool is offered instead.
 const JOIN_DESTINATION_TOOL = 'set_join_destination';
-// The one local destination: a Parquet file this node owns, read back through
-// DuckDB. (LanceDB is a vector store, and reached through a saved connection.)
+// The two local destinations, matching the tokens the join builder and the
+// planner accept: a table in this workflow's own DuckDB database, or a table in
+// the local LanceDB directory (a vector destination).
 const LOCAL_JOIN_DESTINATION = 'local-duckdb';
+const LOCAL_VECTOR_JOIN_DESTINATION = 'local-lancedb';
 
 function joinNeedsDestination(targetNode) {
   if (!targetNode || targetNode.type !== 'join') return false;
@@ -924,26 +1199,38 @@ async function setJoinDestinationTool(ctx, args) {
   const tn = ctx.targetNode;
   if (!tn || tn.type !== 'join') throw new Error('No Join node is in focus.');
   const ref = String(args.destination || '').trim();
-  if (!ref) throw new Error('destination is required — a saved connection id or name, or "local-duckdb".');
+  if (!ref) throw new Error(`destination is required — a saved connection id or name, "${LOCAL_JOIN_DESTINATION}", or "${LOCAL_VECTOR_JOIN_DESTINATION}".`);
 
-  const isLocal = /^local-/i.test(ref) || /^local(\s+file)?$/i.test(ref);
   const connections = ctx.helpers?.connections || [];
-  const conn = isLocal ? null : (
-    connections.find((c) => (c.id || c._id) === ref)
+  // A saved connection wins over the local tokens, so one the user happened to
+  // name "local …" still resolves to itself.
+  const conn = connections.find((c) => (c.id || c._id) === ref)
     || connections.find((c) => String(c.name || '').toLowerCase() === ref.toLowerCase())
-  );
+    || null;
+  const isLocal = !conn && (/^local-/i.test(ref) || /^local(\s+\w+)*$/i.test(ref));
+  // Which local store: LanceDB when the answer names it (or a vector table),
+  // DuckDB otherwise. Never collapse a requested vector table into DuckDB.
+  const localToken = /lance|vector/i.test(ref) ? LOCAL_VECTOR_JOIN_DESTINATION : LOCAL_JOIN_DESTINATION;
+  // Only stores a join can write to are offered or accepted — see
+  // isJoinDestinationConnection in workflowBuilder.js.
+  const names = connections.filter(workflowBuilder.isJoinDestinationConnection)
+    .map((c) => `${c.id || c._id} (${c.name})`).join(', ') || '(none saved)';
+  const localHint = `Or use "${LOCAL_JOIN_DESTINATION}" for a table in this workflow's local DuckDB database, or "${LOCAL_VECTOR_JOIN_DESTINATION}" for a local LanceDB vector table.`;
   if (!isLocal && !conn) {
-    const names = connections.map((c) => `${c.id || c._id} (${c.name})`).join(', ') || '(none saved)';
-    throw new Error(`No saved connection matches "${ref}". Available: ${names}. Or use "${LOCAL_JOIN_DESTINATION}" for a local Parquet file.`);
+    throw new Error(`No saved connection matches "${ref}". Destinations: ${names}. ${localHint}`);
+  }
+  if (conn && !workflowBuilder.isJoinDestinationConnection(conn)) {
+    throw new Error(`"${conn.name}" is a ${conn.dbType} connection, which cannot hold a join result — a join writes to a database or a vector store. Destinations: ${names}. ${localHint}`);
   }
 
+  const isLocalVector = isLocal && localToken === LOCAL_VECTOR_JOIN_DESTINATION;
   const config = isLocal
     ? {
-        joinSettings: { ...(tn.config?.joinSettings || {}), destinationSelection: LOCAL_JOIN_DESTINATION },
-        targetConnectionId: LOCAL_JOIN_DESTINATION,
-        targetConnectionName: 'Local file',
+        joinSettings: { ...(tn.config?.joinSettings || {}), destinationSelection: localToken },
+        targetConnectionId: localToken,
+        targetConnectionName: isLocalVector ? 'Local LanceDB' : 'Local file',
         targetConnectionType: 'file',
-        targetDbType: 'duckdb',
+        targetDbType: isLocalVector ? 'lancedb' : 'duckdb',
         targetDbConfig: {},
       }
     : {
@@ -954,6 +1241,11 @@ async function setJoinDestinationTool(ctx, args) {
         targetDbType: conn.dbType,
         targetDbConfig: conn.dbConfig || {},
       };
+
+  // Written onto the in-memory focused node as well, for the same reason
+  // addNodeContextTool does: `__nodeBuild` only reaches the node through the
+  // renderer, which does not settle before a build_join later in this step.
+  tn.config = { ...(tn.config || {}), ...config };
 
   return {
     destinationSet: true,
@@ -1003,9 +1295,15 @@ async function addNodeContextTool(ctx, args) {
 // MAX_SKILL_ROUNDS and then builds from a misunderstanding.
 //
 // So before the builder sees anything, this decides whether the message belongs
-// in front of it at all. It runs as a short self-driving loop (like
-// generateValidationFunction — NOT the renderer's loop), because the renderer is
-// blocked on this one chat:step and cannot pump turns for it.
+// in front of it at all — as a slim, tool-less gate call (prompts.js
+// nodeBuildRouter), with obvious answers decided before it and an optional
+// lookup after it (nodeBuildLookup). The lookup runs as a short self-driving
+// loop (like generateValidationFunction — NOT the renderer's loop), because the
+// renderer is blocked on this one chat:step and cannot pump turns for it.
+//
+// The gate used to carry the node docs, every connection and the tools itself
+// (~39k chars) and, buried in them, held back "Inner join." three times running
+// as "not an answer" to "INNER, LEFT, RIGHT, or FULL OUTER?". Keep it slim.
 //
 // Deliberately narrow: read-only tools only, a low round budget, and no ability
 // to rewrite the user's message. `run_javascript` is excluded on purpose — it
@@ -1019,25 +1317,91 @@ const ROUTER_TOOLS = new Set([
   'list_workflows', 'get_workflow', 'get_workflow_nodes',
 ]);
 
-// How much of the node's own transcript the router is shown. Enough to see the
-// question it is judging a reply to, without re-sending the whole build history.
-const ROUTER_CHAT_TURNS = 8;
+// The gate is shown the node's WHOLE transcript — node chats are small (a dozen
+// messages, a couple of thousand characters) and the earlier turns are what
+// make a terse reply readable. Capped only as a safety net; past the cap the
+// oldest turns go first, and the gate is told they were dropped.
+const ROUTER_TRANSCRIPT_CHARS = 8000;
+const ROUTER_MESSAGE_CHARS = 1500;
 
 function formatRouterChat(chat) {
   if (!Array.isArray(chat) || chat.length === 0) return '';
-  return chat
-    .slice(-ROUTER_CHAT_TURNS)
+  const lines = chat
     .map((m) => {
       const text = String(m?.text || '').trim();
       if (!text) return null;
-      if (m.sender === 'user') return `User: ${trimText(text, 600)}`;
+      if (m.sender === 'user') return `User: ${trimText(text, ROUTER_MESSAGE_CHARS)}`;
       const meta = m.metadata || {};
-      if (meta.clarification) return `Builder asked: ${trimText(text, 600)}`;
-      if (meta.context) return `Context recorded for the builder: ${trimText(text, 600)}`;
-      return `Builder: ${trimText(text, 600)}`;
+      if (meta.clarification) return `Builder asked: ${trimText(text, ROUTER_MESSAGE_CHARS)}`;
+      if (meta.context) return `Context recorded for the builder: ${trimText(text, ROUTER_MESSAGE_CHARS)}`;
+      return `Builder: ${trimText(text, ROUTER_MESSAGE_CHARS)}`;
     })
-    .filter(Boolean)
-    .join('\n');
+    .filter(Boolean);
+  let total = lines.reduce((n, l) => n + l.length + 1, 0);
+  let dropped = 0;
+  while (lines.length > 1 && total > ROUTER_TRANSCRIPT_CHARS) {
+    total -= lines.shift().length + 1;
+    dropped += 1;
+  }
+  return (dropped ? `(${dropped} earlier message${dropped === 1 ? '' : 's'} omitted)\n` : '') + lines.join('\n');
+}
+
+/**
+ * The user's replies the gate already held back for THIS question.
+ *
+ * A held-back reply never reaches the builder, so it never enters the node's
+ * transcript — a gate reading only the transcript cannot tell it is turning
+ * the same answer away for the third time. The main conversation has it: each
+ * hold-back is a build_* result with `reason: not_an_answer_to_pending_question`
+ * naming the question, after the user message that triggered it.
+ */
+function heldBackReplies(history, question) {
+  if (!Array.isArray(history) || !question) return [];
+  const out = [];
+  let lastUser = null;
+  for (const m of history) {
+    if (!m) continue;
+    if (m.role === 'user' && typeof m.text === 'string') { lastUser = m.text.trim(); continue; }
+    if (m.role !== 'assistant' || m.kind !== 'step' || !Array.isArray(m.actions)) continue;
+    const held = m.actions.some((a) => a?.result?.reason === 'not_an_answer_to_pending_question'
+      && a.result.pending_question === question);
+    if (held && lastUser && out[out.length - 1] !== lastUser) out.push(lastUser);
+  }
+  return out;
+}
+
+// Two hold-backs on one question and the next reply goes through regardless —
+// the builder re-asks if it still needs something, which is one turn; a gate
+// that keeps withholding is a loop the user cannot leave.
+const MAX_HELD_BACK = 2;
+
+// Words that appear in nearly every builder question, so sharing one says
+// nothing about whether a reply answers it.
+const SHORTCUT_STOPWORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'of', 'on', 'in', 'to', 'for', 'by', 'with', 'from', 'as', 'at',
+  'it', 'its', 'this', 'that', 'these', 'those', 'be', 'is', 'are', 'was', 'should', 'would', 'could',
+  'can', 'do', 'does', 'you', 'your', 'i', 'me', 'my', 'we', 'like', 'use', 'using', 'want',
+  'which', 'what', 'how', 'all', 'only', 'any', 'each', 'every', 'new', 'name', 'named',
+  'join', 'joins', 'table', 'tables', 'column', 'columns', 'row', 'rows', 'source', 'sources',
+  'node', 'data', 'field', 'fields', 'record', 'records', 'keep', 'please', 'yes', 'no',
+]);
+const QUESTION_OPENERS = /^(what|how|why|can|could|does|do|is|are|where|when|who|which|should|would|will)\b/i;
+const SHORTCUT_MAX_WORDS = 6;
+
+const wordsOf = (s) => String(s || '').toLowerCase().match(/[a-z0-9_]+/g) || [];
+
+/**
+ * A reply that obviously answers the question, decided without an AI call:
+ * short, not itself a question, and naming something the question offered
+ * ("Inner join." to "…INNER, LEFT, RIGHT, or FULL OUTER?").
+ */
+function obviousAnswer(question, message) {
+  const text = String(message || '').trim();
+  if (!text || text.includes('?') || QUESTION_OPENERS.test(text)) return false;
+  const words = wordsOf(text);
+  if (words.length === 0 || words.length > SHORTCUT_MAX_WORDS) return false;
+  const offered = new Set(wordsOf(question).filter((w) => w.length >= 3 && !SHORTCUT_STOPWORDS.has(w)));
+  return words.some((w) => offered.has(w));
 }
 
 /** The node's current logic, formatted for the router prompt. */
@@ -1088,49 +1452,127 @@ function pendingBuilderQuestion(config) {
 /**
  * Run the gate for the focused node.
  *
+ *   1. Obvious answers skip the model: a short reply naming an option the
+ *      question offered, or a reply after MAX_HELD_BACK hold-backs.
+ *   2. The gate call — slim, no tools: the node's whole transcript, the
+ *      question, the reply, and a few lines on what this builder asks about.
+ *   3. Only if it answers "lookup": a separate lookup call with the read-only
+ *      tools, docs and connections, then the gate once more with what it found
+ *      (no second lookup).
+ *
  * @returns {Promise<{relevant:boolean, note:string|null}>}
- *          Always resolves, and always resolves to `relevant: true` on any
- *          failure — no AI, an unparseable reply, the budget exhausted. This is
- *          a guard in front of the builder; it must never become the reason a
- *          build cannot happen. Degrading to "forward it" is the correct
- *          fallback, because that is what the code did before the gate existed.
+ *          Always resolves, and resolves to `relevant: true` on any failure —
+ *          no AI, an unparseable reply, the budget exhausted. This is a guard
+ *          in front of the builder; it must never become the reason a build
+ *          cannot happen.
  */
 async function runNodeBuildRouter(ctx, tn, pending) {
   const FORWARD = { relevant: true, note: null };
-  if (!ctx.helpers || typeof ctx.helpers.callAI !== 'function') return FORWARD;
+  const label = `[Gate] ${tn.type} ${tn.nodeId || ''}`.trim();
+  const said = JSON.stringify(trimText(String(ctx.message || ''), 80));
+  const verdict = (relevant, how, thought = '', note = null) => {
+    console.log(`${label}: ${relevant ? 'forward' : 'hold back'} (${how}) ${said}${thought ? ` — ${thought}` : ''}`);
+    return { relevant, note };
+  };
+
+  const heldBack = heldBackReplies(ctx.rawHistory, pending.question);
+  if (heldBack.length >= MAX_HELD_BACK) return verdict(true, `${heldBack.length} replies already held back`);
+  if (obviousAnswer(pending.question, ctx.message)) return verdict(true, 'names an offered option');
+  if (!ctx.helpers || typeof ctx.helpers.callAI !== 'function') return verdict(true, 'no AI available');
 
   const config = tn.config || {};
   const chat = Array.isArray(config.chat) ? config.chat : [];
+  const transcript = formatRouterChat(chat);
+  let skillDescription = null;
+  if (pending.skillId) {
+    try { skillDescription = ctx.helpers.pluginManager?.getSkill(pending.skillId)?.metadata?.description || null; } catch (_) { /* optional */ }
+  }
 
-  const prompt = buildPrompt('nodeBuildRouter', {
+  const gate = async (lookupFindings) => {
+    const prompt = buildPrompt('nodeBuildRouter', {
+      nodeType: tn.type,
+      nodeLabel: tn.label || null,
+      pendingQuestion: pending.question,
+      pendingSkillId: pending.skillId,
+      skillDescription,
+      userMessage: ctx.message || '',
+      transcript,
+      heldBack,
+      lookupFindings,
+      lookupAllowed: !lookupFindings,
+    });
+    // The turn itself carries the question and the reply. A bare instruction
+    // here ("Decide.") was read by the model AS the user's message — it held a
+    // real answer back because "the message only specifies the response format".
+    const turn = `The builder asked: ${JSON.stringify(pending.question)}\n`
+      + `The user replied: ${JSON.stringify(String(ctx.message || ''))}\n`
+      + 'Does that reply answer the question (or steer this node)? Reply with the JSON object only.';
+    const raw = await ctx.helpers.callAI(turn, {
+      systemPrompt: prompt.text,
+      provider: ctx.provider,
+      jsonMode: true,
+      promptMeta: prompt.meta,
+    });
+    return parseModelJson(raw) || {};
+  };
+
+  let first;
+  try {
+    first = await gate(null);
+  } catch (_err) {
+    // Including MAX_TOKENS: a gate that cannot answer must not stop a build.
+    return verdict(true, 'gate call failed');
+  }
+  const decision1 = String(first.decision || '').toLowerCase();
+  if (decision1 === 'yes') return verdict(true, 'gate', first.thought);
+  if (decision1 === 'no') return verdict(false, 'gate', first.thought);
+  if (decision1 !== 'lookup' || !String(first.lookup || '').trim()) return verdict(true, 'gate gave no decision', first.thought);
+
+  // ── Lookup, as its own call ─────────────────────────────────────────────
+  const looked = await runNodeBuildLookup(ctx, tn, pending, String(first.lookup).trim(), transcript);
+  if (!looked.findings) return verdict(true, 'lookup found nothing', first.thought, looked.note);
+
+  let second;
+  try {
+    second = await gate(looked.findings);
+  } catch (_err) {
+    return verdict(true, 'gate call failed after lookup', '', looked.note);
+  }
+  const decision2 = String(second.decision || '').toLowerCase();
+  return verdict(decision2 !== 'no', 'gate after lookup', second.thought, looked.note);
+}
+
+/**
+ * The gate's "find this out first": a short read-only tool loop with the
+ * context the slim gate leaves out. Returns { findings, note } — both null when
+ * it could not find anything; never throws.
+ */
+async function runNodeBuildLookup(ctx, tn, pending, lookupRequest, transcript) {
+  const EMPTY = { findings: null, note: null };
+  const prompt = buildPrompt('nodeBuildLookup', {
     nodeType: tn.type,
     nodeLabel: tn.label || null,
     nodeId: tn.nodeId || null,
-    nodeConfigured: !!(config.targetSql || config.joinSql || config.transformFunction
-      || config.nosqlOperation || config.apiFetchCode),
-    nodeDetails: formatNodeDetails(config),
+    lookupRequest,
     pendingQuestion: pending.question,
-    pendingSkillId: pending.skillId,
     userMessage: ctx.message || '',
-    recentChat: formatRouterChat(chat),
+    transcript,
+    nodeDetails: formatNodeDetails(tn.config || {}),
     connections: (ctx.helpers.connections || []).map(summarizeConnection),
     systemContext: workflowBuilder.buildSystemContext(),
-    // How this node type is actually configured. Without it the gate is judging
-    // "is this relevant?" against a question full of terms it does not know.
     nodeTypeDocs: workflowBuilder.nodeTypeDocsAsPromptSection(tn.type),
     maxActions: MAX_ACTIONS_PER_STEP,
     maxRounds: MAX_ROUTER_ROUNDS,
   });
 
   const scratchpad = [];
-  // One decision turn is always allowed on top of the gathering budget.
+  // One reporting turn is always allowed on top of the gathering budget.
   for (let round = 0; round <= MAX_ROUTER_ROUNDS; round++) {
     const turnPrompt = scratchpad.length === 0
-      ? 'Decide whether the user\'s message replies to the pending question, or look something up first.'
+      ? 'Look it up, or report if you already know.'
       : `Work so far:\n${formatScratchpad(scratchpad)}\n\n${round >= MAX_ROUTER_ROUNDS
-          ? 'You are out of lookups. Reply with Schema B — decide.'
-          : 'Continue: look something else up, or decide.'}`;
-
+          ? 'You are out of lookups. Report what you found.'
+          : 'Continue: look something else up, or report.'}`;
     let parsed;
     try {
       const raw = await ctx.helpers.callAI(turnPrompt, {
@@ -1141,24 +1583,24 @@ async function runNodeBuildRouter(ctx, tn, pending) {
       });
       parsed = parseModelJson(raw);
     } catch (_err) {
-      // Including MAX_TOKENS: a gate that cannot answer must not stop a build.
-      return FORWARD;
+      return EMPTY;
     }
 
-    // Schema B — a decision.
-    if (parsed && typeof parsed.relevant === 'boolean') {
-      return { relevant: parsed.relevant, note: String(parsed.note || '').trim() || null };
+    if (parsed && typeof parsed.findings === 'string') {
+      return {
+        findings: parsed.findings.trim() || null,
+        note: String(parsed.note || '').trim() || null,
+      };
     }
 
-    // Schema A — gather, then loop.
     const actions = Array.isArray(parsed?.actions) ? parsed.actions.slice(0, MAX_ACTIONS_PER_STEP) : [];
-    if (actions.length === 0 || round >= MAX_ROUTER_ROUNDS) return FORWARD;
+    if (actions.length === 0 || round >= MAX_ROUTER_ROUNDS) return EMPTY;
 
     const executed = [];
     for (const a of actions) {
       const name = a && a.tool;
       if (!ROUTER_TOOLS.has(name)) {
-        executed.push({ tool: name || 'unknown', args: a?.args || {}, ok: false, error: `${name} is not available to the router — read-only lookups only.` });
+        executed.push({ tool: name || 'unknown', args: a?.args || {}, ok: false, error: `${name} is not available to the lookup — read-only lookups only.` });
         continue;
       }
       try {
@@ -1169,8 +1611,7 @@ async function runNodeBuildRouter(ctx, tn, pending) {
     }
     scratchpad.push({ index: scratchpad.length + 1, thought: String(parsed?.thought || '').trim(), actions: executed });
   }
-
-  return FORWARD;
+  return EMPTY;
 }
 
 /**
@@ -1340,6 +1781,7 @@ function focusedNodeParams(targetNode, buildToolName, connections = []) {
     needsDestination: joinNeedsDestination(targetNode),
     joinDestinationTool: JOIN_DESTINATION_TOOL,
     localJoinDestination: LOCAL_JOIN_DESTINATION,
+    localVectorJoinDestination: LOCAL_VECTOR_JOIN_DESTINATION,
     nodeContextTool: NODE_CONTEXT_TOOL,
   };
 }
@@ -1474,12 +1916,21 @@ async function runMainTool(name, args, ctx) {
  */
 function apiProbeGate({ request, connections, scratchpad, history }) {
   const haystack = String(request || '').toLowerCase();
+  // Named as a whole term, not as a substring: a connection called "api" is
+  // otherwise "named" by every request containing those letters inside another
+  // word ("rapid", "capital"), and propose_plan is refused for a workflow that
+  // never touches it. The edges are anything that is not a letter or digit, so
+  // a quoted, bracketed or sentence-final name still counts. A name that is an
+  // ordinary word used as a word still matches — that is a real mention.
+  const escape = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mentions = (term) => !!term
+    && new RegExp(`(^|[^a-z0-9])${escape(term)}($|[^a-z0-9])`, 'i').test(haystack);
   const named = (connections || [])
     .filter((c) => c && c.dbType === 'rest-api')
     .filter((c) => {
       const name = String(c.name || '').trim().toLowerCase();
       const id = String(c.id || c._id || '').trim().toLowerCase();
-      return (name && haystack.includes(name)) || (id && haystack.includes(id));
+      return mentions(name) || mentions(id);
     });
   if (!named.length) return { blocked: false };
 
@@ -1618,19 +2069,31 @@ async function runWorkflowTool(name, args, ctx) {
     });
     if (plan.action === 'plan' && plan.mode === 'modify' && workflow) {
       plan.workflowId = workflow.id || workflow._id;
+      // A modify plan names the nodes it keeps, changes and deletes by id —
+      // which is what the build needs and nothing a reader recognises. The
+      // plan card shows these names instead (display only; the build ignores it).
+      plan.nodeLabels = Object.fromEntries((workflow.nodes || []).map((n) => [
+        n.id,
+        n.data?.config?.node_name || n.data?.label || n.id,
+      ]));
     }
-    // Carry the clarifications forward as data. The planner already honoured
-    // them — it reads this same transcript — but the post-build reviewer is
-    // handed `plan.clarifications`, and until now that held only the questions a
-    // BUILDER asked mid-build. A question answered before the plan (the kind
-    // that corrects a table name) was invisible to it. Merged, not replaced,
-    // and de-duplicated so a resumed plan does not accumulate the same pair.
+    // Carry the conversation's clarifications forward as data, for the
+    // post-build REVIEWER only. The planner already honoured them — it reads
+    // this same transcript — but a question answered before the plan (the kind
+    // that corrects a table name) was otherwise invisible to the reviewer.
+    //
+    // Kept OUT of `plan.clarifications`. That field is the builders' channel:
+    // executeBuild seeds every entry without a stepIndex into EVERY node's chat,
+    // so a pre-plan answer like "overwrite" landed in each node's transcript as
+    // its latest user message and was read as part of that node's brief. A
+    // conversation-level answer belongs to no single node; the planner already
+    // folded it into each step's prompt.
     if (plan.action === 'plan') {
-      const existing = Array.isArray(plan.clarifications) ? plan.clarifications : [];
-      const seen = new Set(existing.map((c) => `${c?.question} ${c?.answer}`));
+      const existing = Array.isArray(plan.conversationClarifications) ? plan.conversationClarifications : [];
+      const seen = new Set(existing.map((c) => `${c?.question} ${c?.answer}`));
       const added = clarificationPairs(chatHistory)
-        .filter((c) => !seen.has(`${c.question} ${c.answer}`));
-      if (added.length) plan.clarifications = [...existing, ...added];
+        .filter((c) => !seen.has(`${c.question} ${c.answer}`));
+      if (added.length) plan.conversationClarifications = [...existing, ...added];
     }
     // Short-circuit: the backend will finish the turn with the planner's
     // output rather than asking the model to relay it. Plans become a
@@ -1918,16 +2381,33 @@ const MAX_REVIEW_MSG_CHARS = 1200;
 
 function formatRequestHistory(chatHistory) {
   if (!Array.isArray(chatHistory) || chatHistory.length === 0) return '(no conversation recorded)';
-  return chatHistory
-    .slice(-MAX_REVIEW_HISTORY)
-    .map((m) => {
-      const who = m && m.role === 'assistant' ? 'Assistant' : 'User';
-      const text = String((m && (m.text || m.content)) || '').trim();
-      if (!text) return null;
-      return `${who}: ${trimText(text, MAX_REVIEW_MSG_CHARS)}`;
-    })
-    .filter(Boolean)
-    .join('\n');
+  const recent = chatHistory.slice(-MAX_REVIEW_HISTORY);
+  const line = (m) => {
+    const who = m && m.role === 'assistant' ? 'Assistant' : 'User';
+    const text = String((m && (m.text || m.content)) || '').trim();
+    if (!text) return null;
+    return `${who}: ${trimText(text, MAX_REVIEW_MSG_CHARS)}`;
+  };
+  // A node's transcript spans every build it has had. When the renderer marks
+  // which turns belong to THIS change, show the earlier builds apart from it:
+  // read as one brief, an old request's wording ("join products_store …")
+  // overruled a later "make it an inner join" and failed a correct build.
+  const earlier = recent.filter((m) => m && m.phase === 'earlier');
+  if (!earlier.length) return recent.map(line).filter(Boolean).join('\n');
+  const current = recent.filter((m) => m && m.phase !== 'earlier');
+  return [
+    '## Earlier builds of this node — BACKGROUND ONLY',
+    'What the node was asked to do before this change. Already reflected in its',
+    'current configuration. NOT requirements for this review: use them only to',
+    'understand what "it", "the join", "same columns" and the like refer to.',
+    ...earlier.map(line).filter(Boolean),
+    '',
+    '## This change — THE REQUIREMENT',
+    'The user\'s newest request (and any answers to the AI\'s questions about it).',
+    'Judge the node against this. Anything it does not mention was meant to stay',
+    'as it was, so do not fault the node for it.',
+    ...current.map(line).filter(Boolean),
+  ].join('\n');
 }
 
 /**
@@ -1983,9 +2463,18 @@ async function validateWorkflowChange({ workflow, helpers, provider, change = {}
     ? 'This node\'s own build transcript — the ONLY brief it was built from (oldest first).'
       + ' Lines beginning "Clarification by AI:" are questions the builder asked;'
       + ' lines beginning "Context from the chat:" are facts recorded for the builder.'
+      + ' When it is split into earlier builds and this change, only "This change" is'
+      + ' the requirement; the earlier builds are background.'
       + ' Judge ONLY this node against it. Other nodes, and anything the user asked'
       + ' for elsewhere in the app, are out of scope and must not make this invalid.'
     : 'The request this build was planned from, plus any clarifications and the plan itself (oldest first).';
+
+  // Tables written by more than one node, found from the config rather than
+  // asked of the model: two nodes replacing the same table every run is a
+  // defect whatever the transcript says, and a node review cannot otherwise see
+  // the sibling it collides with (the rest of the workflow is scoped out above).
+  const outputCollisions = workflowBuilder.findOutputTableCollisions(workflow)
+    .filter((g) => !isNode || !reviewedIds.size || g.nodes.some((x) => reviewedIds.has(x.id)));
 
   const prompt = buildPrompt("changeReview", {
     isNode,
@@ -2007,6 +2496,7 @@ async function validateWorkflowChange({ workflow, helpers, provider, change = {}
     // parent outputs. Their recorded input has already been refreshed; their own
     // logic has not, so the reviewer is asked to check it and to name the fix.
     impactedDownstream,
+    outputCollisions,
   });
 
   let raw;
@@ -2229,15 +2719,49 @@ async function buildSnapshot(getDb, helpers) {
 
 function formatContext(activeContext) {
   if (!activeContext || !activeContext.kind) return null;
-  const { kind, id, name, summary } = activeContext;
+  const { kind, id, name, summary, unsaved } = activeContext;
   const lines = [
     `Kind:    ${kind}`,
     id   ? `Id:      ${id}`   : null,
     name ? `Name:    ${name}` : null,
     summary ? `Summary: ${typeof summary === 'string' ? summary : JSON.stringify(summary, null, 2)}` : null,
+    // Stated here, acted on in the prompt's unsaved-workflow rules. There is no
+    // id to print for one of these — it addresses no record yet.
+    unsaved ? 'Saved:   NO — it exists only on the user\'s canvas; nothing about it is in the database' : null,
   ].filter(Boolean);
   return lines.join('\n');
 }
+
+/**
+ * The headline for the workflow the user is looking at.
+ *
+ * Preference order matters: the CANVAS wins over the database. A saved workflow
+ * with unsaved edits, and an unsaved one, are the same problem — the stored row
+ * describes what the last save wrote, not what the user is looking at and asking
+ * about. `activeContext.graph` is that canvas, pruned by the editor before it
+ * crosses IPC; the row is the fallback for a workflow that is in focus without
+ * the editor being open (opened from the workflows list).
+ */
+async function contextWorkflowHeadline(activeContext, getDb) {
+  if (!activeContext || activeContext.kind !== 'workflow') return null;
+  const fromCanvas = workflowHeadline(activeContext.graph);
+  if (fromCanvas) return fromCanvas;
+  if (!activeContext.id || typeof getDb !== 'function') return null;
+  try {
+    const wf = await getDb('workflows').findOneAsync({
+      $or: [{ id: activeContext.id }, { _id: activeContext.id }],
+    });
+    return workflowHeadline(wf);
+  } catch (err) {
+    console.warn('[chat] could not read the focused workflow for its headline:', err.message);
+    return null;
+  }
+}
+
+/** Is the thing the user is looking at a workflow with no stored copy? */
+const contextIsUnsavedWorkflow = (activeContext) => !!(activeContext
+  && activeContext.kind === 'workflow'
+  && activeContext.unsaved);
 
 // One action's observation, exactly as the model will see it.
 //
@@ -2310,6 +2834,51 @@ function historyResult(action) {
   if (tokens <= limit) return text;
   return `(result not included — ~${tokens} tokens, over the ${limit}-token replay `
     + 'limit; run the call again if you need the data)';
+}
+
+// Who wrote a history message and what it was about, as one line the model
+// reads ahead of the message — e.g.
+//   [context: question from the node builder about Transformer "rates_by_day"
+//    (transformer-17…) in workflow "E2E REST" — waiting for the user's answer]
+// The renderer records these on each message when it is written (agentSource,
+// and `context`: the workflow in view and the node in focus). Without it a
+// builder's question and the main agent's replies read alike, and a reply sent
+// after the focus moved on lost track of which node the question was about.
+const HISTORY_AGENT_NAMES = {
+  main: 'the assistant',
+  workflow: 'the workflow builder',
+  planner: 'the workflow planner',
+  builder: 'the node builder',
+  reviewer: 'the change reviewer',
+};
+const HISTORY_NODE_TYPES = { transformer: 'Transformer', join: 'Join', dataSource: 'Data Source', output: 'Output' };
+
+function historyContextLine(h) {
+  const c = h && h.context && typeof h.context === 'object' ? h.context : null;
+  const isAssistant = h && h.role === 'assistant';
+  const source = String(h?.agentSource || '');
+  const agent = source.startsWith('skill:')
+    ? `the "${source.slice(6)}" skill`
+    : HISTORY_AGENT_NAMES[source] || null;
+  if (!c && !(isAssistant && agent)) return null;
+  const node = c && c.nodeId
+    ? `${HISTORY_NODE_TYPES[c.nodeType] || c.nodeType || 'node'}${c.nodeLabel ? ` "${c.nodeLabel}"` : ''} (${c.nodeId})`
+    : null;
+  const wf = c && (c.workflowName || c.workflowId) ? `workflow "${c.workflowName || c.workflowId}"` : null;
+  const parts = [];
+  if (isAssistant) {
+    const kind = h.clarification ? 'question' : 'reply';
+    parts.push(`${kind} from ${agent || 'the assistant'}`);
+    if (node) parts.push(`about ${node}`);
+    if (wf) parts.push(`${node ? 'in' : 'about'} ${wf}`);
+    if (h.clarification && (source === 'builder' || source.startsWith('skill:'))) {
+      parts.push('— the user\'s next message is the answer to it');
+    }
+  } else {
+    if (node) parts.push(`sent with ${node} in focus`);
+    if (wf) parts.push(`${node ? ', in' : 'while viewing'} ${wf}`);
+  }
+  return parts.length ? `[context: ${parts.join(' ').replace(/ ,/g, ',')}]` : null;
 }
 
 /**
@@ -2512,7 +3081,16 @@ function scratchpadToToolTurns(scratchpad) {
         tool: a.tool,
         args: a.args || {},
         isError: !a.ok,
-        content: serializeObservation(a),
+        // Labelled exactly as scratchpadToTurns labels the text path, because a
+        // visual's "source" is that "<step>.<action>" index and the prompt tells
+        // the model to read it off the observation. On this path the results are
+        // tool_result blocks, so without the label there was nothing in context
+        // to read: the model counted messages by eye and pointed a table at the
+        // wrong step. The label is a pure function of the step index and the
+        // call's position, so it stays byte-identical on every replay and the
+        // provider's prefix cache is unaffected — see serializeObservation's
+        // invariant, which is why the prefix belongs here and not inside it.
+        content: `[observation ${step.index}.${i + 1}] ${a.tool}\n${serializeObservation(a)}`,
       })),
     });
   }
@@ -2584,6 +3162,19 @@ function extractRows(result) {
   return null;
 }
 
+// A result that carries no data because the tool asked for something instead of
+// producing an answer: run_javascript returns `ran: false` both when the
+// generator needs clarification and when the function is parked for approval.
+// Neither is an error — the call succeeded — so `action.error` does not catch
+// them, and a table visual pointed at one used to render the envelope itself
+// (the "ask_questions" object showing up as the answer's only table row). A
+// visual naming one of these means the model mis-numbered its source, so the
+// visual is dropped rather than filled with the envelope.
+const isControlEnvelope = (result) => !!result
+  && typeof result === 'object'
+  && !Array.isArray(result)
+  && result.ran === false;
+
 // Resolve a "<step>.<action>" reference (e.g. "3.1") to that action's raw result.
 function resultFromScratchpad(source, scratchpad) {
   if (typeof source !== 'string') return null;
@@ -2593,6 +3184,7 @@ function resultFromScratchpad(source, scratchpad) {
   if (!step || !Array.isArray(step.actions)) return null;
   const action = step.actions[Number(m[2]) - 1];
   if (!action || action.error) return null;
+  if (isControlEnvelope(action.result)) return null;
   return action.result;
 }
 
@@ -2892,11 +3484,18 @@ async function runStep({
   } else {
     const snapshot = await buildSnapshot(getDb, helpers);
     const contextSummary = formatContext(activeContext);
+    const contextOutline = await contextWorkflowHeadline(activeContext, getDb);
     prompt = buildPrompt('main', {
       toolMode: useTools,
-      docIndex, readme, contextSummary, snapshot, systemContext,
+      docIndex, readme, contextSummary, snapshot, systemContext, contextOutline,
+      contextUnsaved: contextIsUnsavedWorkflow(activeContext),
       maxActions: MAX_ACTIONS_PER_STEP,
-      focusedNode: focusedNodeParams(targetNode, buildToolName, helpers.connections),
+      // Only these connections are listed as join destinations — the prompt
+      // offers nothing set_join_destination would refuse.
+      focusedNode: focusedNodeParams(
+        targetNode, buildToolName,
+        (helpers.connections || []).filter(workflowBuilder.isJoinDestinationConnection),
+      ),
       // A brand-new conversation has no history yet, so this turn is the one
       // that also names it — see the "Name this conversation" section in the
       // main prompt and `chatTitle` on the way back out.
@@ -2918,9 +3517,11 @@ async function runStep({
     // see historyStepTurns.
     if (h.kind === 'step') return historyStepTurns(h);
     const baseText = h.text || h.content || '';
-    const text = h.clarification
+    const said = h.clarification
       ? `Clarification by AI: ${baseText}`
       : baseText;
+    const contextLine = historyContextLine(h);
+    const text = contextLine ? `${contextLine}\n${said}` : said;
     return [{
       sender: h.role === 'assistant' ? 'assistant' : 'user',
       text,
@@ -3011,6 +3612,23 @@ async function runStep({
     const finalCall = calls.find((c) => c.tool === 'final_answer');
     const toolCalls = calls.filter((c) => c.tool !== 'final_answer');
 
+    // Classify the text channel BEFORE the no-calls branch below, because a
+    // mis-used text channel is not conditional on the absence of calls. The
+    // model can write final_answer's payload as text ({"answer": …}) while ALSO
+    // making a real tool call in the same turn — and that one landed here as
+    // `thought`, so the user read a serialized JSON wrapper under "Step N".
+    //
+    // On this path text is only ever the short live status line (see turnRules
+    // in prompts.js). Anything that is not prose is the model mis-using the
+    // channel, and it is dropped rather than unwrapped: with calls still to run
+    // the turn is not over, so an "answer" written here is one the model is
+    // about to supersede once it sees the observations. Dropping it also keeps
+    // it out of `step.thought`, which historyStepTurns would otherwise replay
+    // next turn as {"thought":"{\"answer\":…}", …} — the envelope handed back in
+    // the model's own voice, teaching it the habit it is being corrected for.
+    const fromText = readToolText(res.text);
+    if (fromText.kind !== 'prose') thought = '';
+
     // final_answer alone ends the turn. Batched with real tools it is dropped
     // instead: the model asked for those results, so run them and let it answer
     // once it has seen them.
@@ -3026,19 +3644,18 @@ async function runStep({
     // "one bounded retry, then the failure stands" bargain repairModelJson makes.
     if (toolCalls.length === 0) {
       const structured = String(finalCall?.args?.answer || '').trim();
-      const fromText = readToolText(res.text);
       // A previous step recorded as `invalid` is this same failure, already
       // retried once.
       const retried = (scratchpad || []).some((s) =>
         (s.actions || []).some((a) => a && a.tool === 'invalid'));
       // `turnObject` is excluded at every point, retry spent or not: it
       // describes calls that never ran, so there is no answer inside it.
+      //
+      // Note this reads the envelope's answer out of `fromText`, not `thought`:
+      // `thought` has already been cleared above for exactly these kinds, which
+      // is what stops the wrapper being shown as a status line beside it.
       const finalAnswer = structured
         || (retried && fromText.kind !== 'turnObject' ? fromText.answer : '');
-      // `thought` was read off the same text channel. When that text was an
-      // envelope, it is the answer wearing a wrapper — not a status line, and
-      // showing the wrapper is the whole defect being fixed here.
-      if (fromText.kind === 'envelope') thought = '';
       if (finalAnswer) {
         // Both agents may attach visuals: they answer into the same chat bubble,
         // and the sub-agent shows the user real data too (candidate tables, a
@@ -3070,8 +3687,9 @@ async function runStep({
       // (scratchpadToToolTurns turns an action-less step into a plain assistant
       // turn carrying it). Replaying a JSON envelope or turn object there would
       // hand the model back the exact malformed shape, in its own voice, on the
-      // turn we are asking it to correct — so only real prose is carried.
-      const replayThought = fromText.kind === 'prose' ? thought : '';
+      // turn we are asking it to correct — so only real prose is carried, which
+      // the clearing above has already reduced `thought` to.
+      const replayThought = thought;
       const failure = fromText.kind === 'turnObject'
         ? 'model wrote a turn object as text instead of calling tools'
         : 'no tool calls and no answer';
@@ -3275,6 +3893,32 @@ async function runStep({
     // so mint the same deterministic one both sides already assume.
     const id = a.id || `${stepIndex}_${aIdx + 1}`;
     const key = `${tool}|${canonicalArgs(args)}`;
+    // Once a call has parked code for the user's approval, or has ended the
+    // turn with an answer of its own (a builder's question, a plan card), the
+    // rest of this step does not run.
+    //
+    // Approval first: a call batched after it cannot use its result — the
+    // model has not seen it yet — and the step has to stop there for the user
+    // anyway. A build_* in the same step used to run on a guess and, if its
+    // builder asked a question, end the turn through __shortCircuit, whose
+    // response carries no approval: the parked code was never shown, and
+    // expired. The right order is run_javascript, see the result, record what
+    // matters with add_node_context, THEN build.
+    //
+    // Each skipped call still gets a result — the provider pairs every call
+    // with one — and it is an error, so the call is not deduplicated and the
+    // model can make it again once it has what it needs.
+    if (pendingApproval || shortCircuit) {
+      executed.push({
+        id, tool, args, ok: false,
+        error: pendingApproval
+          ? 'Not run: an earlier call in this step is waiting for the user to approve its code. '
+            + 'Nothing batched after it runs until you have seen that result — call this again then, '
+            + 'using what it returned.'
+          : 'Not run: an earlier call in this step already ended the turn with a reply to the user.',
+      });
+      continue;
+    }
     if (seenCalls.has(key)) {
       executed.push({
         id, tool, args, ok: false,

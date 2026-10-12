@@ -14,7 +14,7 @@ import {
 } from '@ant-design/icons';
 import axios from 'axios';
 import Editor from '@monaco-editor/react';
-import { nodeDisplayName } from './nodes/nodeCardShared';
+import { nodeDisplayName, writeModeOf, targetIsSourceWarning } from './nodes/nodeCardShared';
 // Whether a node's output exists yet is workflow state, not node config — a
 // transformer/join/output names its target table the moment it is built, and
 // only a run puts anything behind that name. See utils/executedNodes.js.
@@ -216,6 +216,16 @@ const ResultBlock = ({ data, height }) => {
   );
 };
 
+// The Schema tab's key for one table entry. The schema is part of it: a
+// Pinecone index lists once per NAMESPACE under the same index name, and two
+// schemas of a database can hold tables of the same name. Keyed by the name
+// alone, those entries collided (React duplicate keys) and a column load lost
+// its namespace.
+const schemaEntryKey = (table) => {
+  if (typeof table === 'string') return table;
+  return table.schema ? `${table.schema}.${table.name}` : table.name;
+};
+
 const DataPreview = ({
   selectedNode,
   nodes,
@@ -347,7 +357,12 @@ const DataPreview = ({
           || config.skillParams?.namespace
           || (readsSourceIndex
             ? (config.sourceSchema || config.sourceTableSchema?.schema)
-            : config.targetTableSchema?.schema)
+            // A node whose OUTPUT is a Pinecone namespace (in-place
+            // maintenance) records it as `targetSchema`; reading only
+            // targetTableSchema sent its preview — and every node reading
+            // from it — to the default namespace, which held none of its rows.
+            : ((dbType === 'pinecone' ? config.targetSchema : null)
+              || config.targetTableSchema?.schema))
           || '';
 
         if (!tableName) {
@@ -1584,10 +1599,11 @@ const DataPreview = ({
         const tableName = typeof table === 'string' ? table : table.name;
         const tableSchema = typeof table === 'string' ? null : table.schema;
 
-        init[tableName] = {
+        init[schemaEntryKey(table)] = {
           columns: null,
           loading: false,
           expanded: false,
+          tableName,
           tableSchema: tableSchema
         };
       });
@@ -1607,7 +1623,10 @@ const DataPreview = ({
     }
   }, [dbTables, selectedNode]);
 
-  const loadTableSchema = async (tableName) => {
+  // `key` is the Schema tab's entry key (schemaEntryKey); the table's own
+  // name and schema — a Pinecone namespace — are read back from the entry.
+  const loadTableSchema = async (key) => {
+    const tableName = dbSchema[key]?.tableName || key;
     // Use activeConnection if available (during configuration), otherwise fall back to saved config
     const connection = activeConnection || selectedNode?.data?.config;
 
@@ -1617,13 +1636,13 @@ const DataPreview = ({
     }
 
     // Check if columns already loaded
-    if (dbSchema[tableName]?.columns) {
+    if (dbSchema[key]?.columns) {
       return;
     }
 
     setDbSchema(prev => ({
       ...prev,
-      [tableName]: { ...prev[tableName], loading: true }
+      [key]: { ...prev[key], loading: true }
     }));
 
     try {
@@ -1635,7 +1654,7 @@ const DataPreview = ({
           console.error('Missing local path or local DB API');
           setDbSchema(prev => ({
             ...prev,
-            [tableName]: { ...prev[tableName], columns: [], loading: false }
+            [key]: { ...prev[key], columns: [], loading: false }
           }));
           return;
         }
@@ -1659,7 +1678,7 @@ const DataPreview = ({
 
           setDbSchema(prev => ({
             ...prev,
-            [tableName]: { ...prev[tableName], columns, loading: false }
+            [key]: { ...prev[key], columns, loading: false }
           }));
         } else if (connection.dbType === 'sqlite') {
           // For SQLite, use PRAGMA table_info to get column information
@@ -1683,8 +1702,8 @@ const DataPreview = ({
 
             setDbSchema(prev => ({
               ...prev,
-              [tableName]: {
-                ...prev[tableName],
+              [key]: {
+                ...prev[key],
                 columns: columns,
                 loading: false
               }
@@ -1699,12 +1718,12 @@ const DataPreview = ({
         console.error('Database API not available');
         setDbSchema(prev => ({
           ...prev,
-          [tableName]: { ...prev[tableName], columns: [], loading: false }
+          [key]: { ...prev[key], columns: [], loading: false }
         }));
         return;
       }
 
-      const tableInfo = dbSchema[tableName] || {};
+      const tableInfo = dbSchema[key] || {};
       console.log('Loading columns for:', tableName, 'schema:', tableInfo.tableSchema);
       console.log('connection: ', connection)
 
@@ -1721,8 +1740,8 @@ const DataPreview = ({
 
       setDbSchema(prev => ({
         ...prev,
-        [tableName]: {
-          ...prev[tableName],
+        [key]: {
+          ...prev[key],
           columns: result.success ? result.columns : [],
           loading: false
         }
@@ -1732,7 +1751,7 @@ const DataPreview = ({
       message.error(`Failed to load columns for ${tableName}`);
       setDbSchema(prev => ({
         ...prev,
-        [tableName]: { ...prev[tableName], columns: [], loading: false }
+        [key]: { ...prev[key], columns: [], loading: false }
       }));
     }
   };
@@ -1785,7 +1804,6 @@ const DataPreview = ({
       pushTo(targetRows, 'Target', config.targetConnectionName);
       pushTo(targetRows, 'Target type', [config.targetConnectionType, config.targetDbType].filter(nonEmpty).join(' · '));
       pushTo(targetRows, 'Target table', config.targetTableName || config.targetCollection);
-      pushTo(targetRows, 'Operation mode', config.transformationSettings?.operationMode);
       pushTo(targetRows, 'Storage', config.transformationSettings?.storageLocation);
       if (config.usesSkill) pushTo(targetRows, 'Skill', config.skillId);
     } else if (type === 'join') {
@@ -1799,7 +1817,6 @@ const DataPreview = ({
       pushTo(sourceRows, 'Join columns', cols);
       pushTo(targetRows, 'Target', config.targetConnectionName);
       pushTo(targetRows, 'Target table', config.targetTableName || config.targetCollection);
-      pushTo(targetRows, 'Operation mode', config.joinSettings?.operationMode);
       pushTo(targetRows, 'Storage', config.joinSettings?.storageLocation);
     } else if (type === 'dataSource' && isApiDataSource) {
       // A REST API source has no table or schema to describe — what matters is
@@ -1838,6 +1855,21 @@ const DataPreview = ({
       pushTo(targetRows, 'Local path', config.targetLocalPath);
     } else if (type === 'start') {
       pushTo(targetRows, 'Trigger', config.triggerType || 'manual');
+    }
+
+    // How the node writes — the same field the canvas card shows — and a kept
+    // target waiting to be recreated. Shown flat, above the collapsed panels.
+    const generalRows = [];
+    const writeMode = writeModeOf(type, config);
+    if (writeMode) {
+      generalRows.push(['Write mode', writeMode.detail ? `${writeMode.label} (${writeMode.detail})` : writeMode.label]);
+    }
+    const rb = type === 'join' ? config.joinSettings?.targetRebuild : null;
+    if (rb?.pending) {
+      generalRows.push(['Pending change', `${rb.table} will be dropped and recreated on the next run`
+        + `${Number.isFinite(rb.rowCount) ? ` (${rb.rowCount} rows now)` : ''} — ${rb.reason}. `
+        + `${rb.approvedFingerprint && rb.approvedFingerprint === rb.ddlFingerprint ? 'Approved.' : 'Needs approval when it runs.'}`
+        + `${targetIsSourceWarning(rb) ? ` ⚠ ${targetIsSourceWarning(rb)}` : ''}`]);
     }
 
     const totalRows = sourceRows.length + targetRows.length;
@@ -2005,6 +2037,10 @@ const DataPreview = ({
           </div>
         )}
 
+        {generalRows.length > 0 && (
+          <div style={{ marginBottom: 14 }}>{renderRows(generalRows)}</div>
+        )}
+
         {/* Build logic — the generated SQL / DDL / functions that define what
             this node does, first panel open. */}
         {codeBlocks.length > 0 && (
@@ -2120,11 +2156,12 @@ const DataPreview = ({
           {dbTables.map((table) => {
             const tableName = typeof table === 'string' ? table : table.name;
             const schemaName = typeof table === 'string' ? null : table.schema;
-            const info = dbSchema[tableName] || { columns: null, loading: false };
+            const entryKey = schemaEntryKey(table);
+            const info = dbSchema[entryKey] || { columns: null, loading: false };
 
             return (
               <Panel
-                key={tableName}
+                key={entryKey}
                 header={
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <DatabaseOutlined style={{ color: '#52c41a' }} />

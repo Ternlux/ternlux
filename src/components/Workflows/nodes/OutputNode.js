@@ -1,7 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { MailOutlined, ExportOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter, WriteModeRow } from './nodeCardShared';
 
 const COLOR = NODE_COLORS.output;
 const MONO = "'JetBrains Mono', monospace";
@@ -22,7 +22,7 @@ const OutputNode = ({ data, selected }) => {
       const format = outputSettings.format?.toUpperCase() || 'FILE';
       return `Export to ${format}`;
     } else if (outputSettings.outputType === 'connection') {
-      return outputSettings.tableName || 'Database Export';
+      return outputSettings.objectName || outputSettings.tableName || 'Database Export';
     }
 
     return 'Output';
@@ -69,6 +69,8 @@ const OutputNode = ({ data, selected }) => {
       // writing MySQL labelled itself "(Local LanceDB)". The connection it
       // actually writes to is resolved from outputSettings.connectionId and
       // shown by the DestinationFooter below.
+      // A cloud object is uploaded, not inserted into.
+      if (outputSettings.objectPath) return `Upload to ${outputSettings.objectPath}`;
       return `Insert data into ${outputSettings.tableName}`;
     }
 
@@ -163,6 +165,7 @@ const OutputNode = ({ data, selected }) => {
 
       <ExpandableCodes codes={latestCodes} />
 
+      <WriteModeRow type="output" config={data.config || {}} accent={COLOR} />
       <DestinationFooter type="output" config={data.config || {}} accent={COLOR} />
     </div>
   );

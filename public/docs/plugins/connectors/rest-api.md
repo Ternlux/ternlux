@@ -12,7 +12,9 @@ hit and how to paginate.
 - For any node, describe in plain language what data you want; the AI
   generates a custom fetch function that handles authentication,
   pagination, and shaping the response into rows.
-- Use four authentication schemes out of the box.
+- Put whatever the endpoint needs — headers, keys, tenant ids, query
+  parameters — into one key/value list, and let the generated function
+  decide where each belongs.
 
 ## Connection form
 
@@ -89,7 +91,16 @@ and saved workflows contain no secrets even if shared.
   API from looping forever.
 - Sensible defaults are baked into generated functions: GET method,
   JSON Accept header, a request timeout, and a reasonable page size.
-- If the API returns nothing, Ternlux still creates an empty
-  collection so downstream nodes have a defined source.
 - If the API returns a single object, Ternlux wraps it as a
   single-element array.
+- The function runs only after you approve it: the first **Run this
+  node** for a chat-built source, or a **Run this call** card when a
+  workflow plan needs its columns to build the next steps. That call gives
+  the node a real schema from a real response. A call that fails, returns
+  an HTTP error, returns no rows, or returns rows with no readable columns
+  fails with the reason — there is no empty-source fallback.
+- At run time the rows the function returns become this node's table in
+  the workflow's own DuckDB database.
+- Connections saved before the key/value list existed still carry a
+  legacy auth scheme (bearer, API key, HTTP basic, or none), and their
+  placeholder vocabulary is scoped to it.

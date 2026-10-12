@@ -2,9 +2,15 @@
  * SQLite Connector Plugin for Ternlux
  *
  * Backs local file connections — spreadsheet/CSV imports and node outputs that
- * were landed into a SQLite file. sqlite3 comes from the app's own
- * dependencies; each call opens its own handle, matching public/lib/sqlite.js
- * (the driver does its own locking, and the app DB pool is owned elsewhere).
+ * were landed into a SQLite file.
+ *
+ * A SQLite file is read and written through DuckDB's sqlite extension, by the
+ * DuckDB connector: it ATTACHes the file under its own catalog, scopes the tree
+ * to `config.tables`, and runs reads and writes natively against the attached
+ * tables. This plugin is that connector under the SQLite name, so the two kinds
+ * of local database behave the same way. The sqlite3 npm driver it used to open
+ * is gone — its native binary is per-platform, and a build carrying the wrong
+ * one broke every SQLite read at once.
  *
  * Config: { dbPath, tables? }
  *   dbPath  the .db file
@@ -14,66 +20,35 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 
-function openDb(dbPath, readonly = false) {
-  if (!dbPath) throw new Error('SQLite requires a dbPath');
-  if (!fs.existsSync(dbPath)) throw new Error(`SQLite file not found: ${dbPath}`);
-  // eslint-disable-next-line global-require
-  const sqlite3 = require('sqlite3');
-  return new sqlite3.Database(dbPath, readonly ? sqlite3.OPEN_READONLY : sqlite3.OPEN_READWRITE);
-}
-
-const closeDb = (db) => new Promise((resolve) => db.close(() => resolve()));
+const duckdbConnector = require(path.join(__dirname, '..', 'duckdb'));
+const duck = require(path.join(__dirname, '..', '..', '..', 'public', 'duckdb'));
 
 /**
- * Run a statement, optionally stopping after `maxRows`.
- *
- * Whether a statement returns rows is decided by SQLite, not by inspecting the
- * text. Guessing from the leading keyword gets `WITH new AS (…) INSERT …`
- * wrong twice over — it looks like a SELECT, so it would be dispatched as a
- * read AND the file opened read-only, failing a statement that is perfectly
- * valid. Stepping the prepared statement asks the engine instead.
- *
- * Rows are pulled one at a time so a cap costs only the rows asked for; the
- * rest of the result set is never stepped. A statement that returns none has
- * still executed by then, and `changes()` on this connection reports what it
- * did (the connection is opened per call, so nothing earlier can leak in).
+ * The file has to be there already. Attaching a missing path would quietly
+ * CREATE an empty database at it — a connection whose file was moved or deleted
+ * would then browse as "no tables" instead of saying what happened.
  */
-async function query(dbPath, sql, params = [], { maxRows = 0 } = {}) {
-  const db = openDb(dbPath);
-  try {
-    const stmt = await new Promise((resolve, reject) => {
-      let prepared;
-      prepared = db.prepare(sql, params, (err) => (err ? reject(err) : resolve(prepared)));
-    });
-    const step = () => new Promise((resolve, reject) => {
-      stmt.get((err, row) => (err ? reject(err) : resolve(row)));
-    });
-
-    const rows = [];
-    try {
-      // One past the cap, so "is there more?" is observed rather than assumed.
-      const ceiling = maxRows > 0 ? maxRows + 1 : Infinity;
-      for (;;) {
-        if (rows.length >= ceiling) break;
-        const row = await step();
-        if (row === undefined) break;
-        rows.push(row);
-      }
-    } finally {
-      await new Promise((resolve) => stmt.finalize(() => resolve()));
-    }
-
-    if (rows.length > 0) return rows;
-
-    const changed = await new Promise((resolve, reject) => {
-      db.get('SELECT changes() AS n', (err, row) => (err ? reject(err) : resolve(row ? row.n : 0)));
-    });
-    return changed > 0 ? { changes: changed } : [];
-  } finally {
-    await closeDb(db);
-  }
+function requireFile(config) {
+  if (!config || !config.dbPath) throw new Error('SQLite requires a dbPath');
+  if (!fs.existsSync(config.dbPath)) throw new Error(`SQLite file not found: ${config.dbPath}`);
+  // Only this connection is opened: the DuckDB connector would otherwise
+  // register every sibling file the explorer lists, which is a DuckDB-explorer
+  // feature this connector does not advertise.
+  return { ...config, siblings: undefined };
 }
+
+/** Run a connector call, turning a missing file into the call's own failure shape. */
+const guarded = (fn, failure) => async (config, ...rest) => {
+  let checked;
+  try {
+    checked = requireFile(config);
+  } catch (error) {
+    return { success: false, message: error.message, ...failure };
+  }
+  return fn(checked, ...rest);
+};
 
 /** SQLite quotes identifiers with double quotes; an inner one is doubled. */
 const quote = (name) => `"${String(name).replace(/"/g, '""')}"`;
@@ -103,147 +78,49 @@ module.exports = {
     STRING: () => 'TEXT',
   },
 
-  testConnection: async (config) => {
-    try {
-      await query(config.dbPath, 'SELECT 1');
-      return { success: true, message: 'Connection successful' };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
-  },
+  testConnection: guarded((config) => duckdbConnector.testConnection(config), {}),
 
-  /**
-   * List tables and views. `main` is SQLite's default schema, so that is what
-   * the tree groups under.
-   */
-  getTables: async (config) => {
-    try {
-      const rows = await query(
-        config.dbPath,
-        `SELECT name, type FROM sqlite_master
-         WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
-         ORDER BY name`,
-      );
+  releaseConnection: (config, connectionId) => duckdbConnector.releaseConnection(config, connectionId),
 
-      // Restrict to this connection's own tables when it declares them. The
-      // filter is strict on purpose: many connections can point at the same
-      // shared file, so falling back to "show everything" would surface other
-      // connections' tables and make them all look identical.
-      const owned = Array.isArray(config.tables) && config.tables.length
-        ? config.tables
-        : null;
-      const use = owned ? rows.filter((r) => owned.includes(r.name)) : rows;
+  getTables: guarded(
+    (config, connectionId) => duckdbConnector.getTables(config, connectionId),
+    { tables: [] },
+  ),
 
-      return {
-        success: true,
-        tables: use.map((r) => ({
-          schema: 'main',
-          name: r.name,
-          type: r.type === 'view' ? 'VIEW' : 'BASE TABLE',
-        })),
-      };
-    } catch (error) {
-      return { success: false, message: error.message, tables: [] };
-    }
-  },
-
-  getColumns: async (config, connectionId, schema, table) => {
-    try {
-      // Accept a database-qualified "main.orders" as well as a bare table.
-      // PRAGMA table_info takes ONE identifier, so the qualified form would ask
-      // for a table whose name contains a dot and come back empty — silently,
-      // since the caller that needs this treats a failed lookup as "cannot
-      // check". SQLite has no schema layer, so the qualifier is simply dropped.
-      const parts = String(table || '').split('.');
-      if (parts.length === 2) [, table] = parts;
-      const rows = await query(config.dbPath, `PRAGMA table_info(${quote(table)})`);
-      return {
-        success: true,
-        columns: rows.map((r) => ({
-          name: r.name,
-          type: r.type || 'BLOB',
-          nullable: !r.notnull,
-          isPrimary: Boolean(r.pk),
-          defaultValue: r.dflt_value,
-        })),
-      };
-    } catch (error) {
-      return { success: false, message: error.message, columns: [] };
-    }
-  },
+  getColumns: guarded(
+    (config, connectionId, schema, table) => duckdbConnector.getColumns(config, connectionId, schema, table),
+    { columns: [] },
+  ),
 
   /**
    * @param {object} [options]
-   * @param {number} [options.maxRows] - Stop after this many rows. Honoured by
-   *   stepping the prepared statement, so the SQL the user wrote is the SQL
-   *   SQLite runs — no LIMIT is appended.
+   * @param {number} [options.maxRows] - Stop after this many rows, by streaming
+   *   the result — the SQL the user wrote is the SQL that runs.
    */
-  runQuery: async (config, connectionId, queryObj, options = {}) => {
-    try {
-      const sql = queryObj && queryObj.query ? queryObj.query : queryObj;
-      const maxRows = Number(options.maxRows) > 0 ? Number(options.maxRows) : 0;
-      const result = await query(config.dbPath, sql, [], { maxRows });
-
-      if (Array.isArray(result)) {
-        const rows = maxRows ? result.slice(0, maxRows) : result;
-        return {
-          success: true,
-          rows,
-          columns: rows.length ? Object.keys(rows[0]) : [],
-          rowCount: rows.length,
-          ...(maxRows ? { truncated: result.length > maxRows } : {}),
-        };
-      }
-
-      return {
-        success: true,
-        rows: [],
-        columns: [],
-        rowCount: result.changes,
-        message: `${result.changes} row(s) affected`,
-      };
-    } catch (error) {
-      return { success: false, message: error.message, rows: [], columns: [] };
-    }
-  },
+  runQuery: guarded(
+    (config, connectionId, queryObj, options = {}) => duckdbConnector.runQuery(config, connectionId, queryObj, options),
+    { rows: [], columns: [] },
+  ),
 
   batchInsert: async (config, connectionId, tableName, columns, rows) => {
     if (!rows || rows.length === 0) return { success: true, rowsInserted: 0 };
-
-    const db = openDb(config.dbPath);
     try {
-      const placeholders = `(${columns.map(() => '?').join(', ')})`;
-      const sql = `INSERT INTO ${quote(tableName)} (${columns.map(quote).join(', ')}) VALUES ${placeholders}`;
-
-      await new Promise((resolve, reject) => {
-        db.serialize(() => {
-          db.run('BEGIN TRANSACTION');
-          const stmt = db.prepare(sql);
-          for (const row of rows) {
-            stmt.run(columns.map((c) => {
-              const v = row[c];
-              if (v === undefined) return null;
-              if (v instanceof Date) return v.toISOString();
-              if (v !== null && typeof v === 'object') return JSON.stringify(v);
-              return v;
-            }));
-          }
-          stmt.finalize((err) => {
-            if (err) { db.run('ROLLBACK'); reject(err); return; }
-            db.run('COMMIT', (commitErr) => (commitErr ? reject(commitErr) : resolve()));
-          });
-        });
-      });
-
+      const { dbPath } = requireFile(config);
+      const docs = rows.map((row) => Object.fromEntries(columns.map((c) => {
+        const v = row[c];
+        if (v === undefined) return [c, null];
+        if (v instanceof Date) return [c, v.toISOString()];
+        if (v !== null && typeof v === 'object') return [c, JSON.stringify(v)];
+        return [c, v];
+      })));
+      const bare = String(tableName).replace(/^"|"$/g, '').replace(/^main\./, '');
+      await duck.ingestRowsToTableAt(docs, dbPath, bare, { mode: 'append', sqlite: true });
       return { success: true, rowsInserted: rows.length };
     } catch (error) {
       return { success: false, message: error.message };
-    } finally {
-      await closeDb(db);
     }
   },
 
-  // Handles are per-call, so there is nothing pooled to tear down.
   closeConnection: async () => {},
 
   configSchema: {
@@ -259,10 +136,6 @@ module.exports = {
     ],
   },
 
-  /**
-   * `main` is implicit and prefixing it breaks nothing but reads badly, so
-   * only the table itself is quoted.
-   */
   // A dotted name given as one string ("main.orders", or an attached database's
   // "aux.orders") is a database-qualified table name, so each part is quoted
   // separately — quoting it whole would name a single table containing a dot,
@@ -274,9 +147,7 @@ module.exports = {
     // Already quoted — hand it back untouched. Callers pass identifiers that
     // another layer has sometimes quoted already, and quoting a second time
     // produces ONE identifier whose text is the quoted string, which resolves
-    // to nothing: a read of "PUBLIC"."public.transactions" came back as
-    // `Object 'TERNLUX.PUBLIC.""PUBLIC"."public.transactions""' does not exist`.
-    // The SQL Server connector has always done this; the rest now agree.
+    // to nothing.
     if (typeof identifier === 'string'
         && identifier.startsWith('"') && identifier.endsWith('"') && identifier.length > 1) {
       return identifier;
@@ -297,29 +168,12 @@ module.exports = {
   getPreviewQuery: (tableName, limit = 100) => `SELECT * FROM ${tableName} LIMIT ${limit}`,
 
   /**
-   * Data Explorer dialect. Read by public/database/dialect.js — keyword and
-   * function lists are unioned with the shared ANSI baseline, so only what is
-   * distinctly SQLite belongs here.
+   * Data Explorer dialect: the statements run on DuckDB, so this is the DuckDB
+   * connector's dialect — without its sibling connections, which this
+   * connector does not register (see requireFile).
    */
-  explorer: {
-    language: 'sql',
-    sqlDialect: 'SQLite',
-    formatter: 'sqlite',
-    // runQuery honours { maxRows } by stepping the statement — see the note there.
-    maxRowsOption: true,
-    // SQLite has no schema layer; attached files are the closest thing.
-    container: 'Database',
-    objectLabel: 'Table',
-    quote: '"',
-    keywords: [
-      'PRAGMA', 'ATTACH', 'DETACH', 'VACUUM', 'REINDEX', 'AUTOINCREMENT',
-      'WITHOUT ROWID', 'ON CONFLICT', 'DO NOTHING', 'DO UPDATE', 'RETURNING',
-      'GLOB', 'REGEXP', 'INDEXED BY', 'EXPLAIN QUERY PLAN', 'ROWID',
-    ],
-    functions: [
-      'IFNULL', 'GROUP_CONCAT', 'JULIANDAY', 'STRFTIME', 'DATE', 'DATETIME',
-      'TIME', 'UNIXEPOCH', 'TYPEOF', 'HEX', 'RANDOM', 'INSTR', 'SUBSTR',
-      'JSON_EXTRACT', 'JSON_ARRAY', 'JSON_OBJECT', 'JSON_EACH', 'PRINTF',
-    ],
-  },
+  explorer: (() => {
+    const { siblingConnections, ...rest } = duckdbConnector.explorer;
+    return rest;
+  })(),
 };

@@ -32,6 +32,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('api-key:clear'),
 
   /**
+   * How securely this system can hold the keys saved above.
+   *
+   * `weak` is true on Linux boxes with no desktop keyring, where secrets fall
+   * back to an in-memory key and are recoverable by anything that can read the
+   * file. Worth surfacing before the user pastes a production key in.
+   *
+   * @returns {Promise<{
+   *   platform: string,
+   *   available: boolean,
+   *   backend: 'gnome_libsecret'|'kwallet'|'kwallet5'|'kwallet6'|'basic_text'|'unknown'|null,
+   *   weak: boolean
+   * }>}
+   */
+  getSecretStorageStatus: () =>
+    ipcRenderer.invoke('secret-storage:status'),
+
+  /**
    * The app's own metadata store — internal bookkeeping, not user data.
    * Collections: 'workflows' | 'connections' | 'executions' | 'chatSessions'
    *            | 'workflowHistory'
@@ -158,9 +175,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * Import files into internal databases
    */
   /**
-   * Record a local file as a data source. Nothing is imported: CSV/JSON/Parquet
-   * are registered by path and queried in place by DuckDB; Excel and Avro are
-   * converted to Parquet once, since DuckDB cannot read those directly.
+   * Record a local file as a data source. Nothing is imported or converted:
+   * CSV/JSON/Parquet/Excel/Avro are registered by path and queried in place by
+   * DuckDB (Excel and Avro through its excel and avro extensions).
    * Returns { success, format, converted, tables: [{ name, path, rowCount, schema }] }.
    * @param {{ filePath: string, importId?: string }} params
    */
@@ -430,7 +447,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     listModels: (provider) =>
       ipcRenderer.invoke('ai:listModels', { provider }),
 
-    /** Read the persisted default provider + model (used by backend-internal calls). */
+    /** Read the persisted default { provider, model, modelProvider, maxTokens } —
+     *  the only store for them; every AI call uses these. */
     getDefaultProvider: () =>
       ipcRenderer.invoke('ai:getDefaultProvider'),
 
@@ -447,7 +465,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setDefaultProvider: (provider, model) =>
       ipcRenderer.invoke('ai:setDefaultProvider', { provider, model }),
 
-    /** Persist the user's Max Tokens so backend AI calls honor it too. */
+    /** Persist the user's Max Tokens (used by every AI call). */
     setMaxTokens: (maxTokens) =>
       ipcRenderer.invoke('ai:setMaxTokens', { maxTokens }),
   },
@@ -673,6 +691,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   terms: {
     get: () => ipcRenderer.invoke('terms:get'),
     save: (record) => ipcRenderer.invoke('terms:save', record),
+  },
+
+  /**
+   * Durable mirror of the renderer's localStorage.
+   *
+   * A packaged window runs from a file:// origin, whose storage Chromium drops
+   * when the window closes. src/utils/persistentLocalStorage.js reloads this at
+   * startup and writes it back on change, so localStorage call sites work
+   * unchanged and survive a restart.
+   */
+  store: {
+    /** Every persisted key as a { key: string } map. `{}` when nothing is saved. */
+    load: () => ipcRenderer.invoke('store:load'),
+    /** Replace the saved store with this complete snapshot. */
+    save: (entries) => ipcRenderer.invoke('store:save', entries),
   },
 
   /**

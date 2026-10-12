@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react';
 import { Handle, Position, useStore, useUpdateNodeInternals } from 'reactflow';
 import { MergeOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter, sourceIssueLabel, joinInputHandleId, joinInputHandleCount } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter, sourceIssueLabel, joinInputHandleId, joinInputHandleCount, WriteModeRow } from './nodeCardShared';
 import SourceChangedPopup from './SourceChangedPopup';
 
 const COLOR = NODE_COLORS.join;
@@ -196,6 +196,7 @@ const JoinNode = ({ id, data, selected }) => {
 
       <ExpandableCodes codes={latestCodes} />
 
+      <WriteModeRow type="join" config={config} accent={COLOR} />
       <DestinationFooter type="join" config={config} accent={COLOR} />
 
       <Handle

@@ -101,7 +101,7 @@ async function refreshAccessTokenIfNeeded(oauth2Client, connectionId) {
 
     return tokens;
   } catch (error) {
-    console.error('[Google Drive] Token refresh error:', error);
+    console.error('[Google Drive] Token refresh error:', error.response?.data?.error_description || error.message);
     throw error;
   }
 }
@@ -125,9 +125,11 @@ const looksLikeDriveId = (v) => /^[A-Za-z0-9_-]{11,}$/.test(String(v || ''));
  * `File not found: My Drive`. `segments` are folder names between the
  * container and the file, which only a path-shaped object name carries.
  *
- * A named folder that does not exist is an error rather than a silent write to
- * the parent: putting the file somewhere other than where the user pointed is
- * worse than saying so.
+ * A folder in `segments` that does not exist yet is created, the way S3, GCS,
+ * Dropbox and OneDrive all accept `e2e/stores.csv` into an empty bucket — the
+ * picker lets the user type that path, so it has to be writable. It is never a
+ * silent write to the parent instead. An unresolvable CONTAINER is still an
+ * error: that is a destination the user picked, not one they asked us to make.
  */
 async function resolveFolderId(drive, container, segments = []) {
   let parent = 'root';
@@ -150,19 +152,38 @@ async function resolveFolderId(drive, container, segments = []) {
   }
 
   for (const folder of segments) {
-    const escaped = folder.replace(/'/g, "\\'");
-    const res = await drive.files.list({
-      q: `name = '${escaped}' and '${parent}' in parents `
-        + `and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-      fields: 'files(id, name)',
-      pageSize: 1,
+    const found = (await listChildren(drive, parent, folder, { folders: true }))[0];
+    if (found) {
+      parent = found.id;
+      continue;
+    }
+    const created = await drive.files.create({
+      requestBody: { name: folder, mimeType: FOLDER_MIME, parents: [parent] },
+      fields: 'id',
     });
-    const found = res.data.files?.[0];
-    if (!found) throw new Error(`Google Drive folder "${folder}" not found in the selected destination`);
-    parent = found.id;
+    parent = created.data.id;
   }
 
   return parent;
+}
+
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+
+/**
+ * Non-trashed children of `parent` called `name`, oldest first — folders only,
+ * or files only. Drive allows any number of same-named siblings, so this is a
+ * list rather than a lookup.
+ */
+async function listChildren(drive, parent, name, { folders }) {
+  const escaped = String(name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const res = await drive.files.list({
+    q: `name = '${escaped}' and '${parent}' in parents `
+      + `and mimeType ${folders ? '=' : '!='} '${FOLDER_MIME}' and trashed = false`,
+    fields: 'files(id, name)',
+    orderBy: 'createdTime',
+    pageSize: 100,
+  });
+  return res.data.files || [];
 }
 
 module.exports = {
@@ -240,7 +261,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[Google Drive] Token exchange error:', error);
+      console.error('[Google Drive] Token exchange error:', error.response?.data?.error_description || error.message);
       return {
         success: false,
         message: error.message
@@ -283,7 +304,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[Google Drive] Token refresh error:', error);
+      console.error('[Google Drive] Token refresh error:', error.response?.data?.error_description || error.message);
       return {
         success: false,
         message: error.message
@@ -470,11 +491,6 @@ module.exports = {
 
       const folderId = await resolveFolderId(drive, containerName, segments);
 
-      const fileMetadata = {
-        name,
-        parents: [folderId]
-      };
-
       // Convert Buffer to readable stream if needed
       const bodyStream = Buffer.isBuffer(data) ? Readable.from(data) : data;
 
@@ -483,11 +499,18 @@ module.exports = {
         body: bodyStream
       };
 
-      const response = await drive.files.create({
-        requestBody: fileMetadata,
-        media: media,
-        fields: 'id, name'
-      });
+      // Drive happily keeps two files with one name in one folder, so a plain
+      // create on every run piled up copies. An output replaces its object
+      // everywhere else; here that means writing a new revision of the file
+      // already at this path, which keeps its id, sharing and link.
+      const existing = (await listChildren(drive, folderId, name, { folders: false }))[0];
+      const response = existing
+        ? await drive.files.update({ fileId: existing.id, media, fields: 'id, name' })
+        : await drive.files.create({
+          requestBody: { name, parents: [folderId] },
+          media,
+          fields: 'id, name'
+        });
 
       return {
         success: true,

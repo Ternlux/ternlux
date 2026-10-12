@@ -120,3 +120,11 @@ region (e.g. `xy12345.us-east-1`).
 - Primary keys are not enforced; the flag is informational only.
 - The AI's transform prompts produce Snowflake-flavoured SQL that
   uses the warehouse and role context you configured.
+- **Case folding is resolved against the catalog.** Snowflake stores an
+  unquoted identifier upper-cased, so a table recorded as
+  `pg_txn_customers` may really be `PG_TXN_CUSTOMERS`. Before an output
+  loads into a table, the connector asks the catalog which of the two
+  the name actually names and uses that — which is what keeps a load
+  from quietly creating a second, lower-case table beside the real one.
+- In the Data Explorer, autocomplete quotes an identifier only when the
+  name would not survive Snowflake's upper-case folding.

@@ -197,23 +197,6 @@ async function upsertVectors(db, tableName, data, opts = {}) {
     }
   }
 
-  // Overwrite: drop any existing table first so a "new_table" write is fully
-  // idempotent. Without this, re-runs APPEND — which both duplicates rows and
-  // can fail when the freshly-inferred batch schema differs from the existing
-  // table's (e.g. similar_1_id was Utf8 last run because of gaps, but is Float64
-  // this run because every row matched → "Append with different schema").
-  if (opts.overwrite) {
-    try {
-      const names = await db.tableNames();
-      if (Array.isArray(names) && names.includes(tableName)) {
-        await db.dropTable(tableName);
-        console.log(`Dropped existing LanceDB table ${tableName} (overwrite)`);
-      }
-    } catch (dropErr) {
-      console.warn(`Could not drop table ${tableName} for overwrite: ${dropErr.message}`);
-    }
-  }
-
   // Normalize so every column has ONE consistent Arrow type across ALL records.
   // The AI-generated join can emit columns that are numeric for some rows and
   // missing/empty for others (e.g. similar_3_id is a number when a match exists
@@ -224,6 +207,23 @@ async function upsertVectors(db, tableName, data, opts = {}) {
 
   let table;
   let isNewTable = false;
+
+  // Overwrite: replace the whole table in ONE step, after the records are
+  // already converted. A "new_table" write is then idempotent — re-runs neither
+  // append duplicates nor trip over a batch schema that drifted from last run's
+  // ("Append with different schema") — and a write that fails leaves the old
+  // table intact. (This used to drop the table first and then create it, so a
+  // create that failed lost every record.)
+  if (opts.overwrite) {
+    table = await db.createTable(tableName, records, { schema, mode: 'overwrite' });
+    console.log(`Replaced LanceDB table ${tableName} with ${records.length} records (overwrite)`);
+    return {
+      success: true,
+      data: records,
+      recordCount: records.length,
+      message: `Replaced table '${tableName}' with ${records.length} vectors`,
+    };
+  }
 
   try {
     // Try to open existing table
@@ -252,9 +252,26 @@ async function upsertVectors(db, tableName, data, opts = {}) {
     // fails inside Lance with a Rust-level message that names neither the table
     // that has to change nor how it got that way. Check first and say it.
     await assertVectorWidthMatches(table, records, tableName);
-    // Add new vectors to existing table
-    await table.add(records);
-    console.log(`Added ${records.length} vectors to existing table ${tableName}`);
+
+    // Upsert = merge by id: a record whose id is already stored REPLACES it,
+    // the rest are added, everything else stays. `table.add` alone appended a
+    // second copy of every re-written record. LanceDB 0.4 has no mergeInsert,
+    // so the merged set is written back in one atomic overwrite — a failure
+    // leaves the table as it was.
+    const usableId = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+    if (records.every((r) => usableId(r.id))) {
+      const incoming = new Set(records.map((r) => String(r.id)));
+      const kept = toPlainRows(await table.query().toArray())
+        .filter((r) => !incoming.has(String(r.id)))
+        .map((r) => ({ ...r, vector: Array.from(r.vector || []) }));
+      const merged = normalizeRecordsForArrow([...kept, ...records]);
+      table = await db.createTable(tableName, merged.records, { schema: merged.schema, mode: 'overwrite' });
+      console.log(`Upserted ${records.length} vectors into ${tableName} `
+        + `(${kept.length} other records kept, ${merged.records.length} total)`);
+    } else {
+      await table.add(records);
+      console.log(`Added ${records.length} vectors to existing table ${tableName}`);
+    }
   }
 
   return {
@@ -687,7 +704,7 @@ async function dropTable(tableName, config = {}) {
  * Dispatches to the existing executeLanceDBOperation switch.
  *
  * query shape: {
- *   operation: 'query' | 'queryVectors' | 'upsert' | 'delete' | 'update' | 'list',
+ *   operation: 'query' | 'queryVectors' | 'upsert' | 'delete' | 'update' | 'list' | 'count',
  *   tableName?, table?,
  *   data?,                           // upsert
  *   queryVector?, limit?, topK?,     // query
@@ -696,6 +713,8 @@ async function dropTable(tableName, config = {}) {
  * }
  *
  * 'list' is a convenience for "give me everything (or filtered) up to limit".
+ * 'count' returns [{ count }] — the table's row count, or the rows matching a
+ * where-filter — without reading a single row.
  * 'queryVectors' is a synonym for 'query' so the AI's mental model lines up
  * with the connector-side API used by Pinecone.
  */
@@ -743,15 +762,27 @@ async function runQuery({ dbPath, ...query } = {}) {
 
   // 'list': open the table, optionally apply a where-filter, return rows up
   // to limit. No query vector → LanceDB returns rows in insertion order.
+  // Without a limit every row comes back — a plain LanceDB query has none of
+  // its own. It used to default to 1000, so code that counted or scanned a
+  // bigger table got a silently short answer.
   if (op === 'list') {
     const db = await getLanceDBConnection(config);
     const table = await db.openTable(tableName);
-    let q = table.query().limit(query.limit || 1000);
+    let q = table.query();
+    const limit = Number(query.limit);
+    if (Number.isFinite(limit) && limit > 0) q = q.limit(limit);
     if (typeof query.filter === 'string' && query.filter.trim() !== '') q = q.where(query.filter);
     return toPlainRows(await q.toArray());
   }
 
-  throw new Error(`Unknown LanceDB operation: ${op}`);
+  if (op === 'count') {
+    const db = await getLanceDBConnection(config);
+    const table = await db.openTable(tableName);
+    const filter = typeof query.filter === 'string' && query.filter.trim() !== '' ? query.filter : undefined;
+    return [{ count: await table.countRows(filter) }];
+  }
+
+  throw new Error(`Unknown LanceDB operation: ${op}. Supported: list, count, query (queryVectors), upsert, delete, update.`);
 }
 
 /** getTables({ dbPath }) — lists all tables in the LanceDB database. */
@@ -795,5 +826,11 @@ module.exports = {
   // For callers that read a table through the LanceDB client directly and
   // still need ordinary objects to hand on (see toPlainRow).
   toPlainRow,
-  toPlainRows
+  toPlainRows,
+  // One Arrow type per column, no nulls, first-seen order — for callers that
+  // rewrite a table through the client directly (vector maintenance).
+  normalizeRecordsForArrow,
+  // How to read LanceDB and Pinecone through runQuery, for prompts. Exposed
+  // here because skills reach this module through helpers.lancedb.
+  VECTOR_QUERY_GUIDE: require('./vectorQueryGuide').VECTOR_QUERY_GUIDE,
 };

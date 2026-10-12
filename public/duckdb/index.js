@@ -29,6 +29,7 @@ const os = require('os');
 const { EXTENSION_FOR_FORMAT, ensureExtension, resetExtensions } = require('./extensions');
 const { throwIfCancelled } = require('../NodeExecution/executionCancel');
 const xlsxFile = require('./xlsx');
+const readOptions = require('./readOptions');
 
 // Formats DuckDB reads. csv / json / parquet are built in; xlsx and avro need
 // an extension, which ships with the app and is loaded on first use — see
@@ -152,6 +153,7 @@ function resetConnection() {
   // rebuild a connection onto the same poisoned instance.
   instancePromise = null;
   attached.clear();
+  attachedPaths.clear();
   // Extensions are loaded into an INSTANCE, so the new one starts without them.
   // Leaving the cache populated would have the next xlsx read skip the LOAD it
   // now needs and fail on an unknown function instead.
@@ -163,13 +165,15 @@ function resetConnection() {
  * that takes the connection with it.
  */
 async function withConnection(fn) {
-  const connection = await getConnection();
-  try {
-    return await fn(connection);
-  } catch (err) {
-    if (isFatalError(err)) resetConnection();
-    throw err;
-  }
+  return holdDatabases(async () => {
+    const connection = await getConnection();
+    try {
+      return await fn(connection);
+    } catch (err) {
+      if (isFatalError(err)) resetConnection();
+      throw err;
+    }
+  });
 }
 
 /** Escape a value for inclusion as a SQL string literal. */
@@ -210,8 +214,13 @@ function sourceRef(filePath, format = null, { sheet = null, allVarchar = false }
   const resolved = format || detectFormat(filePath);
   const literal = quoteLiteral(filePath);
   switch (resolved) {
-    case 'csv':
-      return `read_csv_auto(${literal})`;
+    case 'csv': {
+      // A header below line 1 (a banner line above it): skip what precedes it.
+      const headerRow = readOptions.headerRowFor(filePath, null);
+      return headerRow > 1
+        ? `read_csv_auto(${literal}, skip = ${headerRow - 1})`
+        : `read_csv_auto(${literal})`;
+    }
     case 'json':
       // `sample_size = -1` infers from the WHOLE file: correct whatever the
       // data does, and the fallback `jsonRef` drops to when it cannot pin a
@@ -221,9 +230,19 @@ function sourceRef(filePath, format = null, { sheet = null, allVarchar = false }
       return `read_json_auto(${literal}, union_by_name = true, sample_size = -1)`;
     case 'parquet':
       return `read_parquet(${literal})`;
-    case 'xlsx':
-      return `read_xlsx(${literal}${sheet ? `, sheet = ${quoteLiteral(sheet)}` : ''}, header = true`
+    case 'xlsx': {
+      // A header below row 1 (a title above it): read from the header row to
+      // the sheet's last used cell. Read from A1 instead, DuckDB takes the
+      // title as the header and stops at the first empty header cell, so the
+      // other columns are silently lost — see readOptions.js.
+      const headerRow = readOptions.headerRowFor(filePath, sheet);
+      const used = headerRow > 1 ? xlsxFile.usedRange(filePath, sheet) : null;
+      const range = used && used.endRow >= headerRow
+        ? `, range = ${quoteLiteral(`${used.startCol}${headerRow}:${used.endCol}${used.endRow}`)}`
+        : '';
+      return `read_xlsx(${literal}${sheet ? `, sheet = ${quoteLiteral(sheet)}` : ''}, header = true${range}`
         + `${allVarchar ? ', all_varchar = true' : ''})`;
+    }
     case 'avro':
       return `read_avro(${literal})`;
     default:
@@ -393,7 +412,7 @@ async function csvTypeOverrides(filePath) {
   try {
     const connection = await getConnection();
     const reader = await connection.runAndReadAll(
-      `SELECT * FROM read_csv(${quoteLiteral(filePath)}, all_varchar = true) LIMIT ${TYPE_OVERRIDE_SAMPLE}`,
+      `SELECT * FROM read_csv(${quoteLiteral(filePath)}, all_varchar = true${readOptions.headerRowFor(filePath, null) > 1 ? `, skip = ${readOptions.headerRowFor(filePath, null) - 1}` : ''}) LIMIT ${TYPE_OVERRIDE_SAMPLE}`,
     );
     const rows = reader.getRowObjectsJson();
     overrides = reader.columnNames().filter((name) =>
@@ -569,7 +588,11 @@ async function tableRef(filePath, format = null, { sheet = null } = {}) {
   if (overrides.length === 0) return sourceRef(filePath, resolved);
 
   const types = overrides.map((name) => `${quoteLiteral(name)}: 'VARCHAR'`).join(', ');
-  return `read_csv(${quoteLiteral(filePath)}, auto_detect = true, types = {${types}})`;
+  // The same header-row setting sourceRef applies — this path builds its own
+  // read_csv and would otherwise read the banner line as the header.
+  const headerRow = readOptions.headerRowFor(filePath, null);
+  const skip = headerRow > 1 ? `, skip = ${headerRow - 1}` : '';
+  return `read_csv(${quoteLiteral(filePath)}, auto_detect = true${skip}, types = {${types}})`;
 }
 
 /** Column descriptors in the shape the Data Explorer and previews expect. */
@@ -761,6 +784,18 @@ async function queryUpTo(sql, maxRows, { params = null } = {}) {
  * @yields {object[]} One chunk of coerced row objects.
  */
 async function* streamRows(sql, { params = null } = {}) {
+  // Held for the whole stream, not per chunk: the consumer's awaits between
+  // chunks are idle time to everything else here, and a database released in
+  // one of them would end the read mid-table.
+  busy += 1;
+  try {
+    yield* streamRowsHeld(sql, { params });
+  } finally {
+    letGo();
+  }
+}
+
+async function* streamRowsHeld(sql, { params = null } = {}) {
   const instance = await getInstance();
 
   // The search path is SESSION state, and the callers of this function depend
@@ -861,6 +896,21 @@ async function* streamLocalRows(filePath, tableName, { format = null, sheet = nu
   yield* streamFileRows(filePath, format, { sheet });
 }
 
+/**
+ * The columns streamLocalRows would yield for the same arguments, read without
+ * reading a row: the same ref, `LIMIT 0`. An Output copies these types rather
+ * than guessing them from values (see NodeExecution/columnTypes.js).
+ *
+ * @returns {Promise<{name: string, type: string}[]>}
+ */
+async function describeLocalSource(filePath, tableName, { format = null, sheet = null } = {}) {
+  const ref = isDatabaseFile(filePath)
+    ? await attachedTableRef(filePath, tableName)
+    : await tableRef(filePath, format, { sheet });
+  const { columns } = await query(`SELECT * FROM ${ref} LIMIT 0`);
+  return columns;
+}
+
 /** Run a statement for its side effects. */
 async function exec(sql) {
   await withConnection((connection) => connection.run(sql));
@@ -930,6 +980,42 @@ async function statementType(sql, index = 0) {
       prepared.destroySync();
     }
   });
+}
+
+/**
+ * Does DuckDB's PARSER see this as ONE SELECT-family query — the only thing
+ * `CREATE OR REPLACE TABLE … AS <sql>` will take?
+ *
+ * The same "ask the engine, don't read the text" rule as statementType, for the
+ * one caller that cannot use statementType: a workflow BUILD validating SQL it
+ * is not yet able to run. statementType prepares, and preparing BINDS, so it
+ * throws `Catalog Error: Table … does not exist` for a join whose source views
+ * are only registered at execution time. json_serialize_sql parses and stops.
+ *
+ * It answers exactly the question asked: it refuses anything that is not a
+ * single SELECT (INSERT, CREATE TABLE AS, a two-statement script) and accepts
+ * every shape a SELECT comes in — a CTE, a parenthesised set operation, and
+ * DuckDB's own FROM-first forms (`FROM t SELECT c`, bare `FROM t`), which a
+ * leading-keyword test rejects as readily as it accepts `WITH x AS (…) INSERT`.
+ *
+ * @returns {Promise<{ok: boolean, message: string|null}|null>} null when the
+ *   question could not be asked at all, which a caller must not read as "no".
+ */
+async function parsesAsSelectQuery(sql) {
+  const text = trimStatement(sql);
+  if (!text) return { ok: false, message: 'the statement is empty' };
+  let parsed;
+  try {
+    const { rows } = await query(`SELECT json_serialize_sql(${quoteLiteral(text)}) AS j`);
+    parsed = JSON.parse(rows[0]?.j || '{}');
+  } catch (_err) {
+    // The parser could not be reached at all. A caller cannot tell a bad
+    // statement from an unanswered question, so say so rather than condemning
+    // SQL that may be perfectly good.
+    return null;
+  }
+  if (parsed.error) return { ok: false, message: parsed.error_message || null };
+  return { ok: true, message: null };
 }
 
 /**
@@ -1409,11 +1495,33 @@ async function dropViews(created = []) {
   }
 }
 
+/** The folder every workflow's database lives in. */
+function workflowDataDir() {
+  const { app } = require('electron');
+  return path.join(app.getPath('userData'), 'workflow-data');
+}
+
 /** Where a workflow's database lives. */
 function workflowDbPath(workflowId) {
   if (!workflowId) throw new Error('A workflow id is required to resolve its database');
-  const { app } = require('electron');
-  return path.join(app.getPath('userData'), 'workflow-data', `${sanitizeIdentifier(workflowId)}.duckdb`);
+  return path.join(workflowDataDir(), `${sanitizeIdentifier(workflowId)}.duckdb`);
+}
+
+/**
+ * Is this a workflow's own database — where node outputs are tables — rather
+ * than a .duckdb file the user owns? Decided by location, never by extension:
+ * a user's .duckdb connection ends in .duckdb too, and treating it as a
+ * workflow database reads its tables out of the wrong file.
+ */
+function isWorkflowDatabase(dbPath) {
+  if (!dbPath || !/\.duckdb$/i.test(String(dbPath))) return false;
+  let dir;
+  try {
+    dir = workflowDataDir();
+  } catch (_) {
+    return false; // outside Electron there are no workflow databases
+  }
+  return path.dirname(path.resolve(String(dbPath))) === path.resolve(dir);
 }
 
 /**
@@ -1429,20 +1537,143 @@ const workflowAlias = (workflowId) => aliasForDbPath(workflowDbPath(workflowId))
 // alias → promise of the completed ATTACH. Cached so concurrent callers share
 // one attach rather than racing to issue it twice.
 const attached = new Map();
+// alias → the file behind it, so the idle release below knows which are the
+// user's files and which are the app's own.
+const attachedPaths = new Map();
+
+// ── holding the user's database files only while they are in use ──────────
+//
+// An ATTACHed .duckdb is locked by this process: DuckDB, Python or a second app
+// instance opening it gets "Could not set lock on file … held in Electron". The
+// app's OWN databases (a workflow's file, the shared imports store — anything
+// under userData) are nobody else's business and stay attached. A file the user
+// owns — an output written to their Desktop, a .duckdb or .sqlite connection —
+// is attached for the work that needs it and detached once nothing here is
+// using the engine any more, so it is locked only while it is being executed.
+//
+// "Using" is counted, not guessed: every statement on the shared connection,
+// every open stream and every holdDatabases() block counts as busy. A node run
+// is wrapped in holdDatabases as a whole, because it registers views over an
+// attached database and then may spend seconds fetching rows from somewhere
+// else before reading them — idle to the engine, but not finished. The release
+// waits a moment after the count reaches zero so one operation's consecutive
+// statements (attach, then read) never see their database leave in between.
+
+const RELEASE_AFTER_MS = 1000;
+let busy = 0;
+let releaseTimer = null;
+// Set while a release is detaching, so an attach in that window waits for it
+// rather than finding a cache entry that is about to be removed.
+let releasing = null;
+
+/** Is this one of the app's own databases (kept attached), rather than the user's? */
+function isAppDatabase(dbPath) {
+  let userData = null;
+  try {
+    // eslint-disable-next-line global-require
+    userData = require('electron').app.getPath('userData');
+  } catch (_) {
+    return false; // outside Electron there is no app-owned location
+  }
+  const rel = path.relative(userData, path.resolve(String(dbPath)));
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function letGo() {
+  busy = Math.max(0, busy - 1);
+  if (busy > 0 || releaseTimer) return;
+  const hasExternal = [...attachedPaths.values()].some((p) => !isAppDatabase(p));
+  if (!hasExternal) return;
+  releaseTimer = setTimeout(() => {
+    releaseTimer = null;
+    if (busy === 0) releasing = releaseUserDatabases().finally(() => { releasing = null; });
+  }, RELEASE_AFTER_MS);
+  if (typeof releaseTimer.unref === 'function') releaseTimer.unref();
+}
+
+/**
+ * Run `fn` with the user's attached databases kept attached until it settles.
+ * Re-entrant: nested holds simply count.
+ */
+async function holdDatabases(fn) {
+  busy += 1;
+  if (releaseTimer) { clearTimeout(releaseTimer); releaseTimer = null; }
+  try {
+    return await fn();
+  } finally {
+    letGo();
+  }
+}
+
+/** Detach every user-owned database, flushing it first. Never throws. */
+async function releaseUserDatabases() {
+  for (const [alias, dbPath] of [...attachedPaths]) {
+    if (busy > 0) return; // something started; it will schedule the next release
+    if (isAppDatabase(dbPath)) continue;
+    attached.delete(alias);
+    attachedPaths.delete(alias);
+    try {
+      const connection = await getConnection();
+      // CHECKPOINT folds the WAL back into the file, so what is left on disk is
+      // one self-contained database rather than a .duckdb plus a .wal beside it.
+      // A SQLite attachment has no checkpoint of DuckDB's; that failure is fine.
+      try { await connection.run(`CHECKPOINT ${quoteIdentifier(alias)}`); } catch (_) { /* sqlite */ }
+      await connection.run(`DETACH ${quoteIdentifier(alias)}`);
+    } catch (_) {
+      // Already gone, or the instance was reset. Nothing left to release.
+    }
+  }
+}
+
+/**
+ * Is this an existing SQLite database file? Decided by the file's own header
+ * ("SQLite format 3\0"), never by its extension: `.db` is used by both engines,
+ * and the imported-file store is a `.db` that is SQLite.
+ */
+function isSqliteFile(filePath) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(16);
+    const read = fs.readSync(fd, header, 0, 16, 0);
+    return read === 16 && header.toString('latin1') === 'SQLite format 3\u0000';
+  } catch (_) {
+    return false; // missing or unreadable — not a SQLite file to attach
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch (_) { /* already closed */ } }
+  }
+}
 
 /**
  * Attach a database file (once per session) and return its alias.
  * Creates the file if it does not exist yet.
  */
-async function attachDb(dbPath) {
+async function attachDb(dbPath, { sqlite = false } = {}) {
+  if (releasing) await releasing;
   const alias = aliasForDbPath(dbPath);
   if (!attached.has(alias)) {
+    attachedPaths.set(alias, dbPath);
     const pending = (async () => {
       fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+      // A SQLite file is read by DuckDB's sqlite extension. Loaded through
+      // ensureExtension, not left to ATTACH's autoload: autoload always goes
+      // to the network, while ensureExtension installs the copy bundled with
+      // the app where there is one (see ./extensions) — the same offline-first
+      // rule the excel and avro readers follow. TYPE is stated rather than
+      // sniffed so the attach never depends on autoload being enabled.
+      // `sqlite` is the caller saying what a file that does not exist yet
+      // should BE — an output node writing .sqlite — since there is no header
+      // to read until something has written one.
+      if (sqlite || isSqliteFile(dbPath)) {
+        await ensureExtension('sqlite_scanner', { exec, query });
+        await exec(`ATTACH IF NOT EXISTS ${quoteLiteral(dbPath)} AS ${quoteIdentifier(alias)} (TYPE sqlite)`);
+        return alias;
+      }
       await exec(`ATTACH IF NOT EXISTS ${quoteLiteral(dbPath)} AS ${quoteIdentifier(alias)}`);
       return alias;
     })().catch((err) => {
       attached.delete(alias); // let a later call retry
+      attachedPaths.delete(alias);
       throw err;
     });
     attached.set(alias, pending);
@@ -1481,6 +1712,7 @@ async function detachDb(dbPath) {
   const alias = aliasForDbPath(dbPath);
   if (!attached.has(alias)) return;
   attached.delete(alias);
+  attachedPaths.delete(alias);
   try {
     await exec(`DETACH ${quoteIdentifier(alias)}`);
   } catch {
@@ -1493,6 +1725,7 @@ async function detachWorkflow(workflowId) {
   const alias = workflowAlias(workflowId);
   if (!attached.has(alias)) return;
   attached.delete(alias);
+  attachedPaths.delete(alias);
   try {
     await exec(`DETACH ${quoteIdentifier(alias)}`);
   } catch {
@@ -1623,6 +1856,30 @@ async function tableExistsAt(dbPath, tableName) {
 /** Does this workflow's database already hold that table? */
 const tableExists = (workflowId, tableName) => tableExistsAt(workflowDbPath(workflowId), tableName);
 
+/**
+ * A table's columns and primary key, in a database addressed by PATH — read
+ * from the catalog (duckdb_columns / duckdb_constraints), never from the
+ * table's own SQL. null when the table does not exist.
+ */
+async function describeTableAt(dbPath, tableName) {
+  const alias = await attachDb(dbPath);
+  const where = `database_name = ${quoteLiteral(alias)} AND table_name = ${quoteLiteral(sanitizeIdentifier(tableName))}`;
+  const { rows } = await query(
+    `SELECT column_name, data_type FROM duckdb_columns() WHERE ${where} ORDER BY column_index`,
+  );
+  if (!rows.length) return null;
+  const { rows: keys } = await query(
+    `SELECT constraint_column_names AS cols FROM duckdb_constraints() WHERE ${where} AND constraint_type = 'PRIMARY KEY'`,
+  );
+  const raw = keys[0]?.cols;
+  const keyCols = new Set((Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.replace(/^\[|\]$/g, '').split(',') : []))
+    .map((c) => String(c).trim().replace(/^"|"$/g, '')).filter(Boolean));
+  return rows.map((r) => ({ name: r.column_name, type: r.data_type, isPrimary: keyCols.has(r.column_name) }));
+}
+
+/** describeTableAt for a table in this workflow's database. */
+const describeTable = (workflowId, tableName) => describeTableAt(workflowDbPath(workflowId), tableName);
+
 /** Rows currently in a table, in a database addressed by PATH. */
 async function tableRowCountAt(dbPath, tableName) {
   const alias = await attachDb(dbPath);
@@ -1648,8 +1905,12 @@ async function readTableHead(workflowId, tableName, limit = 1000) {
  * @param {AsyncIterable<object>|Iterable<object>} rows
  * @param {{ mode?: 'replace'|'append', onProgress?: function }} options
  */
-async function ingestRowsToTableAt(rows, dbPath, tableName, { mode = 'replace', onProgress = null } = {}) {
-  const alias = await attachDb(dbPath);
+async function ingestRowsToTableAt(rows, dbPath, tableName, { mode = 'replace', onProgress = null, sqlite = false } = {}) {
+  return holdDatabases(() => ingestRowsHeld(rows, dbPath, tableName, { mode, onProgress, sqlite }));
+}
+
+async function ingestRowsHeld(rows, dbPath, tableName, { mode, onProgress, sqlite }) {
+  const alias = await attachDb(dbPath, { sqlite });
   const ref = `${quoteIdentifier(alias)}.${quoteIdentifier(sanitizeIdentifier(tableName))}`;
   const { stagePath, count } = await stageRowsAsNdjson(rows, { onProgress });
   try {
@@ -1775,6 +2036,8 @@ async function close() {
       try { await connection.run(`CHECKPOINT ${quoteIdentifier(alias)}`); } catch { /* nothing to flush */ }
     }
     attached.clear();
+    attachedPaths.clear();
+    if (releaseTimer) { clearTimeout(releaseTimer); releaseTimer = null; }
     connection.closeSync();
   } catch {
     // Already gone; nothing to release.
@@ -1790,11 +2053,14 @@ module.exports = {
   streamTableRowsAt,
   streamFileRows,
   streamLocalRows,
+  describeLocalSource,
   isDatabaseFile,
+  isSqliteFile,
   attachedTableRef,
   exec,
   statementCount,
   statementType,
+  parsesAsSelectQuery,
   fingerprint,
   describe,
   describeColumns,
@@ -1821,14 +2087,18 @@ module.exports = {
   detachDb,
   // Workflow databases — a node output is a table in its workflow's own file.
   workflowDbPath,
+  isWorkflowDatabase,
   workflowAlias,
   aliasForDbPath,
   attachDb,
+  holdDatabases,
   attachWorkflow,
   detachWorkflow,
   readTableHeadAt,
   tablesAt,
   workflowTableRef,
+  describeTable,
+  describeTableAt,
   withWorkflowLock,
   withSession,
   withCatalog,

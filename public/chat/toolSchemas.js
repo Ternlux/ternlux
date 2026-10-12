@@ -113,7 +113,8 @@ const CONNECTION_TOOLS = [
   {
     name: 'run_query',
     description: 'Run a READ-ONLY query against a saved connection and return rows. '
-      + 'SELECT / WITH…SELECT / SHOW / EXPLAIN / DESCRIBE, Mongo find/count/aggregate without $out|$merge. '
+      + 'SELECT / WITH…SELECT / SHOW / EXPLAIN / DESCRIBE, Mongo find/count/aggregate without $out|$merge, '
+      + 'LanceDB / Pinecone list, count, query (similarity) and fetch. '
       + 'Anything that modifies data is blocked — to change data, hand off with plan_workflow_build. '
       + `Capped at ${MAX_QUERY_ROWS} rows; add LIMIT to the query too, and COUNT first when a result may be large. `
       + 'The table name is NOT the connection name: use the connection\'s "tables" entry, or call get_tables.',
@@ -121,7 +122,15 @@ const CONNECTION_TOOLS = [
       type: 'object',
       properties: {
         connection: { type: 'string', description: 'Connection id or name.' },
-        query: { type: 'string', description: 'SQL string, or a JSON object for the MongoDB connector.' },
+        query: {
+          type: 'string',
+          description: 'SQL string; or JSON text for MongoDB, LanceDB and Pinecone. '
+            + 'LanceDB: {"operation":"count"|"list","tableName":"<table>","filter"?:"<SQL where>","limit"?:n} '
+            + 'or {"operation":"query","tableName","queryVector":[...],"topK"?:n}. '
+            + 'Pinecone: {"operation":"count","indexName","namespace"?} — the namespace record count — '
+            + 'or {"operation":"list","indexName","namespace"?,"limit"?:n,"filter"?} to show records (no vector needed) '
+            + 'or {"operation":"fetch","indexName","namespace"?,"ids":[...]} / {"operation":"query",...,"queryVector":[...]} (similarity).',
+        },
         limit: { type: 'number', description: `Row cap, at most ${MAX_QUERY_ROWS}.` },
       },
       required: ['connection', 'query'],
@@ -162,9 +171,10 @@ const EXECUTION_TOOLS = [
 // which cannot authenticate, and so cannot probe most real endpoints.
 const RUN_JAVASCRIPT_TOOL = {
   name: 'run_javascript',
-  description: 'Generate AND run a one-off async JavaScript function for logic run_query and http_request '
+  description: 'Generate a one-off async JavaScript function for logic run_query and http_request '
     + 'cannot express — per-row AI calls, embeddings, orchestrating several connections, or calling an API '
-    + 'that needs saved credentials. The function runs with ctx helpers (runQuery, askAi, vectorize, axios, '
+    + 'that needs saved credentials. The user reads the code and approves it before it runs; it then runs '
+    + 'with ctx helpers (runQuery — read-only here, askAi, vectorize, axios, '
     + 'getTables, getColumns, apiCredentials, log); its returned array comes back as `rows`, capped at '
     + `${MAX_QUERY_ROWS}. This computes an answer to SHOW; it saves nothing — `
     + 'to build a saved transformer node use plan_workflow_build instead. Sample rows rather than looping over '
@@ -292,13 +302,15 @@ const JOIN_DESTINATION_SCHEMA = {
   description: 'Record where the focused Join node writes its result. The join cannot be built until this is set, '
     + 'so if the user asks to configure the join and has not said where the output goes, ask them — list the '
     + 'destinations from the node-in-focus section — and call this once they name one. Accepts a saved connection '
-    + 'id or name, or "local-duckdb" for a local table in the workflow\'s DuckDB database.',
+    + 'id or name, "local-duckdb" for a local table in the workflow\'s DuckDB database, or "local-lancedb" '
+    + 'for a local LanceDB vector table (only when the user wants the result stored as vectors).',
   input_schema: {
     type: 'object',
     properties: {
       destination: {
         type: 'string',
-        description: 'A saved connection id or name, or "local-duckdb" for a local DuckDB table.',
+        description: 'A saved connection id or name, "local-duckdb" for a local DuckDB table, or '
+          + '"local-lancedb" for a local LanceDB vector table.',
       },
     },
     required: ['destination'],
@@ -375,9 +387,9 @@ const FINAL_ANSWER_TOOL = {
       answer: { type: 'string', description: 'The reply, in markdown.' },
       visuals: { type: 'array', maxItems: 3, items: VISUAL_SCHEMA },
       // Present only on the first turn of a new chat, and only then does the
-      // system prompt ask for it (see chatTitleSection in prompts.js). Naming
-      // the conversation this way costs nothing; the standalone chatTitle
-      // prompt is the fallback for turns that never reach a final answer.
+      // system prompt ask for it (see chatTitleSection in prompts.js). This is
+      // the only place a chat is named; a turn that never reaches a final
+      // answer keeps the placeholder title seeded from the user's message.
       title: {
         type: 'string',
         description: 'Only when the system prompt asked you to name this conversation: a 3-5 word, '

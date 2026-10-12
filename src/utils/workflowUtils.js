@@ -11,6 +11,25 @@ import { nodeDisplayName } from '../components/Workflows/nodes/nodeCardShared';
  * @param {string} startNodeId - ID of the start node
  * @returns {Array} - Array of node IDs in execution order
  */
+/**
+ * How many inputs a node needs before it can be configured, and what to tell
+ * the user when it has fewer. One definition for the canvas (opening a node)
+ * and the assistant (being asked to build one), so both say the same thing.
+ */
+const REQUIRED_INPUTS = { transformer: 1, join: 2, branch: 1, output: 1 };
+const REQUIREMENT_MESSAGES = {
+  transformer: 'Transformer node requires a source connection to configure',
+  join: 'Join node requires two input connections to configure',
+  branch: 'Branch node requires at least one input connection to configure',
+  output: 'Output node requires an input connection to configure',
+};
+
+/** Does a node of `type` with `inputCount` incoming edges have what it needs? */
+export const hasRequiredInputs = (type, inputCount) => inputCount >= (REQUIRED_INPUTS[type] || 0);
+
+/** The message for a node of `type` that is missing inputs. */
+export const nodeRequirementMessage = (type) => REQUIREMENT_MESSAGES[type] || 'Node cannot be configured';
+
 export const getNodeExecutionOrder = (workflowNodes, workflowEdges, startNodeId) => {
   const executionOrder = [];
   const processed = new Set();
@@ -244,8 +263,15 @@ const repointSourceConfigEntry = (entry, fresh) => {
     || null;
   const connId = fresh.sourceConnectionId || entry.connection?.id || null;
   const connMoved = !!entry.connection?.id && !!connId && entry.connection.id !== connId;
-  if (!connMoved && table === entry.tableName
-    && (fresh.sourceTableSchema || null) === (entry.sourceTableSchema || null)) return entry;
+  // A parent with no schema says nothing about the shape — a REST API source has
+  // none until its fetch is built, and older data sources were saved before
+  // theirs loaded — so it cannot mean the entry's schema changed. Counting it as
+  // a change rebuilt an identical entry on every pass (the rebuild keeps the
+  // entry's schema), the canvas re-synced forever, and each pass overwrote any
+  // other edit to the join.
+  const schemaUnchanged = !fresh.sourceTableSchema
+    || fresh.sourceTableSchema === (entry.sourceTableSchema || null);
+  if (!connMoved && table === entry.tableName && schemaUnchanged) return entry;
   const tableMoved = !!entry.tableName && table !== entry.tableName;
   const moved = connMoved || tableMoved;
   // Where this step's `sql` and `ddl` still point: the FIRST divergence, kept
@@ -373,7 +399,10 @@ const sourceStaleReason = (nodeType, config, movedSource, sourcesConfig, parentI
   const steps = (Array.isArray(sourcesConfig) ? sourcesConfig : []).filter(Boolean);
   if (steps.length === 0) return '';
   if (steps.some((s) => s.sourceMoved)) return 'moved';
-  const named = steps.map((s) => s.sourceNodeId).filter(Boolean);
+  // Mirrors staleJoinSource: a similarity join's vector source is read by the
+  // join's own function, so it has no step but is not "unread".
+  const direct = Array.isArray(config.directReadSources) ? config.directReadSources.filter(Boolean) : [];
+  const named = [...steps.map((s) => s.sourceNodeId).filter(Boolean), ...direct];
   if (named.some((id) => !parentIds.includes(id))) return 'disconnected';
   if (parentIds.some((id) => !named.includes(id))) return 'unread';
   return '';

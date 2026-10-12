@@ -14,7 +14,6 @@
  */
 
 // import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-// import { getWorkflowAssistance } from '../../../utils/workflowAI';
 // import ChatArea from '../../Chat/ChatArea';
 // import { qualifyLocalTableName } from '../../../utils/workflowNaming';
 // import { buildChatPrompt } from '../../../utils/chatPrompts';

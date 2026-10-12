@@ -11,8 +11,12 @@ const avro = require('avsc');
 const { batchChunkSizeFor } = require('../lib/batchChunkSize');
 const { throwIfCancelled, isCancelledError } = require('./executionCancel');
 const { setBatchWindow } = require('./executionLog');
-const { openSourcePages } = require('./sourcePages');
+const { openSourcePages, readSourceSchema } = require('./sourcePages');
+const {
+  destinationType, valueConverters, convertRow, zonedInstantColumns,
+} = require('./columnTypes');
 const { resolveTableRef } = require('../lib/tableRef');
+const { probeTargetTable } = require('../lib/targetShape');
 // Needed by the READ as well as the write: an Excel destination has a row
 // ceiling, and the reader stops at it rather than filling memory with rows the
 // writer can never take.
@@ -150,8 +154,12 @@ function dialectFor(plugin, dbType) {
 function inferColumnType(columnName, sampleValues, dialect = SQLITE_TYPES) {
   const validValues = sampleValues.filter(v => v !== null && v !== undefined);
 
+  // Through destinationType so a kind the dialect lacks (BIGINT on SQLite)
+  // takes its fallback rather than coming back undefined.
   const typeName = (key, len) => {
-    const entry = dialect[key] != null ? dialect[key] : SQLITE_TYPES[key];
+    const named = destinationType(dialect, { kind: key }, len);
+    if (named) return named;
+    const entry = SQLITE_TYPES[key];
     return typeof entry === 'function' ? entry(len) : entry;
   };
 
@@ -165,6 +173,7 @@ function inferColumnType(columnName, sampleValues, dialect = SQLITE_TYPES) {
   let hasTimeComponent = false;
   let isAllBools = true;
   let isAllInts = true;
+  let needs64Bits = false;
   let isAllFloats = true;
   let hasObjects = false;
   let maxLength = 0;
@@ -193,20 +202,24 @@ function inferColumnType(columnName, sampleValues, dialect = SQLITE_TYPES) {
       }
     }
 
-    // Boolean Check
-    if (isAllBools) {
-      const isBool = typeof v === 'boolean' || v === 'true' || v === 'false';
-      if (!isBool) isAllBools = false;
-    }
+    // Boolean Check — real booleans only. Text that reads "true"/"false" on
+    // the first rows is still text: a later "yes" in the same column was
+    // silently stored as TRUE once the column had been made BOOLEAN.
+    if (isAllBools && typeof v !== 'boolean') isAllBools = false;
 
-    // Number Check
+    // Number Check. A string with a leading zero ("02947", a ZIP or a code)
+    // is an identifier, not a number: as one it loses the zero for good.
     if (isAllFloats) {
-      const isNum = typeof v === 'number' || (typeof v === 'string' && strV.trim() !== '' && !isNaN(Number(v)));
+      const isNum = typeof v === 'number'
+        || (typeof v === 'string' && strV.trim() !== '' && !isNaN(Number(v))
+          && !/^\s*[+-]?0\d/.test(strV));
       if (!isNum) {
         isAllInts = false;
         isAllFloats = false;
       } else if (isAllInts && !Number.isInteger(Number(v))) {
         isAllInts = false;
+      } else if (isAllInts && Math.abs(Number(v)) > 2147483647) {
+        needs64Bits = true;
       }
     }
   }
@@ -216,7 +229,8 @@ function inferColumnType(columnName, sampleValues, dialect = SQLITE_TYPES) {
     return typeName(hasTimeComponent ? 'TIMESTAMP' : 'DATE_ONLY', maxLength);
   }
   if (isAllBools) return typeName('BOOLEAN', maxLength);
-  if (isAllInts) return typeName('INTEGER', maxLength);
+  // Past 2^31 a 32-bit INTEGER overflows on the first such row.
+  if (isAllInts) return typeName(needs64Bits ? 'BIGINT' : 'INTEGER', maxLength);
   if (isAllFloats) return typeName('FLOAT', maxLength);
   if (hasObjects) return typeName('OBJECT', maxLength);
 
@@ -229,12 +243,13 @@ function inferColumnType(columnName, sampleValues, dialect = SQLITE_TYPES) {
  * @param {Array} data - Array of data rows
  * @param {Object} dialect - The destination's type map (see dialectFor)
  * @param {number} sampleSize - Number of rows to sample for type inference
+ * @param {string[]} [columns] - Columns to type; defaults to the first row's keys.
  * @returns {Object} Map of column names to SQL types
  */
-function inferColumnTypes(data, dialect = SQLITE_TYPES, sampleSize = 100) {
+function inferColumnTypes(data, dialect = SQLITE_TYPES, sampleSize = 100, columns = null) {
   if (!data || data.length === 0) return {};
 
-  const columns = Object.keys(data[0]);
+  columns = columns || Object.keys(data[0]);
   const columnTypes = {};
 
   // Sample rows for type inference (use first N rows)
@@ -418,6 +433,48 @@ function inferAvroSchema(data, shapes = inferColumnShapes(data)) {
  * @param {Object} [skillHelpers] - Helpers bundle for skill calls (e.g. vector-db-executor)
  * @returns {Promise<Object>} Result with success, message, filePath/rowsInserted
  */
+// What a vector store keeps next to a row's own data: the vector itself and the
+// embedding bookkeeping the vector skill writes (see INTERNAL_FIELDS in
+// plugins/skills/vector-db-executor). The record `id` is kept — it is data.
+const VECTOR_MACHINERY_FIELDS = new Set([
+  'vector', 'values', 'embedding', '__vid',
+  '_content_hash', '_meta_hash',
+  '_embedded_column', '_embedding_provider', '_embedding_model', '_embedded_at',
+]);
+
+const isVectorType = (plugin, dbType) =>
+  plugin?.dbCategory === 'Vector' || dbType === 'pinecone' || dbType === 'lancedb';
+
+function isVectorSource(sourceConnection, pluginManager) {
+  if (!sourceConnection) return false;
+  return isVectorType(pluginManager.getConnector(sourceConnection.dbType), sourceConnection.dbType);
+}
+
+async function isVectorDestination(outputSettings, pluginManager, getDb) {
+  if (outputSettings.outputType === 'local') return outputSettings.format === 'lancedb';
+  if (outputSettings.outputType !== 'connection' || !outputSettings.connectionId) return false;
+  const target = (await getDb('connections').findAsync({}))
+    .find((c) => c.id === outputSettings.connectionId);
+  return !!target && isVectorType(pluginManager.getConnector(target.dbType), target.dbType);
+}
+
+function stripVectorFields(row) {
+  if (!row || typeof row !== 'object') return row;
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (VECTOR_MACHINERY_FIELDS.has(k)) continue;
+    // Pinecone rows carry their fields under `metadata`, bookkeeping included.
+    out[k] = (k === 'metadata' && v && typeof v === 'object' && !Array.isArray(v))
+      ? stripVectorFields(v)
+      : v;
+  }
+  return out;
+}
+
+async function* withoutVectorColumns(pages) {
+  for await (const page of pages) yield page.map(stripVectorFields);
+}
+
 async function executeOutput(
   sourceConnection,
   sourceTableSchema,
@@ -438,10 +495,34 @@ async function executeOutput(
     // Only a destination that can hold rows ACROSS runs has a choice to make.
     // A file — local export or an object in cloud storage — is rewritten whole
     // every time by definition, so it is always effectively 'truncate' and the
-    // setting is ignored rather than half-honoured.
+    // setting is ignored rather than half-honoured. The exception is a LanceDB
+    // file: it is a vector database, and it is written exactly like a LanceDB
+    // connection (append = upsert, truncate = replace).
     const writeMode = outputSettings.writeMode === 'truncate' ? 'truncate' : 'append';
+    // A vector destination (LanceDB file, Pinecone, a LanceDB connection) fed
+    // plain rows embeds this column on the way out. Ignored by every other
+    // destination, and by rows that already carry vectors.
+    const embedding = outputSettings.embedColumn
+      ? {
+        columnToEmbed: outputSettings.embedColumn,
+        embeddingProvider: outputSettings.embeddingProvider || 'openai',
+        embeddingModel: outputSettings.embeddingModel || 'text-embedding-3-small',
+      }
+      : null;
+    // The row's primary key for a vector destination — optional, picked on the
+    // node in Append mode. Kept when the node is switched to Truncate & insert,
+    // so its records keep the same ids and a later Append replaces them rather
+    // than adding a second copy under a different id scheme.
+    const idColumn = outputSettings.idColumn || null;
 
-    console.log(`[Output] Starting ${outputType} output operation (${writeMode})`);
+    // A local export is a file, rewritten whole whatever the setting says. A
+    // connection's effective mode is logged once its destination is known (see
+    // insertToConnection): a cloud object is a file too.
+    console.log(outputType === 'local'
+      ? (format === 'lancedb'
+        ? `[Output] Starting local LanceDB output operation: ${writeMode}`
+        : '[Output] Starting local output operation (replace: the file is rewritten whole)')
+      : `[Output] Starting ${outputType} output operation`);
 
     // Step 0: source and destination on ONE connection? Then the engine can do
     // the copy itself and no row needs to travel through this process. Returns
@@ -466,7 +547,7 @@ async function executeOutput(
     // writeMode 'truncate' the destination had been emptied first, so the
     // silent truncation was silent data loss. See NodeExecution/sourcePages.js
     // for what each source type can and cannot stream.
-    const { pages, pagesAreStreamed } = openSourcePages({
+    let { pages, pagesAreStreamed } = openSourcePages({
       sourceConnection,
       sourceTableSchema,
       pluginManager,
@@ -478,6 +559,17 @@ async function executeOutput(
       `[Output] Reading ${sourceTableSchema?.tableName || 'source'} `
       + `(${pagesAreStreamed ? 'streamed' : 'buffered'})`,
     );
+
+    // A vector source written anywhere that is not itself a vector store sends
+    // its rows' data, not the store's machinery: the stored vector and the
+    // embedding bookkeeping (_content_hash, _embedded_at, …) are dropped. They
+    // mean nothing in a SQL table or a file, and a 1536-wide vector serialised
+    // into a text column is noise the user never asked for.
+    if (isVectorSource(sourceConnection, pluginManager)
+      && !(await isVectorDestination(outputSettings, pluginManager, getDb))) {
+      console.log('[Output] Vector source → non-vector destination: dropping vector and embedding bookkeeping columns');
+      pages = withoutVectorColumns(pages);
+    }
 
     // Whether the destination can take rows a page at a time, or needs the
     // whole set at once.
@@ -571,6 +663,10 @@ async function executeOutput(
           sourceData, format, savePath, pluginManager, skillHelpers,
           sheetName || sourceTableSchema?.tableName || null,
           tableName || sourceTableSchema?.tableName || null,
+          embedding,
+          // LanceDB only: a LanceDB file keeps its records between runs, so it
+          // takes the same Append (upsert) / Truncate choice as a connection.
+          { writeMode, idColumn },
         );
         if (sourceIsEmpty && result?.success) {
           return {
@@ -590,9 +686,17 @@ async function executeOutput(
 
     // A database destination: rows go in a page at a time and the whole source
     // is never resident.
+    //
+    // Its column types come from the SOURCE's schema where the source has one
+    // (see columnTypes.js); a buffered source with none — Mongo — has every
+    // row in hand already, so it is typed over all of them rather than a page.
+    const sourceSchema = await readSourceSchema({
+      sourceConnection, sourceTableSchema, pluginManager, getFullConfig,
+    });
     return await insertToConnection(
       pages, connectionId, tableName, pluginManager, getFullConfig, getDb,
-      skillHelpers, writeMode, { sourceName },
+      skillHelpers, writeMode,
+      { sourceName, embedding, idColumn, sourceSchema, scanAll: !pagesAreStreamed },
     );
 
   } catch (error) {
@@ -789,7 +893,8 @@ async function* pagesFromArray(rows, pageSize = 5000) {
  */
 async function exportToLocalFile(
   sourceData, format, savePath, pluginManager, skillHelpers = null,
-  sheetName = null, tableName = null,
+  sheetName = null, tableName = null, embedding = null,
+  { writeMode = 'truncate', idColumn = null } = {},
 ) {
   // Every branch below opens `savePath` — a workbook, a database, a parquet or
   // avro writer — and each would fail its own way on a folder that is not there.
@@ -824,81 +929,20 @@ async function exportToLocalFile(
       filePath: savePath,
       sheetName: sheet
     };
-  } else if (format === 'sqlite') {
+  } else if (format === 'sqlite' || format === 'duckdb') {
     // The table this node writes. It used to be hard-coded to "data", so two
-    // output nodes pointed at one .sqlite file silently overwrote each other and
-    // the file could hold only ever one dataset. The node names it now, and the
+    // output nodes pointed at one file silently overwrote each other and the
+    // file could hold only ever one dataset. The node names it now, and the
     // fallback keeps a node built before the field existed writing where it
     // always did.
-    const table = sanitizeTableIdentifier(tableName) || 'data';
-    const sqlite3 = require('sqlite3').verbose();
-    // Opens an existing database in place — only the table below is replaced, so
-    // whatever else the file holds survives, exactly as an .xlsx keeps its other
-    // sheets. A path with no file at it gets a new database.
-    const db = new sqlite3.Database(savePath);
-    // Infer columns and types from data
-    if (sourceData.length > 0) {
-      const columns = Object.keys(sourceData[0]);
-      // A real .db file, so the SQLite connector's own types — asked for the
-      // same way every other destination's are, rather than named by a string
-      // here. It falls back to SQLITE_TYPES anyway if the connector is absent.
-      const columnTypes = inferColumnTypes(
-        sourceData, dialectFor(pluginManager?.getConnector?.('sqlite'), 'sqlite'),
-      );
-      const columnDefs = columns.map(col => `"${col}" ${columnTypes[col]}`).join(', ');
-
-      // Drop THIS table if it exists to ensure fresh schema
-      await new Promise((res, rej) => {
-        db.run(`DROP TABLE IF EXISTS "${table}"`, (err) => err ? rej(err) : res());
-      });
-
-      const createTableSql = `CREATE TABLE "${table}" (${columnDefs})`;
-
-      await new Promise((res, rej) => {
-        db.run(createTableSql, (err) => err ? rej(err) : res());
-      });
-
-      // Insert data using transaction
-      await new Promise((res, rej) => {
-        db.serialize(() => {
-          db.run("BEGIN TRANSACTION");
-          const placeholders = columns.map(() => '?').join(', ');
-          const quotedCols = columns.map((c) => `"${c}"`).join(', ');
-          const stmt = db.prepare(`INSERT INTO "${table}" (${quotedCols}) VALUES (${placeholders})`);
-
-          for (const row of sourceData) {
-            const values = columns.map(col => {
-              const val = row[col];
-              if (val === null || val === undefined) return null;
-              if (val instanceof Date) return val.toISOString();
-              if (typeof val === 'object') return JSON.stringify(val);
-              return val;
-            });
-            stmt.run(values);
-          }
-
-          stmt.finalize();
-          db.run("COMMIT", (err) => {
-            if (err) rej(err);
-            else res();
-          });
-        });
-      });
-    }
-
-    db.close();
-
-    return {
-      success: true,
-      message: `Successfully exported ${sourceData.length} rows to table "${table}" in ${path.basename(savePath)}`,
-      filePath: savePath,
-      tableName: table
-    };
-  } else if (format === 'duckdb') {
-    // Same contract as SQLite and Excel: the file is opened, not rewritten, and
-    // only this node's table is replaced. ingestRowsToTableAt attaches the
-    // database and runs CREATE OR REPLACE TABLE, so the file's other tables are
-    // untouched and a path with no file at it gets a new database.
+    //
+    // Both engines go through DuckDB: a .duckdb natively, a .sqlite through
+    // DuckDB's sqlite extension (`sqlite: true` makes a file that does not
+    // exist yet a SQLite database, not a DuckDB one). The file is opened, not
+    // rewritten — ingestRowsToTableAt runs CREATE OR REPLACE TABLE on this one
+    // table — so whatever else it holds survives, exactly as an .xlsx keeps its
+    // other sheets.
+    const engine = format === 'sqlite' ? 'SQLite' : 'DuckDB';
     const table = sanitizeTableIdentifier(tableName) || 'data';
     if (sourceData.length === 0) {
       // ingestRowsToTableAt refuses an empty batch (it has no columns to declare
@@ -912,7 +956,9 @@ async function exportToLocalFile(
       };
     }
     try {
-      const { rowCount } = await duckdb.ingestRowsToTableAt(sourceData, savePath, table, { mode: 'replace' });
+      const { rowCount } = await duckdb.ingestRowsToTableAt(
+        sourceData, savePath, table, { mode: 'replace', sqlite: format === 'sqlite' },
+      );
       return {
         success: true,
         message: `Successfully exported ${rowCount} rows to table "${table}" in ${path.basename(savePath)}`,
@@ -920,10 +966,10 @@ async function exportToLocalFile(
         tableName: table
       };
     } catch (error) {
-      console.error('DuckDB export error:', error);
+      console.error(`${engine} export error:`, error);
       return {
         success: false,
-        message: `Failed to export DuckDB: ${error.message}`
+        message: `Failed to export ${engine}: ${error.message}`
       };
     }
   } else if (format === 'parquet') {
@@ -1019,6 +1065,11 @@ async function exportToLocalFile(
         // falls back to naming it after the directory, which is what it did
         // before this was passed.
         tableName,
+        embedding,
+        // Append upserts into the table (with the skip rule), Truncate
+        // replaces it — the same as a LanceDB connection.
+        writeMode,
+        idColumn,
         helpers: skillHelpers
       });
 
@@ -1050,6 +1101,18 @@ async function exportToLocalFile(
  *
  * @returns {Promise<{ok: boolean, error: Error|null}>}
  */
+/**
+ * How to quote a COLUMN name for this connector: its quoteColumn, which never
+ * splits on a dot ("e.mail" stays one identifier). quoteIdentifier is the
+ * fallback for a connector that predates quoteColumn — it is built for table
+ * references and splits dotted names, which is why it is not the first choice.
+ */
+function columnQuoter(plugin) {
+  if (plugin && typeof plugin.quoteColumn === 'function') return (c) => plugin.quoteColumn(c);
+  if (plugin && typeof plugin.quoteIdentifier === 'function') return (c) => plugin.quoteIdentifier(c, null, null);
+  return (c) => c;
+}
+
 async function clearTable(plugin, fullConfig, connectionId, quotedTableName, label) {
   const attempts = [
     `TRUNCATE TABLE ${quotedTableName}`,
@@ -1067,6 +1130,77 @@ async function clearTable(plugin, fullConfig, connectionId, quotedTableName, lab
     }
   }
   return { ok: false, error: lastError };
+}
+
+/**
+ * An empty copy of an existing table's COLUMNS, to load a Truncate & insert
+ * into before the real table is touched.
+ *
+ * Truncating first and then loading meant any row the destination refused —
+ * a value too long, "N/A" in an integer column — failed the run AFTER the
+ * table had been emptied: the old rows were gone and the new ones never
+ * arrived. Loading into a copy that has the destination's own column types
+ * moves every such refusal to before anything is deleted.
+ *
+ * Created by the engine from the table itself (no type is re-derived here), so
+ * it accepts exactly what the destination would. Two spellings, tried in order
+ * the way clearTable tries TRUNCATE then DELETE: CREATE TABLE … AS SELECT (most
+ * engines) and SELECT … INTO (SQL Server, which has no CTAS). The name is bare,
+ * like a join's staging table, so batchInsert and the swap resolve it the same
+ * way the connection resolves any unqualified name.
+ *
+ * Returns { bare, quoted } or null when neither form worked — the caller then
+ * keeps the old truncate-first path rather than refusing a load that used to run.
+ */
+async function createStagingLike(plugin, fullConfig, connectionId, quotedTableName) {
+  const bare = `tlx_stage_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const quoted = typeof plugin.quoteIdentifier === 'function'
+    ? plugin.quoteIdentifier(bare, null, fullConfig)
+    : bare;
+  const attempts = [
+    `CREATE TABLE ${quoted} AS SELECT * FROM ${quotedTableName} WHERE 1=0`,
+    `SELECT * INTO ${quoted} FROM ${quotedTableName} WHERE 1=0`,
+  ];
+  for (const query of attempts) {
+    try {
+      const result = await plugin.runQuery(fullConfig, connectionId, { query });
+      if (result && result.success === false) continue;
+      return { bare, quoted };
+    } catch (_err) {
+      // try the next spelling
+    }
+  }
+  return null;
+}
+
+/**
+ * Replace the destination's rows with the staging table's, as one unit.
+ *
+ * DELETE (not TRUNCATE) because TRUNCATE is DDL on MySQL and Snowflake and
+ * commits on its own, which would split the pair. `WHERE 1=1` because BigQuery
+ * refuses a DELETE without a WHERE clause. With a connector that can run a
+ * transaction, a failing INSERT rolls the DELETE back and the destination keeps
+ * its old rows; without one, the two run back to back — still after the load
+ * succeeded, which is where nearly every failure used to happen.
+ */
+async function swapFromStaging(plugin, fullConfig, connectionId, quotedTableName, stagingQuoted, columnList) {
+  const statements = [
+    `DELETE FROM ${quotedTableName} WHERE 1=1`,
+    `INSERT INTO ${quotedTableName} (${columnList}) SELECT ${columnList} FROM ${stagingQuoted}`,
+  ];
+  if (typeof plugin.runInTransaction === 'function') {
+    const result = await plugin.runInTransaction(fullConfig, connectionId, statements);
+    return result && result.success === false
+      ? { ok: false, atomic: true, error: new Error(result.message || 'swap failed') }
+      : { ok: true, atomic: true };
+  }
+  for (const query of statements) {
+    const result = await plugin.runQuery(fullConfig, connectionId, { query });
+    if (result && result.success === false) {
+      return { ok: false, atomic: false, error: new Error(result.message || 'swap failed') };
+    }
+  }
+  return { ok: true, atomic: false };
 }
 
 /**
@@ -1170,7 +1304,7 @@ async function trySameConnectionCopy({
   // Columns BARE — quoteIdentifier cannot tell a table from a column, and
   // MySQL's would prepend the database, which is a syntax error in a column
   // list. Same rule the streaming path's CREATE TABLE applies.
-  const quotedColumns = destColumns.map((c) => plugin.quoteIdentifier(c, null, null));
+  const quotedColumns = destColumns.map(columnQuoter(plugin));
   const columnList = quotedColumns.join(', ');
 
   // How many rows are about to move. Also the empty-source answer, which has to
@@ -1220,7 +1354,7 @@ async function trySameConnectionCopy({
   // and the source does not fails here with the engine's own message — the
   // streaming path's shape check needs rows in hand and has nothing to offer.
   const insertSql = `INSERT INTO ${quotedDest} (${columnList}) SELECT ${columnList} FROM ${quotedSource}`;
-  console.log(`[Output] Same-connection copy on ${targetConnection.dbType}: ${insertSql}`);
+  console.log(`[Output] Same-connection copy on ${targetConnection.dbType} (${writeMode}): ${insertSql}`);
   const result = await plugin.runQuery(fullConfig, targetConnection.id, { query: insertSql });
   if (!result || result.success === false) {
     return {
@@ -1257,7 +1391,9 @@ async function trySameConnectionCopy({
  * @param {Function} getDb - Function to get an app-metadata datastore by collection name
  * @returns {Promise<Object>} Result with success, message, documentsInserted/rowsInserted
  */
-async function insertToConnection(pages, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers = null, writeMode = 'append', { sourceName = 'the source' } = {}) {
+async function insertToConnection(pages, connectionId, tableName, pluginManager, getFullConfig, getDb, skillHelpers = null, writeMode = 'append', {
+  sourceName = 'the source', embedding = null, idColumn = null, sourceSchema = null, scanAll = false,
+} = {}) {
   const connectionsDb = getDb('connections');
   const targetConnectionDocs = await connectionsDb.findAsync({});
   const targetConnection = targetConnectionDocs.find(c => c.id === connectionId);
@@ -1273,6 +1409,13 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
   const plugin = pluginManager.getConnector(targetConnection.dbType);
   const isCloudStorage = plugin?.storageType === 'cloud-storage' || targetConnection.dbType === 'google-sheets';
   const isVector = plugin?.dbCategory === 'Vector' || targetConnection.dbType === 'pinecone' || targetConnection.dbType === 'lancedb';
+
+  // The mode that actually applies. An object in cloud storage is a file and is
+  // replaced whole, so its writeMode is ignored; a Sheets tab, a table, a
+  // collection and a vector index honour it.
+  const replacesObject = isCloudStorage && targetConnection.dbType !== 'google-sheets';
+  console.log(`[Output] Writing to ${targetConnection.name || connectionId} (${targetConnection.dbType}) `
+    + `${tableName || ''}: ${replacesObject ? 'replace (the object is rewritten whole)' : writeMode}`);
 
   /** Nothing came out of the source: leave the destination exactly as it is. */
   const nothingToDo = () => {
@@ -1292,7 +1435,7 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
     // skill embeds and upserts one array.
     const sourceData = await collectPages(pages);
     if (sourceData.length === 0) return nothingToDo();
-    return await insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers, writeMode);
+    return await insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers, writeMode, embedding, idColumn);
   }
 
   if (isCloudStorage) {
@@ -1477,10 +1620,32 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
     // The first page decides the destination's shape, and answers "is there
     // anything to write at all" — both before a single row is sent, and before
     // the truncate below can empty a table for nothing.
-    const { firstPage, rest } = await peekPages(pages);
+    let { firstPage, rest } = await peekPages(pages);
+
+    // A buffered source with no schema of its own (a document store) is typed
+    // over EVERY row and every key any row has. Its rows are all in memory
+    // already, so this costs no extra read — and a field that first appears on
+    // document 6,000, or is a number on the first page and text later, is
+    // typed for what it really holds instead of being dropped or failing.
+    let allRows = null;
+    let columns = null;
+    if (firstPage && scanAll && !sourceSchema) {
+      allRows = await collectPages(rest);
+      const seen = new Set();
+      for (const row of allRows) {
+        for (const key of Object.keys(row || {})) seen.add(key);
+      }
+      columns = [...seen];
+      rest = (async function* () { if (allRows.length) yield allRows; })();
+    }
 
     if (firstPage) {
-      const columns = Object.keys(firstPage[0]);
+      // A source with a schema names its columns; for a document store that
+      // is every field any document has (MongoDB's scan), not just the first
+      // document's. A key the schema lacks is still kept.
+      columns = columns || (sourceSchema
+        ? [...new Set([...Object.keys(sourceSchema), ...Object.keys(firstPage[0])])]
+        : Object.keys(firstPage[0]));
       // Types are inferred from the FIRST PAGE rather than the whole source.
       //
       // Not a compromise forced by streaming — an improvement. The old code
@@ -1493,9 +1658,42 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
       // The trade is real and worth naming: a column that is integral for the
       // first page and fractional later now gets the narrower type. That was
       // already true past row 1,000,000; it is simply true sooner.
-      const columnTypes = inferColumnTypes(
-        firstPage, dialectFor(plugin, targetConnection.dbType),
-      );
+      const dialect = dialectFor(plugin, targetConnection.dbType);
+      const columnTypes = allRows
+        ? inferColumnTypes(allRows, dialect, Infinity, columns)
+        : inferColumnTypes(firstPage, dialect, 100, columns);
+      // With no schema, the values are the only evidence. A column holding
+      // nothing but instants with a zone is still an instant: treated as if
+      // the source had said TIMESTAMPTZ, so it gets that type and its values
+      // are converted to UTC like any other.
+      if (!sourceSchema) {
+        const zonedCols = zonedInstantColumns(allRows || firstPage, columns);
+        if (Object.keys(zonedCols).length > 0) sourceSchema = zonedCols;
+      }
+      // A column the source declares a type for keeps THAT type, mapped to
+      // this destination's name for it. Only the rest are guessed. See
+      // columnTypes.js — this is what keeps "02947" text and a 64-bit id
+      // a BIGINT.
+      if (sourceSchema) {
+        const typedFromSchema = [];
+        for (const col of columns) {
+          const canonical = sourceSchema[col];
+          if (!canonical) continue;
+          const sampleMaxLen = firstPage.reduce((max, row) => {
+            const v = row[col];
+            return v == null ? max : Math.max(max, String(v).length);
+          }, 0);
+          const named = destinationType(dialect, canonical, sampleMaxLen);
+          if (named) {
+            columnTypes[col] = named;
+            typedFromSchema.push(col);
+          }
+        }
+        console.log(`[Output] Column types from the source schema: ${typedFromSchema.length}/${columns.length}`);
+      }
+      // Values the chosen types need converted on the way in (an instant
+      // with an offset → UTC). null when nothing does.
+      const converters = valueConverters(sourceSchema, dialect);
       // Quote column identifiers so reserved words (e.g. a "timestamp" column on
       // SQL Server) don't break the CREATE TABLE. Without this the CREATE fails
       // with a syntax error that the try/catch below swallows, leaving the table
@@ -1508,9 +1706,7 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
       // (`db`.`col` INT ...)`, which failed, got swallowed, and surfaced as
       // "table doesn't exist" on insert. Only MySQL reads config; the other SQL
       // connectors ignore it, so bare-quoting is safe for all of them.
-      const quoteCol = (plugin && plugin.quoteIdentifier)
-        ? (c) => plugin.quoteIdentifier(c, null, null)
-        : (c) => c;
+      const quoteCol = columnQuoter(plugin);
       const columnDefs = columns.map(col => `${quoteCol(col)} ${columnTypes[col]}`).join(', ');
 
       // Pass NO schema when the destination carries its own qualifier —
@@ -1570,45 +1766,18 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
       //
       // Reads the RESOLVED identity, so the shape check and the truncate below
       // are looking at the table the insert will really write to.
-      const readColumns = async (schema) => {
-        try {
-          const res = await plugin.getColumns(fullConfig, targetConnection.id, schema, writeTableName);
-          if (res && res.success !== false && Array.isArray(res.columns)) return res.columns;
-        } catch (err) {
-          console.log(`[Output] Could not read columns of ${writeTableName}:`, err.message || err);
-        }
-        return null; // couldn't tell
-      };
-
-      const probeTable = async () => {
-        if (typeof plugin.getColumns !== 'function') return { state: 'unknown', columns: null };
-
-        // The resolver already carries them where it reads columns itself.
-        if (resolved.found && Array.isArray(resolved.columns) && resolved.columns.length) {
-          return { state: 'exists', columns: resolved.columns };
-        }
-
-        const scoped = await readColumns(resolved.found ? resolved.schema : lookupSchema);
-        if (scoped && scoped.length > 0) return { state: 'exists', columns: scoped };
-
-        // An empty result from a SCOPED lookup is not proof of absence — the
-        // schema guessed above may not be one the engine uses. `lookupSchema`
-        // falls back to the DATABASE name when the connection records no
-        // schema, and on SQL Server that is never a schema (tables live in
-        // `dbo`), so a real table came back with zero columns and read as
-        // missing. Ask again unscoped and let the connector apply its own
-        // default before believing the table is not there.
-        if (lookupSchema) {
-          const bare = await readColumns(null);
-          if (bare && bare.length > 0) return { state: 'exists', columns: bare };
-          if (bare && scoped) return { state: 'missing', columns: null };
-          return { state: 'unknown', columns: null };
-        }
-
-        // Every table has at least one column, so a lookup that succeeded and
-        // returned none means there is no such table.
-        return scoped ? { state: 'missing', columns: null } : { state: 'unknown', columns: null };
-      };
+      // The shared probe (lib/targetShape) — the same lookup a join uses to
+      // decide whether its kept target still fits. It reads the RESOLVED
+      // identity, so the shape check and the truncate below look at the table
+      // the insert will really write to.
+      const probeTable = () => probeTargetTable({
+        plugin,
+        config: fullConfig,
+        connectionId: targetConnection.id,
+        tableName,
+        defaultSchema: lookupSchema,
+        resolved,
+      });
 
       let probe = await probeTable();
       let tableIsNew = false;
@@ -1618,6 +1787,25 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
         // not by throwing — see the postgres/mysql/mssql runQuery, which catch
         // the driver error themselves. Both shapes are handled so a connector
         // that does throw still works.
+        // A column name this engine cannot hold fails here, by name, with the
+        // fix — rather than as whatever the CREATE says (MySQL's "Identifier
+        // name … is too long"), or not at all where the engine silently
+        // shortens it (Postgres). The rules are the connector's own.
+        if (typeof plugin.columnNameProblem === 'function') {
+          const problems = columns
+            .map((col) => ({ col, why: plugin.columnNameProblem(col) }))
+            .filter((p) => p.why);
+          if (problems.length > 0) {
+            return {
+              success: false,
+              message: `Could not create ${writeTableName}: `
+                + problems.map((p) => `column "${p.col}" ${p.why}`).join('; ')
+                + '. Add a Transformer before this Output that renames '
+                + (problems.length === 1 ? 'it' : 'them')
+                + ', then run again.',
+            };
+          }
+        }
         const createTableSql = `CREATE TABLE ${quotedTableName} (${columnDefs})`;
         console.log('[Output] Creating destination table:', createTableSql);
         try {
@@ -1699,17 +1887,39 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
       // the fallback rather than the first choice. A failure of BOTH is
       // reported instead of swallowed: silently appending to rows the user
       // asked to have removed is the one outcome worth failing over.
+      //
+      // An existing table is no longer emptied FIRST. The rows are loaded into
+      // a staging copy of it, and only once every row is in does one
+      // transaction swap them in (createStagingLike / swapFromStaging). A row
+      // the destination refuses now fails the run with the destination still
+      // holding its previous rows. Only when no staging copy can be made does
+      // the old truncate-first path run.
+      let staging = null;
       if (writeMode === 'truncate' && !tableIsNew) {
-        const cleared = await clearTable(
-          plugin, fullConfig, targetConnection.id, quotedTableName, writeTableName,
-        );
-        if (!cleared.ok) {
-          return {
-            success: false,
-            message: `Could not truncate ${writeTableName} before loading: ${cleared.error?.message || 'unknown error'}`,
-          };
+        staging = await createStagingLike(plugin, fullConfig, targetConnection.id, quotedTableName);
+        if (!staging) {
+          console.log(`[Output] Could not stage ${writeTableName}; truncating before the load instead.`);
+          const cleared = await clearTable(
+            plugin, fullConfig, targetConnection.id, quotedTableName, writeTableName,
+          );
+          if (!cleared.ok) {
+            return {
+              success: false,
+              message: `Could not truncate ${writeTableName} before loading: ${cleared.error?.message || 'unknown error'}`,
+            };
+          }
         }
       }
+      // The table batchInsert writes: the staging copy when there is one.
+      const loadTableName = staging ? staging.bare : writeTableName;
+      const dropStaging = async () => {
+        if (!staging) return;
+        try {
+          await plugin.runQuery(fullConfig, targetConnection.id, { query: `DROP TABLE IF EXISTS ${staging.quoted}` });
+        } catch (err) {
+          console.log(`[Output] Could not drop staging table ${staging.bare}: ${err.message}`);
+        }
+      };
 
       // Insert in chunks using the plugin's batchInsert, reading the source as
       // we go — one chunk of rows is resident at a time, whatever the size of
@@ -1741,7 +1951,7 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
             // `tableName` re-introduced the wrong case after everything above
             // had resolved it correctly, and the rows went to a table nothing
             // else in this function was looking at.
-            const result = await plugin.batchInsert(fullConfig, targetConnection.id, writeTableName, columns, chunk);
+            const result = await plugin.batchInsert(fullConfig, targetConnection.id, loadTableName, columns, chunk);
             if (!result.success) {
               throw new Error(result.message || 'Batch insert failed');
             }
@@ -1760,7 +1970,7 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
               if (typeof val === 'object') return `'${JSON.stringify(val).replace(/'/g, "''")}'`;
               return val;
             });
-            return `INSERT INTO ${quotedTableName} (${columns.join(', ')}) VALUES (${values.join(', ')})`;
+            return `INSERT INTO ${staging ? staging.quoted : quotedTableName} (${columns.join(', ')}) VALUES (${values.join(', ')})`;
           });
 
           const batchInsert = insertStatements.join('; ');
@@ -1796,13 +2006,41 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
         await writeChunk(chunk);
       };
 
-      for await (const page of rest) {
-        for (const row of page) {
-          buffer.push(row);
-          if (buffer.length >= CHUNK_SIZE) await flush();
+      try {
+        for await (const page of rest) {
+          for (const row of page) {
+            buffer.push(converters ? convertRow(row, converters) : row);
+            if (buffer.length >= CHUNK_SIZE) await flush();
+          }
+        }
+        await flush();
+      } catch (err) {
+        if (staging) {
+          // Nothing reached the destination: say so, because "the load failed"
+          // after a Truncate used to mean the table had already been emptied.
+          await dropStaging();
+          // A Stop keeps its own error type — the runner reads it as a cancel.
+          if (isCancelledError(err)) throw err;
+          const reason = String(err?.message || err);
+          throw new Error(`${reason} — nothing was changed in ${writeTableName}; it still has its previous rows.`);
+        }
+        throw err;
+      }
+
+      if (staging) {
+        const columnList = columns.map(quoteCol).join(', ');
+        const swapped = await swapFromStaging(
+          plugin, fullConfig, targetConnection.id, quotedTableName, staging.quoted, columnList,
+        );
+        await dropStaging();
+        if (!swapped.ok) {
+          return {
+            success: false,
+            message: `Could not replace the rows in ${writeTableName}: ${swapped.error?.message || 'unknown error'}`
+              + (swapped.atomic ? ' — nothing was changed; it still has its previous rows.' : ''),
+          };
         }
       }
-      await flush();
 
       return {
         success: true,
@@ -1828,7 +2066,7 @@ async function insertToConnection(pages, connectionId, tableName, pluginManager,
  * @param {Function} getFullConfig - Function to get full config with credentials
  * @returns {Promise<Object>} Result with success, message, vectorsInserted
  */
-async function insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers = null, writeMode = 'append') {
+async function insertToVectorDatabase(sourceData, targetConnection, tableName, pluginManager, getFullConfig, skillHelpers = null, writeMode = 'append', embedding = null, idColumn = null) {
   try {
     // Parse index name and namespace for Pinecone
     let indexName = tableName;
@@ -1863,6 +2101,8 @@ async function insertToVectorDatabase(sourceData, targetConnection, tableName, p
       targetIndexName: indexName,
       targetNamespace: namespace,
       writeMode,
+      embedding,
+      idColumn,
       pluginManager,
       getFullConfig,
       helpers: skillHelpers
@@ -1899,7 +2139,8 @@ async function insertToVectorDatabase(sourceData, targetConnection, tableName, p
 }
 
 module.exports = {
-  executeOutput,
+  // Held for the whole node — see holdDatabases in ../duckdb.
+  executeOutput: (...args) => duckdb.holdDatabases(() => executeOutput(...args)),
   exportToLocalFile,
   insertToConnection,
   trySameConnectionCopy,

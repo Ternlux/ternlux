@@ -11,6 +11,7 @@ import {
   Alert,
 } from '@mui/material';
 import { Visibility, VisibilityOff, OpenInNew } from '@mui/icons-material';
+import SecretStorageWarning from '../SecretStorageWarning/SecretStorageWarning';
 import { saveProviderConfig, loadProviderMeta } from '../../utils/apiKeyStorage';
 import { OPENAI_COMPAT_PROVIDERS } from '../../utils/aiProviders';
 
@@ -182,6 +183,9 @@ const OthersProviderForm = ({ initialType = 'openrouter', onComplete }) => {
             ? 'Encrypted and stored on this device using your OS keychain. It never leaves your machine.'
             : 'Local servers usually need no key — leave blank unless yours requires one.'}
       </Typography>
+
+      <SecretStorageWarning />
+
       <TextField
         fullWidth
         value={apiKey}

@@ -27,22 +27,39 @@ export const categorizeConnection = (conn) => {
   return 'Other';
 };
 
-// The one local destination: the join result is written as a Parquet file the
-// node owns and read back through DuckDB. Tabular and document data alike —
-// there is no local SQLite destination any more.
+/**
+ * Can a join write its result to this saved connection? Mirrors
+ * isJoinDestinationConnection in public/chat/workflowBuilder.js — the builder
+ * refuses anything this lets through, so the two must agree.
+ *
+ * A database (SQL or Mongo) or a vector store. Cloud storage and API
+ * connections have no table to create, and a local FILE connection is not
+ * written to (a DuckDB-type file routes to the workflow's own database, which
+ * is what the "Local file" option already means). Local LanceDB is a vector
+ * store, so it stays.
+ */
+export const isJoinDestination = (conn) => {
+  if (!conn) return false;
+  if (conn.dbCategory === 'CloudStorage' || conn.dbCategory === 'API' || conn.dbType === 'rest-api') return false;
+  if (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType)) return true;
+  return conn.connectionType === 'database';
+};
+
+// The one local option in the picker: the join result becomes a table in the
+// workflow's own DuckDB database. Tabular and document data alike.
 export const LOCAL_FILE_DESTINATION = {
   id: 'local-duckdb',
   label: 'Local file',
   value: 'local-duckdb',
-  description: 'Store the result as a local Parquet file (read with DuckDB)',
+  description: 'Store the result as a table in this workflow\'s DuckDB database',
   connection: { dbType: 'duckdb', connectionType: 'file' },
   group: 'Local Files',
   groupColor: DESTINATION_GROUP_COLOR['Local Files'],
 };
 
 /**
- * Every saved connection (deduplicated, categorized) plus the local Parquet
- * file option. Returns plain data; attach icons in the caller.
+ * Every saved connection a join can write to (deduplicated, categorized) plus
+ * the local option. Returns plain data; attach icons in the caller.
  */
 export const loadJoinDestinations = async () => {
   let allConnections = [];
@@ -57,6 +74,7 @@ export const loadJoinDestinations = async () => {
   allConnections.forEach((conn) => {
     if (!conn || seen.has(conn.id)) return;
     seen.add(conn.id);
+    if (!isJoinDestination(conn)) return;
     const group = categorizeConnection(conn);
     destinations.push({
       id: conn.id,

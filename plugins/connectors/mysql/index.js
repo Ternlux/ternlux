@@ -33,6 +33,22 @@ function getPool(config, connectionId) {
       connectTimeout: 10000,
     });
 
+    // Talk to the server in the DATABASE's collation, not the driver's.
+    //
+    // mysql2 opens every connection as utf8mb4_unicode_ci. A string the session
+    // makes — a literal, CAST(x AS CHAR), CONCAT — takes the connection's
+    // collation, while columns keep their table's (utf8mb4_0900_ai_ci on a
+    // MySQL 8 default database). Comparing the two failed with "Illegal mix of
+    // collations … for operation '='", which is how a cross-engine join on a
+    // cast key died. Asking the server for its own default rather than naming
+    // one keeps this right on MariaDB and on databases with other collations.
+    // Statements on one connection run in order, so this lands before any query.
+    pool.on('connection', (conn) => {
+      conn.query('SET collation_connection = @@collation_database', (err) => {
+        if (err) console.log('[mysql] Could not match the database collation:', err.message);
+      });
+    });
+
     connectionPools.set(key, pool);
   }
 
@@ -71,11 +87,30 @@ module.exports = {
   name: 'MySQL',
   icon: './icon.svg',
   dbCategory: 'SQL',
+  // See postgres: how a join may merge into this database (write mode "merge").
+  mergeSupport: {
+    statements: ['INSERT … ON DUPLICATE KEY UPDATE'],
+    guidance: 'MySQL has no MERGE. Use INSERT INTO {{TARGET}} (<cols>) SELECT … ON DUPLICATE KEY UPDATE '
+      + '<col> = VALUES(<col>), … . It only matches rows through a PRIMARY KEY or UNIQUE index on the key, so '
+      + 'targetDdl MUST declare PRIMARY KEY (<key>) (a VARCHAR key needs a length, e.g. VARCHAR(255)). '
+      + 'Against an existing table without that key it silently inserts duplicates instead of updating.',
+  },
 
   /**
    * Column types for a CREATE TABLE this app generates. See the note on
    * `types` in plugins/connectors/snowflake/index.js.
    */
+  /**
+   * Why this engine cannot create a column with this name, or null. Checked
+   * before an Output creates a table, so a name the engine would refuse (or
+   * silently shorten) fails with the column named and the fix, not with
+   * whatever the CREATE happens to say.
+   */
+  columnNameProblem: (name) => {
+    const n = [...String(name)].length;
+    return n > 64 ? `is ${n} characters long; MySQL allows at most 64` : null;
+  },
+
   types: {
     NULL: () => 'TEXT',
     DATE_ONLY: () => 'DATE',
@@ -86,7 +121,47 @@ module.exports = {
     INTEGER: () => 'INT',
     FLOAT: () => 'DOUBLE',
     OBJECT: () => 'TEXT',
-    STRING: (maxLen) => (maxLen > 255 ? 'TEXT' : `VARCHAR(${varcharFor(maxLen)})`),
+    // LONGTEXT for a column with no length at its source: TEXT stops at 64KB.
+    STRING: (maxLen) => {
+      if (maxLen === Infinity) return 'LONGTEXT';
+      return maxLen > 255 ? 'TEXT' : `VARCHAR(${varcharFor(maxLen)})`;
+    },
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js. No TIMESTAMPTZ: an instant lands in
+    // DATETIME, converted to UTC (MySQL has no type that keeps an offset).
+    BIGINT: () => 'BIGINT',
+    DECIMAL: (p, s) => (p && p <= 65 && (s || 0) <= 30 ? `DECIMAL(${p},${s || 0})` : null),
+    TIME: () => 'TIME',
+  },
+
+  /**
+   * This engine's type for a column (a getColumns entry) as a canonical type —
+   * what an Output writing a copy of this table elsewhere builds its column
+   * from. See public/NodeExecution/columnTypes.js for the kinds. null leaves
+   * the column to be guessed from its values.
+   */
+  toCanonicalType: (column) => {
+    // COLUMN_TYPE: "int", "bigint unsigned", "decimal(10,2)", "varchar(40)"…
+    const t = String(column?.type || '').toLowerCase().trim();
+    const size = t.match(/\((\d+)(?:,(\d+))?\)/);
+    const unsigned = /\bunsigned\b/.test(t);
+    const base = t.split(/[\s(]/)[0];
+    // tinyint(1) is how MySQL spells a boolean, but its values arrive as 0/1;
+    // kept an integer so a copy holds exactly what was read.
+    if (['tinyint', 'smallint', 'mediumint', 'year'].includes(base)) return { kind: 'INTEGER' };
+    if (base === 'int' || base === 'integer') return { kind: unsigned ? 'BIGINT' : 'INTEGER' };
+    if (base === 'bigint') return unsigned ? { kind: 'DECIMAL', precision: 20, scale: 0 } : { kind: 'BIGINT' };
+    if (base === 'float' || base === 'double' || base === 'real') return { kind: 'DOUBLE' };
+    if (base === 'decimal' || base === 'numeric') {
+      return { kind: 'DECIMAL', precision: size ? Number(size[1]) : 10, scale: size && size[2] ? Number(size[2]) : 0 };
+    }
+    if (base === 'date') return { kind: 'DATE_ONLY' };
+    if (base === 'datetime' || base === 'timestamp') return { kind: 'TIMESTAMP' };
+    if (base === 'time') return { kind: 'TIME' };
+    if (base === 'json') return { kind: 'OBJECT' };
+    if (base === 'varchar' || base === 'char') return { kind: 'STRING', length: size ? Number(size[1]) : null };
+    // text types, enum, set, blobs, bit…
+    return { kind: 'STRING', length: null };
   },
 
   /**
@@ -126,6 +201,8 @@ module.exports = {
 
       return {
         success: true,
+        // The connection's one database, listed even while it holds no tables.
+        schemas: config.database ? [config.database] : [],
         tables: rows
       };
     } catch (error) {
@@ -155,6 +232,12 @@ module.exports = {
       if (!schema && parts.length === 2) {
         [schema, table] = parts;
       }
+      // No schema at all means the connection's own database — MySQL's
+      // "schema" IS the database. Without this the lookup asked for
+      // TABLE_SCHEMA = NULL and found nothing, so every caller that checks
+      // whether a table exists (a join in append / merge mode, the output
+      // node's same-connection copy) was told it did not.
+      schema = schema || config.database || null;
       const pool = getPool(config, connectionId);
       const [rows] = await pool.execute(`
         SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type,
@@ -199,11 +282,17 @@ module.exports = {
       try {
         const pool = getPool(config, connectionId);
         const [rows, fields] = await pool.execute(sqlQuery);
+        // A statement that returns no result set (INSERT, UPDATE, DDL) hands
+        // back a ResultSetHeader, not an array — its count is `affectedRows`.
+        // Reading `.length` off it gave undefined, which callers reported as
+        // "0 rows inserted" for a load that wrote every row.
+        const isResultSet = Array.isArray(rows);
         return {
           success: true,
           rows,
           columns: fields ? fields.map(f => f.name) : [],
-          rowCount: rows.length
+          rowCount: isResultSet ? rows.length : (rows?.affectedRows ?? 0),
+          ...(isResultSet ? {} : { affectedRows: rows?.affectedRows ?? 0 }),
         };
       } catch (error) {
         return queryError(error);
@@ -229,7 +318,11 @@ module.exports = {
       };
 
       try {
-        const q = connection.connection.query(sqlQuery);
+        // rowsAsArrays: see the PostgreSQL connector — keeps same-named
+        // result columns apart for the Data Explorer.
+        const q = connection.connection.query(options.rowsAsArrays
+          ? { sql: sqlQuery, rowsAsArray: true }
+          : sqlQuery);
         q.on('fields', (fields) => { columns = (fields || []).map(f => f.name); });
 
         const stream = q.stream();
@@ -246,6 +339,7 @@ module.exports = {
           columns: columns.length ? columns : Object.keys(rows[0] || {}),
           rowCount: Math.min(rows.length, maxRows),
           truncated: rows.length > maxRows,
+          ...(options.rowsAsArrays ? { rowsAreArrays: true } : {}),
         });
         stream.on('end', done);
         stream.on('close', done);
@@ -382,7 +476,9 @@ module.exports = {
           // the Linux default) is a different table from the folded one.
           const valuePlaceholders = slice.map(() => `(${columns.map(() => '?').join(', ')})`);
           const insertSql = `INSERT INTO ${module.exports.quoteIdentifier(tableName, null, config)} `
-            + `(${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+            // Columns quoted one by one — bare, a column called `order` or
+            // `first name` was a syntax error, and a capital was folded away.
+            + `(${columns.map((c) => module.exports.quoteColumn(c)).join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
 
           // Flatten all values into a single array
           const allValues = slice.flatMap(row =>
@@ -413,6 +509,34 @@ module.exports = {
       }
     } catch (error) {
       return queryError(error);
+    }
+  },
+
+  /**
+   * Run several statements as ONE transaction on one connection: all of them
+   * land, or none do. See the PostgreSQL connector's note — the same contract.
+   *
+   * Callers must not put DDL in here: MySQL commits implicitly before and after
+   * any DDL (TRUNCATE included), which would end the transaction early. A
+   * DELETE + INSERT … SELECT is plain DML and stays atomic on InnoDB.
+   */
+  runInTransaction: async (config, connectionId, statements) => {
+    let connection;
+    try {
+      connection = await getPool(config, connectionId).getConnection();
+    } catch (error) {
+      return queryError(error);
+    }
+    try {
+      await connection.beginTransaction();
+      for (const sql of statements) await connection.query(sql);
+      await connection.commit();
+      return { success: true };
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      return queryError(error);
+    } finally {
+      connection.release();
     }
   },
 
@@ -681,6 +805,18 @@ module.exports = {
    * @param {object} config - Database configuration containing database name
    * @returns {string} Properly quoted identifier
    */
+  /**
+   * Quote ONE column name, whatever characters it holds.
+   *
+   * quoteIdentifier is for TABLE references and reads a dot as a qualifier
+   * ("public.orders" → schema public, table orders). A column is never
+   * qualified, so a name like "e.mail" has to stay one identifier — handing it
+   * to quoteIdentifier produced "e"."mail" and every CREATE / INSERT that
+   * carried it failed. Spaces, reserved words, unicode and emoji are covered by
+   * the quoting itself.
+   */
+  quoteColumn: (name) => `\`${String(name).replace(/`/g, '``')}\``,
+
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
     // Already quoted — hand it back untouched. Callers pass identifiers that
@@ -745,6 +881,9 @@ module.exports = {
    * distinctly MySQL belongs here.
    */
   explorer: {
+    // runQuery returns array rows on request ({ rowsAsArrays }), so the explorer
+    // can keep same-named result columns apart.
+    rowsAsArrays: true,
     language: 'sql',
     sqlDialect: 'MySQL',
     formatter: 'mysql',

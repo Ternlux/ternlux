@@ -57,6 +57,12 @@ const FORMAT_OPTIONS = [
  */
 const TABLE_FORMATS = new Set(['sqlite', 'duckdb', 'lancedb']);
 
+// What an Output can embed with — the dimension is what a Pinecone index must match.
+const EMBEDDING_MODEL_OPTIONS = [
+  { label: 'text-embedding-3-small (1536 dimensions)', value: 'text-embedding-3-small' },
+  { label: 'text-embedding-3-large (3072 dimensions)', value: 'text-embedding-3-large' },
+];
+
 /** Where the file extension differs from the format's name. Only Excel does. */
 const EXTENSION_BY_FORMAT = { excel: 'xlsx' };
 
@@ -195,6 +201,12 @@ const OutputNodeChat = ({
     savePath: saved?.savePath || null,
     connectionId: saved?.connectionId || null,
     tableName: saved?.tableName || null,
+    // Cloud only: the object the upload writes, as the user sees it — the path
+    // inside the container ("e2e/stores.csv") and its file name. `tableName`
+    // keeps the full `<container>/<path>` the connector needs, but its container
+    // half is often an id ("root", a drive GUID), which is no name for a card.
+    objectPath: saved?.objectPath || null,
+    objectName: saved?.objectName || null,
     // Excel only. An output node has exactly one input, so it writes exactly
     // one sheet — pointing several nodes at the same workbook with different
     // sheet names is how a multi-sheet file gets built.
@@ -205,6 +217,15 @@ const OutputNodeChat = ({
     // whatever this says — so the control below is shown for those only.
     // Defaults to append, which is what every output node did before.
     writeMode: saved?.writeMode || 'append',
+    // Vector destinations only (a LanceDB file, a Pinecone / LanceDB
+    // connection): the column embedded on the way out when the input is plain
+    // rows. Empty means the input already carries vectors.
+    embedColumn: saved?.embedColumn || null,
+    embeddingModel: saved?.embeddingModel || 'text-embedding-3-small',
+    // Vector destination in Append mode only, optional: the column that is the
+    // row's primary key. Records are upserted under it, so a re-run replaces
+    // them. Empty: ids are a hash of the whole row.
+    idColumn: saved?.idColumn || null,
   });
 
   const [dirty, setDirty] = useState(false);
@@ -346,7 +367,10 @@ const OutputNodeChat = ({
 
     const enriched = allConnections.map((conn) => {
       const plugin = pluginsMap.get(conn.dbType);
-      return { ...conn, dbCategory: plugin?.dbCategory || null, storageType: plugin?.storageType || null };
+      // LanceDB is built in, not a connector plugin, so its connections keep the
+      // category they were saved with — overwriting it with the (missing)
+      // plugin's dropped every LanceDB connection from the destinations.
+      return { ...conn, dbCategory: plugin?.dbCategory || conn.dbCategory || null, storageType: plugin?.storageType || null };
     });
 
     // Only databases, vector stores and cloud storage can receive output. A
@@ -449,8 +473,27 @@ const OutputNodeChat = ({
   // is a real question. A table, a collection, a vector index and a Sheets tab
   // all qualify. An object in cloud storage and a local file do not: the write
   // replaces the whole file, which is the same thing every run.
-  const keepsRowsBetweenRuns = outputSettings.outputType === 'connection'
-    && (destKind === 'database' || destKind === 'vector' || dbType === 'google-sheets');
+  // Where the rows become vectors: a LanceDB file, or a vector connection.
+  const writesVectors = (outputSettings.outputType === 'local' && outputSettings.format === 'lancedb')
+    || (outputSettings.outputType === 'connection' && destKind === 'vector');
+  const embedColumnOptions = useMemo(() => [
+    { label: 'None — the data already has vectors', value: '' },
+    ...((sourceTableSchema?.columns || [])
+      .map((c) => (typeof c === 'string' ? c : c?.name))
+      .filter(Boolean)
+      .map((name) => ({ label: name, value: name }))),
+  ], [sourceTableSchema]);
+
+  const idColumnOptions = useMemo(() => [
+    { label: 'None — use a hash of the whole row', value: '' },
+    ...embedColumnOptions.slice(1),
+  ], [embedColumnOptions]);
+
+  // A LanceDB file is the exception among local files: it is a vector
+  // database, written exactly like a LanceDB connection.
+  const keepsRowsBetweenRuns = (outputSettings.outputType === 'connection'
+    && (destKind === 'database' || destKind === 'vector' || dbType === 'google-sheets'))
+    || (outputSettings.outputType === 'local' && outputSettings.format === 'lancedb');
 
   // ── Validation ───────────────────────────────────────────────────────────
 
@@ -541,12 +584,12 @@ const OutputNodeChat = ({
 
   const changeOutputType = (value) => {
     // Switching sides drops whatever the other side had picked.
-    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null, sheetName: null, writeMode: 'append' });
+    patch({ outputType: value, format: null, savePath: null, connectionId: null, tableName: null, objectPath: null, objectName: null, sheetName: null, writeMode: 'append', embedColumn: null, idColumn: null });
     setAttempted(false);
   };
 
   const changeDestination = (conn) => {
-    patch({ connectionId: conn.id, tableName: null });
+    patch({ connectionId: conn.id, tableName: null, objectPath: null, objectName: null });
     setAttempted(false);
   };
 
@@ -569,7 +612,12 @@ const OutputNodeChat = ({
 
   const handleCloudStoragePathSelect = (pathInfo) => {
     setCloudStorageBrowserOpen(false);
-    patch({ tableName: pathInfo.fullPath });
+    const objectPath = pathInfo.objectPath || null;
+    patch({
+      tableName: pathInfo.fullPath,
+      objectPath,
+      objectName: objectPath ? objectPath.split('/').filter(Boolean).pop() || null : null,
+    });
   };
 
   const buildConfig = (finalSettings) => {
@@ -731,7 +779,7 @@ const OutputNodeChat = ({
                   label="Table name"
                   required
                   invalid={invalid('tableName')}
-                  hint={<>The table this output writes, replaced on every run. An existing database file keeps its other tables, so a second output node pointed at the same file adds another table rather than replacing it. Letters, digits and underscores.</>}
+                  hint={<>The table this output writes{outputSettings.format === 'lancedb' ? ' (see Write mode below)' : ', replaced on every run'}. An existing database file keeps its other tables, so a second output node pointed at the same file adds another table rather than replacing it. Letters, digits and underscores.</>}
                 >
                   <TextInput
                     value={outputSettings.tableName ?? ''}
@@ -845,6 +893,41 @@ const OutputNodeChat = ({
           </Card>
         )}
 
+        {writesVectors && (
+          <Card label="Embedding">
+            <Fields>
+              <Field
+                label="Column to embed"
+                hint={outputSettings.embedColumn
+                  ? (outputSettings.writeMode === 'append'
+                    ? (outputSettings.idColumn
+                      ? 'Each row is embedded from this column. On a re-run, unchanged rows are skipped, rows whose other columns changed are updated without re-embedding, and only new or edited text is embedded.'
+                      : 'Each row is embedded from this column. On a re-run, unchanged rows are skipped; a changed row is a new record and is embedded. Pick an ID column below to update changed rows in place instead.')
+                    : 'Each row is embedded from this column. The destination is emptied and reloaded each run, so every row is embedded every run.')
+                  : 'Pick a column when the input is plain rows. Leave it on None when the input already carries vectors (an embedding step or another vector store) — they are copied as they are.'}
+              >
+                <SelectInput
+                  value={outputSettings.embedColumn ?? ''}
+                  options={embedColumnOptions}
+                  onChange={(v) => patch({ embedColumn: v || null })}
+                />
+              </Field>
+              {outputSettings.embedColumn && (
+                <Field
+                  label="Embedding model"
+                  hint="OpenAI, using the key in Settings → AI Provider. A Pinecone index must have the same dimension as the model."
+                >
+                  <SelectInput
+                    value={outputSettings.embeddingModel || 'text-embedding-3-small'}
+                    options={EMBEDDING_MODEL_OPTIONS}
+                    onChange={(v) => patch({ embeddingModel: v })}
+                  />
+                </Field>
+              )}
+            </Fields>
+          </Card>
+        )}
+
         {keepsRowsBetweenRuns && (
           <Card label="Write mode">
             <Fields>
@@ -853,10 +936,12 @@ const OutputNodeChat = ({
                 hint={outputSettings.writeMode === 'truncate'
                   ? (dbType === 'google-sheets'
                     ? 'The tab is cleared before the rows are written, so it holds only this run.'
-                    : destKind === 'vector'
-                      ? 'The index (or namespace) is emptied first, so stale vectors cannot survive a re-run.'
+                    : writesVectors
+                      ? 'The table (or namespace) is emptied first, so stale vectors cannot survive a re-run.'
                       : 'The table is emptied first — TRUNCATE where the engine supports it, DELETE otherwise. The table itself is kept.')
-                  : 'Rows are added to whatever is already there. Re-running adds another copy.'}
+                  : writesVectors
+                    ? 'Records are upserted: a re-run replaces the records it wrote before (matched by the ID column below, or by a hash of the whole row) and adds new ones.'
+                    : 'Rows are added to whatever is already there. Re-running adds another copy.'}
               >
                 <Segmented
                   value={outputSettings.writeMode}
@@ -867,6 +952,20 @@ const OutputNodeChat = ({
                   onChange={(v) => patch({ writeMode: v })}
                 />
               </Field>
+              {writesVectors && outputSettings.writeMode === 'append' && (
+                <Field
+                  label="ID column (optional)"
+                  hint={outputSettings.idColumn
+                    ? `Records are upserted by ${outputSettings.idColumn}: a re-run replaces the record with the same value and adds new ones.`
+                    : 'The column that identifies a row (its primary key). Without one, ids are a hash of the whole row, so a row whose values change is stored as a new record and the old one stays until a Truncate & insert.'}
+                >
+                  <SelectInput
+                    value={outputSettings.idColumn ?? ''}
+                    options={idColumnOptions}
+                    onChange={(v) => patch({ idColumn: v || null })}
+                  />
+                </Field>
+              )}
             </Fields>
           </Card>
         )}
@@ -876,12 +975,16 @@ const OutputNodeChat = ({
             <Handoff
               color={FORM_ACCENT.source}
               icon={<IconFolder color={FORM_ACCENT.source} size={14} />}
-              title="Choose where to upload"
+              title={dbType === 'google-sheets' ? 'Choose the tab to write' : 'Choose where to upload'}
             >
               <HandoffBody>
-                Browse the bucket and pick the container and object path the results are written to.
-                Save stays disabled until a path is chosen. The object is replaced on every run —
-                a file has no append.
+                {dbType === 'google-sheets'
+                  ? <>Open the spreadsheet and pick the tab the rows are written to. Save stays
+                    disabled until a tab is chosen. Write mode above decides what happens to the
+                    rows already in it.</>
+                  : <>Browse the bucket and pick the container and object path the results are
+                    written to. Save stays disabled until a path is chosen. The file is replaced
+                    on every run.</>}
               </HandoffBody>
               {outputSettings.tableName ? (
                 <Picked>Uploading to <code>{outputSettings.tableName}</code></Picked>

@@ -259,7 +259,7 @@ const GoogleSheetsPicker = ({ connection, mode = 'import', onFileSelect, onClose
                 <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
                   {selectedTab.trim() && !existingTab
                     ? `"${selectedTab.trim()}" does not exist yet and will be created.`
-                    : 'Rows are appended when the tab already has a header row.'}
+                    : 'An existing tab — the output\'s Write mode decides whether its rows are kept or cleared first.'}
                 </Text>
               </div>
             )}

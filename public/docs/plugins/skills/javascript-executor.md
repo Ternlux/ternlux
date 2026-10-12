@@ -1,57 +1,58 @@
 # JavaScript Executor skill
 
-A skill (transformer + join) that runs AI-authored JavaScript inside
-the background engine. Used when a transformation or join needs custom
-logic that doesn't map cleanly to vanilla SQL or NoSQL.
+A **transformer** skill that runs AI-authored JavaScript inside the
+background engine. Used when a transformation needs logic that doesn't
+map cleanly to SQL or document operations.
 
-## When the AI picks this skill
+It is not offered for joins — a join that needs per-row JavaScript gets
+it from the join template itself, which emits a join function for a
+document or vector destination.
 
-The assistant offers this skill when:
+## When the analysis picks this skill
 
-- The transformation or join needs branching, conditional rewrites,
-  or multi-step orchestration.
-- The operation needs to call out to your saved connections, the AI,
-  or external HTTP endpoints during execution.
-- The logic would require generating multiple SQL statements or
-  multiple document operations that are easier to express as a single
-  function.
+- The work needs to cross-reference another saved connection mid-flight.
+- It needs to call an AI model per record (classify, extract, summarise).
+- It needs to hit an external HTTP API.
+- It needs branching or multi-step orchestration that would otherwise be
+  a forest of CASE expressions and CTEs.
+- It needs a vector search from one fixed probe — "the five most similar
+  to *clothes*" — where there are no left-hand rows to match and so no
+  join.
 
-## What the script can use
+For plain data movement and reshaping the analysis prefers SQL or
+document operations: they're cheaper to run and easier to read. This
+skill also orchestrates its own AI calls rather than handing a prompt
+back to the builder, so its planning and its code generation both happen
+inside it.
 
-The script runs in the background engine with a small, predictable
-set of helpers — the same surface every AI-generated function in
-Ternlux sees. From inside the script you can:
+## The shape of the code
 
-- Look up your saved connections by name or id.
-- Read from any saved connection or any local file with a single
-  unified call (SQL, document, or vector — the call shape is the
-  same).
-- List tables, collections, indexes, and their columns.
-- Call the AI for a sub-task with one line.
-- Embed text into vectors using your configured embedding provider.
-- Make arbitrary HTTP requests.
-- Log to the run output for debugging.
+A single async function over the source's records, plus a context object
+carrying the shared helper surface — connection lookup, unified read,
+table and column listing, AI calls, embedding, HTTP, logging. See
+[Skill capabilities at run time](../../ai-providers/helpers-bundle.md).
 
-See the [Skill capabilities at run time](../../ai-providers/helpers-bundle.md)
-page for the full description of this surface.
+## Where the result goes
 
-## Why use it instead of writing SQL
-
-Three things make this skill the right pick over generated SQL:
-
-- **Cross-system operations.** A single script can pull from a
-  PostgreSQL table, look something up in MongoDB, embed it via
-  OpenAI, and write the result to LanceDB — all in one pass, with no
-  intermediate workflows.
-- **Conditional logic.** Branching that would need a CASE-and-CTE
-  forest in SQL is just an `if` in JavaScript.
-- **External calls.** When the transformation needs to hit a third
-  party API per row, JavaScript with the shared HTTP client is the
-  natural shape.
+**Local only.** The output is a table in the workflow's own DuckDB
+database — or a LanceDB table when the records it produces carry a
+vector field, which the skill decides from the data rather than from the
+request. It cannot write back to a SQL or document server, so a request
+needing per-row JavaScript *and* a result living in Mongo or SQL is two
+steps: this node, then an Output node.
 
 ## What it cannot do
 
-The script is sandboxed to the helpers above. It does not get raw
-file-system, operating-system, or network access beyond what the
-helpers expose. Credentials are still resolved by the background
-engine — the script never sees a decrypted password or token directly.
+The script is confined to the helpers above. It does not get raw
+file-system, operating-system, or network access beyond what they expose,
+and it never sees a decrypted password or token — credentials are
+resolved inside the engine.
+
+## The same skill in the chat
+
+When you ask the assistant a question that needs computation rather than
+a query — per-row AI calls, an authenticated API call, orchestrating
+several sources — it uses this skill to *generate* a one-off function and
+then stops. You read the source, approve it, and only then does it run,
+with read-only data access. Nothing is saved either way; the rows come
+back as an answer.

@@ -736,6 +736,15 @@ module.exports = {
   id: 'duckdb',
   name: 'DuckDB',
   dbCategory: 'SQL',
+  // See postgres: how a join may merge into this database (write mode
+  // "merge"). Also what a LOCAL join destination (the workflow's DuckDB) gets.
+  mergeSupport: {
+    statements: ['MERGE', 'INSERT … ON CONFLICT … DO UPDATE'],
+    guidance: 'Prefer MERGE INTO {{TARGET}} AS t USING (<the joined SELECT>) AS s ON t.<key> = s.<key> '
+      + 'WHEN MATCHED THEN UPDATE SET <col> = s.<col>, … WHEN NOT MATCHED THEN INSERT (<cols>) VALUES (s.<cols>). '
+      + 'INSERT INTO {{TARGET}} … ON CONFLICT (<key>) DO UPDATE SET <col> = EXCLUDED.<col> needs a PRIMARY KEY or '
+      + 'UNIQUE on the key, declared in targetDdl.',
+  },
 
   /**
    * Column types for a CREATE TABLE this app generates. See the note on
@@ -755,6 +764,11 @@ module.exports = {
     OBJECT: () => 'VARCHAR',
     // VARCHAR is unbounded in DuckDB — a length would be accepted and ignored.
     STRING: () => 'VARCHAR',
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js.
+    DECIMAL: (p, s) => (p && p <= 38 ? `DECIMAL(${p},${s || 0})` : null),
+    TIMESTAMPTZ: () => 'TIMESTAMPTZ',
+    TIME: () => 'TIME',
   },
 
   testConnection: async (config) => {

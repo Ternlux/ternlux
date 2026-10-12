@@ -322,7 +322,7 @@ export const destinationOf = (type, config = {}, connections = null) => {
       : null;
     return {
       store: conn?.name || (out.connectionId ? 'Connection' : null),
-      table: out.tableName || null,
+      table: out.objectPath || out.tableName || null,
       dbType: conn?.dbType || null,
       isLocal: false,
     };
@@ -424,6 +424,104 @@ const EndpointFooter = ({ endpoint: dest, accent }) => {
 };
 
 /**
+ * How a node writes its result — one of three, the same words on the canvas
+ * card and in the Data Preview's Details tab:
+ *
+ *   'new_table'    New table        — replaced on every run (a join or
+ *                                     transformer in new-table mode, an output
+ *                                     in Truncate & insert, any file export)
+ *   'in_place'     Modify in place  — a transformer editing its source's rows
+ *   'append_merge' Append/Merge     — rows added to (or merged into) a table
+ *                                     that is kept between runs
+ *
+ * `detail` says which of append / merge, the merge key, and whether a kept
+ * target is waiting to be recreated. null for nodes that write nothing.
+ */
+/**
+ * The warning for a join whose pending drop-and-recreate target is ALSO one of
+ * its sources (joinSettings.targetRebuild.targetIsSource, set by the builder).
+ * Dropping it empties that source before the join reads it. One wording for
+ * every place the drop is approved. null when there is nothing to warn about.
+ */
+export const targetIsSourceWarning = (rebuild) => {
+  const clash = rebuild?.targetIsSource;
+  if (!clash) return null;
+  const [other, temp] = clash.suggestions || [];
+  return `${rebuild.table} is also this join's source "${clash.source}". Dropping it deletes that source's `
+    + 'rows before the join reads them — the join would run against an empty table, write nothing, and the data '
+    + `would be gone. Write the join to another table instead${other ? ` (e.g. ${other}` : ''}`
+    + `${temp ? `, or a temporary ${temp}` : ''}${other ? ')' : ''}, and replace ${rebuild.table} from it afterwards if you need to.`;
+};
+
+export const WRITE_MODE_LABEL = {
+  new_table: 'New table',
+  in_place: 'Modify in place',
+  append_merge: 'Append/Merge',
+};
+
+export const writeModeOf = (type, config = {}) => {
+  const c = config || {};
+  if (type === 'transformer') {
+    const mode = c.transformationSettings?.operationMode;
+    if (!mode && !c.targetTableName && !c.targetCollection) return null;
+    const value = mode === 'in_place' ? 'in_place' : 'new_table';
+    return { value, label: WRITE_MODE_LABEL[value], detail: null };
+  }
+  if (type === 'join') {
+    const js = c.joinSettings || {};
+    if (!js.operationMode && !c.targetTableName && !c.targetCollection) return null;
+    if (js.operationMode === 'append' || js.operationMode === 'merge') {
+      const parts = [js.operationMode === 'merge'
+        ? `merge${Array.isArray(js.mergeKeys) && js.mergeKeys.length ? ` on ${js.mergeKeys.join(', ')}` : ''}`
+        : 'append'];
+      if (js.targetRebuild?.pending) parts.push(`${js.targetRebuild.table || 'target'} will be recreated on the next run`);
+      return { value: 'append_merge', label: WRITE_MODE_LABEL.append_merge, detail: parts.join(' · ') };
+    }
+    return { value: 'new_table', label: WRITE_MODE_LABEL.new_table, detail: null };
+  }
+  if (type === 'output') {
+    const os = c.outputSettings || {};
+    if (!os.outputType) return null;
+    // A file is rewritten whole every run, whatever the setting — except a
+    // LanceDB file, which appends (upserts) like a vector connection.
+    const isFile = os.outputType === 'local' && os.format !== 'lancedb';
+    const value = !isFile && os.writeMode !== 'truncate' ? 'append_merge' : 'new_table';
+    const detail = isFile ? 'file rewritten each run'
+      : (os.writeMode === 'truncate' ? 'truncate & insert' : 'append');
+    return { value, label: WRITE_MODE_LABEL[value], detail };
+  }
+  return null;
+};
+
+/** The write-mode line on a transformer, join or output card. */
+export const WriteModeRow = ({ type, config, accent }) => {
+  const mode = writeModeOf(type, config);
+  if (!mode) return null;
+  const pending = type === 'join' && !!config?.joinSettings?.targetRebuild?.pending;
+  return (
+    <div
+      title={mode.detail ? `${mode.label} — ${mode.detail}` : mode.label}
+      style={{
+        padding: '4px 10px',
+        borderTop: '1px solid #f0f2f5',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        fontSize: 10,
+        fontFamily: MONO,
+        color: MUTED,
+      }}
+    >
+      <span style={{ letterSpacing: '0.08em', textTransform: 'uppercase', color: DIM }}>Write</span>
+      <span style={{ color: accent || MUTED, fontWeight: 600 }}>{mode.label}</span>
+      {pending && (
+        <span style={{ marginLeft: 'auto', color: '#b45309' }}>recreate pending</span>
+      )}
+    </div>
+  );
+};
+
+/**
  * The strip along the bottom of a card naming where the result lands.
  *
  * Renders nothing at all when the node has no destination yet — an unconfigured
@@ -443,6 +541,44 @@ export const SourceFooter = ({ config, accent }) => {
   return <EndpointFooter endpoint={src} accent={accent} />;
 };
 
+/**
+ * What a REST source calls, for its card. The builder records the endpoint the
+ * fetch function calls (`GET {{BASE_URL}}latest`); `{{BASE_URL}}` is shown as
+ * the connection's base URL and the query string is dropped, since that is
+ * where keys and long parameter lists live. A node built before the endpoint
+ * was recorded falls back to the connection's HOST — its full base URL names
+ * one endpoint (e.g. …/todos/1) that the node may not call at all.
+ */
+const apiEndpointLabel = (endpoint, baseUrl) => {
+  if (nonEmpty(endpoint)) {
+    const shown = endpoint
+      .replace(/\{\{BASE_URL\}\}/g, nonEmpty(baseUrl) ? baseUrl : '')
+      .replace(/\?.*$/, '')
+      // "Fetches GET …" says GET twice; other methods are worth showing.
+      .replace(/^\s*GET\s+/i, '')
+      .trim();
+    // Only a real URL is shown. Anything else — a description the model wrote
+    // in place of one — would put a URL on the card that the node never calls,
+    // so it falls through to the host below.
+    const [method, url] = /\s/.test(shown) ? shown.split(/\s+/, 2) : [null, shown];
+    const candidate = method && /^[A-Z]+$/.test(method) && !/\s/.test(shown.slice(method.length + 1))
+      ? `${method} ${url}`
+      : (method ? null : url);
+    if (candidate) {
+      try {
+        // eslint-disable-next-line no-new
+        new URL(candidate.replace(/^[A-Z]+\s+/, ''));
+        return candidate;
+      } catch (_) { /* not a URL — use the host */ }
+    }
+  }
+  try {
+    return new URL(baseUrl).host || 'the API';
+  } catch (_) {
+    return 'the API';
+  }
+};
+
 const describeDataSource = (config) => {
   // A REST API source has no table to name — the endpoint identifies it, and
   // the collection it caches into is where downstream nodes read from.
@@ -450,7 +586,7 @@ const describeDataSource = (config) => {
   if (api || config.sourceConnectionType === 'api') {
     if (!nonEmpty(config.apiFetchCode)) return 'REST API — describe the request in the chat';
     const into = nonEmpty(config.sourceCollection) ? ` into ${config.sourceCollection}` : '';
-    return `Fetches ${nonEmpty(api?.baseUrl) ? api.baseUrl : 'the API'}${into}`;
+    return `Fetches ${apiEndpointLabel(config.apiEndpoint, api?.baseUrl)}${into}`;
   }
   const dataset = sourceDatasetOf(config);
   return dataset ? `Reads ${dataset}` : '';
@@ -557,6 +693,9 @@ const derivedNameOf = (type, config = {}) => {
   if (type === 'join') return targetDatasetOf(config);
   if (type === 'output') {
     const os = config.outputSettings || config;
+    // A cloud upload is named by the file it writes, not `<container>/<path>` —
+    // the container is often an id ("root", a drive GUID).
+    if (nonEmpty(os.objectName)) return os.objectName;
     if (nonEmpty(os.tableName)) return os.tableName;
     // A file output is named by its file, not the whole path.
     if (nonEmpty(os.savePath)) return String(os.savePath).split(/[\\/]/).pop();

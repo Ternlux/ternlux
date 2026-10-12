@@ -88,8 +88,10 @@ const ChatPrompts = {
 // fetch function — the SAME executor the workflow runtime uses
 // (workflowExecutionHelpers' API source path). Requiring the singleton here
 // reuses the instance electron.js already wired up via apiFetch.initialize().
-const { handleExecuteApiFetch } = require('../NodeExecution/ApiFetch');
+const { handleExecuteApiFetch, describeApiTable } = require('../NodeExecution/ApiFetch');
 const { qualifierFor } = require('../lib/tableRef');
+const targetShape = require('../lib/targetShape');
+const { parseNoSQLOperation, sourceCollectionOf } = require('../joins/joinExecutionHelpers');
 
 // A local node's output is a table in its workflow's database. Compute the path
 // here so the builder can record targetLocalPath even when the source is a
@@ -420,6 +422,24 @@ class ClarificationNeeded extends Error {
   }
 }
 
+/**
+ * A plan build paused for the user to APPROVE generated code before it runs —
+ * today, a REST API fetch whose columns the following steps are built from.
+ *
+ * It is a ClarificationNeeded so it pauses and resumes through exactly the same
+ * path (steps already built are kept, the workflow id carries over); the
+ * renderer tells the two apart by `isApprovalNeeded` and shows a Run / Don't run
+ * card instead of waiting for a typed answer. `context.approval` carries what
+ * the card shows and what the resume needs.
+ */
+class ApprovalNeeded extends ClarificationNeeded {
+  constructor(question, context = {}) {
+    super(question, context);
+    this.name = 'ApprovalNeeded';
+    this.isApprovalNeeded = true;
+  }
+}
+
 // Answers to a builder's follow-up questions come straight from the node's chat
 // transcript — there is no separate clarifications array. When a builder asks a
 // question it's committed as a bot message; the user's reply is the next user
@@ -495,8 +515,82 @@ function chatToHistory(chat) {
       // reached this builder (see noteNodeContext) — labelled so the model reads
       // it as established background, not as something it said to the user.
       else if (meta && meta.context) text = `Context from the chat: ${String(m.text).trim()}`;
+      // A build's summary message. Its text is the short line the user reads;
+      // what the build actually PRODUCED — the SQL, DDL, function, target table,
+      // settings — lives in `metadata`, where the chat panel renders it. Handed
+      // to the model as text too, so a refinement ("also drop the nulls",
+      // "rename total") starts from the exact code it is refining instead of
+      // regenerating from a one-line description and drifting — a new table
+      // name, a different join key, a rewritten SQL.
+      else if (meta) {
+        const output = formatBuildOutput(meta);
+        if (output) text = `${String(m.text).trim()}\n\n${output}`;
+      }
       return { sender: m.sender === 'user' ? 'user' : 'assistant', text };
     });
+}
+
+// Fields of a build message's metadata that are code, shown verbatim under a
+// label rather than JSON-escaped onto one line.
+const BUILD_OUTPUT_CODE_FIELDS = [
+  ['targetTableName', 'Target table'],
+  ['targetConnection', 'Target connection'],
+  ['operationMode', 'Operation mode'],
+  ['storageLocation', 'Storage location'],
+  ['skillId', 'Built by skill'],
+  ['ddl', 'DDL'],
+  ['sql', 'SQL'],
+  ['insertSql', 'Insert SQL'],
+  ['previewSql', 'Preview SQL'],
+  ['operationType', 'NoSQL operation type'],
+  ['nosqlOperation', 'NoSQL operation'],
+  ['targetDdl', 'Target DDL'],
+  ['joinSql', 'Join SQL'],
+  ['transformFunction', 'JavaScript function'],
+  ['apiFetchCode', 'Fetch function'],
+  ['collection', 'Stored as table'],
+];
+// Fields that are structured settings, shown as JSON.
+const BUILD_OUTPUT_JSON_FIELDS = [
+  ['joinSettings', 'Join settings'],
+  ['joinColumns', 'Join columns'],
+  ['sourcesConfig', 'Per-source reads'],
+  ['vectorDestination', 'Vector destination'],
+  ['outputSettings', 'Output settings'],
+];
+
+/**
+ * A build message's metadata as the text a model reads. Empty when the message
+ * carries none of the build fields (a note, a question, a plain status line).
+ *
+ * `sourcesConfig` loses its resolved `connection` and `sourceTableSchema`: those
+ * are the executor's lookup data (connection config, sample rows, possibly
+ * vectors), not decisions the build made, and they would dwarf everything else.
+ */
+function formatBuildOutput(meta) {
+  if (!meta || typeof meta !== 'object') return '';
+  const present = (v) => v !== undefined && v !== null && v !== ''
+    && !(Array.isArray(v) && v.length === 0)
+    && !(typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
+  const parts = [];
+  for (const [key, label] of BUILD_OUTPUT_CODE_FIELDS) {
+    const v = meta[key];
+    if (!present(v)) continue;
+    parts.push(`${label}:\n${typeof v === 'string' ? v.trim() : JSON.stringify(v, null, 2)}`);
+  }
+  for (const [key, label] of BUILD_OUTPUT_JSON_FIELDS) {
+    let v = meta[key];
+    if (!present(v)) continue;
+    if (key === 'sourcesConfig' && Array.isArray(v)) {
+      v = v.map((sc) => {
+        if (!sc || typeof sc !== 'object') return sc;
+        const { connection, sourceTableSchema, _preloadedRows, ...rest } = sc;
+        return rest;
+      });
+    }
+    parts.push(`${label}:\n${JSON.stringify(v, null, 2)}`);
+  }
+  return parts.length ? `What this build produced:\n${parts.join('\n\n')}` : '';
 }
 
 /**
@@ -833,6 +927,15 @@ function slimJoinSource(src) {
   if (!src || typeof src !== 'object') return src;
   const out = { ...src };
   for (const k of JOIN_SOURCE_OMIT) delete out[k];
+  // The source's own column NAMES survive. The join SQL says which columns were
+  // SELECTED, never which ones the source HAS — and a node review sees only the
+  // join, not its source nodes, so without this "keep all employee columns"
+  // over `SELECT e.employee_id, e.name, e.store_id` cannot be checked and was
+  // failed as a subset of a three-column table. Names only: no types, no rows.
+  const cols = src.sourceTableSchema?.columns;
+  if (Array.isArray(cols) && cols.length) {
+    out.sourceColumns = cols.map((c) => (c && typeof c === 'object' ? c.name : c)).filter(Boolean);
+  }
   return out;
 }
 
@@ -860,6 +963,34 @@ function slimNodeData(data) {
   return { ...rest, ...(config !== undefined ? { config } : {}) };
 }
 
+/**
+ * Output tables that more than one node in this workflow writes.
+ *
+ * A transformer (new_table) and a join REPLACE their target on every run, so
+ * two of them writing the same table on the same connection overwrite each
+ * other. Matched on the destination connection and the table name, nothing
+ * more; the change review is told about each match and judges it.
+ *
+ * @returns {Array<{ table: string, connection: string, nodes: Array<{id, label}> }>}
+ */
+function findOutputTableCollisions(wf) {
+  const groups = new Map();
+  for (const n of (Array.isArray(wf?.nodes) ? wf.nodes : [])) {
+    if (n.type !== 'transformer' && n.type !== 'join') continue;
+    const c = n?.data?.config || {};
+    // In place, the node writes its SOURCE — it has no table of its own.
+    if (c.transformationSettings?.operationMode === 'in_place') continue;
+    const table = c.targetTableName;
+    if (!table || !c.targetConnectionId) continue;
+    const key = `${c.targetConnectionId}|${String(table).toLowerCase()}`;
+    if (!groups.has(key)) {
+      groups.set(key, { table, connection: c.targetConnectionName || c.targetConnectionId, nodes: [] });
+    }
+    groups.get(key).nodes.push({ id: n.id, label: c.node_name || n?.data?.label || n.id });
+  }
+  return [...groups.values()].filter((g) => g.nodes.length > 1);
+}
+
 function slimWorkflowForPrompt(wf) {
   if (!wf || typeof wf !== 'object') return wf;
   const nodes = Array.isArray(wf.nodes) ? wf.nodes : [];
@@ -880,7 +1011,14 @@ function slimWorkflowForPrompt(wf) {
       // sees an unexplained node and concludes nobody asked for it — which is
       // how a change review came to propose deleting two nodes the user had
       // added themselves.
-      ...(n?.data?.config && !n.data.config.builderPrompt
+      //
+      // Only when the config actually HOLDS something. A node dropped on the
+      // canvas starts with an empty default config ({ operation: '', config:
+      // {} }) and no builderPrompt, so the bare "has a config, no prompt" test
+      // labelled every brand-new node as hand-configured — and the main
+      // assistant, shown an unconfigured transformer flagged that way next to a
+      // fully built one, answered about the built one.
+      ...(n?.data?.config && !n.data.config.builderPrompt && hasAnySetting(n.data.config)
         ? { configuredInEditor: true }
         : {}),
       data: slimNodeData(n.data),
@@ -894,6 +1032,18 @@ function slimWorkflowForPrompt(wf) {
 // ```json fences, but the model still occasionally pads with prose. Reuse the
 // brace-balanced scan from chatAssistant.js for robustness.
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether a node config carries any setting at all: some value that is not
+ * empty — not '', null/undefined, an empty object or an empty array, at any
+ * depth. The empty default a freshly dropped node starts with answers false.
+ */
+function hasAnySetting(value) {
+  if (value === null || value === undefined || value === '') return false;
+  if (Array.isArray(value)) return value.some(hasAnySetting);
+  if (typeof value === 'object') return Object.values(value).some(hasAnySetting);
+  return true;
+}
 
 function extractFirstJsonObject(s) {
   let depth = 0, start = -1, inString = false, escape = false;
@@ -1082,6 +1232,28 @@ const buildTimings = {
 
 const fmtChars = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k chars` : `${n} chars`);
 
+// ── Saying what is underway ────────────────────────────────────────────────
+//
+// Every line buildTimings prints is written when a stage FINISHES, which is the
+// one moment a stalled build never reaches: the console went quiet after
+// "join:readSchema" and the chat's build log sat on "working…" for ten minutes,
+// with nothing anywhere naming the call that was outstanding.
+//
+// So each stage also announces its START — to the console, and to whatever sink
+// executeBuild installed (which puts it on the build-progress channel the chat
+// panel already listens to). One function, no timers: how long the stage has
+// been running is the receiver's business, and the renderer ticks its own clock.
+let stageSink = null;
+
+/** Install the sink for the duration of a build. Pass null to remove it. */
+function onStageStart(sink) { stageSink = typeof sink === 'function' ? sink : null; }
+
+function reportStage(stage, detail) {
+  console.log(`[build] ${stage} — started${detail ? `, ${detail}` : ''}`);
+  if (!stageSink) return;
+  try { stageSink(stage); } catch (_err) { /* progress is best-effort */ }
+}
+
 /**
  * Time a step of a build that is NOT a model call — a live schema read, a file
  * scan — and record it beside the AI stages.
@@ -1094,6 +1266,7 @@ const fmtChars = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k chars` : `${n} ch
 async function timedStep(stage, detail, run) {
   const started = Date.now();
   let failed = false;
+  reportStage(stage, detail);
   try {
     return await run();
   } catch (err) {
@@ -1107,6 +1280,7 @@ async function timedStep(stage, detail, run) {
 /** Time one model round trip and record it under `stage`. */
 async function timedCall(stage, prompt, run) {
   const started = Date.now();
+  reportStage(stage, typeof prompt === 'string' ? `prompt ${fmtChars(prompt.length)}` : null);
   try {
     const reply = await run();
     buildTimings.add({
@@ -1163,6 +1337,28 @@ async function callTextResumable(helpers, prompt, options = {}, { stage, resumed
 // saved connection. AI sees the list, returns exactly one id. Validated.
 // ---------------------------------------------------------------------------
 
+/**
+ * Can a join write its result to this saved connection?
+ *
+ * A join destination is a store the executor can CREATE a table or collection
+ * in: a database (SQL or Mongo) or a vector store. Everything else is refused:
+ *   - cloud storage and API connections have no table to create — the SQL path
+ *     reached one and failed with no batchInsert to call;
+ *   - a local FILE connection is not written to either: a DuckDB-type file
+ *     (csv/parquet/xlsx) routes to the workflow's own database, and a SQLite
+ *     import would land an unregistered table in the shared app database. The
+ *     `local-duckdb` option is what writing locally means.
+ * A local LanceDB connection IS a destination — it is a vector store.
+ *
+ * Mirrored in src/components/Workflows/joinDestinations.js for the picker.
+ */
+function isJoinDestinationConnection(conn) {
+  if (!conn) return false;
+  if (conn.dbCategory === 'CloudStorage' || conn.dbCategory === 'API' || conn.dbType === 'rest-api') return false;
+  if (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType)) return true;
+  return conn.connectionType === 'database';
+}
+
 function summarizeConnections(connections) {
   return connections.map((c) => ({
     id: c.id || c._id,
@@ -1182,7 +1378,9 @@ async function pickTable(intent, tables, helpers, warnings) {
   if (!tables.length) throw new Error('Connection has no tables/collections.');
   const list = tables.map((t) => {
     if (typeof t === 'string') return { name: t, schema: null };
-    return { name: t.name || String(t), schema: t.schema || null, type: t.type || null };
+    // `??`, not `||`: a vector store's default namespace is the empty string,
+    // and it is a real choice, not a missing one.
+    return { name: t.name || String(t), schema: t.schema ?? null, type: t.type || null };
   });
   const prompt = `Pick exactly one table/collection for the user's intent.
 
@@ -1201,7 +1399,13 @@ The "table" value MUST match one of the names above EXACTLY.`;
 
       console.log('pickTable+out: ', out)
 
-      const found = list.find((t) => t.name === out.table);
+      // Match the schema too when the model gave one. A vector store lists one
+      // entry per namespace under the SAME index name, so a name-only match
+      // always returned the first namespace, whatever the model picked.
+      const wantSchema = out.schema === undefined ? undefined : (out.schema ?? null);
+      const found = (wantSchema !== undefined
+        && list.find((t) => t.name === out.table && (t.schema ?? null) === wantSchema))
+        || list.find((t) => t.name === out.table);
       if (found) return found;
     } catch (_) { /* retry */ }
   }
@@ -1278,6 +1482,11 @@ async function loadSchemaSample(connection, table, schema, helpers, warnings, db
   // LanceDB source got a schema with no sampleData — invisible unless you went
   // looking for the warning.
   const isLanceDB = connection.dbType === 'lancedb';
+  // Any other vector store takes an operation object too — a SQL string sent
+  // to Pinecone failed with "Index name is required" and the node saved no
+  // sample rows. `schema` is the namespace there (see pickTable).
+  const isVectorStore = !isLanceDB
+    && (connection.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(connection.dbType));
   let columns = [];
   let sampleData = [];
 
@@ -1299,10 +1508,18 @@ async function loadSchemaSample(connection, table, schema, helpers, warnings, db
     let query;
     if (isNoSQL) query = { collection: table, filter: {}, limit: SAMPLE_ROW_LIMIT };
     else if (isLanceDB) query = { operation: 'list', tableName: table, limit: SAMPLE_ROW_LIMIT };
+    else if (isVectorStore) query = { operation: 'list', indexName: table, namespace: schema ?? '', limit: SAMPLE_ROW_LIMIT };
     else query = sqlPreviewQuery(table, schema, connection.dbType, helpers, SAMPLE_ROW_LIMIT);
     const sampleStarted = Date.now();
     sampleData = await helpers.runQuery(connection, query, dbPath);
     if (!Array.isArray(sampleData)) sampleData = sampleData?.rows || sampleData?.data || [];
+    // A vector record keeps its fields under `metadata`; the sample shows them
+    // as the flat columns the source reads as (id, then the metadata fields).
+    if (isVectorStore) {
+      sampleData = sampleData.map((r) => (r && typeof r === 'object' && r.metadata && typeof r.metadata === 'object'
+        ? { id: r.id, ...r.metadata }
+        : r));
+    }
     console.log(
       `[build]   sample read(${table}) — ${((Date.now() - sampleStarted) / 1000).toFixed(1)}s`
       + `, ${sampleData.length} rows`,
@@ -1345,7 +1562,7 @@ const LOCAL_TABLE_FORMATS = new Set(['sqlite', 'duckdb', 'lancedb']);
  * That distinction is why a live re-read is the wrong answer for these parents.
  * A transformer drops and recreates its target before its DDL runs
  * (NodeExecution issues `DROP TABLE IF EXISTS` ahead of the CREATE), and a join
- * always replaces its target — so the table a child reads live holds columns
+ * in its default replace mode does the same — so the table a child reads live holds columns
  * that are about to be removed. That produced a node whose DDL was
  * `ALTER TABLE … MODIFY COLUMN revenue_band`: correct against the table as it
  * stood, and guaranteed to fail with "Unknown column" on the next full run,
@@ -1419,48 +1636,6 @@ async function refreshSourceSchema(source, helpers) {
   }
 }
 
-// Build a `sourceTableSchema` for a REST API source AFTER its fetch function
-// has materialised rows into the workflow's DuckDB database. Unlike
-// loadSchemaSample, there is no connector getColumns to call — the API response
-// shape is only knowable from the rows it returned — so columns are derived from
-// the materialised rows (falling back to the single sampleRow
-// handleExecuteApiFetch returns when the read comes back empty).
-async function loadApiSchemaSample(collection, localPath, sampleRow, helpers, warnings) {
-  let sampleData = [];
-  if (localPath) {
-    try {
-      sampleData = await helpers.runQuery(
-        'duckdb',
-        `SELECT * FROM ${duckdbCore.quoteIdentifier(duckdbCore.sanitizeIdentifier(collection))} LIMIT ${SAMPLE_ROW_LIMIT}`,
-        localPath,
-      );
-      if (!Array.isArray(sampleData)) sampleData = sampleData?.rows || sampleData?.data || [];
-    } catch (err) {
-      warnings.push(`API sample read for "${collection}" failed: ${err.message}`);
-    }
-  }
-  if (!sampleData.length && sampleRow && typeof sampleRow === 'object') {
-    sampleData = [sampleRow];
-  }
-
-  const stripId = (row) => {
-    if (!row || typeof row !== 'object') return row;
-    const { _id, ...rest } = row;
-    return rest;
-  };
-  const clean = sampleData.map(stripId);
-
-  const keys = new Set();
-  for (const row of clean) { Object.keys(row || {}).forEach((k) => keys.add(k)); }
-  const columns = Array.from(keys).map((name) => ({ name, type: 'unknown' }));
-
-  return {
-    tableName: collection,
-    columns,
-    sampleData: clean.slice(0, SAMPLE_ROW_LIMIT),
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Start node
 // ---------------------------------------------------------------------------
@@ -1520,7 +1695,64 @@ Return ONLY the JSON object.`;
 // connection.fileInfo; cloud → warn).
 // ---------------------------------------------------------------------------
 
-async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connectionId, chat, nodeId, workflowId = null, resumedCalls = null }) {
+/**
+ * Run an APPROVED REST fetch function and record what it produced on `config`:
+ * the table it wrote, its columns and sample rows. Only ever called once the
+ * user has approved this exact function (see buildDataSourceConfig).
+ *
+ * A fetch that returns nothing is a FAILED BUILD, not a warning. This used to
+ * be best-effort — the node was saved with no schema and the build carried on
+ * — and the cost landed two steps later, on the transformer, which found no
+ * columns and asked "which table should it transform?" about an API that has
+ * no tables. Throwing puts the real reason in the chat, where the user can act
+ * on it — a wrong endpoint, a missing credential, an empty result.
+ */
+async function materializeApiSource(config, { connName, connectionId, code, collection, workflowId, nodeId, chat }) {
+  const apiFailed = (reason) => new Error(
+    `The API call for "${connName}" ${reason}. The data source can't be built until it returns rows — `
+    + 'check the endpoint, the credentials saved on the connection, and any query parameters it needs. '
+    + 'The workflow has been left as it was.',
+  );
+  let fetchResult;
+  try {
+    fetchResult = await handleExecuteApiFetch({
+      apiConnectionId: connectionId,
+      apiConnectionConfig: config.apiConnectionPublicConfig,
+      apiFetchCode: code,
+      targetCollection: collection,
+      operationMode: 'new_table',
+      workflowId,
+      nodeId,
+    });
+  } catch (err) {
+    throw apiFailed(`threw: ${err.message}`);
+  }
+  if (!fetchResult?.success) {
+    throw apiFailed(`failed: ${fetchResult?.error || 'unknown error'}`);
+  }
+  // Zero rows never reaches the store — handleExecuteApiFetch returns before
+  // the write — so there is no table to read columns from.
+  if (!fetchResult.rowCount) {
+    throw apiFailed('returned no rows');
+  }
+  config.sourceLocalPath = fetchResult.localPath || null;
+  config.sourceTableSchema = await describeApiTable({
+    workflowId, collection, sampleRow: fetchResult.sampleRow, limit: SAMPLE_ROW_LIMIT,
+  });
+  config.apiFetchResult = {
+    rowCount: fetchResult.rowCount || 0,
+    localPath: fetchResult.localPath || null,
+    collection: fetchResult.collection || collection,
+  };
+  config.apiFetchPending = false;
+  if (!config.sourceTableSchema?.columns?.length) {
+    throw apiFailed(`returned ${fetchResult.rowCount} row(s) but no readable columns`);
+  }
+  pushBotMsg(chat, `Fetched ${fetchResult.rowCount} row${fetchResult.rowCount === 1 ? '' : 's'} from API "${connName}" into "${collection}" (${config.sourceTableSchema.columns.length} columns detected).`);
+  return config;
+}
+
+async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connectionId, chat, nodeId, workflowId = null, resumedCalls = null, existingConfig = null, apiFetchApproval = null }) {
   // The planner declares step.connectionId at plan-build time and the
   // envelope validator guarantees it resolves to a real saved connection,
   // so the builder no longer has to ask the AI which one to pick.
@@ -1547,6 +1779,9 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
   // Branch 1 — REST API. Generates an async fetch function via the existing
   // RestApi prompt. No table step; the runner materialises rows into DuckDB.
   if (conn.dbType === 'rest-api') {
+    // The table a rebuilt node already writes. Downstream nodes read it by
+    // name, so the prompt is told to keep it and the builder falls back to it.
+    const currentCollection = existingConfig?.sourceCollection || existingConfig?.sourceDataset || null;
     const restPrompt = ChatPrompts.restApi.restApiAnalysisRequest({
       userRequest: stepPrompt,
       connectionAuthType: conn.dbConfig?.authType || 'none',
@@ -1555,9 +1790,9 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       connectionBasicUser: conn.dbConfig?.basicUser || '',
       // Key names only — the values stay encrypted and never reach the model.
       connectionParamKeys: conn.dbConfig?.apiParamKeys || [],
+      currentCollectionName: currentCollection,
     });
     const out = await callJsonResumable(helpers, restPrompt, { chatHistory: chatToHistory(chat) }, { stage: 'dataSource:restAnalysis', resumed: resumedCalls });
-    console.log('buildDataSourceConfig+out: ', out)
     if (out.action !== 'create_plan' || !out.code) {
       // The AI needs more from the user (which endpoint, which auth header, what
       // the request body should contain, …). Ask rather than assembling a source
@@ -1565,11 +1800,22 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       const q = clarificationQuestionFrom(out);
       const answer = q ? findClarificationAnswer(chat, q) : null;
       if (q && !answer) throw new ClarificationNeeded(q, { nodeId, kind: 'dataSource.api_fetch' });
-      // Already answered (or nothing to ask) and STILL no code — record it and
-      // assemble what we have instead of re-asking the same question forever.
-      warnings.push(`REST API source: AI returned action="${out.action}" — fetch function not produced. Reason: ${q || 'unknown'}`);
+      // Already answered (or nothing to ask) and STILL no code. A source node
+      // with no fetch function cannot run, so it is a failed build — never a
+      // node saved as though it were finished.
+      throw new Error(
+        `The REST API source for "${conn.name}" could not be built: the AI returned no fetch function`
+        + `${q ? ` (it said: ${q})` : ''}. Describe the endpoint and what to fetch, then try again — `
+        + 'the node has been left as it was.',
+      );
     }
-    const apiCollection = sanitizeCollectionName(stepPrompt);
+    // The model's name for the table, else the one this node already writes.
+    // The user's own words are only the last resort, and are capped — they are
+    // a sentence, and every downstream node addresses this table by name.
+    const namedCollection = typeof out.collectionName === 'string' ? out.collectionName.trim() : '';
+    const apiCollection = namedCollection
+      ? sanitizeCollectionName(namedCollection)
+      : (currentCollection || sanitizeCollectionName(String(stepPrompt || '').slice(0, 40)));
     Object.assign(config, {
       sourceConnectionType: 'api',
       sourceDbType: 'duckdb',
@@ -1582,6 +1828,10 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       sourceLocalPath: null,
       apiFetchPrompt: stepPrompt,
       apiFetchExplanation: out.explanation || '',
+      // What the node calls, for its canvas card ("GET {{BASE_URL}}latest").
+      // The connection's base URL alone is not it: one connection serves many
+      // endpoints, so every card used to show the same URL.
+      apiEndpoint: typeof out.endpoint === 'string' ? out.endpoint.trim().slice(0, 300) : '',
       apiFetchCode: out.code || '',
       apiConnectionPublicConfig: {
         baseUrl: conn.dbConfig?.baseUrl || '',
@@ -1594,67 +1844,75 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
 
     pushBotMsg(chat, out.explanation
       ? `Configured REST API data source "${conn.name}": ${out.explanation}`
-      : `Configured REST API data source "${conn.name}".`);
+      : `Configured REST API data source "${conn.name}".`,
+    // The fetch function and table this build produced — read back by the next
+    // build through chatToHistory, so a refinement edits this code.
+    { metadata: { apiFetchCode: out.code || null, collection: apiCollection } });
 
-    // Run the fetch NOW so downstream nodes get a real schema. The API
-    // response shape can't be known statically (no getTables/getColumns for a
-    // REST source), so we execute the AI-authored function exactly the way the
-    // runtime does, materialise the rows into local DuckDB, and derive
-    // sourceTableSchema + sourceLocalPath from the result.
+    // The fetch function is GENERATED here, never RUN without the user's say-so.
+    // Running it is an outbound call with the user's credentials, and the code
+    // is whatever the model wrote — so, like every other generated JavaScript,
+    // it waits for approval.
     //
-    // A fetch that returns nothing is a FAILED BUILD, not a warning. This used
-    // to be best-effort — the node was saved with no schema and the build
-    // carried on — and the cost landed two steps later, on the transformer,
-    // which found no columns and asked "which table should it transform?" about
-    // an API that has no tables. That question cannot be answered: the recovery
-    // path looks the source's connection up among saved connections, and an API
-    // source records `local-duckdb`, which is not one. So the build stopped on a
-    // question with no answer and no mention of the API call that actually
-    // failed. Throwing puts the real reason in the chat, where the user can act
-    // on it — a wrong endpoint, a missing credential, an empty result.
+    //   Chat-built node (no `apiFetchApproval`): the config goes onto the canvas
+    //   with the function and no fresh data. The approval card's "Run this node"
+    //   is the first time it runs; that run writes the table and hands the
+    //   schema back to the node (see the REST branch of executeDataSourceNode).
+    //
+    //   Plan build (`apiFetchApproval.route === 'plan'`): the steps after this
+    //   one are built FROM its columns, so the build can't go on without them.
+    //   This is a second call even when the workflow agent already called the
+    //   API to plan: that look-up was different code, and its request (path,
+    //   query, paging, reshaping) need not match this node's, so its rows say
+    //   nothing reliable about what THIS function returns.
+    //   It pauses with ApprovalNeeded; approving resumes this step with the same
+    //   function (replayed from resumedCalls, so what ran is what was shown),
+    //   and only then is it run and its schema read.
     if (out.action === 'create_plan' && out.code) {
-      const apiFailed = (reason) => new Error(
-        `The API call for "${conn.name}" ${reason}. The data source can't be built until it returns rows — `
-        + 'check the endpoint, the credentials saved on the connection, and any query parameters it needs. '
-        + 'The workflow has been left as it was.',
-      );
-      let fetchResult;
-      try {
-        fetchResult = await handleExecuteApiFetch({
-          apiConnectionId: conn.id || conn._id,
-          apiConnectionConfig: config.apiConnectionPublicConfig,
-          apiFetchCode: out.code,
-          targetCollection: apiCollection,
-          operationMode: 'new_table',
-          workflowId,
-          nodeId,
+      const approvedHere = apiFetchApproval?.route === 'plan'
+        && typeof apiFetchApproval.approvedCode === 'string'
+        && apiFetchApproval.approvedCode === out.code;
+
+      if (apiFetchApproval?.route === 'plan' && !approvedHere) {
+        throw new ApprovalNeeded(
+          `Approve this API call for "${conn.name}" so I can read what it returns — the steps after it are built from its columns.`,
+          {
+            nodeId,
+            kind: 'dataSource.api_fetch_approval',
+            approval: {
+              kind: 'api_fetch',
+              connectionName: conn.name,
+              code: out.code,
+              explanation: out.explanation || '',
+              endpoint: config.apiEndpoint || '',
+              collection: apiCollection,
+              // The analysis call this approval is about. Replayed on resume so
+              // the function that runs is byte-for-byte the one approved.
+              resumedCalls: { 'dataSource:restAnalysis': out },
+            },
+          },
+        );
+      }
+
+      if (approvedHere) {
+        await materializeApiSource(config, {
+          connName: conn.name, connectionId: conn.id || conn._id, code: out.code,
+          collection: apiCollection, workflowId, nodeId, helpers, warnings, chat,
         });
-      } catch (err) {
-        throw apiFailed(`threw: ${err.message}`);
+      } else {
+        // Waiting on "Run this node". The node keeps whatever it last fetched —
+        // the table and columns from its previous run, if any — so nodes built
+        // against it are not orphaned by a rebuild that has not run yet.
+        // Same table, same place, whether or not it has been fetched yet: the
+        // workflow's database, where a fetch writes it. Nodes built from this
+        // source read it from there.
+        config.sourceLocalPath = existingConfig?.sourceLocalPath
+          || (workflowId ? duckdbCore.workflowDbPath(workflowId) : null);
+        config.sourceTableSchema = existingConfig?.sourceTableSchema || null;
+        config.apiFetchResult = existingConfig?.apiFetchResult || null;
+        config.apiFetchPending = true;
+        pushBotMsg(chat, 'The fetch has not run yet — approve it with "Run this node" to call the API and load its rows.');
       }
-      if (!fetchResult?.success) {
-        throw apiFailed(`failed: ${fetchResult?.error || 'unknown error'}`);
-      }
-      // Zero rows never reaches the store — handleExecuteApiFetch returns before
-      // the write — so the table the schema read is about to open does not
-      // exist. Caught here rather than letting that read fail into a warning and
-      // hand back a source with no columns.
-      if (!fetchResult.rowCount) {
-        throw apiFailed('returned no rows');
-      }
-      config.sourceLocalPath = fetchResult.localPath || null;
-      config.sourceTableSchema = await loadApiSchemaSample(
-        apiCollection, fetchResult.localPath, fetchResult.sampleRow, helpers, warnings,
-      );
-      config.apiFetchResult = {
-        rowCount: fetchResult.rowCount || 0,
-        localPath: fetchResult.localPath || null,
-        collection: fetchResult.collection || apiCollection,
-      };
-      if (!config.sourceTableSchema?.columns?.length) {
-        throw apiFailed(`returned ${fetchResult.rowCount} row(s) but no readable columns`);
-      }
-      pushBotMsg(chat, `Fetched ${fetchResult.rowCount} row${fetchResult.rowCount === 1 ? '' : 's'} from API "${conn.name}" into "${apiCollection}" (${config.sourceTableSchema.columns.length} columns detected).`);
     }
 
     return config;
@@ -1664,9 +1922,16 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
   // builder can't open one. Surface a warning and stop short of inventing a
   // path so the user can finish the node manually.
   if ((conn.dbCategory || '').toLowerCase() === 'cloudstorage') {
-    warnings.push(`Cloud storage source "${conn.name}" needs an object path the AI cannot pick automatically — open the node in the editor to choose a file.`);
-    pushBotMsg(chat, `Configured cloud-storage data source "${conn.name}" — please open the node in the editor to pick the object path.`);
-    return config;
+    // FAIL, don't save half a node. A cloud source is complete only once a
+    // file is picked and downloaded — that is what gives it a table — and the
+    // picker exists only in the editor. Saved with just the connection, it has
+    // no table, and every node reading it failed later on one that does not
+    // exist.
+    throw new Error(
+      `Cloud storage source "${conn.name}" needs a file picked in the workflow editor — the builder cannot choose `
+      + 'one. Add the data source there, pick the file, and ask again: everything downstream of it can then be '
+      + 'built from chat. The workflow has been left as it was.',
+    );
   }
 
   // Branch 3 — LanceDB file connection.
@@ -1745,7 +2010,9 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     if (isVector) {
       config.sourceIndexName = picked.name;
       config.sourceTableName = picked.name;
-      config.sourceNamespace = picked.namespace || '';
+      // Connectors list a vector namespace in the `schema` field (see
+      // pickTable); '' is the store's default namespace.
+      config.sourceNamespace = picked.namespace ?? picked.schema ?? '';
       config.sourceSchema = config.sourceNamespace;
     } else if (isNoSQL) {
       config.sourceCollection = picked.name;
@@ -1825,7 +2092,13 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       }
     }
 
-    if (picked) {
+    if (!picked) {
+      throw new Error(
+        `Local file connection "${conn.name}" lists no table to read, so the data source would have none. `
+        + 'Check the file in the Data Explorer, then try again — the node has been left as it was.',
+      );
+    }
+    {
       const name = picked.name;
       config.sourceSelectedTables = [name];
       if (conn.dbType === 'duckdb') {
@@ -1854,9 +2127,12 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
     return config;
   }
 
-  warnings.push(`Connection "${conn.name}" (type=${conn.connectionType}, dbType=${conn.dbType}) is not handled by the workflow builder; open the node in the editor to finish configuration.`);
-  pushBotMsg(chat, `Connection "${conn.name}" (${conn.dbType}) isn't auto-configurable — please open the node in the editor to finish setup.`);
-  return config;
+  // Nothing above knew how to pick a table on this connection, so the node would
+  // have none — unfinished, not buildable. Fail rather than save it.
+  throw new Error(
+    `Connection "${conn.name}" (${conn.dbType}) can't be set up as a data source by the builder, so it would `
+    + 'have no table. Configure the data source in the workflow editor. The workflow has been left as it was.',
+  );
 }
 
 /**
@@ -1874,15 +2150,31 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
  * each other's output. It comes from the node id, so it is stable across
  * rebuilds of the same node.
  */
+/** The short, per-node part of a generated table name: the id's last 6 digits. */
+function nodeNameSuffix(nodeId = null) {
+  return String(nodeId || Date.now()).replace(/\D/g, '').slice(-6);
+}
+
 function defaultTransformerTableName(base = {}, nodeId = null) {
   const source = base.sourceTableName
     || base.sourceCollection
     || base.sourceTableSchema?.tableName
     || base.sourceDataset;
-  const suffix = String(nodeId || Date.now()).replace(/\D/g, '').slice(-6);
+  const suffix = nodeNameSuffix(nodeId);
   return source
     ? `${sanitizeCollectionName(source)}_transformed_${suffix}`
     : `transformed_${suffix}`;
+}
+
+/**
+ * A name the analyser coined, made this node's own: `products_over_100` →
+ * `products_over_100_713683`. Always applied to a coined name, not only on a
+ * clash — the destination database can already hold a table by that name, and
+ * nothing in the workflow would show it.
+ */
+function coinedTableName(name, nodeId = null) {
+  const suffix = nodeNameSuffix(nodeId);
+  return String(name).endsWith(`_${suffix}`) ? String(name) : `${name}_${suffix}`;
 }
 
 function sanitizeCollectionName(s) {
@@ -1895,6 +2187,18 @@ function sanitizeCollectionName(s) {
 // operation. Copies source* from the upstream node's target* (or source*) the
 // way TransformerNodeChat.buildConfig does at :1623-1638.
 // ---------------------------------------------------------------------------
+
+/**
+ * Rows that already sit in local DuckDB: a file, a REST API source's table, or
+ * another node's local output. There is no database behind them to write a
+ * result back to, so a transform of them is always stored locally and the user
+ * is never asked "database or local?".
+ */
+function isLocalSource(base = {}) {
+  return base.sourceConnectionType === 'file'
+    || base.sourceConnectionType === 'api'
+    || base.sourceConnectionId === 'local-duckdb';
+}
 
 function copySourceFromUpstream(upstreamNode) {
   const u = upstreamNode?.data?.config || {};
@@ -2046,8 +2350,11 @@ function propagateSourceSchema(workflow, nodeId, config) {
   const childIds = new Set(edges.filter((e) => e && e.source === nodeId).map((e) => e.target));
   if (childIds.size === 0) return { nodes, impacted: [] };
 
-  // The parent as its children should now see it.
-  const parent = { id: nodeId, data: { config } };
+  // The parent as its children should now see it. Its label comes from the
+  // node itself: `config` carries none, and a parent built without one would
+  // copy `sourceNodeLabel: undefined` onto every child it refreshes.
+  const parentNode = nodes.find((n) => n && n.id === nodeId);
+  const parent = { id: nodeId, data: { label: parentNode?.data?.label, config } };
   const fresh = copySourceFromUpstream(parent);
   // What the parent produces NOW. Read through `fresh` rather than off
   // `config.targetTableSchema`, because a dataSource has no target* side — its
@@ -2107,6 +2414,9 @@ function propagateSourceSchema(workflow, nodeId, config) {
       nextConfig = { ...cfg, sources, sourcesConfig };
     } else {
       nextConfig = { ...cfg, ...fresh };
+      // The label is display only — keep the child's own when the parent node
+      // has none rather than wiping it.
+      if (!fresh.sourceNodeLabel && cfg.sourceNodeLabel) nextConfig.sourceNodeLabel = cfg.sourceNodeLabel;
       // A TRANSFORMER's own SQL names its source table, and an in-place one
       // writes back to it — `targetTableName` IS that table — so once the
       // object moves it cannot run as it stands, exactly like a join source.
@@ -2125,8 +2435,20 @@ function propagateSourceSchema(workflow, nodeId, config) {
         };
         // Back on the original clears the mark; away from it raises or keeps
         // one. Same rule as a join step, and as the editor's own pass.
-        if (sameJoinSourceIdentity(origin, to)) delete nextConfig.sourceMoved;
+        const stillAway = !sameJoinSourceIdentity(origin, to);
+        if (!stillAway) delete nextConfig.sourceMoved;
         else nextConfig.sourceMoved = { from: origin, to };
+        // Reported the same way a join step reports it: moved by THIS refresh
+        // and still away from what the SQL was written for. Without it a
+        // transformer's move never captured `sourceBuiltAgainst` below and
+        // reached the reviewer with no from/to.
+        const was = {
+          connectionId: cfg.sourceConnectionId || null,
+          tableName: cfg.sourceTableName || cfg.sourceCollection || null,
+        };
+        if (stillAway && !sameJoinSourceIdentity(was, to)) {
+          moved = { movedFrom: origin, movedTo: to };
+        }
       }
     }
 
@@ -2309,6 +2631,19 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
     // here, so a re-ask now costs the skill nothing and the answer is already
     // in front of it.
     const aiResponse = await callTextResumable(helpers, built.prompt, { chatHistory }, { stage, resumed });
+    // The skill decided which prompt to send from its source (vector-db-executor:
+    // "maintain the records of this vector store" vs "embed these rows"), and
+    // returns that verdict in `built.context`. Its response is validated
+    // against `currentState`, so the verdict has to travel with it — otherwise
+    // a correct maintain-records reply is checked as an embed and rejected for
+    // lacking `vectorDbType`, and the user is asked for it forever.
+    if (built.context && typeof built.context.isSourceVector === 'boolean') {
+      currentState = {
+        ...currentState,
+        isSourceVector: built.context.isSourceVector,
+        ...(built.context.sourceVectorDbType ? { sourceVectorDbType: built.context.sourceVectorDbType } : {}),
+      };
+    }
     result = await helpers.pluginManager.processSkillResponse(
       skillId,
       aiResponse,
@@ -2481,7 +2816,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       stepPrompt,
       sourceSchemaInfo,
       dbType,
-      base.sourceConnectionType === 'file',
+      isLocalSource(base),
       availableSkills,
       defaultTargetSchema,
     );
@@ -2546,17 +2881,23 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   const prevSettings   = isFullRebuild ? {} : (existingConfig?.transformationSettings || {});
   // `existingTarget` is deliberately NOT reset by a full rebuild: the output
   // table's name is this node's identity — downstream nodes were built to read
-  // it — not a setting the analyser is re-deciding. The analyser's own
-  // `tableName` still wins when it names one, which is how a rename is asked for.
+  // it — not a setting the analyser is re-deciding. A name the USER gives still
+  // wins, which is how a rename is asked for; a name the analyser coined does
+  // not, and a new node's coined name carries the node's suffix (coinedTableName).
   const existingTarget = existingConfig?.targetTableName || existingConfig?.targetCollection || null;
   const operationMode  = analysis?.inferredSettings?.operationMode || prevSettings.operationMode || 'new_table';
-  const storageLocation = analysis?.inferredSettings?.storageLocation
-    || prevSettings.storageLocation
-    || (base.sourceConnectionType === 'file' ? 'local' : 'database');
+  const storageLocation = isLocalSource(base)
+    ? 'local'
+    : (analysis?.inferredSettings?.storageLocation
+      || prevSettings.storageLocation
+      || 'database');
   const targetTableName = (!analysis && existingTarget)
     ? existingTarget
     : qualifyLocalTableName(
-        analysis?.tableName || existingTarget || defaultTransformerTableName(base, nodeId),
+        (analysis?.tableNameFromUser === true && analysis?.tableName)
+          || existingTarget
+          || (analysis?.tableName && coinedTableName(analysis.tableName, nodeId))
+          || defaultTransformerTableName(base, nodeId),
         { workflowId, isLocal: storageLocation === 'local' },
       );
   // The analyser returns the schema as its own field, so `tableName` is the
@@ -2573,20 +2914,46 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // build through ClarificationNeeded (carrying the skill's state so the next
   // turn resumes it rather than restarting it); anything else hands the request
   // back to the standard SQL/NoSQL path below, in THIS run.
-  const activeSkillId = routedSkillId || (analysis?.usesSkill ? analysis?.skillId : null);
+  // A vector store as the SOURCE can only be handled by the vector skill: the
+  // standard path is SQL over DuckDB, which cannot open a LanceDB directory or
+  // a Pinecone index ("DuckDB cannot read …"). The analyser does not always see
+  // that — it sent a LanceDB source down the SQL path, which then generated an
+  // ALTER/UPDATE against a staging table and never touched the records — so it
+  // is decided here rather than left to the model.
+  //
+  // The one other skill that can take a vector source is the JavaScript
+  // executor, which loads its records as plain rows: the right tool for READING
+  // them into a new table (count, summarise, reshape). The vector skill only
+  // changes the records in place and refused such a request outright. So the
+  // analyser's JavaScript pick stands when it writes a NEW table; anything that
+  // would change the vector records stays with the vector skill.
+  const sourceIsVector = base.sourceDbCategory === 'Vector' || VECTOR_DB_TYPES.has(String(dbType || '').toLowerCase());
+  const vectorSkillAvailable = availableSkills.some((s) => (s?.id || s?.skillId) === 'vector-db-executor');
+  const readsVectorIntoNewTable = sourceIsVector
+    && analysis?.usesSkill && analysis?.skillId === 'javascript-executor'
+    && operationMode !== 'in_place';
+  const activeSkillId = routedSkillId
+    || (readsVectorIntoNewTable ? 'javascript-executor' : null)
+    || (sourceIsVector && !bypassSkills && vectorSkillAvailable ? 'vector-db-executor' : null)
+    || (analysis?.usesSkill ? analysis?.skillId : null);
   if (activeSkillId && helpers?.pluginManager?.buildSkillPrompt) {
     const sourceConnection = (helpers.connections || []).find((c) => (c.id || c._id) === base.sourceConnectionId)
       || { id: base.sourceConnectionId, name: base.sourceConnectionName, dbType, connectionType: base.sourceConnectionType };
     const context = {
       kind: 'transformer',
-      sourceTableSchema: base.sourceTableSchema,
+      // `schema` as the executor passes it at run time (the source's schema —
+      // for Pinecone, its namespace), so the skill's sample read looks in the
+      // same place the run will.
+      sourceTableSchema: base.sourceTableSchema
+        ? { ...base.sourceTableSchema, schema: base.sourceTableSchema.schema || base.sourceSchema || undefined }
+        : base.sourceTableSchema,
       sourceConnection,
       dbCategory: dbType,
       operationType: isNoSQL ? 'nosql' : 'sql',
       operationMode,
       storageLocation,
       tableName: targetTableName,
-      isSourceLocal: base.sourceConnectionType === 'file',
+      isSourceLocal: isLocalSource(base),
       // Where a local result is written, resolved rather than asked for.
       //
       // A skill told to produce local output is told (correctly) that it must
@@ -2627,7 +2994,25 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
       const isVectorSkill = !!(ep.vectorDbType) || activeSkillId === 'vector-db-executor';
       let targetConn = null;
       let resolvedTargetTableName = ep.targetTable || ep.targetTableName || targetTableName;
-      if (isVectorSkill) {
+      // Maintaining the records of a vector SOURCE (update / delete / tag) writes
+      // back into that same store — there is no separate destination, and the
+      // skill's reply carries no `vectorDbType`. Defaulting it to local LanceDB
+      // labelled a Pinecone update as a LanceDB write and pointed its preview at
+      // a table that never exists.
+      const inPlaceVector = isVectorSkill && result.state?.isSourceVector === true;
+      if (inPlaceVector) {
+        const conn = (helpers.connections || []).find((c) => (c.id || c._id) === base.sourceConnectionId);
+        targetConn = {
+          id: base.sourceConnectionId,
+          name: base.sourceConnectionName || conn?.name,
+          type: conn?.connectionType || (base.sourceDbType === 'lancedb' ? 'file' : 'database'),
+          dbType: base.sourceDbType || conn?.dbType,
+          config: conn?.dbConfig || {},
+          // Where a LanceDB source lives — the node's output IS that table.
+          ...(base.sourceLocalPath ? { localPath: base.sourceLocalPath } : {}),
+        };
+        resolvedTargetTableName = base.sourceTableName || resolvedTargetTableName;
+      } else if (isVectorSkill) {
         const vdb = ep.vectorDbType || 'lancedb';
         if (vdb === 'lancedb') {
           targetConn = {
@@ -2781,7 +3166,12 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // `{ nodeId }`. A source that is already a table is addressed by its real
   // name; a new table by the generated one.
   //
-  // "a FILE" means there IS a local path and it is not a workflow database. A
+  // "a FILE" means there IS a local path and it is not a database — workflow,
+  // .duckdb or SQLite — by the executor's own test (DuckDB.isDatabaseSource).
+  // Testing only for a workflow database sent a SQLite source down the file
+  // path: the model was told to write against the staging table, and the
+  // executor, which runs a database's statements in place, found no such
+  // table. A
   // REMOTE source (Postgres, MySQL, …) has no `sourceLocalPath` at all, and
   // testing only for the `.duckdb` suffix answered "yes, a file" for every one
   // of them — which fed the connector's prompt a DuckDB staging table name as
@@ -2789,7 +3179,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   // bare one (see targetPreviewSql in assembleTransformerConfig).
   const inPlaceOnFile = operationMode === 'in_place'
     && !!base.sourceLocalPath
-    && !DuckDB.isWorkflowDb(base.sourceLocalPath);
+    && !DuckDB.isDatabaseSource(base.sourceLocalPath);
   const promptTableName = operationMode !== 'in_place'
     ? targetTableName
     : (inPlaceOnFile
@@ -2802,7 +3192,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
   const settingsContext = `Operation mode: ${operationMode}\nStorage location: ${storageLocation}\nTarget name: ${displayTableName}`;
   const usesLocalTemplate =
     (dbType === 'duckdb') ||
-    (base.sourceConnectionType === 'file');
+    isLocalSource(base);
 
   let gen;
   if (usesLocalTemplate) {
@@ -2890,7 +3280,8 @@ async function assembleTransformerConfig({
   // possible, and referencing them undeclared throws at assembly time.
   workflowId = null, nodeId = null,
 }) {
-  // An in-place update whose source is a FILE (not this workflow's .duckdb) has
+  // An in-place update whose source is a FILE (not a database: workflow,
+  // .duckdb or SQLite — DuckDB.isDatabaseSource) has
   // no table of its own — the executor stages the file under a per-node table
   // that is dropped when the run ends. Recomputed here rather than threaded in
   // from the caller: it is a pure function of two arguments this function
@@ -2901,7 +3292,7 @@ async function assembleTransformerConfig({
   // has none. See the matching guard in buildTransformerConfig.
   const inPlaceOnFile = operationMode === 'in_place'
     && !!base.sourceLocalPath
-    && !DuckDB.isWorkflowDb(base.sourceLocalPath);
+    && !DuckDB.isDatabaseSource(base.sourceLocalPath);
 
   if (!targetConn) {
     const isInPlace = operationMode === 'in_place';
@@ -3037,7 +3428,11 @@ async function assembleTransformerConfig({
   // branches above assign is wrong for every one of them.
   if (skillInfo && targetConn?.dbType === 'lancedb') {
     const ep = skillInfo.executionParams || {};
-    const lancedbPath = ep.targetLocalPath || ep.dbPath || ep.lancedbPath || defaultLanceDBPath();
+    // An in-place update of a LanceDB source writes back into the source's
+    // own directory (targetConn.localPath, set by the in-place branch). The
+    // default directory there pointed the node — and every node chained after
+    // it — at a folder that does not hold the table ("Table … was not found").
+    const lancedbPath = targetConn.localPath || ep.targetLocalPath || ep.dbPath || ep.lancedbPath || defaultLanceDBPath();
     config.targetLocalPath = lancedbPath;
     config.targetDbConfig = {
       ...(config.targetDbConfig || {}),
@@ -3089,10 +3484,23 @@ async function assembleTransformerConfig({
       gen?.targetColumns ?? skillInfo?.executionParams?.targetColumns,
       sourceColumns,
     );
+    // An in-place update of a vector store writes back the SAME records, plus
+    // whatever fields it adds. Its output is the source's columns with the new
+    // ones appended — not just the fields the skill declared it touched, which
+    // left a node chained after it believing the store held only `tier` (and
+    // asking which field holds the name). The source's sample rows still
+    // describe those records, so they go along too.
+    const inPlaceVector = !!skillInfo?.isVectorSkill
+      && !!config.targetConnectionId && config.targetConnectionId === base.sourceConnectionId;
+    const inPlaceColumns = inPlaceVector
+      ? [...sourceColumns, ...declared.filter((d) => !sourceColumns.some((c) => c.name === d.name))]
+      : null;
     config.targetTableSchema = {
       tableName: config.targetCollection || config.targetTableName,
-      columns: derived?.columns?.length ? derived.columns : (declared.length ? declared : sourceColumns),
-      sampleData: derived?.sampleData || [],
+      columns: derived?.columns?.length
+        ? derived.columns
+        : (inPlaceColumns || (declared.length ? declared : sourceColumns)),
+      sampleData: derived?.sampleData || (inPlaceVector ? (base.sourceTableSchema?.sampleData || []) : []),
     };
   }
 
@@ -3140,9 +3548,26 @@ async function assembleTransformerConfig({
     : `Mode: ${operationMode === 'in_place' ? 'In-place' : 'New table'}`;
   const explanationText = gen?.explanation
     || `Built ${operationMode === 'in_place' ? 'in-place' : 'new-table'} transformer "${targetTableName}" on ${targetConn.name} (${targetConn.dbType}).`;
-  const transformerMetadata = isNoSQL
-    ? { operationType: gen?.operationType || null, nosqlOperation: gen?.nosqlOperation || null, transformFunction: gen?.transformFunction || null }
-    : { ddl: gen?.ddl || null, sql: gen?.sql || null, insertSql: gen?.insertSql || null, previewSql: gen?.previewSql || null };
+  // Everything this build decided, not only its code: the next build on this
+  // node reads it back through chatToHistory, and a refinement has to start
+  // from the same target table, mode and location it is refining.
+  const transformerMetadata = {
+    targetTableName: config.targetTableName || config.targetCollection || null,
+    targetConnection: targetConn?.name ? `${targetConn.name} (${targetConn.dbType})` : null,
+    operationMode,
+    storageLocation,
+    skillId: skillInfo?.skillId || null,
+    ...(isNoSQL
+      ? { operationType: gen?.operationType || null, nosqlOperation: gen?.nosqlOperation || null, transformFunction: gen?.transformFunction || null }
+      : {
+        ddl: gen?.ddl || null,
+        sql: gen?.sql || null,
+        insertSql: gen?.insertSql || null,
+        previewSql: gen?.previewSql || null,
+        // A skill-built node (javascript-executor) carries its logic here.
+        transformFunction: config.transformFunction || gen?.transformFunction || null,
+      }),
+  };
   const skillBanner = skillInfo ? ` via skill "${skillInfo.skillId}"` : '';
   pushBotMsg(
     chat,
@@ -3189,6 +3614,25 @@ function describeTableSchema(schema, sqlName = null) {
 // the same way.
 const VECTOR_DB_TYPES = new Set(['lancedb', 'pinecone']);
 
+// A join's write modes — see joinSettings.operationMode in buildJoinConfig.
+const JOIN_WRITE_MODES = new Set(['new_table', 'append', 'merge']);
+
+/**
+ * How a destination can merge (update matching rows, insert the rest), or
+ * null when it cannot. Declared by the connector itself (`mergeSupport`), so
+ * this never names an engine. A local join destination is the workflow's
+ * DuckDB, which the duckdb connector speaks for.
+ */
+function mergeSupportFor(dbType, helpers) {
+  try {
+    const conn = helpers?.pluginManager?.getConnector?.(dbType);
+    const ms = conn?.mergeSupport;
+    return ms && typeof ms === 'object' && ms.guidance ? ms : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Resolve one upstream node into the join's source descriptor. A join reads an
 // upstream's OUTPUT, and where that lives depends on the node TYPE:
 //   - dataSource  → the table/collection it READ          (source* fields)
@@ -3229,10 +3673,23 @@ function resolveJoinSource(n) {
   };
 }
 
-async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, warnings, chat, connectionId = null, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null, action = null }) {
+async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, warnings, chat, connectionId = null, existingConfig = null, pendingSkill: pendingSkillArg = null, bypassSkills = false, workflowId = null, resumedCalls = null, action = null, apiFetchApproval = null }) {
   if (!upstreamNodes || upstreamNodes.length < 2) throw new Error('Join needs at least 2 upstream source nodes.');
 
   const sources = upstreamNodes.map((n) => resolveJoinSource(n));
+  // Every input must name the table it contributes. One that does not is an
+  // unfinished node (a data source whose table or cloud file was never picked),
+  // and building on it used to ask the user for join keys and then fail at run
+  // time on a table that does not exist. Stop here and name the node instead.
+  const unnamed = sources.filter((s) => !(s.sourceTableName || s.sourceCollection
+    || s.sourceIndexName || s.sourceTableSchema?.tableName));
+  if (unnamed.length) {
+    throw new Error(
+      `Join input ${unnamed.map((s) => `"${s.sourceNodeLabel || s.sourceNodeId}"`).join(', ')} names no table `
+      + 'for its output, so there is nothing to join. Finish that node — pick its table, or the cloud file — '
+      + 'and build the join again.',
+    );
+  }
   // Each source's stored schema is a snapshot taken when its own node was
   // configured. Join keys are picked from column names, so a source that has
   // gained or lost a column since then produces join conditions on columns that
@@ -3275,7 +3732,31 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   }
 
   const sourcesInfo = sources.map((s, i) => `Source ${i + 1} (${s.sourceNodeLabel || s.sourceNodeId}):\n${describeTableSchema(s.sourceTableSchema)}`).join('\n\n');
-  const destinationCandidates = (helpers.connections || []).map((c) => `- ${c.id || c._id}: ${c.name} (${c.dbType}, ${c.connectionType || 'file'})`).join('\n') || '(none)';
+  // Only connections a join can actually write to — see isJoinDestinationConnection.
+  // The two local tokens are listed too, so the analyser never has to invent one.
+  // Each destination says whether it can take write mode "merge" — read from
+  // the connector's own mergeSupport declaration, so a new connector that
+  // declares one is offered merge with no change here.
+  const mergeNote = (dbType) => (mergeSupportFor(dbType, helpers) ? ' — merge: yes' : ' — merge: no');
+  const destinationCandidates = [
+    ...(helpers.connections || []).filter(isJoinDestinationConnection)
+      .map((c) => `- ${c.id || c._id}: ${c.name} (${c.dbType}, ${c.connectionType || 'file'})${mergeNote(c.dbType)}`),
+    `- local-duckdb: a table in this workflow's own DuckDB database${mergeNote('duckdb')}`,
+    '- local-lancedb: a local LanceDB vector table — merge: no (new_table replaces it; append upserts by id)',
+    // Saved connections a join CANNOT write to, named so the analyser can say
+    // so. Left out of the list entirely, "write it into the e2e duckdb file"
+    // was mapped to the nearest thing that was listed — local-duckdb, which is
+    // a different database — and the destination moved without a word (BUG-11).
+    ...(() => {
+      const refused = (helpers.connections || []).filter((c) => !isJoinDestinationConnection(c));
+      if (!refused.length) return [];
+      return [
+        '',
+        'NOT join destinations (files and storage a join cannot write into — never substitute local-duckdb or anything else for them):',
+        ...refused.map((c) => `- ${c.name} (${c.dbType}, ${c.connectionType || c.dbCategory || 'file'})`),
+      ];
+    })(),
+  ].join('\n');
 
   // Fetch installed join skills (minus vector-db-executor, which is the
   // single-source variant — JoinNodeChat hides it for the same reason).
@@ -3285,6 +3766,31 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     const srcConn = (helpers.connections || []).find((c) => (c.id || c._id) === s.sourceConnectionId);
     return srcConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(s.sourceDbType);
   });
+  // The destination is often settled BEFORE the analyser runs — the planner
+  // declared it (connectionId), set_join_destination / the picker wrote it, or
+  // an earlier build did. Whether it is a vector store decides which join
+  // scenarios the analyser may choose, so it has to be told.
+  const knownDestination = connectionId
+    || existingConfig?.joinSettings?.destinationSelection
+    || existingConfig?.targetConnectionId
+    || null;
+  const hasVectorDestination = (() => {
+    if (!knownDestination) return false;
+    if (knownDestination === 'local-lancedb') return true;
+    if (String(knownDestination).startsWith('local-')) return false;
+    const destConn = (helpers.connections || []).find((c) => (c.id || c._id) === knownDestination);
+    return destConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(destConn?.dbType);
+  })();
+  // The same settled destination, named for the analyser: its "requiresFunction"
+  // rule depends on whether the result lands in a SQL database, local DuckDB, a
+  // document store or a vector store.
+  const destinationDescription = (() => {
+    if (!knownDestination) return null;
+    if (knownDestination === 'local-duckdb') return 'local-duckdb (a table in this workflow\'s DuckDB database)';
+    if (knownDestination === 'local-lancedb') return 'local-lancedb (a local LanceDB vector table)';
+    const destConn = (helpers.connections || []).find((c) => (c.id || c._id) === knownDestination);
+    return destConn ? `${destConn.name} (${destConn.dbType}, ${destConn.dbCategory || destConn.connectionType || 'database'})` : null;
+  })();
   const availableJoinSkills = (() => {
     if (bypassSkills) return [];
     try {
@@ -3321,7 +3827,12 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
       availableJoinSkills,
       {
         hasVectorSource,
-        hasVectorDestination: false,
+        hasVectorDestination,
+        destinationDescription,
+        // The node's current write mode, so a refinement that does not
+        // mention it keeps it.
+        currentMode: existingConfig?.joinSettings?.operationMode || 'new_table',
+        currentMergeKeys: existingConfig?.joinSettings?.mergeKeys || null,
       },
     );
     analysis = await callJsonResumable(helpers, analysisPrompt, { chatHistory }, { stage: 'join:analysis', resumed: resumedCalls });
@@ -3347,9 +3858,9 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   const prevJoin = existingConfig?.joinSettings || {};
   const inferred = analysis?.inferredSettings || {
     destinationSelection: prevJoin.destinationSelection || existingConfig?.targetConnectionId || null,
-    // Not carried over from the saved node: a join is always new_table. See
-    // joinSettings below.
-    operationMode:        'new_table',
+    // Carried over, so a refinement that does not mention the write mode keeps it.
+    operationMode:        JOIN_WRITE_MODES.has(prevJoin.operationMode) ? prevJoin.operationMode : 'new_table',
+    mergeKeys:            prevJoin.mergeKeys || null,
     targetTableName:      prevJoin.targetTableName || existingConfig?.targetTableName || existingConfig?.targetCollection || null,
     selectedColumns:      prevJoin.selectedColumns || {},
   };
@@ -3360,6 +3871,14 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   inferred.vectorRequired = analysis
     ? (analysis.vectorRequired === true)
     : (existingConfig?.vectorRequired === true);
+  // The analyser's verdict that SQL on the destination cannot do this join
+  // (nested / array values into a SQL database, a match SQL cannot express).
+  // Read here as reported; the destinations whose answer is fixed are applied
+  // below, once the destination is resolved, so a model that leaves the flag
+  // false for a Mongo or vector destination changes nothing.
+  inferred.requiresFunction = analysis
+    ? (analysis.requiresFunction === true)
+    : (existingConfig?.requiresFunction === true);
 
   // Honor the analyser's OWN decision instead of forcing a relational
   // "join keys" question. A vector similarity self-join has no join-key
@@ -3432,11 +3951,32 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   const targetConn = isLocalStorage
     ? null
     : resolveTargetConnection(inferred.destinationSelection, helpers.connections, sources[0]);
+  // A destination that names nothing, or names a connection a join cannot
+  // write to, stops here. Unresolved used to fall through to `duckdb` with the
+  // unknown id kept as the target connection — a node pointing nowhere — and a
+  // cloud-storage or API connection reached the SQL path and failed at run time.
+  if (!isLocalStorage && !isJoinDestinationConnection(targetConn)) {
+    const valid = (helpers.connections || []).filter(isJoinDestinationConnection)
+      .map((c) => `"${c.name}"`).join(', ');
+    throw new Error(
+      `The join destination "${targetConn?.name || inferred.destinationSelection}" `
+      + `${targetConn ? `(${targetConn.dbType}) cannot hold a join result` : 'is not a saved connection'}. `
+      + `A join writes to a database, a vector store, "local-duckdb" or "local-lancedb"`
+      + `${valid ? ` — available: ${valid}` : ''}. Pick one of those and build the join again.`,
+    );
+  }
   // The next four derivations are kept 1:1 with JoinNodeChat.js (generateJoin).
   const targetDbType = targetConn?.dbType
     || (isLocalStorage ? inferred.destinationSelection.replace('local-', '') : 'duckdb');
   const isNoSQL = targetDbType === 'mongodb';
   const isVectorDestination = targetConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(targetDbType);
+  // Is this join a JavaScript function rather than SQL? Fixed for a document or
+  // vector destination (they only join in JavaScript) and for an embedding /
+  // similarity join (no SQL engine here can embed). Only for a SQL database or
+  // local DuckDB destination is it a real decision — the analyser's
+  // `requiresFunction`, set when SQL there cannot express the join.
+  const requiresFunction = isNoSQL || isVectorDestination
+    || !!inferred.vectorRequired || !!inferred.requiresFunction;
   const destinationConnectionId = targetConn?.id || targetConn?._id || inferred.destinationSelection;
   // A name carried over from the existing node was already qualified when it was
   // first built — don't run it through qualifyLocalTableName twice.
@@ -3449,27 +3989,67 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 
   const joinSettings = {
     userRequest: stepPrompt,
-    // A join ALWAYS replaces its target — truncate-and-load, never append.
-    // Every destination route implements that: a SQL destination is
-    // DROP + targetDdl + INSERT, local DuckDB is CREATE OR REPLACE TABLE AS, and
-    // a document store drops the collection before inserting.
-    //
-    // FORCED rather than read from `inferred`, so neither a model slip nor a node
-    // saved back when "merge_existing" was still offered can put an append-mode
-    // join into the graph. That mode is unrunnable: NodeExecution only creates
-    // the destination under `new_table`, so anything else yields a join that
-    // cannot make the table it inserts into — see the note on
-    // joinAnalysisRequest in ChatPrompts/Join.js.
-    operationMode: 'new_table',
+    // The write mode:
+    //   'new_table' — replace the target every run (drop, CREATE, INSERT; a
+    //                 document store drops the collection)
+    //   'append'    — keep the target's rows and add this run's: CREATE only
+    //                 when the table is missing, never a drop
+    //   'merge'     — like append, but the insert script is the destination's
+    //                 MERGE / upsert on `mergeKeys` (only where the connector
+    //                 declares mergeSupport — checked below)
+    // Anything else the model reports (an old "merge_existing") reads as
+    // new_table. A vector destination upserts by id whatever the mode.
+    operationMode: JOIN_WRITE_MODES.has(inferred.operationMode) ? inferred.operationMode : 'new_table',
+    ...(inferred.operationMode === 'merge' && Array.isArray(inferred.mergeKeys) && inferred.mergeKeys.length
+      ? { mergeKeys: inferred.mergeKeys.map(String) } : {}),
     destinationSelection: inferred.destinationSelection || (targetConn?.id || targetConn?._id) || 'local-duckdb',
     targetTableName,
     selectedColumns: inferred.selectedColumns || {},
   };
 
+  // Merge is only buildable where the destination declares it, for a SQL join
+  // (a function join's rows are batch-inserted; a document store has no
+  // statement to write), and with a key to match on. Anything short of that is
+  // put to the user once; a repeat answer that still asks for merge is built
+  // as append, with a warning, rather than looping.
+  if (joinSettings.operationMode === 'merge') {
+    const destName = targetConn?.name || (isLocalStorage ? 'the local table' : targetDbType);
+    if (isVectorDestination) {
+      // A vector store upserts by id in every mode — that IS its merge.
+      joinSettings.operationMode = 'append';
+    } else if (!mergeSupportFor(targetDbType, helpers) || isNoSQL || requiresFunction) {
+      const q = `${destName} can't take a merge here (update the matching rows, insert the rest)`
+        + `${requiresFunction && !isNoSQL ? ' — this join runs as a JavaScript function, whose rows are inserted, not merged' : ''}. `
+        + 'I can append this run\'s rows, append only the rows that aren\'t already there (an anti-join on a key), or replace the table each run. Which do you want?';
+      if (!findClarificationAnswer(chat, q)) throw new ClarificationNeeded(q, { nodeId, kind: 'join.mergeMode' });
+      warnings.push(`Join "${targetTableName}": ${destName} cannot merge, so it was built in append mode.`);
+      joinSettings.operationMode = 'append';
+      delete joinSettings.mergeKeys;
+    } else if (!joinSettings.mergeKeys?.length) {
+      const q = 'Which column(s) identify a row, so a merge knows which existing rows to update?';
+      if (!findClarificationAnswer(chat, q)) throw new ClarificationNeeded(q, { nodeId, kind: 'join.mergeKeys' });
+    }
+  }
+
   // ── Skill turn — one round per user message, handled exactly like a builder's
   // own clarification (see buildTransformerConfig).
   const activeSkillId = routedSkillId || (analysis?.usesSkill ? analysis?.skillId : null);
   let gen = null;
+  // The kept target's live shape (append / merge), and the generator's answer
+  // as it came back — see the target-rebuild check below.
+  let liveTarget = null;
+  let genAsGenerated = null;
+  // How the join SQL names each source on a SQL destination — a placeholder the
+  // model writes and the real name the code puts in its place. See
+  // applySourceSlots. Empty for every other destination and for a skill join.
+  const sourceSlots = [];
+  // Sources the join reads where they lie, with nothing staged. The model is
+  // told such a source needs no fields and may leave it out of sourcesConfig
+  // altogether — see ensureInPlaceSteps.
+  const inPlaceSourceIds = [];
+  // How the generated SQL's {{TARGET}} is written on a SQL destination — the
+  // target quoted for that engine. Set with the prompt below.
+  let targetSqlRef = null;
   if (activeSkillId && helpers?.pluginManager?.buildSkillPrompt) {
     const context = {
       kind: 'join',
@@ -3562,6 +4142,10 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
       }
     })();
     const destDbConfig = targetConn?.dbConfig || null;
+    // A function join into a TABLE destination (local or a SQL database): the
+    // executor writes the function's rows as the target. Document and vector
+    // destinations join in JavaScript through their own contracts.
+    const isFunctionJoin = requiresFunction && !isVectorDestination && !isNoSQL;
 
     // The DESTINATION table as this engine must see it written.
     //
@@ -3596,7 +4180,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     // sourcesInfo exactly — otherwise the prompt template dereferences undefined
     // fields (e.g. src.requiredFields.length). isVectorDestination / isNoSQL /
     // destinationConnectionId are computed once above, same as JoinNodeChat.
-    const sourcesForPrompt = sources.map((s) => {
+    const sourcesForPrompt = sources.map((s, idx) => {
       const sourceDbType = s.sourceDbType;
       const srcConn = (helpers.connections || []).find((c) => (c.id || c._id) === s.sourceConnectionId);
       const isSourceNoSQL = sourceDbType === 'mongodb';
@@ -3605,7 +4189,11 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 
       // Determine what fields are needed for this source (mirrors JoinNodeChat).
       let requiredFields = [];
-      if (isVectorDestination) {
+      if (isVectorDestination || isFunctionJoin) {
+        // Every source is loaded whole into memory and handed to the join
+        // function — a vector destination always, and a local or SQL one when
+        // the join needs embeddings / similarity search (isFunctionJoin). A
+        // source only needs the read that loads it; nothing is staged.
         if (isSourceVector) requiredFields = ['vectorFetchOperation'];
         else if (isSourceNoSQL) requiredFields = ['nosqlOperation'];
         else requiredFields = ['sql'];
@@ -3613,11 +4201,42 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         if (isSourceVector) requiredFields = ['vectorFetchOperation'];
         else if (isSourceNoSQL) requiredFields = ['nosqlOperation'];
         else requiredFields = ['sql'];
+      } else if (targetDbType === 'duckdb') {
+        // A LOCAL destination stages nothing the model has to describe.
+        // executeLocalDuckDBJoin reads a DuckDB file, or a table in a workflow
+        // database, WHERE IT LIES — a view over the path, no copy — so such a
+        // source needs no fields at all. Everything else it stages ITSELF, with
+        // ingestRowsToStaging: code, not a model-written `ddl`. So the model
+        // supplies only the READ, plus selectedColumns, which emptyViewSelect
+        // needs to shape the view when that read comes back with no rows.
+        //
+        // The join SQL itself follows the SQL contract (CREATE TABLE {{TARGET}}
+        // + INSERT INTO {{TARGET}}), with every source written as its
+        // {{SOURCE_n}} view — see applySourceSlots. No source gets a `ddl`:
+        // nothing is created on a local destination from model-written DDL.
+        //
+        // Read in place: a DuckDB-readable file with a path, and every SQLite
+        // source — SQLite is always a local file, and localFilePathOf resolves
+        // it (fileInfo.filePath or dbConfig.dbPath) for DuckDB to attach
+        // through its sqlite extension. Anything else is staged and needs its
+        // read; telling a staged source it needs nothing fails the run with "has
+        // no SQL to read it with" after the other sources have been read.
+        const readsInPlace = (sourceDbType === 'duckdb' && !!s.sourceLocalPath) || sourceDbType === 'sqlite';
+        if (readsInPlace) requiredFields = [];
+        else if (isSourceVector) requiredFields = ['vectorFetchOperation'];
+        else if (isSourceNoSQL) requiredFields = ['nosqlOperation', 'selectedColumns'];
+        else requiredFields = ['sql', 'selectedColumns'];
       } else {
-        if (isSourceVector) requiredFields = ['tempTableName', 'ddl', 'vectorFetchOperation', 'insertSql'];
-        else if (isSourceNoSQL) requiredFields = ['tempTableName', 'ddl', 'nosqlOperation', 'insertSql'];
+        // A source staged into a SQL destination. These are exactly the fields
+        // the executor's staging step reads: it CREATEs the temp table from
+        // `ddl`, reads the source with its query, and loads the rows through
+        // batchInsert(tempTableName, selectedColumns, rows) — so `selectedColumns`
+        // is required (the run throws without it) and there is no `insertSql`:
+        // the executor writes its own inserts and never read one.
+        if (isSourceVector) requiredFields = ['tempTableName', 'ddl', 'vectorFetchOperation', 'selectedColumns'];
+        else if (isSourceNoSQL) requiredFields = ['tempTableName', 'ddl', 'nosqlOperation', 'selectedColumns'];
         else if (isInDestinationDb) requiredFields = [];
-        else requiredFields = ['tempTableName', 'ddl', 'sql', 'insertSql'];
+        else requiredFields = ['tempTableName', 'ddl', 'sql', 'selectedColumns'];
       }
 
       const tableName = s.sourceTableName || s.sourceCollection || s.sourceTableSchema?.tableName || null;
@@ -3660,7 +4279,13 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
           if (s.sourceNodeType === 'dataSource') {
             for (const c of columns) {
               const name = typeof c === 'string' ? c : c?.name;
-              if (name) quotedColumns[name] = connector.quoteIdentifier(name, null, null);
+              // quoteColumn when the connector has one: quoteIdentifier splits a
+              // dotted name into qualifier.name, which is wrong for a column.
+              if (name) {
+                quotedColumns[name] = typeof connector.quoteColumn === 'function'
+                  ? connector.quoteColumn(name)
+                  : connector.quoteIdentifier(name, null, null);
+              }
             }
           }
         }
@@ -3707,14 +4332,62 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         }
       }
 
+      if (requiredFields.length === 0) inPlaceSourceIds.push(s.sourceNodeId);
+
+      // On a SQL destination the join SQL names every source as it exists on
+      // THAT database: a staged source by its temp table, a source already
+      // there by its own table. The model writes a placeholder for it and the
+      // real, quoted name is put in afterwards (applySourceSlots) — it used to
+      // copy `temp_datasource_1791017913879_1` into the ddl and the join SQL,
+      // and one garbled digit made the join read a table that never existed.
+      //
+      // A LOCAL destination works the same way: every source is readable in the
+      // workflow's DuckDB under a view the executor registers, named here (one
+      // per source, so a self-join's two sides never share a name).
+      const isLocalSqlJoin = !isVectorDestination && !isFunctionJoin && !isNoSQL && targetDbType === 'duckdb';
+      const isSqlDestSlot = !isVectorDestination && !isFunctionJoin && !isNoSQL && targetDbType !== 'duckdb'
+        && (needsTempTable || isInDestinationDb);
+      let placeholder = null;
+      if (isSqlDestSlot || isLocalSqlJoin) {
+        placeholder = `{{SOURCE_${idx + 1}}}`;
+        const viewName = isLocalSqlJoin
+          ? `src${idx + 1}_${String(tableName || 'source').replace(/[^A-Za-z0-9_]/g, '_')}`.toLowerCase().slice(0, 60)
+          : null;
+        sourceSlots.push({
+          placeholder,
+          sourceNodeId: s.sourceNodeId,
+          // 'staged' — a temp table CREATEd on the destination from the step's ddl
+          // 'inPlace' — a table already on the destination, read where it is
+          // 'view'   — a local source, registered as a view under tempTableName
+          kind: isLocalSqlJoin ? 'view' : (needsTempTable ? 'staged' : 'inPlace'),
+          tempTableName: isLocalSqlJoin ? viewName : (needsTempTable ? tempTableName : null),
+          sqlRef: isLocalSqlJoin
+            ? `"${viewName}"`
+            : (needsTempTable ? (quotedTempTableRef || tempTableName) : (quotedTableRef || tableName)),
+          // For the replace guard: the table this source reads, where it reads it.
+          tableName,
+          schema: s.sourceSchema || null,
+          readsDestination: isInDestinationDb || (isLocalSqlJoin && sourceDbType === 'duckdb'
+            && !!s.sourceLocalPath && duckdbCore.isWorkflowDatabase?.(s.sourceLocalPath)),
+          label: s.sourceNodeLabel || tableName || s.sourceNodeId,
+        });
+      }
+
       return {
         sourceNodeId: s.sourceNodeId,
         sourceNodeLabel: s.sourceNodeLabel,
         tableName,
-        quotedTableRef,
+        // A source read in place on the destination is written as its
+        // placeholder; the quoted form would only invite the model to write it
+        // itself.
+        // A source read in place on a SQL destination is written ONLY as its
+        // placeholder. A local source keeps its quoted form: its own read
+        // (when it has one) still runs against it.
+        quotedTableRef: (placeholder && isSqlDestSlot && !needsTempTable) ? null : quotedTableRef,
         quotedColumns: Object.keys(quotedColumns).length ? quotedColumns : null,
-        tempTableName,
-        quotedTempTableRef,
+        placeholder,
+        staged: !!(placeholder && isSqlDestSlot && needsTempTable),
+        localView: !!(placeholder && isLocalSqlJoin),
         columns,
         sampleData: s.sourceTableSchema?.sampleData || [],
         connectionId: s.sourceConnectionId,
@@ -3723,13 +4396,24 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         localPath: s.sourceLocalPath || null,
         isInDestinationDb,
         isSourceVector,
-        requiredFields,
+        // The temp table's name is the code's, written as the placeholder.
+        requiredFields: placeholder ? requiredFields.filter((f) => f !== 'tempTableName') : requiredFields,
       };
     });
 
     // hasLocalConnection mirrors JoinNodeChat: any source with a local path, or a
     // destination whose dbType is a local file format (duckdb / sqlite / lancedb).
     const LOCAL_DB_TYPES_FOR_PROMPT = new Set(['duckdb', 'lancedb']);
+    targetSqlRef = targetDbType === 'duckdb' ? null : (quotedTargetRef || targetTableName);
+
+    // A join that KEEPS its target (append / merge) writes into whatever table
+    // is already there. Read its live shape so the generator writes for it —
+    // and says when it cannot (see the target-rebuild check after generation).
+    liveTarget = await probeKeptJoinTarget({
+      operationMode: joinSettings.operationMode,
+      targetDbType, isNoSQL, isVectorDestination,
+      targetConn, destConnector, targetTableName, workflowId, helpers,
+    });
     const genPrompt = ChatPrompts.join.generateJoinQuery(
       targetDbType,
       sourcesForPrompt,
@@ -3738,11 +4422,26 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
         tableName: targetTableName,
         quotedTargetRef,
         isVectorDestination,
-        vectorRequired: !!analysis?.vectorRequired,
+        // Not `analysis?.vectorRequired`: a rebuild that skips the analyser still
+        // carries the node's saved verdict in `inferred`.
+        vectorRequired: !!inferred.vectorRequired,
+        // The resolved verdict, not the analyser's raw flag — see `requiresFunction`.
+        requiresFunction,
+        // Write mode "merge": the destination's own guidance for writing it,
+        // and the key columns the user named.
+        ...(joinSettings.operationMode === 'merge'
+          ? { mergeGuidance: mergeSupportFor(targetDbType, helpers)?.guidance || null, mergeKeys: joinSettings.mergeKeys || [] }
+          : {}),
         hasLocalConnection: sourcesForPrompt.some((s) => s.localPath) || LOCAL_DB_TYPES_FOR_PROMPT.has(targetDbType),
+        ...(liveTarget?.state === 'exists'
+          ? { existingTarget: targetShape.formatShapeForPrompt(liveTarget) }
+          : {}),
       },
     );
     gen = await callJsonResumable(helpers, genPrompt, { chatHistory }, { stage: 'join:gen', resumed: resumedCalls });
+    // As generated, before the placeholders are filled in below — what a
+    // paused build replays so the approved statement is the one that runs.
+    genAsGenerated = gen ? JSON.parse(JSON.stringify(gen)) : null;
   }
   console.log('buildJoinConfig+gen: ', gen)
 
@@ -3751,13 +4450,216 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // open the source — a vector source in particular throws "no tableName".
   if (gen && Array.isArray(gen.sourcesConfig)) {
     gen.sourcesConfig = enrichJoinSourcesConfig(gen.sourcesConfig, sources, helpers, warnings);
+    gen.sourcesConfig = ensureInPlaceSteps(gen.sourcesConfig, inPlaceSourceIds, sources, helpers, warnings);
   }
+  if (gen && sourceSlots.length) {
+    applySourceSlots(gen, sourceSlots, {
+      targetRef: targetSqlRef,
+      targetTableName,
+      operationMode: joinSettings.operationMode,
+    });
+  }
+
+  // The kept target no longer fits what this join writes: it has to be
+  // dropped and recreated once. Recorded on the node, and — in a plan build —
+  // approved before the build goes on (the same pause an API fetch takes).
+  joinSettings.targetRebuild = gen && !gen._skillId
+    ? await joinTargetRebuild({
+      gen, genAsGenerated, analysis, liveTarget, joinSettings, targetTableName,
+      targetConn, targetDbType, workflowId, helpers, nodeId, apiFetchApproval, chat,
+      sourceSlots,
+    })
+    : null;
 
   return assembleJoinConfig({
     sources, stepPrompt, joinSettings, gen, warnings, chat,
     targetConn, isNoSQL, isLocalStorage, targetTableName, helpers,
     workflowId, nodeId,
+    vectorRequired: !!inferred.vectorRequired,
+    // The analyser's own flag is what is saved (so a rebuild re-reads the same
+    // decision); the resolved one is what the build is checked against.
+    requiresFunctionFlag: !!inferred.requiresFunction,
+    requiresFunction,
   });
+}
+
+/**
+ * The live shape of a join's target when the join KEEPS it (append / merge) on
+ * a table destination — SQL database or the workflow's DuckDB. null for every
+ * other case: a replace recreates the target each run, a document store has no
+ * schema to fit, and a vector store upserts records.
+ */
+async function probeKeptJoinTarget({
+  operationMode, targetDbType, isNoSQL, isVectorDestination,
+  targetConn, destConnector, targetTableName, workflowId, helpers,
+}) {
+  if (operationMode !== 'append' && operationMode !== 'merge') return null;
+  if (isNoSQL || isVectorDestination || !targetTableName) return null;
+  try {
+    if (targetDbType === 'duckdb') {
+      if (!workflowId) return null;
+      return await targetShape.probeLocalTable(workflowId, targetTableName);
+    }
+    if (!destConnector || !targetConn || typeof helpers.getFullConfig !== 'function') return null;
+    const id = targetConn.id || targetConn._id;
+    const fullConfig = await helpers.getFullConfig(id, targetConn.dbConfig || {});
+    const defaultSchema = targetConn.dbConfig?.schema || fullConfig?.schema || fullConfig?.dbConfig?.schema || null;
+    return await targetShape.probeTargetTable({
+      plugin: destConnector, config: fullConfig, connectionId: id, tableName: targetTableName, defaultSchema,
+    });
+  } catch (err) {
+    console.log(`[Join] Could not read the live shape of ${targetTableName}:`, err.message || err);
+    return null;
+  }
+}
+
+/** Rows currently in the kept target — shown on the approval, best effort. */
+async function keptTargetRowCount({ liveTarget, targetDbType, targetConn, targetTableName, workflowId, helpers }) {
+  try {
+    if (targetDbType === 'duckdb') return await duckdbCore.tableRowCount(workflowId, targetTableName);
+    const ref = liveTarget?.resolved?.quotedRef;
+    if (!ref || typeof helpers.runQuery !== 'function') return null;
+    const rows = await helpers.runQuery(targetConn, `SELECT COUNT(*) AS n FROM ${ref}`);
+    const first = (Array.isArray(rows) ? rows : rows?.rows || [])[0] || {};
+    const n = Number(Object.values(first)[0]);
+    return Number.isFinite(n) ? n : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Does this join's kept target have to be dropped and recreated before the
+ * join can write into it? The generator says so itself (`targetSchemaChange`);
+ * the structured comparison in lib/targetShape is the backstop for the two
+ * differences that always break a write (a missing column, a primary key that
+ * differs). Returns the record saved as `joinSettings.targetRebuild`, or null.
+ *
+ * In a plan build the change is approved before the build continues: the build
+ * pauses with ApprovalNeeded, and the approval is bound to the exact CREATE
+ * statement (a rebuild that generates a different one asks again). From a
+ * node's own chat it is approved by "Run this node", and from the canvas by
+ * the Execute prompt; a run that has not been approved touches nothing.
+ */
+/**
+ * Do two table names, as the app holds them, name the same table? Quotes and
+ * case are ignored; a schema/dataset qualifier is compared only when both
+ * names carry one ("orders" matches "public.orders"). Names, not SQL.
+ */
+function sameTableName(a, b) {
+  const parts = (n) => String(n || '').split('.').map((p) => p.replace(/^[`"\[]+|[`"\]]+$/g, '').toLowerCase());
+  const pa = parts(a);
+  const pb = parts(b);
+  if (!pa[pa.length - 1] || pa[pa.length - 1] !== pb[pb.length - 1]) return false;
+  if (pa.length > 1 && pb.length > 1) return pa[pa.length - 2] === pb[pb.length - 2];
+  return true;
+}
+
+/**
+ * The join source that IS this table, read where it lies on the destination —
+ * or null. Dropping such a target deletes that source's rows before the join
+ * reads them: the join then runs against an empty table and writes nothing,
+ * and the data that was there is gone.
+ */
+function sourceThatIsTarget(sourceSlots, targetTableName) {
+  if (!Array.isArray(sourceSlots) || !targetTableName) return null;
+  return sourceSlots.find((sl) => sl.readsDestination && sameTableName(sl.tableName, targetTableName)) || null;
+}
+
+/** Two tables to write to instead — shown when the target is also a source. */
+function otherTargetSuggestions(targetTableName) {
+  const parts = String(targetTableName).split('.');
+  const bare = parts.pop().replace(/^[`"\[]+|[`"\]]+$/g, '');
+  const prefix = parts.length ? `${parts.join('.')}.` : '';
+  return [`${prefix}${bare}_joined`, `${prefix}tmp_${bare}`];
+}
+
+async function joinTargetRebuild({
+  gen, genAsGenerated, analysis, liveTarget, joinSettings, targetTableName,
+  targetConn, targetDbType, workflowId, helpers, nodeId, apiFetchApproval, chat,
+  sourceSlots = [],
+}) {
+  if (!liveTarget || liveTarget.state !== 'exists') return null;
+  const wanted = {
+    columns: (Array.isArray(gen.targetColumns) ? gen.targetColumns : []).map((c) => (typeof c === 'string' ? c : c?.name)).filter(Boolean),
+    primaryKey: Array.isArray(gen.targetPrimaryKey) ? gen.targetPrimaryKey : [],
+  };
+  const cmp = targetShape.compareTargetShape(liveTarget, wanted);
+  const said = gen.targetSchemaChange && typeof gen.targetSchemaChange === 'object' ? gen.targetSchemaChange : null;
+  if (!(said?.required === true || cmp.changed)) return null;
+  if (!String(gen.targetDdl || '').trim()) return null;
+
+  const reason = String(said?.required === true && said.reason ? said.reason : '').trim()
+    || targetShape.describeDifference(cmp, targetTableName)
+    || `${targetTableName} does not have the shape this join writes`;
+  // Shown inside sentences ("— <reason>. The rows …"), so no closing stop.
+  const reasonText = reason.replace(/[.\s]+$/, '');
+  const rowCount = await keptTargetRowCount({ liveTarget, targetDbType, targetConn, targetTableName, workflowId, helpers });
+  const ddl = String(gen.targetDdl);
+  // The target is one of this join's own inputs: the drop would empty it
+  // before the join reads it. Still the user's call — it is flagged, with what
+  // to write to instead, on every place the drop is approved.
+  const clash = sourceThatIsTarget(sourceSlots, targetTableName);
+  const targetIsSource = clash
+    ? { source: clash.label, suggestions: otherTargetSuggestions(targetTableName) }
+    : null;
+  const clashText = targetIsSource
+    ? `${targetTableName} is also this join's source "${targetIsSource.source}". Dropping it deletes that `
+      + 'source\'s rows before the join reads them, so the join would run against an empty table, write nothing, '
+      + `and the data would be gone. Write the join to another table instead — e.g. ${targetIsSource.suggestions[0]}, `
+      + `or a temporary ${targetIsSource.suggestions[1]} — and replace ${targetTableName} from it afterwards if you need to.`
+    : null;
+  const record = {
+    pending: true,
+    table: targetTableName,
+    targetIsSource,
+    reason: reasonText,
+    rowCount,
+    liveColumns: liveTarget.columns.map((c) => c.name),
+    livePrimaryKey: liveTarget.primaryKey,
+    newColumns: wanted.columns,
+    newPrimaryKey: wanted.primaryKey,
+    ddlFingerprint: targetShape.statementFingerprint(ddl),
+    approvedFingerprint: null,
+  };
+
+  const rowsText = Number.isFinite(rowCount) ? ` (${rowCount} row${rowCount === 1 ? '' : 's'})` : '';
+  if (apiFetchApproval?.route === 'plan') {
+    const approvedHere = typeof apiFetchApproval.approvedCode === 'string' && apiFetchApproval.approvedCode === ddl;
+    if (!approvedHere) {
+      throw new ApprovalNeeded(
+        `${targetTableName} already exists and no longer fits this join: ${reasonText}. `
+        + `Approve dropping it${rowsText} and recreating it on the next run.`
+        + (clashText ? ` ⚠ ${clashText}` : ''),
+        {
+          nodeId,
+          kind: 'join.target_rebuild',
+          approval: {
+            kind: 'target_rebuild',
+            table: targetTableName,
+            reason: reasonText,
+            rowCount,
+            code: ddl,
+            explanation: `Drops ${targetTableName}${rowsText} and recreates it on the next run — ${reasonText}. The rows in it now are deleted.`,
+            // Shown as a warning on the card, above the approve button.
+            ...(clashText ? { warning: clashText, targetIsSource } : {}),
+            // Replayed on resume, so the statement that runs is the one approved.
+            resumedCalls: {
+              ...(analysis ? { 'join:analysis': JSON.parse(JSON.stringify(analysis)) } : {}),
+              ...(genAsGenerated ? { 'join:gen': genAsGenerated } : {}),
+            },
+          },
+        },
+      );
+    }
+    record.approvedFingerprint = record.ddlFingerprint;
+    pushBotMsg(chat, `Approved: ${targetTableName} will be dropped and recreated on the next run (${reasonText}).`);
+  } else {
+    pushBotMsg(chat, `⚠ ${targetTableName} already exists and no longer fits this join: ${reasonText}. `
+      + `Running it drops the table${rowsText} and recreates it — "Run this node" asks before it does.`
+      + (clashText ? ` ⚠ ${clashText}` : ''));
+  }
+  return record;
 }
 
 // Attach the resolved source connection AND the source table name to every
@@ -3769,6 +4671,137 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
 // sourcesConfig only carries a vectorFetchOperation, so without this the loader
 // throws "no tableName/indexName found on sourceConfig or connection.dbConfig".
 // Mirrors the per-source shape the interactive JoinNodeChat persists.
+// Every source a join reads in place — already in the destination database, or
+// a local file a local join opens by path — still needs its sourcesConfig
+// entry. Nothing is staged for it, so the executor never misses it; but the
+// entries are also the record of which sources the join was BUILT from, and the
+// staleness checks (sourceStaleReason on the canvas, staleJoinSource in the
+// executor) read a wired source with no entry as "a new source the join does
+// not read" and refuse every run. The prompt tells the model such a source
+// needs no fields, and it sometimes takes that as "no entry", so the entry is
+// added here rather than left to it.
+function ensureInPlaceSteps(sourcesConfig, inPlaceIds, sources, helpers, warnings = []) {
+  const have = new Set(sourcesConfig.map((sc) => sc?.sourceNodeId).filter(Boolean));
+  const missing = inPlaceIds.filter((id) => !have.has(id)).map((sourceNodeId) => ({ sourceNodeId }));
+  if (!missing.length) return sourcesConfig;
+  return [...sourcesConfig, ...enrichJoinSourcesConfig(missing, sources, helpers, warnings)];
+}
+
+// Put the real table names where the model wrote {{SOURCE_n}}.
+//
+// On a SQL destination each source is read under a name only the code should
+// write: a staged source's temp table, quoted for the destination, or a table
+// already there, quoted the same way. The model is shown placeholders instead
+// of those names, so it has nothing to garble. This swaps them in and refuses a
+// result that cannot run: a join SQL that never reads one of its sources, a
+// staged source whose DDL creates some other table, or a placeholder that
+// names no source.
+const SOURCE_PLACEHOLDER = /\{\{\s*SOURCE_(\d+)\s*\}\}/g;
+const TARGET_PLACEHOLDER_RE = /\{\{\s*TARGET\s*\}\}/g;
+// Non-global twin for presence checks — a /g regex's .test() keeps state.
+const HAS_TARGET_PLACEHOLDER = /\{\{\s*TARGET\s*\}\}/;
+
+function applySourceSlots(gen, slots, { targetRef = null, targetTableName = null, operationMode = 'new_table' } = {}) {
+  const byPlaceholder = new Map(slots.map((sl) => [sl.placeholder, sl]));
+  const fill = (text) => (typeof text === 'string'
+    ? text.replace(SOURCE_PLACEHOLDER, (m, n) => {
+      const slot = byPlaceholder.get(`{{SOURCE_${n}}}`);
+      if (!slot) {
+        throw new Error(`Join: the generated SQL names ${m}, but this join has no such source `
+          + `(its sources are ${slots.map((sl) => sl.placeholder).join(', ')}). Rebuild the join.`);
+      }
+      return slot.sqlRef;
+    })
+    : text);
+  // {{TARGET}} is filled in here for a SQL destination. A local one keeps it:
+  // the executor resolves it once the workflow database is attached.
+  // (Spacing variants are normalised to the exact token it looks for.)
+  const fillTarget = (text) => (typeof text === 'string'
+    ? text.replace(TARGET_PLACEHOLDER_RE, targetRef || '{{TARGET}}')
+    : text);
+
+  const joinSql = String(gen.joinSql || '');
+  const named = (text) => new Set([...String(text || '').matchAll(SOURCE_PLACEHOLDER)].map((m) => `{{SOURCE_${m[1]}}}`));
+  const inJoin = named(joinSql);
+  const unread = slots.filter((sl) => !inJoin.has(sl.placeholder));
+  if (joinSql && unread.length) {
+    throw new Error(`Join: the generated join SQL never reads ${unread.map((sl) => `${sl.label} (${sl.placeholder})`).join(', ')}. `
+      + 'Every source must appear in it under its placeholder. Rebuild the join.');
+  }
+  if (joinSql && !HAS_TARGET_PLACEHOLDER.test(joinSql)) {
+    throw new Error('Join: the generated join SQL does not write {{TARGET}} — it must be INSERT INTO {{TARGET}} … (or MERGE INTO {{TARGET}} … in merge mode). Rebuild the join.');
+  }
+  if (gen.targetDdl && !HAS_TARGET_PLACEHOLDER.test(String(gen.targetDdl))) {
+    throw new Error('Join: the generated targetDdl does not create {{TARGET}} — it must be CREATE TABLE {{TARGET}} (…). Rebuild the join.');
+  }
+
+  // Replace mode drops and recreates the target before the INSERT reads its
+  // sources — so a source that IS the target would be emptied first, and the
+  // run would "succeed" with 0 rows and the data gone. Append never drops.
+  if (operationMode !== 'append' && operationMode !== 'merge' && targetTableName) {
+    const clash = sourceThatIsTarget(slots, targetTableName);
+    if (clash) {
+      throw new Error(`Join: the target table "${targetTableName}" is also one of this join's sources (${clash.label}). `
+        + 'A join replaces its target on every run, which would empty that source before it is read. '
+        + 'Write to a different table, or ask for append mode (add this run\'s rows to the table instead of replacing it).');
+    }
+  }
+
+  const steps = Array.isArray(gen.sourcesConfig) ? gen.sourcesConfig : [];
+  for (const slot of slots) {
+    const step = steps.find((sc) => sc?.sourceNodeId === slot.sourceNodeId);
+    if (!step) continue;
+    if (slot.kind === 'staged') {
+      if (!named(step.ddl).has(slot.placeholder)) {
+        throw new Error(`Join: the staging DDL for ${slot.label} does not create ${slot.placeholder} `
+          + `(it reads: ${String(step.ddl || '(none)').slice(0, 160)}). Rebuild the join.`);
+      }
+      step.tempTableName = slot.tempTableName;
+      step.ddl = fill(step.ddl);
+    } else if (slot.kind === 'view') {
+      // Registered as a view by the executor under this name; its read (if
+      // any) stays as written. Nothing is created from a DDL.
+      step.tempTableName = slot.tempTableName;
+      delete step.ddl;
+    } else {
+      // Read in place: nothing to stage, whatever the model added.
+      delete step.tempTableName;
+      delete step.ddl;
+      delete step.sql;
+      delete step.nosqlOperation;
+    }
+  }
+
+  // A source's own read runs on the SOURCE engine, where no placeholder means
+  // anything — one written there is a mistake, not a name to fill in.
+  for (const step of steps) {
+    const stray = [step?.sql, step?.nosqlOperation].find((t) => typeof t === 'string' && /\{\{\s*(SOURCE_\d+|TARGET)\s*\}\}/.test(t));
+    if (stray) {
+      throw new Error(`Join: the read for source ${step.sourceNodeId} uses a {{…}} placeholder, which only names `
+        + `tables on the destination. It should read the source's own table. Rebuild the join.`);
+    }
+  }
+
+  gen.joinSql = fillTarget(fill(gen.joinSql));
+  gen.targetDdl = fillTarget(fill(gen.targetDdl));
+  gen.previewSql = fillTarget(fill(gen.previewSql));
+  // A local preview cannot name {{TARGET}} before a run; the default preview
+  // query (assembleJoinConfig) reads the node's table instead.
+  if (typeof gen.previewSql === 'string' && HAS_TARGET_PLACEHOLDER.test(gen.previewSql)) gen.previewSql = null;
+  if (Array.isArray(gen.joinColumns)) {
+    gen.joinColumns = gen.joinColumns.map((pair) => (pair && typeof pair === 'object'
+      // Display only (the node's details panel), so the readable name.
+      ? Object.fromEntries(Object.entries(pair).map(([k, v]) => [
+        k.replace(SOURCE_PLACEHOLDER, (m, n) => {
+          const slot = byPlaceholder.get(`{{SOURCE_${n}}}`);
+          return slot ? (slot.tempTableName || slot.label) : m;
+        }),
+        v,
+      ]))
+      : pair));
+  }
+}
+
 function enrichJoinSourcesConfig(sourcesConfig, sources, helpers, warnings = []) {
   if (!Array.isArray(sourcesConfig)) return sourcesConfig;
   return sourcesConfig.map((sc, i) => {
@@ -3847,12 +4880,19 @@ function enrichJoinSourcesConfig(sourcesConfig, sources, helpers, warnings = [])
 // generateJoinQuery path AND the skill-result builder so both wind up
 // with an identical config shape. `gen` is the operation envelope
 // (joinSql / transformFunction / etc.).
-function assembleJoinConfig({
+async function assembleJoinConfig({
   sources, stepPrompt, joinSettings, gen, warnings, chat,
   targetConn, isNoSQL, isLocalStorage, targetTableName, helpers,
   // Scope this node's local output file. Threaded in from the caller —
   // referencing them undeclared throws at assembly time.
   workflowId = null, nodeId = null,
+  // The analyser's verdict that this join embeds / runs a similarity search.
+  vectorRequired = false,
+  // The analyser's raw `requiresFunction` (saved), and the resolved verdict —
+  // true for every document / vector destination and embedding join too
+  // (checked against).
+  requiresFunctionFlag = false,
+  requiresFunction = false,
 }) {
   // Which kind of local destination the token names. Only two exist: a local
   // file (DuckDB) or a local vector table (LanceDB) — the vector case must be
@@ -3870,7 +4910,20 @@ function assembleJoinConfig({
     joinRequest: stepPrompt,
     joinSettings,
     joinColumns: gen?.joinColumns || [],
-    sourcesConfig: gen?.sourcesConfig || [],
+    // A document-store read is saved as the JSON string the prompt asks for.
+    // A model can return the object instead; normalised here so the saved
+    // config (and its workflow-code file) has one shape whatever came back.
+    // The collection is filled in from the source's own node when the model
+    // left it out (see parseNoSQLOperation) — so the saved read is complete.
+    sourcesConfig: (gen?.sourcesConfig || []).map((sc) => {
+      if (!sc || !sc.nosqlOperation) return sc;
+      try {
+        const op = parseNoSQLOperation(sc.nosqlOperation, sourceCollectionOf(sc, sc.connection));
+        return { ...sc, nosqlOperation: JSON.stringify(op) };
+      } catch (_) {
+        return sc;   // not JSON — left for the executor to report
+      }
+    }),
     joinSql: gen?.joinSql || null,
     targetDdl: gen?.targetDdl || '',
     transformFunction: gen?.javascriptFunction || gen?.transformFunction || null,
@@ -3879,7 +4932,39 @@ function assembleJoinConfig({
     targetConnectionType: isLocalStorage ? 'file' : (targetConn?.connectionType || 'database'),
     targetDbType: isLocalStorage ? localDbType : targetConn?.dbType,
     targetDbConfig: isLocalStorage ? {} : (targetConn?.dbConfig || {}),
+    // Saved so a rebuild that skips the analyser (a skill dialog, a cascade)
+    // keeps building the same kind of join — buildJoinConfig reads it back.
+    vectorRequired: !!vectorRequired,
+    requiresFunction: !!requiresFunctionFlag,
   };
+
+  // A similarity join reads its vector source itself — `ctx.runQuery` against
+  // the store, per row — so that source has no `sourcesConfig` step to load.
+  // Recorded here, against the sources the join was built from, so the
+  // staleness checks (canvas and executor) count it as read instead of
+  // refusing every run with "a new source is connected that the join does not
+  // read". Only function joins read anything themselves. Always written, so a
+  // rebuild merged over an older config cannot inherit a stale list.
+  //
+  // "Reads itself" means the vector source has NO read of its own: no step at
+  // all, or a step that carries no vectorFetchOperation (that is how the
+  // prompt asks for a store searched through ctx). Such a source is not loaded
+  // and not passed to the function — the executor applies the same rule
+  // (NodeExecution's isDirectReadStep), so the arguments line up with the
+  // function's parameters.
+  const readOf = new Map(config.sourcesConfig.filter(Boolean).map((s) => [s.sourceNodeId, s]));
+  const hasOwnRead = (step) => !!step && (
+    Object.prototype.hasOwnProperty.call(step, 'vectorFetchOperation')
+    || !!String(step.sql || '').trim()
+    || !!step.nosqlOperation
+  );
+  config.directReadSources = config.transformFunction
+    ? (Array.isArray(sources) ? sources : [])
+      .filter((s) => s?.sourceNodeId
+        && VECTOR_DB_TYPES.has(String(s.sourceDbType || '').toLowerCase())
+        && !hasOwnRead(readOf.get(s.sourceNodeId)))
+      .map((s) => s.sourceNodeId)
+    : [];
 
   // Record the file the join writes to (matches JoinNodeChat's
   // config.targetLocalPath, which it sets from the execution result). The
@@ -3961,22 +5046,45 @@ function assembleJoinConfig({
     throw new Error(`Join "${targetTableName}" generation was incomplete — the AI returned no joinSql or function (its output was likely truncated). Try a simpler join (exact-key match, fewer columns, no CTEs/temp tables).`);
   }
 
-  // A SQL destination is BUILT from targetDdl: the executor runs
-  // DROP TABLE IF EXISTS, then this CREATE, then joinSql. Without it the target
-  // is never created and the join dies at the INSERT with "table doesn't
-  // exist" — with nothing in the node to explain why. Fail the build instead.
+  // A function join is ONLY runnable as a function — an embedding step SQL
+  // cannot call, nested values SQL on this destination cannot unpack, a match
+  // SQL cannot express. SQL written for it would run as something else with no
+  // error. The executor runs a function join whenever there is no joinSql, so
+  // the generator must have produced a function and nothing else.
+  const functionReason = vectorRequired
+    ? 'needs embeddings or a similarity search'
+    : 'cannot be expressed as SQL on this destination';
+  if (!gen?._skillId && requiresFunction && !(gen?.javascriptFunction || gen?.transformFunction)) {
+    throw new Error(`Join "${targetTableName}" ${functionReason}, but the AI returned SQL instead of a JavaScript join function. Try again, or describe the match more explicitly.`);
+  }
+  if (!gen?._skillId && requiresFunction && gen?.joinSql) {
+    warnings.push(`Join "${targetTableName}": the AI returned SQL alongside the join function; the SQL was dropped because this join ${functionReason}.`);
+    gen.joinSql = null;
+    config.joinSql = null;
+    if ('targetSql' in config) config.targetSql = null;
+  }
+
+  // A SQL or local destination is BUILT from targetDdl: in replace mode the
+  // executor runs DROP TABLE IF EXISTS, then this CREATE, then joinSql; in
+  // append / merge mode it runs the CREATE only when the target is missing.
+  // Without it the target can never be created and the join dies at the
+  // INSERT with "table doesn't exist". Fail the build instead.
   //
-  // Only a real SQL destination needs it. Local DuckDB builds its target with
-  // CREATE OR REPLACE TABLE AS, a document store drops the collection and
-  // inserts, and a vector destination is written through its skill — all three
-  // derive the target from the result and take no DDL.
+  // A document store drops/keeps the collection and inserts, and a vector
+  // destination is written through its skill — both derive the target from
+  // the result and take no DDL.
   const destDbType = config.targetDbType;
-  const needsTargetDdl = !isLocalStorage
-    && !isNoSQL
+  // A local DuckDB destination now shares the SQL contract — CREATE TABLE
+  // {{TARGET}} plus INSERT INTO {{TARGET}} — so it needs the DDL too. Only a
+  // document or vector destination, or a function join into a local table
+  // (its rows are written straight to the table), takes none.
+  const isLocalTableDest = isLocalStorage && localDbType === 'duckdb';
+  const needsTargetDdl = !isNoSQL
     && !VECTOR_DB_TYPES.has(destDbType)
-    && destDbType !== 'duckdb';
+    && !isVectorLocal
+    && !(isLocalTableDest && requiresFunction);
   if (!gen?._skillId && needsTargetDdl && !String(gen?.targetDdl || '').trim()) {
-    throw new Error(`Join "${targetTableName}" generation was incomplete — no targetDdl was produced, so the destination table on ${targetConn?.name || destDbType} could never be created. A join always replaces its target, and needs a CREATE TABLE to do it.`);
+    throw new Error(`Join "${targetTableName}" generation was incomplete — no targetDdl was produced, so the destination table on ${targetConn?.name || destDbType} could never be created. A join needs a CREATE TABLE for its target (run on every replace, and in append mode when the table is missing).`);
   }
 
   const destLabel = isLocalStorage
@@ -3994,6 +5102,8 @@ function assembleJoinConfig({
     `✓ Join generated${skillBanner}!\n\n${joinExplanation}\n\nSources: ${sources.length}\nDestination: ${destLabel}\nTarget table: ${targetTableName}`,
     {
       metadata: {
+        targetTableName,
+        targetConnection: `${destLabel} (${config.targetDbType || 'unknown'})`,
         joinSettings,
         joinColumns: gen?.joinColumns || [],
         sourcesConfig: gen?.sourcesConfig || [],
@@ -4068,11 +5178,17 @@ async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, 
   };
 
   const connectionList = summarizeConnections(helpers.connections || []);
+  // Whether the rows arriving here already carry vectors (an embedding step or a
+  // vector store upstream). A vector destination embeds only when they do not.
+  const sourceColumnNames = (source.sourceTableSchema?.columns || []).map((c) => c?.name).filter(Boolean);
+  const sourceHasVectors = (source.sourceTableSchema?.columns || [])
+    .some((c) => /^(vector|values|embedding)$/i.test(c?.name || '') || String(c?.type || '').toLowerCase() === 'vector');
   const prompt = `Pick output settings for a workflow Output node.
 
 User intent: "${stepPrompt}"
 
 Source schema: ${describeTableSchema(source.sourceTableSchema)}
+Source rows already carry vectors: ${sourceHasVectors ? 'YES' : 'NO'}
 
 Available connections for "connection" output:
 ${JSON.stringify(connectionList, null, 2)}
@@ -4094,14 +5210,42 @@ For a database connection output:
   "append" when the request says nothing either way: it cannot destroy data
   that is already there.
   Ignored for a local file output and for cloud-storage objects — a file is
-  rewritten whole every run regardless.
+  rewritten whole every run regardless. The exception is a local "lancedb"
+  output: it is a vector database and takes writeMode like a vector connection.
+
+VECTOR DESTINATIONS — a connection whose dbCategory is "Vector" (Pinecone, a
+saved LanceDB connection) or a local "lancedb" file. Add these fields:
+  "embedColumn": "<source column whose text is embedded>" | null,
+  "embeddingModel": "text-embedding-3-small" | "text-embedding-3-large",
+  "idColumn": "<source column that is the row's primary key>" | null
+- tableName for Pinecone is "index-name" or "index-name/namespace".
+- embedColumn: REQUIRED when the source rows do NOT already carry vectors — the
+  column whose text is embedded (OpenAI). null when they already carry vectors
+  (they are copied as they are, nothing is re-embedded).
+- embeddingModel: text-embedding-3-small (1536 dimensions) unless the user
+  names another; a Pinecone index's dimension must match the model.
+- Records are written with "writeMode" like any table: "append" UPSERTS (a
+  record with the same id is replaced, new ones are added, nothing else is
+  touched), "truncate" empties the index/namespace/table first and loads this
+  run's rows.
+- idColumn: ONLY with writeMode "append" (a vector connection or a local
+  "lancedb" file) — null otherwise. The column that identifies a row (its primary key: product_id,
+  order_id, sku), so a re-run replaces that row's record instead of adding
+  another. Normally NOT the embedded column — two rows can share the same text.
+  Only name a column from the source schema that plausibly identifies one row;
+  never pick a column just because it is called "id". If nothing qualifies,
+  null — ids then come from a hash of the whole row, so a row whose fields
+  change becomes a new record and the old one stays until a truncate.
 
 For a local file output:
 { "outputSettings": { "outputType": "local", "format": "json"|"csv"|"excel"|"duckdb"|"sqlite"|"lancedb"|"parquet"|"avro", "savePath": "<absolute path>", "connectionId": null, "tableName": "<table name, sqlite/duckdb/lancedb only>", "sheetName": null } }
-- lancedb: a local vector DATABASE DIRECTORY at savePath, holding the table
-  named by tableName. The rows must already carry a vector column. A saved
-  LanceDB CONNECTION is a different destination that already exists somewhere
-  else; never substitute one for a path the user gave.
+- lancedb: a local vector DATABASE DIRECTORY at savePath (a name ending in
+  .lance is fine — it is the folder itself), holding the table named by
+  tableName. It is written exactly like a vector connection: set "writeMode",
+  "embedColumn", "embeddingModel" and "idColumn" as described under VECTOR
+  DESTINATIONS above ("append" upserts, "truncate" replaces the table). A saved LanceDB
+  CONNECTION is a different destination that already exists somewhere else;
+  never substitute one for a path the user gave.
 - savePath: a real absolute path the user gave. If the user did NOT give a
   concrete path (e.g. they said "use the save dialog" or didn't mention one),
   set savePath to null — the builder fills in a sensible default. Never invent
@@ -4114,7 +5258,8 @@ For a local file output:
 - tableName: SQLITE, DUCKDB and LANCEDB ONLY, null for every other local format.
   Those hold many tables, exactly as a workbook holds many sheets, so the node
   has to say which one it writes. An existing database keeps its other tables
-  and only this one is replaced each run. Set it only when the user named a
+  and only this one is written (replaced each run for sqlite/duckdb; for
+  lancedb, per writeMode). Set it only when the user named a
   table; leave it null and the builder names it after the source table.
 
 Return ONLY the JSON object.`;
@@ -4125,6 +5270,36 @@ Return ONLY the JSON object.`;
   // model answers with something else (or nothing) — appending can be undone
   // by hand, a truncate the user did not ask for cannot.
   config.outputSettings.writeMode = config.outputSettings.writeMode === 'truncate' ? 'truncate' : 'append';
+
+  // Vector fields — kept only where they mean something, and only naming
+  // columns the source really has.
+  {
+    const osv = config.outputSettings;
+    const destConn = (helpers.connections || []).find((c) => (c.id || c._id) === osv.connectionId);
+    const vectorConn = osv.outputType === 'connection'
+      && (destConn?.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(String(destConn?.dbType || '').toLowerCase()));
+    const vectorFile = osv.outputType === 'local' && osv.format === 'lancedb';
+    const knownColumn = (name, field) => {
+      if (!name) return null;
+      if (sourceColumnNames.length && !sourceColumnNames.includes(name)) {
+        warnings.push(`Output: ${field} "${name}" is not a column of the source — left unset.`);
+        return null;
+      }
+      return name;
+    };
+    if (vectorConn || vectorFile) {
+      osv.embedColumn = sourceHasVectors ? null : knownColumn(osv.embedColumn, 'embedColumn');
+      osv.embeddingModel = osv.embeddingModel === 'text-embedding-3-large' ? 'text-embedding-3-large' : 'text-embedding-3-small';
+      osv.idColumn = osv.writeMode === 'append' ? knownColumn(osv.idColumn, 'idColumn') : null;
+      if (!sourceHasVectors && !osv.embedColumn) {
+        warnings.push('Output: the source rows carry no vectors and no column to embed was chosen — pick "Column to embed" on the node, or the run will fail.');
+      }
+    } else {
+      delete osv.embedColumn;
+      delete osv.embeddingModel;
+      delete osv.idColumn;
+    }
+  }
 
   if (config.outputSettings.outputType === 'connection') {
     const exists = (helpers.connections || []).some((c) => (c.id || c._id) === config.outputSettings.connectionId);
@@ -4174,10 +5349,13 @@ Return ONLY the JSON object.`;
   }
 
   const os = config.outputSettings;
+  const vectorNote = os.embedColumn
+    ? ` Embeds "${os.embedColumn}" (${os.embeddingModel})${os.idColumn ? `, upserted by "${os.idColumn}"` : ''}.`
+    : (os.idColumn ? ` Upserted by "${os.idColumn}".` : '');
   const outputSummary = os.outputType === 'connection'
-    ? `Configured output → connection "${os.connectionId}" / table "${os.tableName || '(none)'}".`
+    ? `Configured output → connection "${os.connectionId}" / table "${os.tableName || '(none)'}" (${os.writeMode}).${vectorNote}`
     : os.outputType === 'local'
-      ? `Configured local output → ${os.format} at "${os.savePath || '(no path)'}"${os.sheetName ? `, sheet "${os.sheetName}"` : ''}${os.tableName ? `, table "${os.tableName}"` : ''}.`
+      ? `Configured local output → ${os.format} at "${os.savePath || '(no path)'}"${os.sheetName ? `, sheet "${os.sheetName}"` : ''}${os.tableName ? `, table "${os.tableName}"` : ''}${os.format === 'lancedb' ? ` (${os.writeMode})` : ''}.${vectorNote}`
       : 'Configured output node (settings incomplete — open the node in the editor).';
   pushBotMsg(chat, outputSummary, { metadata: { outputSettings: os } });
 
@@ -4301,6 +5479,24 @@ function topoOrderNodeIds(nodes, edges, startNodeId) {
 // derivation so we never feed the AI an empty list when the user hasn't
 // opened the steps editor. Each entry is shaped so the AI can copy ids,
 // sources, and prompts verbatim when a step should stay unchanged.
+/**
+ * The `connectionId` a plan step carries for an existing node, read from where
+ * the builders actually write it. A plan step's connectionId is the saved
+ * connection a data source reads (for a REST source, the API connection — its
+ * `sourceConnectionId` is the local store the rows land in) or where a join
+ * writes. No node config has a top-level `connectionId`.
+ */
+function stepConnectionIdOf(node) {
+  const cfg = node?.data?.config || {};
+  if (node?.type === 'dataSource') {
+    return cfg.sourceApiConnectionId || cfg.sourceConnectionId || null;
+  }
+  if (node?.type === 'join') {
+    return cfg.joinSettings?.destinationSelection || cfg.targetConnectionId || null;
+  }
+  return null;
+}
+
 function summarizeWorkflowAsSteps(wf) {
   if (!wf || typeof wf !== 'object') return [];
   const nodes = Array.isArray(wf.nodes) ? wf.nodes : [];
@@ -4323,13 +5519,13 @@ function summarizeWorkflowAsSteps(wf) {
   }
   return orderedIds.map((id) => {
     const n = nodesById.get(id);
-    const cfg = n?.data?.config || {};
+    const connectionId = stepConnectionIdOf(n);
     return {
       existingNodeId: id,
       stepType: n?.type,
       label: n?.data?.label || labelFor(n?.type),
       sources: (sourcesByTarget.get(id) || []).slice(),
-      ...(n?.type === 'dataSource' && cfg.connectionId ? { connectionId: cfg.connectionId } : {}),
+      ...(connectionId ? { connectionId } : {}),
       prompt: extractBuilderPromptFromNode(n),
     };
   });
@@ -4457,13 +5653,15 @@ The five node types (the only stepTypes you may emit) and how they relate:
   target each run is what was asked, NO output node is needed.
 
 Key relational rules that follow from the above:
-- A transformer and a join REPLACE their target: each run recreates that table
-  from the rows it just produced. Neither has a write mode, and neither can add
-  to rows already there. So do NOT chain an output that re-writes the same data
-  to the same place under the same semantics — that is a planner bug — but DO
-  plan one when the ask is append / incremental: upstream writes a staging
-  table BESIDE the real destination and the output appends from it. See
-  "Appending to a table that must survive the run".
+- A transformer REPLACES its target: each run recreates that table from the
+  rows it just produced, and it has no write mode. A JOIN replaces by default
+  but has two more modes of its own: APPEND (keeps the target's rows, adds this
+  run's, creates the table when missing) and MERGE (updates the rows that match
+  a key, inserts the rest — on destinations that support it; the join builder
+  checks). Say "append", or "merge on <key>", in the join step's prompt when the
+  user asks for it. Do NOT chain an output that re-writes the same data to the
+  same place under the same semantics — that is a planner bug. See "Appending
+  to a table that must survive the run".
 - 'sources' wires the graph: every transformer/join/output points at the
   upstream node(s) it consumes (by step index in this plan, or by an existing
   node id in modify-mode).
@@ -4517,23 +5715,25 @@ emits NULL columns, or writes to a place the next node can't read). Rules:
       a normal id+metadata table) → ANY destination: a saved connection,
       local-duckdb, or local-lancedb.
     • Similarity / embedding join (Scenario B: "for each row find the most
-      similar…", per-row embed + vector search) → the match runs as a JS
-      function in Node, and the executor ONLY runs that function for a NoSQL or
-      VECTOR destination. Scenario B MUST use local-lancedb or a saved
-      vector connection — a plain relational destination cannot hold them. A
-      SQL destination forces a static-SQL join that cannot embed or search, so
-      the similarity columns come back NULL. If the user wants the FINAL match
-      result as a plain file / CSV, still write the join to local-lancedb, then add an
-      Output node to export that file/format.
+      similar…", per-row embed + vector search) → the match runs as a
+      JavaScript function in Node, and its rows are written to WHATEVER
+      destination the user asked for: a saved SQL database (the table is
+      created from the join's CREATE TABLE), local-duckdb, a Mongo
+      collection, or a vector store. Write it straight to the requested
+      destination — no intermediate local-lancedb table and no Output step
+      to copy it. Use local-lancedb / a vector connection ONLY when the user
+      wants the matches stored AS VECTORS (embedded, similarity-searchable);
+      a vector destination embeds every row again and adds vector and
+      bookkeeping columns the user did not ask for.
 
 - output → delivery only; it never computes. A file export (csv / json / excel /
   parquet / avro / duckdb / sqlite / lancedb) or a DIFFERENT connection/table than
   the upstream already wrote to.
 
-Rule of thumb: choose the destination from the KIND of execution, not just the
-data — "similarity / find-similar / semantic match" ⇒ lancedb / vector
-destination; "hash / per-row JS in a transformer" ⇒ duckdb / lancedb; a plain SQL
-or Mongo reshape ⇒ that same engine or local-duckdb.
+Rule of thumb: a join writes where the user asked, whatever its kind
+(similarity joins included); a vector destination only when the user wants
+vectors stored. "hash / per-row JS in a transformer" ⇒ duckdb / lancedb; a plain
+SQL or Mongo reshape ⇒ that same engine or local-duckdb.
 ${skillDocs ? `\n# Skills (optional execution paths a transformer/join may route through instead of plain SQL/NoSQL — only the ones relevant to this request are loaded)\n${skillDocs}\n` : ''}
 ${systemContext ? `# System & file-path context
 This is the user's actual machine and Ternlux's on-disk layout. When a step
@@ -4630,6 +5830,12 @@ IS the table's name, so use it.
   builder reads this id directly — it does NOT re-pick the connection
   from the prompt text. If you don't know which connection the user
   means, return action="ask_questions" instead of guessing.
+- When the user NAMES a connection ("the products connection", "the local CSV
+  connection products", "from mysql"), use the connection whose NAME is that
+  word — never another connection that merely holds a table of the same name.
+  Several imported files can expose a table called "products"; the user's
+  connection name is what tells them apart, and picking a look-alike reads
+  different data without any error.
 - The connection's TYPE governs what else the step prompt must say:
   - Database connection (Postgres / MySQL / MSSQL / Snowflake / BigQuery /
     MongoDB / DuckDB / SQLite / etc.): name or describe the table /
@@ -4708,7 +5914,14 @@ IS the table's name, so use it.
   finished by a local transformer. Add an OUTPUT step after it with the format
   and path. A request that only says "store it locally" or "make a local table"
   IS finished there, and needs no output step.
-- Optional custom target table/collection name.
+- Name the target table/collection in the step prompt (new_table mode) —
+  REQUIRED, and UNIQUE across the whole workflow: no two steps of this plan,
+  and no step and an existing node of the workflow, may name the same target.
+  Each run replaces a transformer's or join's target, so two nodes sharing a
+  name overwrite each other and every node downstream of one reads the other's
+  rows. Name it after what it holds and what sets it apart — e.g.
+  phoenix_stores_gcs and phoenix_stores_dropbox, never phoenix_stores twice.
+  Use the user's name when they gave one.
 - Vector / embedding TRANSFORMER ops are limited to exactly three cases:
     1. Embed/vectorise a column of THIS one source and store the vectors
        into a vector table (regular data → vector store). Routed to the
@@ -4760,12 +5973,15 @@ IS the table's name, so use it.
   or "stored" somewhere, point the join's own 'connectionId' at that
   destination and add NOTHING after it — an Output step that re-writes the
   same rows to the same place under the same semantics is a planner bug.
-- A join's write REPLACES its target — no write mode, no merge, no
-  preserving what the table held. Never write "append", "insert only the
-  new rows", "don't truncate" or "preserve existing rows" into a join
-  prompt: the builder cannot build it and stops the build to ask an
-  unanswerable question. That request is the staging shape — see
-  "Appending to a table that must survive the run" under ## output.
+- Name the join's target table in its step prompt — unique across the
+  workflow, the same rule as a transformer's target name above.
+- A join REPLACES its target by default. When the user wants rows kept, say
+  "append" in the join step's prompt (and state an anti-join to add only rows
+  not already there); when they want existing rows UPDATED, say "merge on
+  <key column(s)>". The join builder checks merge against the destination and
+  asks if it can't. Never stage a join's rows into a separate table just to
+  append them — the join does that itself. See "Appending to a table that
+  must survive the run" under ## output.
 - An Output step MAY follow a join, and MUST when either:
   - the same rows must ALSO go somewhere the join can't write: a csv /
     json / excel / parquet / avro export, or a DIFFERENT connection/table
@@ -4796,12 +6012,11 @@ IS the table's name, so use it.
     vectors → "local-duckdb". But a STAGING table for an append (see
     "Appending to a table that must survive the run") belongs on the
     destination's own connection, not here — local only if the user asked
-    for the work to happen locally. EXCEPTION: a SIMILARITY / embedding join
-    (Scenario B — "for each row find the most similar", per-row vector
-    search) must NEVER use "local-duckdb" even though its output looks
-    tabular; a SQL destination can't run the per-row search and the match
-    columns come back NULL. Use "local-lancedb" for it (then an Output node if
-    the user wants a CSV/SQLite file of the result).
+    for the work to happen locally. A SIMILARITY / embedding join (Scenario
+    B) follows the same rule: it runs as a JavaScript function, so it can
+    write to a saved SQL connection, "local-duckdb" or Mongo directly. Pick
+    "local-lancedb" for it only when the user wants the matches stored as
+    vectors.
   - The user wants a local document collection → "local-duckdb" (DuckDB reads
     nested JSON natively).
   This is the join's counterpart to 'connectionId' on dataSource —
@@ -4887,15 +6102,36 @@ IS the table's name, so use it.
     the whole dataset each run mean truncate; a log, a history, or "add
     to" means append. Say nothing and it appends — which cannot destroy
     data that is already there. A local file is rewritten whole every
-    run, so never raise the choice for one.
+    run, so never raise the choice for one — except a local lancedb file,
+    which takes append/truncate like a vector connection.
+  - VECTOR DESTINATION (a vector connection — Pinecone, a saved LanceDB —
+    or a local lancedb file): the output itself can embed. If the rows
+    arriving at it do NOT already carry vectors, say in the step's prompt
+    which column's text to embed (and the model if the user named one);
+    no separate embedding transformer is needed just to write them. Rows
+    that already carry vectors (an embedding transformer upstream, another
+    vector store) are copied as they are — say nothing about embedding.
+    For a vector connection AND a local lancedb file, append UPSERTS: name
+    the column that is the row's primary key (product_id, order_id) in the
+    prompt when there is one, so a re-run replaces that row's record
+    instead of adding another; truncate empties the index namespace /
+    table first.
 
 ## Appending to a table that must survive the run
 
 "Append the new rows", "add to the table instead of rebuilding it", "skip
-what's already loaded" — the write mode lives on the OUTPUT step only, so
-the plan must end at one:
+what's already loaded":
 
-  sources → join/transformer → staging table → output (connection, APPEND)
+- When a JOIN produces the rows, the join writes them itself: its step targets
+  the real destination and its prompt says "append" (to skip rows already there,
+  also state the anti-join below) or, to UPDATE rows that already exist, "merge
+  on <key column(s)>". No staging table, no output step.
+- When a TRANSFORMER produces them, the write mode lives on an OUTPUT step, so
+  the plan ends at one:
+
+  sources → transformer → staging table → output (connection, APPEND)
+
+The rules below are for that staging route:
 
 - STAGE ON THE DESTINATION'S OWN CONNECTION: the staging table is a table
   beside the real destination (e.g. "stg_<target>"), so 'connectionId' is
@@ -4913,6 +6149,8 @@ the plan must end at one:
   dataSource reading that destination table, feed it to the join as another
   source, and state the anti-join: LEFT join on the identity column, keep
   only rows with no match. Without it the append re-inserts what is there.
+  (A join appending into the very table it reads is fine; a join REPLACING a
+  table it reads is refused, because the replace would empty it first.)
 
 # When to ask a clarifying question (return action="ask_questions")
 
@@ -5128,7 +6366,7 @@ function validatePlanEnvelope(out, { mode, wfSummary, connections }) {
         existingNodeId: s,
         stepType: existing.type,
         sources: null,           // inherit from existing edges at apply time
-        connectionId: existing?.data?.config?.connectionId || null,
+        connectionId: stepConnectionIdOf(existing),
       };
     }
     if (!s || typeof s !== 'object') {
@@ -5223,8 +6461,14 @@ function validatePlanEnvelope(out, { mode, wfSummary, connections }) {
         throw new Error(`Step ${i} (join) must declare a "connectionId" — the destination where the join result is written. Use a saved connection id, or the literal "local-duckdb" / "local-lancedb".`);
       }
       const isLocal = s.connectionId === 'local-duckdb' || s.connectionId === 'local-lancedb';
-      if (!isLocal && connectionIds.size && !connectionIds.has(s.connectionId)) {
-        throw new Error(`Step ${i} (join) connectionId "${s.connectionId}" is not a saved connection nor "local-duckdb" / "local-lancedb". Pick one of: ${Array.from(connectionIds).join(', ')}, local-duckdb, local-lancedb.`);
+      // Only a store a join can write to — see isJoinDestinationConnection.
+      const joinTargets = (connections || []).filter(isJoinDestinationConnection);
+      const joinTargetIds = joinTargets.map((c) => c.id || c._id).filter(Boolean);
+      if (!isLocal && !joinTargetIds.includes(s.connectionId)) {
+        const named = (connections || []).find((c) => (c.id || c._id) === s.connectionId);
+        throw new Error(`Step ${i} (join) connectionId "${s.connectionId}" ${named
+          ? `is a ${named.dbType} connection, which cannot hold a join result`
+          : 'is not a saved connection'}. A join writes to a database or vector store, or to "local-duckdb" / "local-lancedb". Pick one of: ${[...joinTargetIds, 'local-duckdb', 'local-lancedb'].join(', ')}.`);
       }
     }
 
@@ -6043,7 +7287,20 @@ async function uniqueWorkflowName(name, wfDb) {
   return `${base} ${Date.now()}`;
 }
 
-async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
+/**
+ * Apply a plan. The wrapper exists for one reason: whatever happens inside —
+ * a finished build, a failure, a pause for a clarification — the stage sink
+ * installed per step must not outlive the build that installed it.
+ */
+async function executeBuild(args) {
+  try {
+    return await runBuild(args);
+  } finally {
+    onStageStart(null);
+  }
+}
+
+async function runBuild({ plan, workflow, helpers, getDb, onProgress }) {
   const warnings = [];
   // Resolve the workflow id UP FRONT. The persist step below used to mint it,
   // but node builders write files (the REST API fetch materialises rows into
@@ -6235,7 +7492,7 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       // dropping every later correction and re-asking questions the user had
       // already answered.
       stepPrompt = latestPromptFromNode(ex);
-      connectionId = ex?.data?.config?.connectionId || null;
+      connectionId = stepConnectionIdOf(ex);
       label = ex?.data?.label || labelFor(stepType);
     } else {
       if (!raw || typeof raw !== 'object') throw new Error(`Step ${i}: must be a step object or existing node id string.`);
@@ -6305,6 +7562,10 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       phase: 'step', status: 'running', stepIndex: i, stepType, label, action,
       nodeId, nodeType, position, sources: wired,
     });
+    // Everything this step does from here on reports under its index. Its own
+    // phase, so the consumers that only know about steps (the live canvas)
+    // ignore it; the chat panel shows it under the step's spinner.
+    onStageStart((stage) => emit({ phase: 'stage', stepIndex: i, nodeId, stage }));
 
     // ── KEEP: reuse the existing node verbatim. No builder run.
     //
@@ -6410,6 +7671,14 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
         // The builder returns each at its exact call site instead of re-asking
         // the model, so repeated Continues accumulate rather than overwrite.
         resumedCalls: (plan.resumedCalls && (plan.resumedCalls[i] || plan.resumedCalls[nodeId])) || null,
+        // Generated code this build may RUN — only what the user approved on a
+        // previous pause (ApprovalNeeded), keyed by step. Read by the REST API
+        // data source builder; anything else it would run makes the build stop
+        // and ask.
+        apiFetchApproval: {
+          route: 'plan',
+          approvedCode: (plan.apiFetchApprovals && (plan.apiFetchApprovals[i] || plan.apiFetchApprovals[nodeId])) || null,
+        },
       };
       const fn = builderFor(stepType);
       // Each step of a plan build is timed on its own, same as a single-node
@@ -6422,7 +7691,7 @@ async function executeBuild({ plan, workflow, helpers, getDb, onProgress }) {
       config = await fn(ctx);
       buildTimings.report(stepLabel, Date.now() - stepStarted);
     } catch (err) {
-      if (stepStarted) buildTimings.report(`${stepLabel} — ${err?.isClarificationNeeded ? 'paused for a question' : 'failed'}`, Date.now() - stepStarted);
+      if (stepStarted) buildTimings.report(`${stepLabel} — ${err?.isApprovalNeeded ? 'paused for approval' : err?.isClarificationNeeded ? 'paused for a question' : 'failed'}`, Date.now() - stepStarted);
       if (err && err.isClarificationNeeded) {
         err.stepIndex = i;
         err.stepType = stepType;
@@ -6671,6 +7940,11 @@ module.exports = {
   // with, so both can be exercised without running a build.
   planColumnDepths,
   createLayout,
+  // Stage reporting, same reason: what a build says while it is waiting can be
+  // checked without standing up a build to say it.
+  onStageStart,
+  timedCall,
+  timedStep,
   summarizeWorkflowAsSteps,
   loadNodeDocs,
   loadChatPromptDocs,
@@ -6682,6 +7956,11 @@ module.exports = {
   skillDocsAsPromptSection,
   pickRelevantSkillDocs,
   slimWorkflowForPrompt,
+  findOutputTableCollisions,
   buildSystemContext,
   runSkillTurn,
+  isJoinDestinationConnection,
+  // Join source naming — checkable without a model call.
+  applySourceSlots,
+  ensureInPlaceSteps,
 };

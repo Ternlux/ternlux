@@ -35,20 +35,42 @@ import {
   LockOpenOutlined,
   Logout,
 } from '@mui/icons-material';
+import SecretStorageWarning from '../SecretStorageWarning/SecretStorageWarning';
 import { saveApiKey } from '../../utils/apiKeyStorage';
-import { DEFAULT_MAX_TOKENS, buildTokenOptions, saveMaxTokens } from '../../utils/aiProviders';
+import { DEFAULT_MAX_TOKENS, loadDefaultAiSettings, saveDefaultAiSettings } from '../../utils/aiProviders';
+import useProviderModels from '../../utils/useProviderModels';
 import OthersProviderForm from './OthersProviderForm';
+import DiscordLink from '../ui_components/DiscordLink';
 import {
   register as registerAccount,
   login as loginAccount,
   loginWithGoogle,
   // loginWithApple, // Apple sign-in disabled
   resendVerification,
+  requestPasswordReset,
+  resetPassword,
   isLoggedIn,
   getStoredUser,
   fetchCurrentUser,
   signOut,
 } from '../../utils/authService';
+
+/**
+ * Onboarding renders as a fixed, full-screen shell at z-index 9999 (see
+ * containerStyles). A MUI Select puts its menu in a portal on document.body at
+ * the theme's zIndex.modal — 1300 — so by default that menu paints BEHIND the
+ * shell: the closed field shows its current value, and opening it looks like
+ * nothing happened, or like the list came back empty.
+ *
+ * Settings never hit this. Its Selects are antd with
+ * `getPopupContainer={(trigger) => trigger.parentNode}`, which renders the
+ * popup inline instead of portaling it, and it isn't inside the shell anyway.
+ *
+ * Lifting the menu above the shell fixes it without `disablePortal`, which
+ * would re-parent the menu into an ancestor that scrolls (`overflowY: auto`)
+ * and clip it instead.
+ */
+const MENU_ABOVE_ONBOARDING_SHELL = { sx: { zIndex: 10000 } };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Static data
@@ -267,7 +289,7 @@ const SocialSignInButtons = ({ onSuccess, onError, disabled }) => (
 // SignInView — default landing; login form + Google
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SignInView = ({ onRegister, onComplete, onNeedsVerification, onSkip = null, isSettingsMode = false }) => {
+const SignInView = ({ onRegister, onForgotPassword, onComplete, onNeedsVerification, onSkip = null, isSettingsMode = false }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -372,6 +394,19 @@ const SignInView = ({ onRegister, onComplete, onNeedsVerification, onSkip = null
             }}
           />
 
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: -1 }}>
+            <Link
+              component="button"
+              variant="body2"
+              fontWeight={600}
+              underline="hover"
+              onClick={() => onForgotPassword(email.trim())}
+              disabled={submitting || success}
+            >
+              Forgot password?
+            </Link>
+          </Box>
+
           <Button
             variant="contained"
             fullWidth
@@ -412,6 +447,227 @@ const SignInView = ({ onRegister, onComplete, onNeedsVerification, onSkip = null
             >
               Skip for now
             </Button>
+          )}
+        </Box>
+
+        <Divider sx={{ my: 3 }} />
+        <DiscordLink />
+      </Paper>
+    </Box>
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ForgotPasswordView — email a 6-digit code, then set a new password with it
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ForgotPasswordView = ({ initialEmail = '', onBack, onComplete, isSettingsMode = false }) => {
+  const [step, setStep] = useState('email'); // 'email' | 'reset'
+  const [email, setEmail] = useState(initialEmail);
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [success, setSuccess] = useState(false);
+
+  const sendCode = async () => {
+    if (!email.trim()) { setError('Email is required.'); return; }
+    setSubmitting(true);
+    setError('');
+    setNotice('');
+    const result = await requestPasswordReset(email.trim());
+    setSubmitting(false);
+    if (result.success) {
+      setStep('reset');
+      setNotice(`If an account exists for ${email.trim()}, we've emailed it a 6-digit code. Check your inbox (and spam folder).`);
+    } else {
+      setError(result.error || 'Could not send the reset code. Please try again.');
+    }
+  };
+
+  const handleReset = async () => {
+    if (!/^\d{6}$/.test(code.trim())) { setError('Enter the 6-digit code from the email.'); return; }
+    if (password.length < 8)          { setError('Password must be at least 8 characters.'); return; }
+    if (password !== confirmPassword) { setError('Passwords do not match.'); return; }
+
+    setSubmitting(true);
+    setError('');
+    const result = await resetPassword({ email: email.trim(), code: code.trim(), password });
+    setSubmitting(false);
+    if (result.success) {
+      setSuccess(true);
+      setNotice('');
+      setTimeout(() => onComplete({ via: 'account' }), 800);
+    } else {
+      setError(result.error || 'Could not reset the password. Please try again.');
+    }
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key !== 'Enter' || submitting) return;
+    if (step === 'email') sendCode(); else handleReset();
+  };
+
+  const busy = submitting || success;
+
+  return (
+    <Box
+      sx={{
+        flex: 1,
+        display: 'flex',
+        alignItems: isSettingsMode ? 'flex-start' : 'center',
+        justifyContent: 'center',
+        p: isSettingsMode ? 0 : 4,
+        pt: isSettingsMode ? 3 : 4,
+        bgcolor: isSettingsMode ? 'transparent' : '#f8f9fa',
+      }}
+    >
+      <Paper
+        elevation={0}
+        variant={isSettingsMode ? 'elevation' : 'outlined'}
+        sx={{ width: '100%', maxWidth: 400, borderRadius: isSettingsMode ? 0 : 3, p: isSettingsMode ? 0 : 4, border: isSettingsMode ? 'none' : undefined }}
+      >
+        <Button
+          startIcon={<ArrowBack />}
+          size="small"
+          onClick={onBack}
+          disabled={busy}
+          sx={{ mb: 2, color: 'text.secondary', textTransform: 'none', fontWeight: 600, pl: 0 }}
+        >
+          Back to Sign In
+        </Button>
+
+        <Typography variant="h5" fontWeight={800} mb={0.5}>
+          Reset your password
+        </Typography>
+        <Typography variant="body2" color="text.secondary" mb={3}>
+          {step === 'email'
+            ? "Enter your account email and we'll send you a code to set a new password."
+            : 'Enter the code from the email and choose a new password.'}
+        </Typography>
+
+        {notice && (
+          <Alert severity="info" sx={{ mb: 2, borderRadius: 2 }}>
+            {notice}
+          </Alert>
+        )}
+        {error && (
+          <Alert severity="error" sx={{ mb: 2, borderRadius: 2 }}>
+            {error}
+          </Alert>
+        )}
+        {success && (
+          <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
+            Password updated! Signing you in...
+          </Alert>
+        )}
+
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <TextField
+            label="Email"
+            type="email"
+            value={email}
+            onChange={(e) => { setEmail(e.target.value); setError(''); }}
+            onKeyDown={handleKeyDown}
+            size="small"
+            fullWidth
+            autoFocus={step === 'email'}
+            autoComplete="email"
+            disabled={busy || step === 'reset'}
+          />
+
+          {step === 'email' ? (
+            <Button
+              variant="contained"
+              fullWidth
+              onClick={sendCode}
+              disabled={busy}
+              startIcon={submitting ? <CircularProgress size={16} color="inherit" /> : null}
+              sx={{ borderRadius: 2, fontWeight: 700, py: 1.1 }}
+            >
+              {submitting ? 'Sending code...' : 'Send Reset Code'}
+            </Button>
+          ) : (
+            <>
+              <TextField
+                label="6-digit code"
+                value={code}
+                onChange={(e) => { setCode(e.target.value.replace(/\D/g, '').slice(0, 6)); setError(''); }}
+                onKeyDown={handleKeyDown}
+                size="small"
+                fullWidth
+                autoFocus
+                autoComplete="one-time-code"
+                inputProps={{ inputMode: 'numeric', style: { letterSpacing: 6, fontWeight: 700 } }}
+                disabled={busy}
+              />
+
+              <TextField
+                label="New password"
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => { setPassword(e.target.value); setError(''); }}
+                onKeyDown={handleKeyDown}
+                size="small"
+                fullWidth
+                autoComplete="new-password"
+                helperText="Minimum 8 characters"
+                disabled={busy}
+                InputProps={{
+                  endAdornment: (
+                    <InputAdornment position="end">
+                      <IconButton size="small" onClick={() => setShowPassword(v => !v)} edge="end">
+                        {showPassword ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                      </IconButton>
+                    </InputAdornment>
+                  ),
+                }}
+              />
+
+              <TextField
+                label="Confirm new password"
+                type={showPassword ? 'text' : 'password'}
+                value={confirmPassword}
+                onChange={(e) => { setConfirmPassword(e.target.value); setError(''); }}
+                onKeyDown={handleKeyDown}
+                size="small"
+                fullWidth
+                autoComplete="new-password"
+                disabled={busy}
+              />
+
+              <Button
+                variant="contained"
+                fullWidth
+                onClick={handleReset}
+                disabled={busy}
+                startIcon={submitting ? <CircularProgress size={16} color="inherit" /> : <LockOpenOutlined />}
+                sx={{ borderRadius: 2, fontWeight: 700, py: 1.1 }}
+              >
+                {submitting ? 'Updating password...' : 'Set New Password'}
+              </Button>
+
+              <Typography variant="body2" color="text.secondary" textAlign="center">
+                Didn't get it?{' '}
+                <Link component="button" variant="body2" fontWeight={600} underline="hover" onClick={sendCode} disabled={busy}>
+                  Send a new code
+                </Link>
+                {' · '}
+                <Link
+                  component="button"
+                  variant="body2"
+                  fontWeight={600}
+                  underline="hover"
+                  onClick={() => { setStep('email'); setCode(''); setNotice(''); setError(''); }}
+                  disabled={busy}
+                >
+                  Use a different email
+                </Link>
+              </Typography>
+            </>
           )}
         </Box>
       </Paper>
@@ -607,6 +863,9 @@ const RegisterPage = ({ onBack, onComplete, onRegistered, isSettingsMode = false
             Sign in
           </Link>
         </Typography>
+
+        <Divider sx={{ my: 2.5 }} />
+        <DiscordLink />
       </Paper>
     </Box>
   );
@@ -777,6 +1036,9 @@ const AccountView = ({ onSignOut, isSettingsMode = false }) => {
         >
           Sign Out
         </Button>
+
+        <Divider sx={{ my: 3 }} />
+        <DiscordLink />
       </Paper>
     </Box>
   );
@@ -796,15 +1058,40 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
   // After the key is saved, the user MUST pick a model before continuing so we
   // never silently fall back to a hardcoded (possibly retired) default model.
   const [phase, setPhase] = useState('key');        // 'key' -> 'model'
-  const [models, setModels] = useState([]);
-  const [modelsLoading, setModelsLoading] = useState(false);
   const [selectedModel, setSelectedModel] = useState('');
   const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_TOKENS);
   const [continuing, setContinuing] = useState(false);
 
+  // Same hook Settings → AI Provider uses, so both screens fetch, normalize and
+  // bound the model list identically. Onboarding keeps its own markup (MUI) and
+  // its own selection state; only the logic behind the dropdowns is shared.
+  const {
+    models,
+    loading: modelsLoading,
+    load: loadProviderModels,
+    reset: resetModels,
+    capFor,
+    contextFor,
+    tokenOptions,
+  } = useProviderModels();
+
   // Output ceiling published for the chosen model (Anthropic/Google expose it;
   // OpenAI doesn't) — bounds the Max Tokens choices below.
-  const selectedModelCap = models.find((m) => m.value === selectedModel)?.maxOutputTokens || null;
+  const selectedModelCap = capFor(selectedModel);
+
+  // The Max Tokens list is derived, not fetched, so when it looks too short the
+  // question is always "what cap was it built from". buildTokenOptions keeps
+  // only ladder steps BELOW the cap plus the cap itself — so a cap of 2048 or
+  // less yields exactly one choice.
+  useEffect(() => {
+    if (!selectedModel) return;
+    const opts = tokenOptions(selectedModel);
+    console.log(
+      `[ApiKeySetup] model="${selectedModel}" | cap=${selectedModelCap ?? 'null (full ladder)'}`
+      + ` | ${models.length} model(s) in dropdown | ${opts.length} Max Tokens option(s):`,
+      opts.map((o) => o.value)
+    );
+  }, [selectedModel, selectedModelCap, models, tokenOptions]);
 
   const provider = PROVIDERS.find(p => p.id === selectedProvider);
   const canSave = selectedProvider && apiKey.trim().length > 0 && !saving;
@@ -817,27 +1104,38 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
     setError('');
     setSaved(false);
     setPhase('key');
-    setModels([]);
+    resetModels();
     setSelectedModel('');
   };
 
+  // Asks for `normalizedProvider`, not the tile id: onboarding calls OpenAI's
+  // tile 'chatgpt' and the main process only knows 'openai', so the old call
+  // here returned nothing for that provider while Settings got a full list.
+  // The hook normalizes, but pass the normalized id anyway so the intent is
+  // visible at the call site.
   const loadModels = async () => {
-    setModelsLoading(true);
-    setModels([]);
     setSelectedModel('');
+    // The model already saved for this provider, if any. Re-entering a key (this
+    // flow also runs from Settings) must not quietly swap it for whatever the
+    // provider happens to list first.
+    let savedModel = null;
     try {
-      const res = await window.electronAPI?.ai?.listModels?.(selectedProvider);
-      if (res?.success && Array.isArray(res.models) && res.models.length) {
-        setModels(res.models);
-        setSelectedModel(res.models[0].value);  // sensible preselect; user can change
-      } else {
-        setModels([]);  // no list available — fall back to manual entry in the UI
-      }
-    } catch (e) {
-      setModels([]);
-    } finally {
-      setModelsLoading(false);
-    }
+      const saved = await loadDefaultAiSettings();
+      if (saved.model && saved.modelProvider === normalizedProvider) savedModel = saved.model;
+    } catch (e) { /* main unavailable — fall back to the list */ }
+    return loadProviderModels(normalizedProvider, {
+      onModelsLoaded: (list, { isCompat }) => {
+        // A compat endpoint may serve ids it never enumerates (local servers
+        // list none at all), so there the list is a suggestion, not a whitelist
+        // — leave the field empty for the user to type into.
+        if (isCompat) return;
+        if (savedModel && list.some((m) => m.value === savedModel)) {
+          setSelectedModel(savedModel);
+        } else if (list.length > 0) {
+          setSelectedModel(list[0].value); // user can change
+        }
+      },
+    });
   };
 
   const handleSave = async () => {
@@ -865,10 +1163,15 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
     if (!selectedModel.trim()) return;
     setContinuing(true);
     try {
-      // Persist provider + chosen model so every AI feature uses it.
-      await window.electronAPI?.ai?.setDefaultProvider?.(normalizedProvider, selectedModel.trim());
-      // Same store Settings writes to, clamped to the model's published limit.
-      await saveMaxTokens(maxTokens, selectedModelCap);
+      // Persist provider + chosen model + Max Tokens (clamped to the model's
+      // published limit) in the main process — the only store, and the same
+      // write Settings makes — so every AI feature uses them.
+      await saveDefaultAiSettings({
+        provider: normalizedProvider,
+        model: selectedModel.trim(),
+        maxTokens,
+        cap: selectedModelCap,
+      });
     } catch (e) {
       console.warn('[ApiKeySetup] Could not persist default model:', e);
     } finally {
@@ -1025,6 +1328,8 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
               Your key is encrypted and stored securely on this device using your OS keychain. It never leaves your machine.
             </Typography>
 
+            <SecretStorageWarning />
+
             <TextField
               fullWidth
               value={apiKey}
@@ -1092,6 +1397,7 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
                       label="Model"
                       value={selectedModel}
                       onChange={(e) => setSelectedModel(e.target.value)}
+                      MenuProps={MENU_ABOVE_ONBOARDING_SHELL}
                     >
                       {models.map((m) => (
                         <MenuItem key={m.value} value={m.value}>{m.label || m.value}</MenuItem>
@@ -1122,16 +1428,23 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
                     label="Max Tokens"
                     value={maxTokens}
                     onChange={(e) => setMaxTokens(e.target.value)}
+                    MenuProps={MENU_ABOVE_ONBOARDING_SHELL}
                   >
-                    {buildTokenOptions(selectedModelCap).map((o) => (
+                    {tokenOptions(selectedModel).map((o) => (
                       <MenuItem key={o.value} value={o.value}>{o.label}</MenuItem>
                     ))}
                   </Select>
                 </FormControl>
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                  Longest answer the AI can produce. Reasoning models spend part of
-                  this budget thinking before they reply, so low values can cut an
-                  answer short.
+                  {selectedModelCap
+                    ? `Longest answer the AI can produce. ${
+                        models.find((m) => m.value === selectedModel)?.label || selectedModel
+                      } accepts up to ${selectedModelCap.toLocaleString()} output tokens${
+                        contextFor(selectedModel)
+                          ? ` and a ${contextFor(selectedModel).toLocaleString()}-token context window`
+                          : ''
+                      }. Reasoning models spend part of this budget thinking before they reply, so low values can cut an answer short.`
+                    : 'Longest answer the AI can produce. This provider does not publish per-model limits, so an unsupported value is rejected at request time. Reasoning models spend part of this budget thinking before they reply, so low values can cut an answer short.'}
                 </Typography>
 
                 <Button
@@ -1261,6 +1574,7 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
         {view === 'signin' && (
           <SignInView
             onRegister={() => setView('register')}
+            onForgotPassword={(email) => { setPendingEmail(email); setView('forgot'); }}
             onComplete={handleAccountComplete}
             onNeedsVerification={handleNeedsVerification}
             onSkip={isSettingsMode ? null : handleSkip}
@@ -1272,6 +1586,14 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
             onBack={() => setView('signin')}
             onComplete={handleAccountComplete}
             onRegistered={handleNeedsVerification}
+            isSettingsMode={isSettingsMode}
+          />
+        )}
+        {view === 'forgot' && (
+          <ForgotPasswordView
+            initialEmail={pendingEmail}
+            onBack={() => setView('signin')}
+            onComplete={handleAccountComplete}
             isSettingsMode={isSettingsMode}
           />
         )}

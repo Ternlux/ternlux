@@ -1,10 +1,9 @@
 /**
  * Embedding generation library for vector database operations
- * Supports OpenAI and HuggingFace embedding providers
+ * OpenAI is the only embedding provider
  */
 
 const { OpenAI } = require('openai');
-const { HfInference } = require('@huggingface/inference');
 const { throwIfCancelled } = require('../NodeExecution/executionCancel');
 
 /**
@@ -12,7 +11,7 @@ const { throwIfCancelled } = require('../NodeExecution/executionCancel');
  * @param {Object} params - Parameters
  * @param {Array} params.data - Array of data rows
  * @param {String} params.columnToEmbed - Column name to extract text from
- * @param {String} params.provider - 'openai' or 'huggingface'
+ * @param {String} params.provider - 'openai'
  * @param {String} params.model - Model name/ID
  * @param {String} params.apiKey - API key for the provider
  * @returns {Promise<Array>} Array of data rows with added 'vector' field
@@ -28,7 +27,7 @@ async function generateEmbeddings({ data, columnToEmbed, provider, model, apiKey
   }
 
   if (!provider) {
-    throw new Error('Embedding provider is required (openai or huggingface)');
+    throw new Error('Embedding provider is required (openai)');
   }
 
   if (!apiKey) {
@@ -77,10 +76,8 @@ async function generateEmbeddings({ data, columnToEmbed, provider, model, apiKey
 
   if (provider === 'openai') {
     embeddings = await generateOpenAIEmbeddings(texts, model, apiKey);
-  } else if (provider === 'huggingface') {
-    embeddings = await generateHuggingFaceEmbeddings(texts, model, apiKey);
   } else {
-    throw new Error(`Unknown embedding provider: ${provider}. Supported: openai, huggingface`);
+    throw new Error(`Unknown embedding provider: ${provider}. Supported: openai`);
   }
 
   // Validate embeddings
@@ -146,55 +143,6 @@ async function generateOpenAIEmbeddings(texts, model = 'text-embedding-3-small',
 }
 
 /**
- * Generate HuggingFace embeddings
- * @param {Array<String>} texts - Array of texts to embed
- * @param {String} model - HuggingFace model name
- * @param {String} apiKey - HuggingFace API key
- * @returns {Promise<Array<Array<Number>>>} Array of embedding vectors
- */
-async function generateHuggingFaceEmbeddings(texts, model = 'sentence-transformers/all-MiniLM-L6-v2', apiKey) {
-  const hf = new HfInference(apiKey);
-
-  const allEmbeddings = [];
-
-  // HuggingFace Inference API processes texts individually or in small batches
-  // depending on the model
-  for (let i = 0; i < texts.length; i++) {
-    // One request PER TEXT here, so this is the slowest embedding path there
-    // is and the one most worth being able to stop.
-    throwIfCancelled('generating embeddings', `${i} of ${texts.length} embedded`);
-
-    const text = texts[i];
-
-    if ((i + 1) % 10 === 0 || i === texts.length - 1) {
-      console.log(`Processing HuggingFace embedding ${i + 1}/${texts.length}...`);
-    }
-
-    try {
-      const embedding = await hf.featureExtraction({
-        model,
-        inputs: text
-      });
-
-      // Normalize the embedding to array of numbers
-      let embeddingArray;
-      if (Array.isArray(embedding)) {
-        // Some models return nested arrays
-        embeddingArray = Array.isArray(embedding[0]) ? embedding[0] : embedding;
-      } else {
-        throw new Error('Unexpected embedding format from HuggingFace');
-      }
-
-      allEmbeddings.push(embeddingArray);
-    } catch (error) {
-      throw new Error(`HuggingFace embedding generation failed: ${error.message}`);
-    }
-  }
-
-  return allEmbeddings;
-}
-
-/**
  * Estimate embedding cost for OpenAI
  * @param {Array<String>} texts - Texts to estimate cost for
  * @param {String} model - OpenAI model name
@@ -224,7 +172,7 @@ function estimateOpenAICost(texts, model = 'text-embedding-3-small') {
 
 /**
  * Get embedding dimension for a model
- * @param {String} provider - 'openai' or 'huggingface'
+ * @param {String} provider - 'openai'
  * @param {String} model - Model name
  * @returns {Number|null} Dimension or null if unknown
  */
@@ -238,24 +186,12 @@ function getEmbeddingDimension(provider, model) {
     return dimensions[model] || null;
   }
 
-  if (provider === 'huggingface') {
-    const dimensions = {
-      'sentence-transformers/all-MiniLM-L6-v2': 384,
-      'sentence-transformers/all-mpnet-base-v2': 768,
-      'BAAI/bge-small-en-v1.5': 384,
-      'BAAI/bge-base-en-v1.5': 768,
-      'BAAI/bge-large-en-v1.5': 1024
-    };
-    return dimensions[model] || null;
-  }
-
   return null;
 }
 
 module.exports = {
   generateEmbeddings,
   generateOpenAIEmbeddings,
-  generateHuggingFaceEmbeddings,
   estimateOpenAICost,
   getEmbeddingDimension
 };

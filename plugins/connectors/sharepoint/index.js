@@ -20,36 +20,62 @@ function isTokenExpired(expiryDate) {
   return now >= (expiryDate - bufferTime);
 }
 
+// Tokens from the last refresh, per connection, reused until they come within
+// the expiry buffer. The stored connection config is not rewritten by a
+// refresh, so every run reads the same expired token; without this each call
+// refreshed again, even seconds apart and several times in one run.
+const refreshedTokens = new Map();
+const refreshesInFlight = new Map();
+
+/** Refresh the access token, remember it for this session, and tell any listener. */
+async function refreshAndCache(config, connectionId, key) {
+  console.log('[SharePoint] Token expired or about to expire, refreshing...');
+
+  const module = require('./index.js');
+  const refreshResult = await module.refreshAccessToken(config);
+
+  if (!refreshResult.success) {
+    console.error('[SharePoint] Token refresh failed:', refreshResult.message);
+    throw new Error('Token refresh failed: ' + refreshResult.message);
+  }
+
+  console.log('[SharePoint] Token refreshed successfully');
+  refreshedTokens.set(key, refreshResult.tokens);
+
+  // Trigger callback to update connection in database if registered
+  if (tokenRefreshCallbacks.has(connectionId)) {
+    const callback = tokenRefreshCallbacks.get(connectionId);
+    await callback(refreshResult.tokens);
+  }
+
+  return refreshResult.tokens;
+}
+
 /**
  * Get or create SharePoint client with automatic token refresh
  */
 async function getClient(config, connectionId) {
   const key = connectionId || JSON.stringify(config);
 
-  // Check if token needs refresh
+  // A refresh earlier in this session is still valid: use it instead of the
+  // stored token, which a refresh never updates (see refreshedTokens).
+  const cached = refreshedTokens.get(key);
+  if (cached && !isTokenExpired(cached.expiryDate)
+      && (!config.expiryDate || config.expiryDate < cached.expiryDate)) {
+    Object.assign(config, cached);
+  }
+
   if (isTokenExpired(config.expiryDate)) {
-    console.log('[SharePoint] Token expired or about to expire, refreshing...');
-
-    const module = require('./index.js');
-    const refreshResult = await module.refreshAccessToken(config);
-
-    if (refreshResult.success) {
-      console.log('[SharePoint] Token refreshed successfully');
-      // Update config with new tokens
-      Object.assign(config, refreshResult.tokens);
-
-      // Trigger callback to update connection in database if registered
-      if (tokenRefreshCallbacks.has(connectionId)) {
-        const callback = tokenRefreshCallbacks.get(connectionId);
-        await callback(refreshResult.tokens);
-      }
-
-      // Clear cached client to force recreation with new token
-      sharepointClients.delete(key);
-    } else {
-      console.error('[SharePoint] Token refresh failed:', refreshResult.message);
-      throw new Error('Token refresh failed: ' + refreshResult.message);
+    // One refresh per connection at a time: a call that arrives while one is in
+    // flight waits for it rather than refreshing again.
+    if (!refreshesInFlight.has(key)) {
+      refreshesInFlight.set(key, refreshAndCache(config, connectionId, key)
+        .finally(() => refreshesInFlight.delete(key)));
     }
+    Object.assign(config, await refreshesInFlight.get(key));
+
+    // Clear cached client to force recreation with new token
+    sharepointClients.delete(key);
   }
 
   if (!sharepointClients.has(key)) {
@@ -149,7 +175,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[SharePoint] Token exchange error:', error);
+      console.error('[SharePoint] Token exchange error:', error.response?.data?.error_description || error.message);
       return {
         success: false,
         message: error.response?.data?.error_description || error.message
@@ -199,7 +225,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[SharePoint] Token refresh error:', error);
+      console.error('[SharePoint] Token refresh error:', error.response?.data?.error_description || error.message);
       return {
         success: false,
         message: error.response?.data?.error_description || error.message

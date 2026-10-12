@@ -189,6 +189,13 @@ module.exports = {
   name: 'SQL Server',
   icon: './icon.svg',
   dbCategory: 'SQL',
+  // See postgres: how a join may merge into this database (write mode "merge").
+  mergeSupport: {
+    statements: ['MERGE'],
+    guidance: 'MERGE INTO {{TARGET}} AS t USING (<the joined SELECT>) AS s ON t.<key> = s.<key> '
+      + 'WHEN MATCHED THEN UPDATE SET t.<col> = s.<col>, … WHEN NOT MATCHED BY TARGET THEN INSERT (<cols>) VALUES (s.<cols>); '
+      + '— SQL Server requires the terminating semicolon.',
+  },
 
   /**
    * Column types for a CREATE TABLE this app generates. See the note on
@@ -200,6 +207,17 @@ module.exports = {
    * and the loss is not recoverable afterwards. (TEXT, an older default here,
    * is worse still: non-unicode AND deprecated by SQL Server.)
    */
+  /**
+   * Why this engine cannot create a column with this name, or null. Checked
+   * before an Output creates a table, so a name the engine would refuse (or
+   * silently shorten) fails with the column named and the fix, not with
+   * whatever the CREATE happens to say.
+   */
+  columnNameProblem: (name) => {
+    const n = [...String(name)].length;
+    return n > 128 ? `is ${n} characters long; SQL Server allows at most 128` : null;
+  },
+
   types: {
     NULL: () => 'NVARCHAR(MAX)',
     DATE_ONLY: () => 'DATE',
@@ -211,6 +229,36 @@ module.exports = {
     FLOAT: () => 'FLOAT',
     OBJECT: () => 'NVARCHAR(MAX)',
     STRING: (maxLen) => (maxLen > 255 ? 'NVARCHAR(MAX)' : `NVARCHAR(${nvarcharFor(maxLen)})`),
+    // Only reached for a source column whose type is known — see
+    // public/NodeExecution/columnTypes.js.
+    BIGINT: () => 'BIGINT',
+    DECIMAL: (p, s) => (p && p <= 38 ? `DECIMAL(${p},${s || 0})` : null),
+    TIMESTAMPTZ: () => 'DATETIMEOFFSET',
+    TIME: () => 'TIME',
+  },
+
+  /**
+   * This engine's type for a column (a getColumns entry) as a canonical type —
+   * what an Output writing a copy of this table elsewhere builds its column
+   * from. See public/NodeExecution/columnTypes.js for the kinds. null leaves
+   * the column to be guessed from its values.
+   */
+  toCanonicalType: (column) => {
+    const t = String(column?.type || '').toLowerCase();
+    if (t === 'tinyint' || t === 'smallint' || t === 'int') return { kind: 'INTEGER' };
+    if (t === 'bigint') return { kind: 'BIGINT' };
+    if (t === 'float' || t === 'real') return { kind: 'DOUBLE' };
+    if (t === 'decimal' || t === 'numeric' || t === 'money' || t === 'smallmoney') {
+      return { kind: 'DECIMAL', precision: column.precision ?? null, scale: column.scale ?? null };
+    }
+    if (t === 'bit') return { kind: 'BOOLEAN' };
+    if (t === 'date') return { kind: 'DATE_ONLY' };
+    if (t === 'datetimeoffset') return { kind: 'TIMESTAMPTZ' };
+    if (t.includes('datetime')) return { kind: 'TIMESTAMP' };
+    if (t === 'time') return { kind: 'TIME' };
+    // -1 is (MAX): unbounded.
+    const len = Number(column?.maxLength);
+    return { kind: 'STRING', length: len > 0 ? len : null };
   },
 
   /**
@@ -249,9 +297,18 @@ module.exports = {
         FROM INFORMATION_SCHEMA.TABLES
         ORDER BY TABLE_SCHEMA, TABLE_NAME
       `);
+      // Every user schema, empty ones included — ids 5–16383 are the ones
+      // created in this database; dbo is id 1. The rest are SQL Server's own
+      // (sys, guest, INFORMATION_SCHEMA, the db_* role schemas).
+      const schemaResult = await pool.request().query(`
+        SELECT name FROM sys.schemas
+        WHERE name = 'dbo' OR schema_id BETWEEN 5 AND 16383
+        ORDER BY name
+      `);
 
       return {
         success: true,
+        schemas: schemaResult.recordset.map((row) => row.name),
         tables: result.recordset
       };
     } catch (error) {
@@ -288,6 +345,8 @@ module.exports = {
         .input('table', mssql.NVarChar, table)
         .query(`
           SELECT c.COLUMN_NAME AS name, c.DATA_TYPE AS type, c.IS_NULLABLE AS nullable,
+                 c.CHARACTER_MAXIMUM_LENGTH AS maxLength,
+                 c.NUMERIC_PRECISION AS precision, c.NUMERIC_SCALE AS scale,
                  CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS isPrimary
           FROM INFORMATION_SCHEMA.COLUMNS c
           LEFT JOIN (
@@ -301,7 +360,6 @@ module.exports = {
           WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
           ORDER BY c.ORDINAL_POSITION
         `);
-      console.log('result: ', result)
       return {
         success: true,
         columns: result.recordset
@@ -369,9 +427,14 @@ module.exports = {
       try {
         const request = pool.request();
         request.stream = true;
+        // rowsAsArrays: see the PostgreSQL connector. In object mode the driver
+        // folds same-named columns into one key holding an array.
+        if (options.rowsAsArrays) request.arrayRowMode = true;
 
         request.on('recordset', (recordsetColumns) => {
-          columns = Object.keys(recordsetColumns || {});
+          columns = Array.isArray(recordsetColumns)
+            ? recordsetColumns.map((c) => c.name)
+            : Object.keys(recordsetColumns || {});
         });
         request.on('row', (row) => {
           // One past the cap, so "is there more?" is observed rather than
@@ -402,6 +465,7 @@ module.exports = {
           // effect through `rowsaffected` — that is the only count there is.
           rowCount: Math.min(rows.length, maxRows) || affected,
           truncated: rows.length > maxRows,
+          ...(options.rowsAsArrays ? { rowsAreArrays: true } : {}),
         }));
 
         request.query(sqlQuery);
@@ -508,7 +572,9 @@ module.exports = {
         await transaction.begin();
 
         // Quote column names for SQL Server
-        const quotedColumns = columns.map(col => `[${col}]`);
+        // quoteColumn, not a bare `[${col}]`: a `]` inside the name has to be
+        // doubled or it ends the identifier early.
+        const quotedColumns = columns.map(col => module.exports.quoteColumn(col));
         const quotedTable = quoteSqlServerIdentifier(tableName);
 
         // One INSERT per slice of rows, not one for the whole call: the caller
@@ -565,11 +631,38 @@ module.exports = {
           rowsInserted: rows.length
         };
       } catch (error) {
-        // Rollback on error
-        await transaction.rollback();
+        // Rollback on error. SQL Server aborts the transaction itself on many
+        // errors (a failed conversion, for one), and rolling back an aborted
+        // transaction throws "Transaction has been aborted." — which, unguarded,
+        // replaced the real error: the user saw that sentence and never the
+        // value or column that caused it.
+        await transaction.rollback().catch(() => {});
         throw error;
       }
     } catch (error) {
+      return queryError(error);
+    }
+  },
+
+  /**
+   * Run several statements as ONE transaction on one connection: all of them
+   * land, or none do. See the PostgreSQL connector's note — the same contract.
+   */
+  runInTransaction: async (config, connectionId, statements) => {
+    let transaction;
+    try {
+      const pool = await getPool(config, connectionId);
+      transaction = pool.transaction();
+      await transaction.begin();
+    } catch (error) {
+      return queryError(error);
+    }
+    try {
+      for (const sql of statements) await transaction.request().query(sql);
+      await transaction.commit();
+      return { success: true };
+    } catch (error) {
+      await transaction.rollback().catch(() => {});
       return queryError(error);
     }
   },
@@ -846,6 +939,18 @@ module.exports = {
    * @param {object} config - Database configuration (not used for SQL Server)
    * @returns {string} Properly quoted identifier
    */
+  /**
+   * Quote ONE column name, whatever characters it holds.
+   *
+   * quoteIdentifier is for TABLE references and reads a dot as a qualifier
+   * ("public.orders" → schema public, table orders). A column is never
+   * qualified, so a name like "e.mail" has to stay one identifier — handing it
+   * to quoteIdentifier produced "e"."mail" and every CREATE / INSERT that
+   * carried it failed. Spaces, reserved words, unicode and emoji are covered by
+   * the quoting itself.
+   */
+  quoteColumn: (name) => `[${String(name).replace(/]/g, ']]')}]`,
+
   quoteIdentifier: (identifier, schema = null, config = null) =>
     quoteSqlServerIdentifier(identifier, schema),
 
@@ -865,6 +970,9 @@ module.exports = {
    * distinctly T-SQL belongs here.
    */
   explorer: {
+    // runQuery returns array rows on request ({ rowsAsArrays }), so the explorer
+    // can keep same-named result columns apart.
+    rowsAsArrays: true,
     language: 'sql',
     sqlDialect: 'TransactSQL',
     formatter: 'transactsql',

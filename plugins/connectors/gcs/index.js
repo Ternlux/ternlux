@@ -163,7 +163,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[GCS] Token exchange error:', error);
+      console.error('[GCS] Token exchange error:', error.response?.data?.error_description || error.message);
       return { success: false, message: error.message };
     }
   },
@@ -197,7 +197,7 @@ module.exports = {
         }
       };
     } catch (error) {
-      console.error('[GCS] Token refresh error:', error);
+      console.error('[GCS] Token refresh error:', error.response?.data?.error_description || error.message);
       return { success: false, message: error.message };
     }
   },

@@ -13,9 +13,20 @@ stores.
 - Inspect the fields of any collection — Ternlux samples up to one
   hundred documents and reports the union of the fields it sees. The
   document id is marked as the primary field.
-- Run filter queries to read documents.
-- Drop collections and bulk-insert documents — used internally by
-  outputs and joins.
+- Read: `find`, `aggregate`, `count`, `estimatedDocumentCount`,
+  `distinct`.
+- Write: `insertOne` / `insertMany`, `updateOne` / `updateMany` /
+  `replaceOne`, `deleteOne` / `deleteMany`, `findOneAndUpdate` /
+  `findOneAndReplace` / `findOneAndDelete`, `bulkWrite`, and `drop`.
+- Manage indexes and run database-level commands (`listCollections`,
+  `createCollection`, `runCommand`, `dbStats`, `createIndex`,
+  `dropIndex`, `listIndexes`).
+- Accept **shell syntax** as well as raw parameters. In the Data
+  Explorer you can type what you'd type in `mongosh` —
+  `db.events.find({ ts: { $gte: ISODate("…") } }).limit(50)` — and the
+  connector translates the call and its trailing
+  `.sort()` / `.limit()` / `.skip()` / `.project()` chain. AI-generated
+  nodes emit the raw parameter form, which is accepted unchanged.
 
 ## Connection form
 
@@ -92,9 +103,17 @@ breakdown.
 
 ## Behaviour notes
 
-- Ternlux keeps a small connection pool per saved connection.
+- Ternlux keeps a small connection pool per saved connection (up to ten
+  connections, with an eight-second server-selection timeout).
+- There is no cursor-based streaming read, so a node that reads a whole
+  collection buffers it — uncapped, but resident. Reads through a node
+  are deliberately uncapped: the connector's own default of 100
+  documents applies only to sampling.
 - Updating credentials closes the cached connection so the next query
   reconnects with the new URI.
-- The connector is also used as a destination for joins and outputs;
-  in those modes it accepts bulk inserts that come from data
-  assembled in the local workspace or pulled from another source.
+- The connector is also used as a destination for joins and outputs.
+  In those modes it accepts bulk inserts of documents assembled by the
+  background engine or read from another source. An `_id` carried over
+  from a source collection is stripped before insert, so the destination
+  mints its own — an id names a document within its own collection, and
+  two sources can collide on it.

@@ -13,6 +13,7 @@ import {
   C, MONO, Btn, Tag, MetaItem, MoreMenu, PageHeader, fullscreenModalProps,
 } from './_designShared';
 import { collectDroppableFiles, fileDragHandlers, FileDropOverlay } from './connections/localFileDrop';
+import { reassignImportedNodeIds } from '../../utils/workflowImportIds';
 
 const TYPE_COLORS = {
   transformation: { color: C.accent,  bg: C.aD,                       border: 'rgba(37,99,235,0.18)' },
@@ -357,12 +358,20 @@ const WorkflowsTab = ({
       );
     }
 
-    setEditingWorkflow({
-      name: parsed.name || '',
-      description: parsed.description || '',
+    // Fresh node ids, so the import is a workflow of its own — see
+    // utils/workflowImportIds for why shared ids collided at run time.
+    const fresh = reassignImportedNodeIds({
       nodes: resolvedNodes,
       edges: parsed.edges,
       executionSteps: parsed.executionSteps || [],
+    });
+
+    setEditingWorkflow({
+      name: parsed.name || '',
+      description: parsed.description || '',
+      nodes: fresh.nodes,
+      edges: fresh.edges,
+      executionSteps: fresh.executionSteps,
     });
     setIsEditorOpen(true);
   };

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 import { SettingOutlined, EditOutlined } from '@ant-design/icons';
-import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter, sourceIssueLabel } from './nodeCardShared';
+import { ExpandableCodes, extractLatestCodes, describeNode, nodeDisplayName, truncate, NODE_COLORS, DestinationFooter, sourceIssueLabel, WriteModeRow } from './nodeCardShared';
 import SourceChangedPopup from './SourceChangedPopup';
 
 const COLOR = NODE_COLORS.transformer;
@@ -184,6 +184,7 @@ const TransformerNode = ({ id, data, selected }) => {
 
       <ExpandableCodes codes={latestCodes} />
 
+      <WriteModeRow type="transformer" config={config} accent={COLOR} />
       <DestinationFooter type="transformer" config={config} accent={COLOR} />
 
       <Handle

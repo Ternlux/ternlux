@@ -16,21 +16,25 @@ They share a common surface:
 - **Delete** — remove an object.
 - **Get metadata** — size, modified time, content type.
 
-> **Note:** Cloud storage cannot be added to workflows through the
-> chat assistant for now. You configure and use cloud storage
-> connectors directly through the node UI.
+> **Note:** Cloud storage cannot be configured through the chat
+> assistant. Picking a container and an object needs the editor's native
+> picker, so you add and configure these nodes in the workflow editor.
+> Once such a node exists and has run, chat can build everything
+> downstream of it.
 
 ## How they're used by nodes
 
-- **Data Source nodes.** Point at a single object. At execution time
-  the object is downloaded and imported into the local workspace —
-  spreadsheets / Parquet / Avro into the local SQL workspace, JSON
-  into a local document collection. The container name is used as a
-  prefix on the resulting table or collection name to avoid collisions
-  when you import the same filename from different containers.
-- **Output nodes.** Point at a container plus an object path. The
-  output data is serialised to JSON or CSV (chosen by the file
-  extension you provide) and uploaded.
+- **Data Source nodes.** Point at a single object, and choose where the
+  downloaded copy is kept on disk. At execution time the object is
+  downloaded and written over that path, then read in place by DuckDB —
+  nothing is imported into another store and nothing is converted. A node
+  recorded before files were kept on disk has no path to refresh and says
+  so.
+- **Output nodes.** Point at a container plus an object path. The rows
+  are serialised to JSON or CSV (chosen by the file extension you give)
+  and uploaded as one object, which replaces whatever was there. There is
+  no append to an object, so the write-mode setting does not apply.
+- **Vector files.** Cloud storage cannot bring a LanceDB dataset in.
 
 ## Available connectors
 
@@ -41,7 +45,7 @@ They share a common surface:
 | [Azure Blob Storage](azure-blob.md) | Connection string or account key | Two auth methods supported |
 | [Google Drive](google-drive.md) | OAuth | File IDs, format export |
 | [OneDrive](onedrive.md) | OAuth | Microsoft Graph, multi-tenant aware |
-| [SharePoint](sharepoint.md) | OAuth | Microsoft Graph, site / drive model |
+| [SharePoint](sharepoint.md) | OAuth | Microsoft Graph, site / drive model. Ships, but is not currently offered in the connection picker |
 | [Dropbox](dropbox.md) | OAuth | Team-space detection |
 
 ## OAuth auto-refresh

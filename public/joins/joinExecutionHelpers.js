@@ -4,21 +4,14 @@
  */
 
 const path = require('path');
-const localSqlite = require('../lib/sqlite');
 const { batchChunkSizeFor } = require('../lib/batchChunkSize');
 const { throwIfCancelled, isCancelledError } = require('../NodeExecution/executionCancel');
 const { setBatchWindow } = require('../NodeExecution/executionLog');
 
-// Imported-file SQLite connections have NO plugin connector (sqlite is a local
-// builtin, read via public/lib/sqlite.js). Detect that case so we read the
-// source directly from its .db file instead of calling
-// pluginManager.getConnector('sqlite') — which returns undefined and crashes
-// with "Cannot read properties of undefined (reading 'runQuery')".
-function isLocalSqliteSource(conn, pluginManager) {
-  return !!conn && conn.dbType === 'sqlite'
-    && (!pluginManager || typeof pluginManager.hasConnector !== 'function' || !pluginManager.hasConnector('sqlite'));
-}
-
+// A SQLite source's file. Imported files record it on fileInfo.filePath (most
+// of them share the app's one imported-data file, told apart by table); a
+// SQLite file picked as a connection records it on dbConfig.dbPath. Joins read
+// it through DuckDB — see localFilePathOf.
 function localSqlitePath(conn) {
   return conn.fileInfo?.filePath || conn.localPath || conn.dbConfig?.dbPath || null;
 }
@@ -94,17 +87,23 @@ async function withDuckDBSource(sourceConnection, sourceConfig, fn) {
   }
 
   let body;
-  // A DATABASE — .duckdb, or a .sqlite/.db read through DuckDB's sqlite
+  // A DATABASE — .duckdb, or a SQLite file read through DuckDB's sqlite
   // extension — holds real tables and is attached. Anything else is a data file
   // read in place. `.duckdb` alone was too narrow: a local SQLite source fell
   // into the file branch below, where tableRef has no format for a .db and the
-  // read failed on a source the Data Explorer browses fine. Same predicate as
-  // the DuckDB connector's, so the two cannot disagree.
-  if (duck.isDatabaseFile(dbPath)) {
-    // An upstream node's output, or an imported SQLite file: a real table.
+  // read failed on a source the Data Explorer browses fine. SQLite is also
+  // recognised by its header, whatever the file is called.
+  const isSqlite = duck.isSqliteFile(dbPath);
+  if (isSqlite || duck.isDatabaseFile(dbPath)) {
+    // An upstream node's output, or a SQLite file: a real table.
     if (!table) throw new Error(`Reading a table out of ${path.basename(dbPath)} requires the source's table name.`);
     const alias = await duck.attachDb(dbPath);
-    body = `SELECT * FROM ${duck.quoteIdentifier(alias)}.${duck.quoteIdentifier(duck.sanitizeIdentifier(table))}`;
+    // A table in a file the user owns keeps the name its owner gave it —
+    // spaces, dashes and all — so it is quoted as-is. Only tables this app
+    // wrote (a workflow's own database) were created under the sanitized form.
+    const DuckDB = require('../transfomers/DuckDB');
+    const tableIdent = (!isSqlite && DuckDB.isWorkflowDb(dbPath)) ? duck.sanitizeIdentifier(table) : table;
+    body = `SELECT * FROM ${duck.quoteIdentifier(alias)}.${duck.quoteIdentifier(tableIdent)}`;
   } else {
     // A data file, read where it lies. For a workbook the table name is the
     // sheet; for every other format that resolves to null.
@@ -219,20 +218,55 @@ async function loadDuckDBSourceInChunks(sourceConnection, sourceConfig, sql, chu
  * @param {Function} getFullConfig - Function to get full config with credentials
  * @returns {Promise<Array>} Array of data rows/documents
  */
+/**
+ * A join source's document-store read, as the object the connector runs.
+ *
+ * Saved as a JSON string by contract, but a model can hand back the object
+ * itself, and the builder stores what it is given — JSON.parse on that threw
+ * `"[object Object]" is not valid JSON` and failed every run of the join.
+ *
+ * A find written `{ collection, query: {...} }` is also accepted: the
+ * connector unwraps a top-level `query` as a wrapper around the whole params
+ * object, so that shape lost its collection. `filter` is the field it reads.
+ *
+ * `defaultCollection` is the collection THIS source's Data Source node reads.
+ * Which collection to read is never the model's choice — the node already
+ * decided it — so a read that leaves it out ("A query needs a collection")
+ * reads that one. Each source of a join passes its own.
+ */
+function parseNoSQLOperation(operation, defaultCollection = null) {
+  const parsed = (operation && typeof operation === 'object')
+    ? { ...operation }
+    : JSON.parse(operation || '{}');
+  if (parsed && !Array.isArray(parsed)) {
+    if (!parsed.collection && !parsed.tableName && defaultCollection) parsed.collection = defaultCollection;
+    if (parsed.collection
+        && parsed.query && typeof parsed.query === 'object' && parsed.filter === undefined) {
+      parsed.filter = parsed.query;
+      delete parsed.query;
+    }
+  }
+  return parsed;
+}
+
+/** The collection a join source's own node reads — see parseNoSQLOperation. */
+function sourceCollectionOf(sourceConfig = {}, sourceConnection = {}) {
+  return sourceConfig.tableName
+    || sourceConfig.sourceCollection
+    || sourceConfig.sourceTableSchema?.tableName
+    || sourceConnection?.dbConfig?.tableName
+    || null;
+}
+
 async function loadSourceData(sourceConnection, sourceConfig, pluginManager, getFullConfig) {
   const sourceDbType = sourceConnection.dbType;
 
-  // Local imported-file SQLite source — read straight from its .db file.
-  if (isLocalSqliteSource(sourceConnection, pluginManager)) {
-    const dbPath = localSqlitePath(sourceConnection);
-    if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
-    const sql = sourceConfig.sql.replace('{LIMIT_OFFSET_HERE}', '');
-    return await localSqlite.runQuery({ dbPath, query: sql });
-  }
-
-  // Local DuckDB source — a file, or a table in a workflow database. Read by
-  // path rather than through the connector; see loadDuckDBSourceData.
-  if (sourceDbType === 'duckdb') {
+  // Local file source — a DuckDB/data file, a table in a workflow database, or
+  // a SQLite file. All of them are read by DuckDB by path (a SQLite file
+  // through its sqlite extension), never through a connector or the sqlite3
+  // library; see loadDuckDBSourceData. The source's `sql` runs as a DuckDB
+  // SELECT against the table, registered under its own name.
+  if (sourceDbType === 'duckdb' || (sourceDbType === 'sqlite' && localFilePathOf(sourceConnection))) {
     return await loadDuckDBSourceData(sourceConnection, sourceConfig);
   }
 
@@ -248,9 +282,11 @@ async function loadSourceData(sourceConnection, sourceConfig, pluginManager, get
 
   if (isNoSQLSource) {
     // Load from the document store via its plugin
-    const operation = sourceConfig.nosqlOperation || '{}';
     const plugin = pluginManager.getConnector(sourceDbType);
-    const operationObj = JSON.parse(operation);
+    const operationObj = parseNoSQLOperation(
+      sourceConfig.nosqlOperation,
+      sourceCollectionOf(sourceConfig, sourceConnection),
+    );
     // 0 = no cap. A join source is read WHOLE — the join function needs every
     // document to be correct, and a truncated read is not a smaller answer but
     // a wrong one. The connector's default is 100 (a preview default), which
@@ -321,30 +357,12 @@ async function loadSQLSourceInChunks(
   // workflow database. Read by PATH rather than through the connector, which
   // resolves its file from `config.dbPath` and so cannot open either of those.
   // Mirrors the branch loadSourceData already has; see loadDuckDBSourceInChunks.
-  if (sourceDbType === 'duckdb' && sourceConfig) {
+  // A SQLite file takes the same route: DuckDB attaches it through the sqlite
+  // extension and streams it, instead of paging it with the sqlite3 library.
+  const isLocalFile = sourceDbType === 'duckdb'
+    || (sourceDbType === 'sqlite' && !!localFilePathOf(sourceConnection));
+  if (isLocalFile && sourceConfig) {
     return await loadDuckDBSourceInChunks(sourceConnection, sourceConfig, sql, chunkSize, onChunk);
-  }
-
-  // Local imported-file SQLite source — page through it with the local lib
-  // (LIMIT/OFFSET) since there is no plugin connector for sqlite.
-  if (isLocalSqliteSource(sourceConnection, pluginManager)) {
-    const dbPath = localSqlitePath(sourceConnection);
-    if (!dbPath) throw new Error(`No local SQLite path for source ${sourceConnection.id}`);
-    let offset = 0;
-    let totalProcessed = 0;
-    while (true) {
-      throwIfCancelled('reading a local SQLite source', `${totalProcessed} rows read so far`);
-      const paginationClause = `LIMIT ${chunkSize} OFFSET ${offset}`;
-      const chunkQuery = sql.includes('{LIMIT_OFFSET_HERE}')
-        ? sql.replace('{LIMIT_OFFSET_HERE}', paginationClause)
-        : `${sql} ${paginationClause}`;
-      const rows = await localSqlite.runQuery({ dbPath, query: chunkQuery });
-      if (rows.length === 0) break;
-      totalProcessed += rows.length;
-      await onChunk(rows, offset, totalProcessed);
-      offset += chunkSize;
-    }
-    return totalProcessed;
   }
 
   if (!pluginManager.hasConnector(sourceDbType)) {
@@ -403,6 +421,36 @@ async function loadSQLSourceInChunks(
 }
 
 /**
+ * The temp table's real column names, in `selectedColumns` order.
+ *
+ * The staging DDL is the model's, and it may write its columns bare. Snowflake
+ * folds a bare `product_id` to PRODUCT_ID, while every connector's batchInsert
+ * quotes the names it is handed — so the load asked for "product_id" and failed
+ * with `invalid identifier '"product_id"'` after the table had been created.
+ * Asking the destination what the table actually holds settles it on every
+ * engine, without reading or rewriting the DDL: each selected column maps to
+ * the real column of the same name, exactly, or else ignoring case. A connector
+ * that cannot answer leaves the names as they were.
+ */
+async function resolveStagedColumns(destPlugin, destFullConfig, destConnectionId, tempTableName, selectedColumns) {
+  if (!destPlugin || typeof destPlugin.getColumns !== 'function') return selectedColumns;
+  let real = [];
+  try {
+    const res = await destPlugin.getColumns(destFullConfig, destConnectionId, null, tempTableName);
+    const list = Array.isArray(res) ? res : (res?.columns || []);
+    real = list.map((c) => (typeof c === 'string' ? c : c?.name)).filter(Boolean);
+  } catch (_) {
+    return selectedColumns;
+  }
+  if (!real.length) return selectedColumns;
+  return selectedColumns.map((col) => {
+    if (real.includes(col)) return col;
+    const lower = String(col).toLowerCase();
+    return real.find((r) => String(r).toLowerCase() === lower) || col;
+  });
+}
+
+/**
  * Insert data into a temp table in batches using selectedColumns
  * @param {Object} destPlugin - Destination database plugin
  * @param {Object} destFullConfig - Destination full configuration
@@ -422,11 +470,19 @@ async function insertDataToTempTable(
   tempTableName,
   selectedColumns,
   data,
-  chunkSize
+  chunkSize,
+  // The table's own names for selectedColumns (resolveStagedColumns). When a
+  // name differs, each row is re-keyed so the value lands under it.
+  tableColumns = null
 ) {
   if (data.length === 0) return 0;
   if (!selectedColumns || selectedColumns.length === 0) {
     throw new Error(`No selectedColumns provided for ${tempTableName}`);
+  }
+  if (Array.isArray(tableColumns) && tableColumns.length === selectedColumns.length
+      && tableColumns.some((c, i) => c !== selectedColumns[i])) {
+    data = data.map((row) => Object.fromEntries(selectedColumns.map((c, i) => [tableColumns[i], row[c]])));
+    selectedColumns = tableColumns;
   }
 
   let totalInserted = 0;
@@ -496,10 +552,21 @@ async function insertDataToTempTable(
 }
 
 
-/** The file a local source is read from, or null when it isn't a local file. */
+/**
+ * The file a local source is read from, or null when it isn't a local file.
+ *
+ * DuckDB files and data files, and SQLite files too: DuckDB reads those through
+ * its sqlite extension (attachDb), so a SQLite source is read where it lies
+ * like any other local file — never through the sqlite3 library, and never
+ * copied into staging first.
+ */
 function localFilePathOf(connection) {
-  if (!connection || connection.dbType !== 'duckdb') return null;
-  return connection.fileInfo?.filePath || connection.localPath || connection.dbConfig?.dbPath || null;
+  if (!connection) return null;
+  if (connection.dbType === 'duckdb') {
+    return connection.fileInfo?.filePath || connection.localPath || connection.dbConfig?.dbPath || null;
+  }
+  if (connection.dbType === 'sqlite') return localSqlitePath(connection);
+  return null;
 }
 
 /**
@@ -527,9 +594,26 @@ function emptyViewSelect(selectedColumns) {
  *
  * @returns {Promise<{success, message, localPath, targetTableName, rowCount}>}
  */
+// How the generated SQL names the join's target. A SQL destination has it
+// filled in at build time (workflowBuilder's applySourceSlots); a local one at
+// run time, above, where the workflow database's alias is known.
+const TARGET_PLACEHOLDER = '{{TARGET}}';
+
+// 'append' and 'merge' keep the target (created only when missing, never
+// dropped); 'new_table' replaces it. See NodeExecution's keepsTarget.
+const keepsTarget = (mode) => mode === 'append' || mode === 'merge';
+
 async function executeLocalDuckDBJoin({
   sourcesConfig,
   joinSql,
+  // The SQL-destination contract, which a local join now shares: a CREATE for
+  // the target and an INSERT into it, both naming the target as {{TARGET}}.
+  // Absent on joins built before that — they carry a bare SELECT, run through
+  // CREATE OR REPLACE TABLE … AS below.
+  targetDdl = null,
+  // 'new_table' replaces the target every run; 'append' keeps its rows and
+  // adds this run's, creating the table only when it is missing.
+  operationMode = 'new_table',
   targetTableName,
   targetLocalPath,
   pluginManager,
@@ -547,12 +631,38 @@ async function executeLocalDuckDBJoin({
   try {
     if (!joinSql || !String(joinSql).trim()) throw new Error('Join SQL is empty');
 
+    // Replace mode drops the target before the INSERT reads its sources, so a
+    // source that IS the target (an upstream node's table of the same name in
+    // this workflow database) would be emptied first. Append never drops.
+    if (!keepsTarget(operationMode) && String(targetDdl || '').trim()) {
+      const clash = (sourcesConfig || []).find((sc) => {
+        const conn = sc.connection || sc.sourceConnection || {};
+        return DuckDB.isWorkflowDb(localFilePathOf(conn))
+          && String(sc.tableName || '').toLowerCase() === String(targetTableName || '').toLowerCase();
+      });
+      if (clash) {
+        return {
+          success: false,
+          message: `Join ${targetTableName} replaces its target on every run, but that table is also one of its sources — `
+            + 'the replace would empty it before it is read. Write to a different table, or switch the join to append mode. Nothing was changed.',
+        };
+      }
+    }
+
     // Counts SOURCES, not views. It used to piggyback on `views.length`, which
     // was one-per-source until a source started registering several names.
     let sourceIndex = 0;
     for (const sourceConfig of sourcesConfig) {
       const name = sourceConfig.tempTableName || sourceConfig.tableName;
-      if (!name) continue;
+      // A source with no name cannot be read, and skipping it only moved the
+      // failure into the join SQL as "table does not exist", naming the wrong
+      // cause. Every complete node names its table; this one is unfinished.
+      if (!name) {
+        throw new Error(
+          `Join source "${sourceConfig.sourceNodeId || 'unknown'}" names no table to read. `
+          + 'Finish that source node (pick its table, or the cloud file) and rebuild the join.',
+        );
+      }
       const stagingIndex = sourceIndex++;
 
       const sourceConnection = sourceConfig.connection || sourceConfig.sourceConnection || {};
@@ -563,6 +673,16 @@ async function executeLocalDuckDBJoin({
         // An upstream node's output — already a table in this same database.
         const ref = await duck.workflowTableRef(workflowId, sourceConfig.tableName || name);
         body = `SELECT * FROM ${ref}`;
+      } else if (filePath && (duck.isSqliteFile(filePath) || duck.isDatabaseFile(filePath))) {
+        // A database file the user owns — SQLite (through DuckDB's sqlite
+        // extension) or DuckDB. Attached and read in place: its table under
+        // the name its owner gave it, never copied into staging first.
+        const table = sourceConfig.tableName || sourceConfig.sourceTableSchema?.tableName || null;
+        if (!table) {
+          throw new Error(`Join source "${sourceConfig.sourceNodeId}" reads ${path.basename(filePath)} but names no table in it.`);
+        }
+        const alias = await duck.attachDb(filePath);
+        body = `SELECT * FROM ${duck.quoteIdentifier(alias)}.${duck.quoteIdentifier(table)}`;
       } else if (filePath) {
         // The point of the whole change: read the file where it is. A workbook
         // holds a table per sheet, and this source's table name is which sheet
@@ -610,10 +730,28 @@ async function executeLocalDuckDBJoin({
     }
 
     // The join result is this node's output: a table in the workflow database.
+    let before = 0;
     const rowCount = await duck.withWorkflowLock(workflowId, async () => {
-      await duck.createTableAs(workflowId, targetTableName, joinSql);
+      if (!String(targetDdl || '').trim()) {
+        // Built before the shared contract: joinSql is a bare SELECT.
+        await duck.createTableAs(workflowId, targetTableName, joinSql);
+        return duck.tableRowCount(workflowId, targetTableName);
+      }
+      // {{TARGET}} is resolved here, not at build time: the workflow
+      // database's alias is only known once it is attached.
+      const ref = await duck.workflowTableRef(workflowId, targetTableName);
+      const fill = (sql) => String(sql).split(TARGET_PLACEHOLDER).join(ref);
+      const exists = await duck.tableExists(workflowId, targetTableName);
+      if (keepsTarget(operationMode) && exists) {
+        before = await duck.tableRowCount(workflowId, targetTableName);
+      } else {
+        if (exists) await duck.exec(`DROP TABLE IF EXISTS ${ref}`);
+        await duck.exec(fill(targetDdl));
+      }
+      await duck.exec(fill(joinSql));
       return duck.tableRowCount(workflowId, targetTableName);
     });
+    const written = rowCount - before;
 
     return {
       success: true,
@@ -621,10 +759,14 @@ async function executeLocalDuckDBJoin({
       // read back off the table it wrote, so a zero here is real. It is worth
       // saying out loud: an empty source (which stages as an empty view above)
       // and join keys that simply never match look identical from the outside.
-      warning: rowCount === 0,
-      message: rowCount === 0
-        ? `Join completed — 0 rows written to ${targetTableName}. Either a source was empty or no rows matched the join keys.`
-        : `Join completed — ${rowCount} row(s) written to ${targetTableName}`,
+      // A merge that only updated rows adds none, so the row-count difference
+      // says nothing about it; report the table's size instead.
+      warning: operationMode !== 'merge' && written === 0,
+      message: operationMode === 'merge'
+        ? `Join merged into ${targetTableName} — ${rowCount} row(s) now (${before} before).`
+        : written === 0
+          ? `Join completed — 0 rows written to ${targetTableName}. Either a source was empty or no rows matched the join keys.`
+          : `Join completed — ${written} row(s) ${before ? `appended to ${targetTableName} (${rowCount} in total)` : `written to ${targetTableName}`}`,
       localPath: outPath,
       targetTableName,
       rowCount,
@@ -650,9 +792,88 @@ async function executeLocalDuckDBJoin({
   }
 }
 
+/**
+ * Write a JavaScript join's rows as this node's table in the workflow database.
+ *
+ * The local counterpart of executeLocalDuckDBJoin for a join that could not be
+ * SQL — one that embeds or runs a similarity search. The rows are staged in the
+ * workflow's own file and the target is created from them with the same
+ * CREATE OR REPLACE TABLE a SQL join uses, so readers see one shape either way.
+ * An empty result still replaces the target (a join always does), shaped from
+ * the columns the node declared.
+ */
+async function writeLocalJoinRows({
+  rows,
+  targetTableName,
+  targetLocalPath,
+  emptyColumns = null,
+  // See executeLocalDuckDBJoin.
+  operationMode = 'new_table',
+  workflowId = null,
+  nodeId = null,
+}) {
+  const duck = require('../duckdb');
+  const DuckDB = require('../transfomers/DuckDB');
+  const outPath = DuckDB.resolveTargetDb(targetLocalPath, { workflowId, nodeId });
+  const staged = `join_fn_${String(targetTableName || 'result')}`;
+  let before = 0;
+  const stagedTables = [];
+
+  try {
+    let selectSql;
+    if (Array.isArray(rows) && rows.length > 0) {
+      await duck.ingestRowsToStaging(rows, outPath, staged);
+      stagedTables.push(staged);
+      selectSql = `SELECT * FROM ${await duck.stagingRef(outPath, staged)}`;
+    } else {
+      selectSql = emptyViewSelect(emptyColumns);
+    }
+
+    const rowCount = await duck.withWorkflowLock(workflowId, async () => {
+      if (keepsTarget(operationMode) && await duck.tableExists(workflowId, targetTableName)) {
+        before = await duck.tableRowCount(workflowId, targetTableName);
+        // BY NAME: the function's rows land under the columns of the same
+        // name, whatever order its objects listed them in.
+        const ref = await duck.workflowTableRef(workflowId, targetTableName);
+        await duck.exec(`INSERT INTO ${ref} BY NAME ${selectSql}`);
+      } else {
+        await duck.createTableAs(workflowId, targetTableName, selectSql);
+      }
+      return duck.tableRowCount(workflowId, targetTableName);
+    });
+    const written = rowCount - before;
+
+    return {
+      success: true,
+      warning: written === 0,
+      message: written === 0
+        ? `Join completed — 0 rows written to ${targetTableName}. The join function returned no rows.`
+        : `Join completed — ${written} row(s) ${before ? `appended to ${targetTableName} (${rowCount} in total)` : `written to ${targetTableName}`}`,
+      localPath: outPath,
+      targetTableName,
+      rowCount,
+    };
+  } catch (error) {
+    if (isCancelledError(error)) throw error;
+    console.error('[DuckDB Join] Error writing function-join rows:', error);
+    return {
+      success: false,
+      message: `Local join failed: ${error.message}`,
+      error: error.stack,
+    };
+  } finally {
+    await duck.dropStaging(outPath, stagedTables);
+  }
+}
+
 module.exports = {
   loadSourceData,
+  parseNoSQLOperation,
+  sourceCollectionOf,
+  TARGET_PLACEHOLDER,
   loadSQLSourceInChunks,
   insertDataToTempTable,
-  executeLocalDuckDBJoin
+  resolveStagedColumns,
+  executeLocalDuckDBJoin,
+  writeLocalJoinRows
 };
