@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { C, SANS, MONO, I, MoreMenu } from '../Workflows/_designShared';
 import DataVisualization from './DataVisualization';
+import PresentationCard from './Presentation/PresentationCard';
 import { loadJoinDestinations, hasJoinDestination } from '../Workflows/joinDestinations';
 // One hue per node type, decided by the canvas cards — see NODE_COLORS.
 import { NODE_COLORS, targetIsSourceWarning } from '../Workflows/nodes/nodeCardShared';
@@ -1221,6 +1222,10 @@ const StepBubble = ({ m, activeApprovalMsgId, onApproveCode, onDeclineCode }) =>
             live={activeApprovalMsgId === m.id}
             onApprove={() => onApproveCode && onApproveCode(m)}
             onDecline={() => onDeclineCode && onDeclineCode(m)}
+            {...(m.approval.kind === 'presentation' ? {
+              approveLabel: 'Run analysis',
+              note: 'Runs locally and read-only, then writes the presentation from what it returns. Sending a new message cancels it.',
+            } : {})}
           />
         )}
       </div>
@@ -1941,6 +1946,9 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
           )}
           {!isUser && !m.error && Array.isArray(m.visuals) && m.visuals.length > 0 && (
             <VisualsPanel visuals={m.visuals} />
+          )}
+          {!isUser && !m.error && m.presentation && (
+            <PresentationCard presentation={m.presentation} />
           )}
           {!isUser && m.invalidJson && (
             <InvalidResponsePanel raw={m.invalidJson} />
@@ -4330,6 +4338,9 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
     // A node this turn built, waiting on the user's "Run this node". Appended
     // once the turn is over so it sits under the answer that describes it.
     let pendingNodeRun = null;
+    // A presentation an approved build_presentation run produced this turn. It
+    // goes onto the answer bubble; the scratchpad keeps only its outline.
+    let turnPresentation = null;
     // Config this turn has already applied to the focused node, kept locally so
     // the NEXT step sees it. Handing it to WorkflowEditor only gets it back into
     // focusNodeRef via apply-node-config → setNodes → node-focus → a second
@@ -4546,6 +4557,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         const pa = resp.pendingApproval || null;
         const approval = pa ? {
           state: 'pending',
+          kind: pa.kind || 'javascript',
           runToken: pa.runToken,
           code: pa.transformFunction || '',
           explanation: pa.explanation || '',
@@ -4616,9 +4628,15 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           // waiting on — success or failure, it learns what actually
           // happened and carries on from there.
           const slot = scratchpad[scratchpad.length - 1];
+          const codeTool = pa.kind === 'presentation' ? 'build_presentation' : 'run_javascript';
           const isSlot = (a, i, list) => (a.id === pa.actionId
-            || (!list.some((x) => x.id === pa.actionId) && a.tool === 'run_javascript'));
+            || (!list.some((x) => x.id === pa.actionId) && a.tool === codeTool));
           const action = slot?.actions?.find(isSlot);
+          if (execResp?.success && execResp.result && execResp.result.__presentation) {
+            const { __presentation, ...forModel } = execResp.result;
+            turnPresentation = __presentation;
+            execResp = { ...execResp, result: forModel };
+          }
           // A failure has to carry the SOURCE back, not just the message.
           //
           // The model writes the function, never sees it again, and is handed
@@ -4647,10 +4665,10 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             pa.transformFunction || '(source unavailable)',
             '',
             'Now STOP and tell the user, in your answer: what you called, what came back, and what '
-            + 'you think is wrong. Do NOT call run_javascript again on your own — not with a '
+            + `you think is wrong. Do NOT call ${codeTool} again on your own — not with a `
             + 'different endpoint, a different auth scheme, or error handling that hides the '
             + 'failure. Wait for the user. When they tell you what to change (a URL, a parameter, '
-            + 'where the credential goes), apply exactly that and call run_javascript again.',
+            + `where the credential goes), apply exactly that and call ${codeTool} again.`,
           ].join('\n');
           const outcome = execResp?.success
             ? { ok: true, result: execResp.result }
@@ -4700,6 +4718,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
             text: resp.finalAnswer || '(no answer)',
             workflowPlan: resp.workflowPlan || null,
             visuals: Array.isArray(resp.visuals) ? resp.visuals : null,
+            ...(turnPresentation ? { presentation: turnPresentation } : {}),
             clarification: !!resp.clarification,
             // Who actually produced this reply (hover note on the bubble).
             agentSource: resp.agentSource || null,

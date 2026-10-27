@@ -225,6 +225,28 @@ const EXTERNAL_TOOLS = [
 // ── Main-agent only ────────────────────────────────────────────────────────
 const MAIN_ONLY_TOOLS = [
   {
+    name: 'build_presentation',
+    description: 'Build a dashboard presentation (KPIs, charts and written findings the user opens full-screen) '
+      + 'from saved data. Use it ONLY when the user explicitly asks for a presentation, dashboard, report or '
+      + 'deck — answer ordinary questions with run_query / run_javascript and "visuals" instead. Two calls: '
+      + 'first { request } alone — it asks the user clarifying questions and ends your turn with them. After the '
+      + 'user replies, call again with the same request and `answers` set to the user\'s reply, verbatim. '
+      + 'Never fill in `answers` yourself. That second call writes an analysis function the user approves '
+      + 'before it runs; the presentation is then attached to your answer. Reply with a short summary of the '
+      + 'findings and do not add "visuals". To change an existing presentation, call again with the request '
+      + 'restated to include the change.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        request: { type: 'string', description: 'What the presentation is about, from the user\'s message.' },
+        answers: { type: 'string', description: 'The user\'s reply to the clarifying questions, verbatim. '
+          + 'Omit on the first call.' },
+      },
+      required: ['request'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'plan_workflow_build',
     description: 'TRIGGER — hands control to the workflow-builder sub-agent from the next turn onward. '
       + 'Call it when the user wants to CREATE or MODIFY a workflow. Call it EXACTLY ONCE and ALONE: never '

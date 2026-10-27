@@ -10,9 +10,11 @@ SQL or document operations when a request calls for it.
 | [Vector Database Executor](vector-db-executor.md) | Both | Generates embeddings, runs every vector store operation (upsert, query, delete, update), and powers vector-aware transformers, joins and outputs |
 | [JavaScript Executor](javascript-executor.md) | Transformer | Runs AI-authored JavaScript in the background engine for cross-system, per-row or API-calling work |
 | [Python Executor](python-executor.md) | Transformer | Runs AI-authored Python (pandas, numpy, …) for transformations that don't map cleanly to SQL |
+| [Presentation](presentation.md) | Chat | Builds a dashboard presentation of headline numbers, charts and written findings from saved data, in the main chat only |
 
 A skill's **category** decides which analyses it is offered to:
-`transformer`, `join`, or `both`. Two consequences of the table above are
+`transformer`, `join`, or `both`. A `chat` skill is offered to none of
+them: only the main chat assistant uses it, through a tool of its own. Two consequences of the table above are
 worth stating plainly:
 
 - Only the vector skill is eligible for joins — and the join builder

@@ -962,6 +962,22 @@ async function runApprovedJavascript({ runToken, helpers, provider }) {
     helpers: readOnlyHelpers(helpers, provider),
   });
 
+  // A build_presentation analysis: the rows are datasets, and the run carries on
+  // into the writer. The model gets the outline; the full presentation rides
+  // `__presentation`, which the renderer lifts onto the answer bubble.
+  if (entry.presentation) {
+    const presentationSkill = getPresentationSkill(helpers);
+    const datasets = presentationSkill.normalizeDatasets(output);
+    const presentation = await presentationSkill.writePresentation({
+      request: entry.presentation.request,
+      answers: entry.presentation.answers,
+      conversation: entry.presentation.conversation,
+      datasets,
+      helpers,
+    });
+    return { ...presentationSkill.summarizeForModel(presentation), __presentation: presentation };
+  }
+
   return {
     ran: true,
     explanation: entry.explanation || '',
@@ -1124,6 +1140,104 @@ async function runJavascriptTool({ helpers, provider }, args) {
   };
 }
 
+function getPresentationSkill(helpers) {
+  const skill = helpers?.pluginManager?.getSkill?.('presentation');
+  if (!skill || typeof skill.askClarifyingQuestions !== 'function') {
+    throw new Error('presentation skill is not available');
+  }
+  return skill;
+}
+
+// build_presentation — the presentation skill, main agent only. Two calls:
+//
+//   { request }           → the skill's clarifying questions, which END the turn
+//                           as the reply (a clarification), so nothing is written
+//                           before the user has answered.
+//   { request, answers }  → the javascript-executor skill writes the analysis
+//                           function from the skill's brief, and it is parked for
+//                           approval exactly like run_javascript. On approval,
+//                           runApprovedJavascript runs it and the skill writes
+//                           the presentation from the datasets it returned.
+// The chat so far as plain text, for the presentation skill: what was already
+// asked and answered, and what an earlier presentation covered. Message text
+// only — tool steps and their rows stay out.
+const PRESENTATION_HISTORY_MESSAGES = 12;
+const PRESENTATION_HISTORY_CHARS = 800;
+function conversationText(rawHistory, message) {
+  const lines = (Array.isArray(rawHistory) ? rawHistory : [])
+    .filter((m) => m && m.kind !== 'step' && typeof m.text === 'string' && m.text.trim())
+    .slice(-PRESENTATION_HISTORY_MESSAGES)
+    .map((m) => {
+      const t = m.text.trim();
+      return `${m.role === 'user' ? 'User' : 'Assistant'}: ${t.length > PRESENTATION_HISTORY_CHARS ? `${t.slice(0, PRESENTATION_HISTORY_CHARS)}…` : t}`;
+    });
+  if (typeof message === 'string' && message.trim()) lines.push(`User: ${message.trim()}`);
+  return lines.join('\n');
+}
+
+async function buildPresentationTool({ helpers, rawHistory, message }, args) {
+  const request = args && typeof args.request === 'string' ? args.request.trim() : '';
+  if (!request) throw new Error('request is required');
+  const answers = args && typeof args.answers === 'string' ? args.answers.trim() : '';
+  const presentationSkill = getPresentationSkill(helpers);
+  const connections = (helpers.connections || []).map(describeConnectionForCode);
+  const conversation = conversationText(rawHistory, message);
+
+  if (!answers) {
+    const { questions } = await presentationSkill.askClarifyingQuestions({ request, conversation, connections, helpers });
+    const text = 'Before I build the presentation, a few questions:\n\n'
+      + questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+    return {
+      askedUser: true,
+      questions,
+      __shortCircuit: { finalAnswer: text, clarification: true, agentSource: 'skill:presentation' },
+    };
+  }
+
+  const jsSkill = presentationSkill.getJsSkill(helpers);
+  const prompt = jsSkill.buildChatFunctionPrompt({
+    userRequest: presentationSkill.buildAnalysisRequest({ request, answers, conversation }),
+    connections,
+    aiProviders: helpers.aiProviders || [],
+    embeddingProviders: helpers.embeddingProviders || [],
+    vectorGuide: require('../lib/vectorQueryGuide').VECTOR_QUERY_GUIDE,
+  });
+  const raw = await helpers.callAI(prompt, {});
+  const parsed = typeof jsSkill.processSkillResponse === 'function' ? jsSkill.processSkillResponse(raw) : null;
+  if (!parsed || parsed.action !== 'execute' || !parsed.transformFunction) {
+    return {
+      ran: false,
+      action: parsed?.action || 'ask_questions',
+      message: parsed?.message || null,
+      questionsNeeded: parsed?.questionsNeeded || null,
+    };
+  }
+
+  const explanation = parsed.explanation
+    ? `Presentation analysis: ${parsed.explanation}`
+    : 'Presentation analysis';
+  const runToken = stashPendingRun({
+    transformFunction: parsed.transformFunction,
+    explanation,
+    records: [],
+    presentation: { request, answers, conversation },
+  });
+  return {
+    ran: false,
+    awaitingApproval: true,
+    explanation,
+    transformFunction: parsed.transformFunction,
+    __pendingApproval: {
+      kind: 'presentation',
+      runToken,
+      request,
+      explanation,
+      transformFunction: parsed.transformFunction,
+      inputRecordCount: 0,
+    },
+  };
+}
+
 const MAIN_TOOLS = new Set([
   'list_docs', 'read_doc',
   'list_workflows', 'get_workflow', 'get_workflow_nodes',
@@ -1131,6 +1245,7 @@ const MAIN_TOOLS = new Set([
   'list_executions', 'get_execution',
   'get_tables', 'get_columns', 'run_query',
   'http_request', 'run_javascript',
+  'build_presentation',
   'plan_workflow_build',
   'generate_workflow_validation',
 ]);
@@ -1821,6 +1936,7 @@ async function runMainTool(name, args, ctx) {
 
   if (name === 'http_request')   return httpRequestTool(ctx, args);
   if (name === 'run_javascript') return runJavascriptTool(ctx, args);
+  if (name === 'build_presentation') return buildPresentationTool(ctx, args);
 
   if (name === 'plan_workflow_build') {
     if (!args.request || !String(args.request).trim()) {

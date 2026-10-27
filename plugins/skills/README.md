@@ -21,7 +21,7 @@ module.exports = {
   id: 'unique-skill-id',
   name: 'Skill Name',
   icon: './icon.svg',
-  category: 'transformer' | 'join',  // or both
+  category: 'transformer' | 'join',  // or 'both', or 'chat' (main chat only)
 
   /**
    * Get description for AI context
@@ -201,6 +201,12 @@ To contribute a skill to Ternlux:
 3. Include example usage
 4. Add tests if possible
 5. Submit a pull request
+
+## Chat Skills
+
+A skill with `category: 'chat'` is used only by the main chat assistant, through a
+tool of its own, and is never offered to TransformerNodeChat or JoinNodeChat. See
+`plugins/skills/presentation/` (the `build_presentation` tool).
 
 ## Available Skills
 

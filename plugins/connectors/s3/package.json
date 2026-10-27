@@ -15,5 +15,5 @@
     "@aws-sdk/lib-storage": "^3.400.0"
   },
   "author": "Ternlux",
-  "license": "MIT"
+  "license": "Apache-2.0"
 }

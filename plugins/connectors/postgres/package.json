@@ -15,5 +15,5 @@
     "pg-cursor": "^2.10.3"
   },
   "author": "Ternlux",
-  "license": "MIT"
+  "license": "Apache-2.0"
 }

@@ -1,7 +1,7 @@
 /**
  * Data Explorer — design tokens and icons.
  *
- * Mirrors the Dagflux Data Explorer design. Kept separate from the components
+ * Mirrors the Ternlux Data Explorer design. Kept separate from the components
  * so the panel, editor and result grid all read from one palette.
  */
 

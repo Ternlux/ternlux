@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Google Sheets connector plugin for Ternlux with OAuth2.0 authentication",
   "main": "index.js",
+  "license": "Apache-2.0",
   "ternlux": {
     "id": "google-sheets",
     "displayName": "Google Sheets",

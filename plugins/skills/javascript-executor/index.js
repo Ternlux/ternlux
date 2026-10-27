@@ -1230,3 +1230,8 @@ module.exports.buildFunctionPrompt     = buildFunctionPrompt;
 module.exports.buildChatFunctionPrompt = buildChatFunctionPrompt;
 module.exports.loadSourceRecords       = loadSourceRecords;
 module.exports.runTransformFunction    = runTransformFunction;
+// The presentation skill (plugins/skills/presentation) builds its clarifying
+// questions from the same connection catalogue and parses its model replies the
+// same way, so it reaches for these instead of keeping copies.
+module.exports.connectionCatalogText   = connectionCatalogText;
+module.exports.parseJson               = parseJson;

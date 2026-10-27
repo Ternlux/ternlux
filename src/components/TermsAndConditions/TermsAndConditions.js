@@ -22,7 +22,9 @@ import {
 const STORAGE_KEY_ACCEPTED = 'ternlux_terms_accepted';
 const STORAGE_KEY_VERSION = 'ternlux_terms_version';
 const STORAGE_KEY_ANALYTICS = 'ternlux_analytics_opt_in';
-const TERMS_VERSION = '1.0';
+// Acceptance of an older version does not count: App.js shows this screen
+// again whenever the recorded version differs, so bump it for material changes.
+export const TERMS_VERSION = '1.1';
 
 // The published documents. The copy in the scroll area is a snapshot taken at
 // this version; these are the live ones, and the agreement is to them.
@@ -130,8 +132,8 @@ const termsTypographySx = {
 /**
  * The terms snapshot, as displayed in the scroll area.
  *
- * Wording is verbatim from TERMS_OF_SERVICE version 1.0 (last updated
- * August 5, 2026). Only the structure is ours: headings, paragraph breaks and
+ * Wording is verbatim from TERMS_OF_SERVICE version 1.1 (last updated
+ * October 27, 2026), the revision for the open-source release. Only the structure is ours: headings, paragraph breaks and
  * the repair of page-break artifacts from the source export (words split
  * across a page boundary, sentences run together where one page ended and the
  * next began). No term has been added, removed or reworded.
@@ -140,7 +142,7 @@ const TermsOfServiceBody = () => (
   <Box sx={termsTypographySx}>
     <h1>Ternlux — Terms of Service</h1>
     <p className="df-meta">
-      <strong>Last updated:</strong> August 5, 2026
+      <strong>Last updated:</strong> October 27, 2026
     </p>
 
     <p>
@@ -150,6 +152,11 @@ const TermsOfServiceBody = () => (
       Ternlux desktop application (the “Desktop App”) and, if and when you access it, the
       Ternlux hosted cloud service (the “Cloud Service,” and together with the Desktop App and
       all related plugins, software, and documentation, the “Services”).
+    </p>
+    <p>
+      These Terms govern your use of Official Builds of the Desktop App and of the services
+      Ternlux operates. They do not limit any right you have under the open-source license of the
+      Open-Source Software (Section 5).
     </p>
 
     <p className="df-callout">
@@ -193,8 +200,17 @@ const TermsOfServiceBody = () => (
       application.
     </p>
     <p>
-      <span className="df-term">“Plugins”</span> means connectors and AI “skills” made available
-      through the Ternlux catalog.
+      <span className="df-term">“Official Build”</span> means a Desktop App binary that Ternlux
+      builds, signs, and distributes.
+    </p>
+    <p>
+      <span className="df-term">“Open-Source Software”</span> means the source code of the
+      Desktop App and the Plugins that Ternlux publishes under an open-source license, currently
+      the Apache License, Version 2.0, at github.com/Ternlux.
+    </p>
+    <p>
+      <span className="df-term">“Plugins”</span> means connectors and AI “skills” for the Desktop
+      App, whether bundled with it, downloaded from the Ternlux catalog, or built by you or others.
     </p>
 
     <h2>2. Structure of these Terms</h2>
@@ -212,8 +228,9 @@ const TermsOfServiceBody = () => (
     </p>
     <p>
       In the event of a conflict among these documents, the following order of precedence
-      governs, from highest to lowest: (a) with respect to the processing of personal data, the
-      DPA; (b) these Terms; (c) the AUP; and (d) the Privacy Policy. In all other respects the
+      governs, from highest to lowest: (a) with respect to the Open-Source Software, its
+      open-source license; (b) with respect to the processing of personal data, the DPA; (c)
+      these Terms; (d) the AUP; and (e) the Privacy Policy. In all other respects the
       documents are intended to be read together, and a term in one document that provides
       greater specificity on a subject controls over a more general term in another rather than
       creating a conflict.
@@ -231,10 +248,15 @@ const TermsOfServiceBody = () => (
       Customer organization. If you invite or grant access to others under your account, you are
       responsible for their compliance with these Terms.
     </p>
+    <p>
+      Nothing in this Section limits who may use the Open-Source Software under its license.
+    </p>
 
     <h2>4. Accounts and registration</h2>
     <p>
-      Certain functionality requires an account. You may register with a name, email address, and
+      An account is optional for the Desktop App, including all Plugins. An account is required
+      for the Cloud Service and for any other feature that we identify as requiring one. You may
+      register with a name, email address, and
       password, or via a supported third-party identity provider, in which case you authorize us
       to receive the identity information that provider returns.
     </p>
@@ -244,11 +266,15 @@ const TermsOfServiceBody = () => (
       unauthorized use.
     </p>
 
-    <h2>5. License to the Desktop App</h2>
+    <h2>5. Desktop App and open-source license</h2>
     <p>
-      Subject to these Terms, Ternlux grants you a limited, non-exclusive, non-transferable,
-      revocable license to download and use the Desktop App on computers you own or control, for
-      your internal business purposes. The Desktop App is currently provided free of charge.
+      The Desktop App’s source code and the Plugins are Open-Source Software, licensed under the
+      Apache License, Version 2.0 (the “Open-Source License”). A copy is included with the source
+      code and with each Official Build. Your rights to use, copy, modify, and distribute the
+      Open-Source Software are governed solely by the Open-Source License, and nothing in these
+      Terms restricts them. If these Terms conflict with the Open-Source License with respect to
+      the Open-Source Software, the Open-Source License controls. The Desktop App is currently
+      provided free of charge.
     </p>
     <p>
       The Desktop App runs on your machine. It builds and executes data workflows locally and
@@ -257,18 +283,22 @@ const TermsOfServiceBody = () => (
       data when you use the Desktop App.
     </p>
     <p>
-      The Desktop App is licensed, not sold, and is proprietary to Ternlux. You may not copy,
-      sell, sublicense, distribute, rent, or lease it; modify, translate, or create derivative
-      works; or reverse engineer, decompile, or disassemble it, except to the extent this
-      restriction is prohibited by applicable law.
+      Builds of the Desktop App made by you or by third parties (“Unofficial Builds”) are not
+      provided by Ternlux. Ternlux is not responsible for them, and they may not receive updates
+      or may behave differently from Official Builds.
     </p>
     <p>
-      The Desktop App checks for updates automatically on launch and periodically while running,
+      The Open-Source License does not grant permission to use Ternlux’s trade names,
+      trademarks, service marks, or logos, except as required for reasonable and customary use in
+      describing the origin of the software. See the Ternlux Trademark Policy.
+    </p>
+    <p>
+      Official Builds check for updates automatically on launch and periodically while running,
       and downloads available updates automatically from Ternlux’s software-distribution
       provider. When an update has been downloaded you may choose to restart immediately or
       later; if you defer, the update installs automatically when you next quit the application.
       Updates may add, modify, or remove features and may change how the Desktop App operates,
-      and the license granted in this Section applies to the Desktop App as updated. There is
+      and this Section applies to the Desktop App as updated. There is
       currently no in-app setting to disable update checks; if you do not wish to receive
       automatic updates, do not install or continue to use the Desktop App. Ternlux is not
       obligated to provide updates, support, or maintenance for any prior version.
@@ -307,11 +337,13 @@ const TermsOfServiceBody = () => (
 
     <h2>7. Plugins</h2>
     <p>
-      Plugins are downloaded from the Ternlux catalog and run within the Services; login is
-      required to use them. Ternlux currently authors all Plugins; there is no third-party Plugin
-      marketplace at this time. If Ternlux later enables third-party Plugins, additional
-      marketplace and developer terms will apply. Plugins are part of the Services and subject to
-      these Terms.
+      Plugins are Open-Source Software. Plugins bundled with the Desktop App or downloaded from
+      the Ternlux catalog are authored by Ternlux, and no account is required to install or use
+      them. You may also install Plugins from other sources, including Plugins you or others build
+      or modify (“Third-Party Plugins”). Ternlux does not provide, review, or support Third-Party
+      Plugins. They run with the same access to your computer and Connected Systems as the
+      Desktop App, and you use them at your own risk. If Ternlux later operates a marketplace for
+      Third-Party Plugins, additional terms will apply.
     </p>
 
     <h2>8. Third-party services and Connected Systems</h2>
@@ -552,9 +584,11 @@ const TermsOfServiceBody = () => (
       transmit, and display Customer Content solely to provide and support the Services.
     </p>
     <p>
-      Ternlux and its licensors own all rights in the Services, including all software, model
-      orchestration, user interfaces, prebuilt prompt templates, and documentation. Except for
-      the limited licenses expressly granted, no rights are granted to you.
+      Ternlux and its licensors own all rights in the Ternlux name, logos, and trademarks, and in
+      the Cloud Service, Ternlux’s servers and server-side software, and any software or
+      documentation that Ternlux has not published under an open-source license. Rights in the
+      Open-Source Software are governed by Section 5. Except for the licenses expressly granted in
+      these Terms or the Open-Source License, no rights are granted to you.
     </p>
     <p>
       As between the parties, and subject to the applicable AI Providers’ terms, rights in AI
@@ -574,7 +608,9 @@ const TermsOfServiceBody = () => (
     </p>
     <p>
       You grant Ternlux a perpetual, irrevocable, royalty-free license to use any feedback or
-      suggestions you provide, without restriction.
+      suggestions you provide, without restriction. Contributions of code or documentation to
+      Ternlux’s open-source repositories are governed by the contribution terms in those
+      repositories, not by this paragraph.
     </p>
     <p>
       Ternlux will not use your name or logo as a customer reference without your consent, which
@@ -658,7 +694,7 @@ const TermsOfServiceBody = () => (
     </p>
     <p>
       The exclusions and cap do not apply to your payment obligations, your indemnification
-      obligations under Section 21, or your breach of Sections 5, 13, or 14, and do not apply to
+      obligations under Section 21, or your breach of Sections 13 or 14, and do not apply to
       liability that cannot be limited by law. Ternlux’s indemnification obligations under
       Section 21 are subject to the separate limit stated in that Section rather than the cap in
       this Section.
@@ -690,7 +726,8 @@ const TermsOfServiceBody = () => (
     </p>
     <p>
       Ternlux has no obligation under this Section for any claim arising from: (a) the Desktop
-      App or any free or beta offering; (b) Customer Content, Connected Systems, or AI Output;
+      App, the Open-Source Software, Unofficial Builds, Third-Party Plugins, or any free or beta
+      offering; (b) Customer Content, Connected Systems, or AI Output;
       (c) combination of the Cloud Service with products, data, or services not provided by
       Ternlux, where the claim would not have arisen but for the combination; (d) modifications
       not made by Ternlux; or (e) Customer’s use of the Cloud Service other than in accordance
@@ -730,7 +767,9 @@ const TermsOfServiceBody = () => (
     <p>
       We may suspend or terminate access, in whole or in part, for non-payment, AUP or security
       violations, submission of prohibited data, legal requirement, or, for the Cloud Service,
-      prolonged inactivity. We may terminate the free Desktop App license for material breach.
+      prolonged inactivity. We may suspend or terminate your access to Ternlux-operated services
+      (including your account, the plugin catalog, and updates) for material breach. Termination
+      does not affect any right you have under the Open-Source License.
     </p>
     <p>
       On termination, access ends, scheduled workflows stop, and stored credentials and OAuth
@@ -813,7 +852,8 @@ const TermsOfServiceBody = () => (
     <h2>26. General</h2>
     <p>
       These Terms, together with the incorporated documents, are the entire agreement between the
-      parties regarding the Services and supersede all prior agreements on that subject. If any
+      parties regarding the Services and supersede all prior agreements on that subject, except
+      that the Open-Source License governs the Open-Source Software. If any
       provision is held unenforceable, it will be modified to the minimum extent necessary and
       the remainder will remain in effect. Ternlux’s failure to enforce a provision is not a
       waiver. You may not assign these Terms without Ternlux’s consent; Ternlux may assign them

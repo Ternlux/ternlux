@@ -528,6 +528,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /** Drop generated code the user declined, freeing its captured rows. */
     discardJavascript: ({ runToken } = {}) =>
       ipcRenderer.invoke('chat:discard-javascript', { runToken }),
+
+    /**
+     * Print the open presentation (build_presentation) to a PDF the user picks.
+     * Returns { success, filePath } or { success: false, canceled | message }.
+     */
+    exportPresentationPdf: ({ title } = {}) =>
+      ipcRenderer.invoke('presentation:export-pdf', { title }),
     // NOTE: `skillStep` (chat:skillStep) was removed. A skill that needs more
     // input now raises an ordinary clarification through the builder, so its
     // question travels the same path as any other build question and the answer
