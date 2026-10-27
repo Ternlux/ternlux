@@ -18,8 +18,8 @@ const Workflows = ({
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState('account');
 
-  // Deeply nested components (e.g. ConnectionTypeSelector's "Login to access")
-  // request Settings via this window event instead of prop drilling.
+  // Deeply nested components can request Settings via this window event
+  // instead of prop drilling.
   useEffect(() => {
     const handler = (e) => {
       setSettingsTab(e.detail?.tab || 'account');

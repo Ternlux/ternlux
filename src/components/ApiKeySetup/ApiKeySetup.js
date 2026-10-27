@@ -40,7 +40,7 @@ import { saveApiKey } from '../../utils/apiKeyStorage';
 import { DEFAULT_MAX_TOKENS, loadDefaultAiSettings, saveDefaultAiSettings } from '../../utils/aiProviders';
 import useProviderModels from '../../utils/useProviderModels';
 import OthersProviderForm from './OthersProviderForm';
-import DiscordLink from '../ui_components/DiscordLink';
+import CommunityLink from '../ui_components/CommunityLink';
 import {
   register as registerAccount,
   login as loginAccount,
@@ -76,8 +76,8 @@ const MENU_ABOVE_ONBOARDING_SHELL = { sx: { zIndex: 10000 } };
 // Static data
 // ─────────────────────────────────────────────────────────────────────────────
 
-// NOTE: Plans are disabled for now — accounts are free and only gate plugin
-// access. Re-enable this section when paid plans come back.
+// NOTE: Plans are disabled for now — accounts are free and optional; plugins
+// do not require one. Re-enable this section when paid plans come back.
 // const PLANS = [
 //   {
 //     id: 'starter',
@@ -345,7 +345,7 @@ const SignInView = ({ onRegister, onForgotPassword, onComplete, onNeedsVerificat
           Welcome back
         </Typography>
         <Typography variant="body2" color="text.secondary" mb={3}>
-          Sign in to unlock plugin access in Ternlux.
+          Sign in to your Ternlux account. An account is optional: every plugin works without one.
         </Typography>
 
         {error && (
@@ -451,7 +451,7 @@ const SignInView = ({ onRegister, onForgotPassword, onComplete, onNeedsVerificat
         </Box>
 
         <Divider sx={{ my: 3 }} />
-        <DiscordLink />
+        <CommunityLink />
       </Paper>
     </Box>
   );
@@ -755,7 +755,7 @@ const RegisterPage = ({ onBack, onComplete, onRegistered, isSettingsMode = false
           Create your free account
         </Typography>
         <Typography variant="body2" color="text.secondary" mb={2.5}>
-          Register to unlock plugin access. We'll send a link to verify your email.
+          Create an optional Ternlux account. We'll send a link to verify your email.
         </Typography>
 
         {/* Pricing cards are hidden while plans are disabled — see PLANS above. */}
@@ -865,7 +865,7 @@ const RegisterPage = ({ onBack, onComplete, onRegistered, isSettingsMode = false
         </Typography>
 
         <Divider sx={{ my: 2.5 }} />
-        <DiscordLink />
+        <CommunityLink />
       </Paper>
     </Box>
   );
@@ -1012,19 +1012,13 @@ const AccountView = ({ onSignOut, isSettingsMode = false }) => {
         <Box sx={{ display: 'flex', gap: 1, mb: 3, flexWrap: 'wrap' }}>
           <Chip
             size="small"
-            icon={<LockOpenOutlined sx={{ fontSize: 14 }} />}
-            label="Plugin access unlocked"
-            sx={{ bgcolor: '#05966915', color: '#059669', fontWeight: 700, borderRadius: 1.5 }}
-          />
-          <Chip
-            size="small"
             label={`${(user?.plan || 'free').toUpperCase()} plan`}
             sx={{ bgcolor: '#6366f115', color: '#6366f1', fontWeight: 700, borderRadius: 1.5 }}
           />
         </Box>
 
         <Typography variant="body2" color="text.secondary" mb={3}>
-          You're signed in. Locked plugins in the connector library are now available to install and use.
+          You're signed in to your Ternlux account.
         </Typography>
 
         <Button
@@ -1038,7 +1032,7 @@ const AccountView = ({ onSignOut, isSettingsMode = false }) => {
         </Button>
 
         <Divider sx={{ my: 3 }} />
-        <DiscordLink />
+        <CommunityLink />
       </Paper>
     </Box>
   );
@@ -1475,9 +1469,9 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
-  // Full-screen onboarding: step 1 is the required API key ('key'), step 2 is
-  // the optional, skippable account ('signin' | 'register' | 'verify').
-  // Settings mode shows only the account flow ('account' when signed in).
+  // Full-screen onboarding is the API key step only ('key'): plugins no longer
+  // need an account, so sign-in lives in Settings ('signin' | 'register' |
+  // 'verify', and 'account' when signed in).
   const [view, setView] = useState(() =>
     isSettingsMode ? (isLoggedIn() ? 'account' : 'signin') : 'key'
   );
@@ -1497,11 +1491,9 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
     }
   };
 
-  // Onboarding: key saved → offer the optional sign-in step.
-  const handleKeySaved = () => setView('signin');
-
-  // Onboarding: the account step can be skipped — the key alone unlocks the app.
-  const handleSkip = () => onComplete({ via: 'key' });
+  // Onboarding: the key alone unlocks the app.
+  const handleKeySaved = () => onComplete({ via: 'key' });
+  const handleSkip = handleKeySaved;
 
   // Different styling for settings mode vs full-screen mode
   const containerStyles = isSettingsMode
@@ -1537,8 +1529,6 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
         bgcolor: 'background.paper',
       };
 
-  const onboardingStep = view === 'key' ? 1 : 2;
-
   return (
     <Box sx={containerStyles}>
       {/* ── Header (onboarding only — Settings has its own chrome) ── */}
@@ -1551,9 +1541,7 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
                 Ternlux — Get Started
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                {onboardingStep === 1
-                  ? 'Step 1 of 2 — Connect your LLM provider with your own API key'
-                  : 'Step 2 of 2 — Sign in for plugin access (optional)'}
+                Connect your LLM provider with your own API key
               </Typography>
             </Box>
           </Box>

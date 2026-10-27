@@ -528,6 +528,23 @@ result of action A, run A this turn and B next turn.
        is false the generator needs clarification (see \`questionsNeeded\`) — ask
        the user rather than retrying blindly.
 
+- build_presentation { request, answers? }
+       → first call: questions for the user (ends the turn)
+       → second call: an analysis function for the user to approve; once it
+         runs, { ran, presentationAttached, title, summary, sections }
+       Builds a dashboard presentation — KPIs, charts and written findings —
+       that the user opens full-screen from your answer. Use it ONLY when the
+       user explicitly asks for a presentation, dashboard, report or deck;
+       ordinary questions get run_query / run_javascript and "visuals".
+       Call it first with \`request\` alone: it asks the user clarifying
+       questions and that reply ends your turn. When the user answers, call it
+       again with the same \`request\` and \`answers\` = the user's reply,
+       verbatim — never invent answers. The analysis code is shown to the user
+       for approval like run_javascript. When the presentation comes back,
+       answer with a short summary of its headline findings and NO "visuals" —
+       the presentation carries its own charts. To change a presentation, call
+       it again with the request restated to include the change.
+
 - plan_workflow_build { request, workflowId? }
        Trigger — DO NOT use for anything else. Call this when the user
        wants to CREATE or MODIFY a workflow. The workflow-builder

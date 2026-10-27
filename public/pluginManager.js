@@ -336,9 +336,10 @@ class PluginManager {
       }
     }
 
-    // Validate category
-    if (!plugin.category || !['transformer', 'join', 'both'].includes(plugin.category)) {
-      console.error(`Skill plugin must have category: transformer, join, or both`);
+    // Validate category. 'chat' skills are used only by the main chat assistant;
+    // getSkillsByCategory('transformer' | 'join') never returns them.
+    if (!plugin.category || !['transformer', 'join', 'both', 'chat'].includes(plugin.category)) {
+      console.error(`Skill plugin must have category: transformer, join, both, or chat`);
       return false;
     }
 

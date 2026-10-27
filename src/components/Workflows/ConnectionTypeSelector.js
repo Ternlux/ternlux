@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Modal, message, Spin } from 'antd';
 import { C, MONO, SANS, I, fullscreenModalProps } from './_designShared';
-import { isLoggedIn } from '../../utils/authService';
 import { CONNECTION_TYPES, ConnectorLogo } from './connections/connectorCatalog';
 
 const SECTIONS = [
@@ -13,14 +12,6 @@ const SECTIONS = [
 ];
 
 const NO_PLUGIN_REQUIRED = ['spreadsheet', 'json', 'duckdb', 'sqlite', 'lancedb', 'parquet', 'avro', 'generic'];
-
-// Plugin connectors require a (free) Ternlux account; local file connectors stay open.
-const LoginLockIcon = ({ color = '#d97706', size = 12 }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2">
-    <rect x="3" y="11" width="18" height="11" rx="2" />
-    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-  </svg>
-);
 
 // Inject hover/focus styles — inline styles can't express :hover.
 const STYLE_TAG_ID = 'cts-design-styles';
@@ -69,7 +60,7 @@ const Icon = ({ c }) => (
   <ConnectorLogo c={c} size={44} imgSize={28} letterSize={11} style={{ marginTop: 2 }} />
 );
 
-const StatusTag = ({ c, installing, installed, locked }) => {
+const StatusTag = ({ c, installing, installed }) => {
   const base = {
     display: 'inline-flex', alignItems: 'center', gap: 4,
     fontFamily: MONO, fontSize: 9.5, fontWeight: 600,
@@ -80,13 +71,6 @@ const StatusTag = ({ c, installing, installed, locked }) => {
     <span style={{ width: 5, height: 5, borderRadius: '50%', background: color }} />
   );
 
-  if (locked) {
-    return (
-      <span style={{ ...base, color: C.amber, background: 'rgba(217,119,6,0.08)', border: '1px solid rgba(217,119,6,0.25)' }}>
-        <LoginLockIcon color={C.amber} size={10} /> Login to access
-      </span>
-    );
-  }
   if (installing) {
     return (
       <span style={{ ...base, color: C.violet, background: 'rgba(124,58,237,0.08)', border: '1px solid rgba(124,58,237,0.22)' }}>
@@ -150,7 +134,6 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
   const [activeTab, setActiveTab] = useState('connectors');
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all'); // all | installed | available
-  const [loggedIn, setLoggedIn] = useState(isLoggedIn());
   const searchRef = useRef(null);
 
   useEffect(() => { ensureStyles(); }, []);
@@ -159,7 +142,6 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
     if (open) {
       loadInstalledPlugins();
       loadInstalledSkills();
-      setLoggedIn(isLoggedIn());
       setSearch('');
       setFilter('all');
       setActiveTab('connectors');
@@ -213,22 +195,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
     return installedPlugins.some((p) => p.id === key);
   };
 
-  // Plugin connectors are locked behind a (free) account; local file
-  // connectors never require login.
-  const isLocked = (key) => !NO_PLUGIN_REQUIRED.includes(key) && !loggedIn;
-
-  // Close the selector and send the user to Settings → Account to sign in.
-  const handleLockedClick = (type) => {
-    message.info(`Sign in to access the ${type.title} plugin.`);
-    onClose();
-    window.dispatchEvent(new CustomEvent('ternlux:open-settings', { detail: { tab: 'account' } }));
-  };
-
   const handleInstallPlugin = async (type) => {
-    if (isLocked(type.key)) {
-      handleLockedClick(type);
-      return;
-    }
     setInstalling((prev) => ({ ...prev, [type.key]: true }));
     try {
       if (!window.electronAPI?.plugins?.install) {
@@ -251,10 +218,6 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
   };
 
   const handleSelect = (type) => {
-    if (isLocked(type.key)) {
-      handleLockedClick(type);
-      return;
-    }
     if (!isPluginInstalled(type.key)) {
       message.warning(`Please install the ${type.title} connector first`);
       return;
@@ -280,10 +243,9 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
 
   // Card ---------------------------------------------------------------------
   const renderCard = (c, section) => {
-    const locked = isLocked(c.key);
     const installed = isPluginInstalled(c.key);
     const isInstalling = !!installing[c.key];
-    const selectable = !locked && installed && !isInstalling;
+    const selectable = installed && !isInstalling;
     return (
       <div
         key={c.key}
@@ -296,23 +258,10 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
           gap: 14,
           alignItems: 'flex-start',
           minHeight: 80,
-          ...(locked ? { opacity: 0.65 } : {}),
         }}
-        onClick={() => (locked ? handleLockedClick(c) : selectable && handleSelect(c))}
+        onClick={() => selectable && handleSelect(c)}
       >
-        <div style={{ position: 'relative' }}>
-          <Icon c={c} />
-          {locked && (
-            <div style={{
-              position: 'absolute', right: -5, bottom: -3,
-              width: 18, height: 18, borderRadius: '50%',
-              background: '#fff', border: `1px solid ${C.border2}`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}>
-              <LoginLockIcon color={C.amber} size={10} />
-            </div>
-          )}
-        </div>
+        <Icon c={c} />
         <div style={{ minWidth: 0, paddingTop: 1 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5, flexWrap: 'wrap' }}>
             <span style={{
@@ -320,7 +269,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
               color: selectable ? C.text : C.muted,
               letterSpacing: '-0.01em',
             }}>{c.title}</span>
-            <StatusTag c={c} installing={isInstalling} installed={installed} locked={locked} />
+            <StatusTag c={c} installing={isInstalling} installed={installed} />
           </div>
           <div style={{
             fontSize: 12, color: C.muted, lineHeight: 1.5,
@@ -328,9 +277,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
           }}>{c.description}</div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0, marginTop: 2 }}>
-          {locked ? (
-            <ActionBtn kind="ghost" label="Login to access" onClick={() => handleLockedClick(c)} />
-          ) : isInstalling ? (
+          {isInstalling ? (
             <ActionBtn kind="installing" label="Installing" disabled />
           ) : installed ? (
             <ActionBtn kind="primary" label={section.buttonText} onClick={() => handleSelect(c)} />

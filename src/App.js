@@ -4,7 +4,7 @@ import ChatBot from './components/Chat/ChatBot';
 import ChatAssistant from './components/Chat/ChatAssistant';
 import ExecutionMonitor from './components/Workflows/ExecutionMonitor';
 import ApiKeySetup from './components/ApiKeySetup/ApiKeySetup';
-import TermsAndConditions from './components/TermsAndConditions/TermsAndConditions';
+import TermsAndConditions, { TERMS_VERSION } from './components/TermsAndConditions/TermsAndConditions';
 import Settings from './components/Settings/Settings';
 import { hasAnyApiKey } from './utils/apiKeyStorage';
 import './App.css';
@@ -39,9 +39,10 @@ function App() {
       try {
         if (window.electronAPI?.terms?.get) {
           const record = await window.electronAPI.terms.get();
-          accepted = !!record?.accepted;
+          accepted = !!record?.accepted && record?.version === TERMS_VERSION;
         } else {
-          accepted = localStorage.getItem('ternlux_terms_accepted') === 'true';
+          accepted = localStorage.getItem('ternlux_terms_accepted') === 'true'
+            && localStorage.getItem('ternlux_terms_version') === TERMS_VERSION;
         }
       } catch (e) {
         console.warn('Could not read terms acceptance:', e);
@@ -59,7 +60,7 @@ function App() {
       }
 
       // An LLM API key is required to use the app; signing in is optional
-      // (it only unlocks plugins) and is offered as step 2 of onboarding.
+      // and lives in Settings → Account.
       const hasLlmKey = await hasAnyApiKey();
       setApiKeyReady(hasLlmKey);
     };

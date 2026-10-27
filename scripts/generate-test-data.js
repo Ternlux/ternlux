@@ -36,7 +36,7 @@ const flag = (name, fallback = null) => {
   return next && !next.startsWith('--') ? next : true;
 };
 
-const OUT = String(flag('out', '~/Desktop/test_data'));
+const OUT = String(flag('out', path.join(require('os').homedir(), 'Desktop', 'test_data')));
 const SCALE = Number(flag('scale', 1)) || 1;
 const ONLY = flag('only') ? String(flag('only')).split(',').map((s) => s.trim()) : null;
 const CLEAN = Boolean(flag('clean', false));

@@ -36,10 +36,11 @@ as a `.py` file on disk (see
 
 ## Prerequisites
 
-- Python installed on your machine.
-- The skill's setup script run once after installing it (`setup.sh` on
-  macOS and Linux, `setup.bat` on Windows). It creates a virtual
-  environment and installs the packages the skill needs.
+- Python 3 installed on your machine. The skill ships with Ternlux and
+  needs no setup of its own.
 
-If Python isn't found, the skill returns a clear error pointing at those
-setup instructions.
+It uses the same Python your terminal does, with whatever packages are
+installed globally there — there is no separate environment. If Python
+isn't found, the step fails with the command to install it. If the script
+imports a package that isn't installed, the step fails naming the package
+and the exact `pip install` command for that Python.

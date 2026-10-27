@@ -274,4 +274,4 @@ For issues, questions, or feature requests:
 
 ## License
 
-MIT License - see LICENSE file for details
+Proprietary. Copyright (c) 2026 Ternlux Inc. All rights reserved.

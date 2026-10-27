@@ -12,7 +12,7 @@
     "http"
   ],
   "author": "Ternlux",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
     "axios": "^1.6.0"
   }

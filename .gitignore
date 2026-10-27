@@ -8,3 +8,13 @@ testing/e2e/runs/
 .env
 # DuckDB extension binaries — fetched at build time by scripts/fetch-duckdb-extensions.js
 resources/duckdb-extensions/
+
+# Personal Claude Code settings (machine-specific paths)
+.claude/settings.local.json
+
+# Stray build output and connector logs at the repo root (real sources live in public/ and src/)
+/electron.js
+/index.js
+/index.html
+/aiProviders.js
+*.log

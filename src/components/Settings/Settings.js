@@ -10,7 +10,7 @@ import {
 import ProviderSettings from './ProviderSettings';
 import ApiKeySetup from '../ApiKeySetup/ApiKeySetup';
 import PrivacySettings from './PrivacySettings';
-import DiscordLink from '../ui_components/DiscordLink';
+import CommunityLink from '../ui_components/CommunityLink';
 import './Settings.css';
 
 const { Sider, Content } = Layout;
@@ -78,7 +78,7 @@ const Settings = ({ onClose, initialTab = 'account' }) => {
               className="settings-menu"
             />
             <div className="settings-sider-footer">
-              <DiscordLink variant="compact" />
+              <CommunityLink variant="compact" />
             </div>
           </Sider>
 

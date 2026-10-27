@@ -3,10 +3,75 @@
  * Allows executing Python code directly on the local machine for transformations
  */
 
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const fs = require('fs').promises;
+const { existsSync } = require('fs');
 const path = require('path');
 const os = require('os');
+
+/**
+ * The user's own Python 3, as [command, ...args], or null.
+ *
+ * A packaged app launched from the Dock inherits launchd's bare PATH, so a
+ * plain `python3` misses Homebrew and python.org installs — and on macOS it
+ * lands on /usr/bin/python3, a stub that pops the developer-tools installer
+ * when the Command Line Tools are absent. So ask the login shell first (it
+ * sees the user's real PATH, and with it their global packages), then try
+ * the usual install locations. Only a hit is cached, so installing Python
+ * takes effect without restarting the app.
+ */
+let foundPython = null;
+
+function isPython3(cmd, args) {
+  return new Promise((resolve) => {
+    execFile(cmd, [...args, '-c', 'import sys; sys.exit(sys.version_info[0] != 3)'],
+      { timeout: 10000, windowsHide: true }, (err) => resolve(!err));
+  });
+}
+
+function loginShellPython() {
+  return new Promise((resolve) => {
+    execFile(process.env.SHELL || '/bin/sh', ['-ilc', 'command -v python3'],
+      { timeout: 5000 }, (err, stdout) => {
+        const line = String(stdout || '').trim().split('\n').pop() || '';
+        resolve(!err && line.startsWith('/') ? line : null);
+      });
+  });
+}
+
+async function findPython() {
+  if (foundPython) return foundPython;
+  const candidates = process.platform === 'win32'
+    ? [['py', '-3'], ['python']]
+    : [[await loginShellPython()], ['/opt/homebrew/bin/python3'],
+      ['/usr/local/bin/python3'], ['/usr/bin/python3']];
+  // Apple's /usr/bin/python3 is only real once developer tools are installed.
+  const appleStub = (cmd) => process.platform === 'darwin' && cmd === '/usr/bin/python3'
+    && !existsSync('/Library/Developer/CommandLineTools/usr/bin/python3')
+    && !existsSync('/Applications/Xcode.app/Contents/Developer/usr/bin/python3');
+  for (const [cmd, ...args] of candidates) {
+    if (cmd && !appleStub(cmd) && await isPython3(cmd, args)) {
+      return (foundPython = [cmd, ...args]);
+    }
+  }
+  return null;
+}
+
+const INSTALL_PYTHON = {
+  win32: 'winget install Python.Python.3.12',
+  darwin: 'brew install python   (or the installer from https://www.python.org/downloads/)',
+  linux: 'sudo apt install python3 python3-pip',
+};
+
+// Import name -> pip name, where they differ.
+const PIP_NAMES = {
+  sklearn: 'scikit-learn', dateutil: 'python-dateutil', yaml: 'pyyaml',
+  PIL: 'pillow', cv2: 'opencv-python', bs4: 'beautifulsoup4',
+};
+
+function shellCommand(parts) {
+  return parts.map((p) => (/\s/.test(p) ? `"${p}"` : p)).join(' ');
+}
 
 /**
  * The JSON object in a model reply.
@@ -404,7 +469,7 @@ Otherwise use standard SQL/NoSQL transformation.
       sourceConnection,
       sourceTableSchema,
       pythonCode,
-      pythonPath = 'python3',
+      pythonPath = null,
       operationType = 'sql',
       pluginManager,
       getFullConfig,
@@ -419,6 +484,17 @@ Otherwise use standard SQL/NoSQL transformation.
     const startTime = Date.now();
 
     try {
+      // Checked before the source is loaded, so a missing Python fails fast.
+      const python = pythonPath ? [pythonPath] : await findPython();
+      if (!python) {
+        return {
+          success: false,
+          error: 'Python steps need Python 3 installed on this computer. Install it, then run this step again:\n  '
+            + (INSTALL_PYTHON[process.platform] || INSTALL_PYTHON.linux),
+          executionTime: Date.now() - startTime
+        };
+      }
+
       console.log('[Python Executor] Step 1: Loading source data...');
 
       // Step 1: Pull data from source (similar to executeOutput)
@@ -576,7 +652,7 @@ if __name__ == '__main__':
         let stdout = '';
         let stderr = '';
 
-        const pythonProcess = spawn(pythonPath, [scriptPath], {
+        const pythonProcess = spawn(python[0], [...python.slice(1), scriptPath], {
           cwd: tempDir,
           env: process.env
         });
@@ -591,6 +667,15 @@ if __name__ == '__main__':
 
         pythonProcess.on('close', async (code) => {
           if (code !== 0) {
+            // The script imports at top level, outside its try, so a missing
+            // package surfaces as a traceback; name the fix instead.
+            const missing = stderr.match(/No module named '([^'.]+)/);
+            if (missing) {
+              const pkg = PIP_NAMES[missing[1]] || missing[1];
+              reject(new Error(`Python is missing the "${pkg}" package. Install it, then run this step again:\n  `
+                + shellCommand([...python, '-m', 'pip', 'install', pkg])));
+              return;
+            }
             reject(new Error(`Python execution failed: ${stderr || 'Unknown error'}`));
             return;
           }

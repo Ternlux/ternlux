@@ -24,7 +24,7 @@
     "openai"
   ],
   "author": "Ternlux",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
     "openai": "^4.28.0",
     "@seald-io/nedb": "^4.0.2"

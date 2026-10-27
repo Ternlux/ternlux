@@ -18,7 +18,7 @@
     "transformer"
   ],
   "author": "Ternlux",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
     "@seald-io/nedb": "^4.0.2"
   }

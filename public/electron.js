@@ -2664,6 +2664,35 @@ ipcMain.handle('chat:run-approved-javascript', async (_event, { runToken, provid
 });
 
 /**
+ * presentation:export-pdf — print the open presentation to a PDF the user
+ * chooses. The renderer's print stylesheet hides everything but the
+ * presentation, so printing the whole window yields just the dashboard.
+ */
+ipcMain.handle('presentation:export-pdf', async (event, { title = 'Presentation' } = {}) => {
+  try {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const safeName = String(title).replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 120) || 'Presentation';
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: 'Export presentation as PDF',
+      defaultPath: `${safeName}.pdf`,
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+    if (canceled || !filePath) return { success: false, canceled: true };
+    const pdf = await event.sender.printToPDF({
+      printBackground: true,
+      landscape: true,
+      pageSize: 'A4',
+      margins: { top: 0.4, bottom: 0.4, left: 0.4, right: 0.4 },
+    });
+    await fs.promises.writeFile(filePath, pdf);
+    return { success: true, filePath };
+  } catch (err) {
+    console.error('[presentation:export-pdf]', err);
+    return { success: false, message: err.message };
+  }
+});
+
+/**
  * chat:discard-javascript — drop a parked function the user declined, so the
  * code and the source rows it captured don't sit in memory until they age out.
  */

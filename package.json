@@ -3,9 +3,9 @@
   "productName": "Ternlux",
   "version": "1.0.0",
   "private": true,
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "author": "Ternlux Inc",
-  "description": "Visual data workflow builder \u2014 connect databases and files, transform with SQL, and schedule pipelines.",
+  "description": "Visual data workflow builder — connect databases and files, transform with SQL, and schedule pipelines.",
   "homepage": "./",
   "main": "public/electron.js",
   "dependencies": {
