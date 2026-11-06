@@ -1,13 +1,26 @@
 # Ternlux
 
 <p align="center">
+  <a href="https://github.com/Ternlux/ternlux/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/Ternlux/ternlux?label=release"></a>
+  <a href="https://github.com/Ternlux/ternlux/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/Ternlux/ternlux/total"></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-informational">
+</p>
+
+<p align="center">
   <img src="assets/demo.gif" width="600" alt="Ternlux demo: a left join built from one chat message, run locally, then moved into Postgres">
 </p>
+
+**For analysts and small data teams** who work across files and databases and
+want AI help that joins across sources, writes code you can read, and turns a
+one-off question into a pipeline you can schedule.
 
 Ternlux is a free, local-first desktop app for ETL and data analysis. Connect
 databases, warehouses, cloud storage, APIs and local files, describe a pipeline
 in plain English, review the plan the AI drafts, and run it as deterministic
-code on your machine. Bring your own model: OpenAI, Claude, Gemini, any
+code: pushed down to the target database, or locally on the built-in engine.
+Joins work across sources, so a Postgres table, an Excel file and an S3 folder
+can meet in one step. Bring your own model: OpenAI, Claude, Gemini, any
 OpenAI-compatible endpoint, or a local model through Ollama or LM Studio.
 
 - Connectors: Postgres, MySQL, SQL Server, BigQuery, Snowflake, MongoDB,
@@ -18,9 +31,12 @@ OpenAI-compatible endpoint, or a local model through Ollama or LM Studio.
 - Credentials are encrypted with your OS keychain, stay on your machine, and
   never reach the model.
 
-**Download:** official, signed builds are at
-[github.com/Ternlux/releases](https://github.com/Ternlux/releases) and
-[ternlux.com](https://www.ternlux.com/).
+**Download:** signed and notarized builds for macOS, Windows and Linux are on
+the [Releases page](https://github.com/Ternlux/ternlux/releases/latest) and at
+[ternlux.com](https://www.ternlux.com/). The app updates itself.
+
+If Ternlux saves you time, a star helps other analysts and data engineers
+find it.
 
 ## Tutorial
 

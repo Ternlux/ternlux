@@ -15,7 +15,7 @@ to acknowledge reports within 3 business days.
 
 In scope: this repository's code, including the Desktop App, the bundled
 plugins, and official builds from
-[github.com/Ternlux/releases](https://github.com/Ternlux/releases).
+[github.com/Ternlux/ternlux/releases](https://github.com/Ternlux/ternlux/releases).
 
 You may review, test and modify this code on your own systems. Don't test
 against Ternlux-operated servers (for example `api.ternlux.com`) without written

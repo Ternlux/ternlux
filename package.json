@@ -65,7 +65,7 @@
     "publish": {
       "provider": "github",
       "owner": "Ternlux",
-      "repo": "releases"
+      "repo": "ternlux"
     },
     "asarUnpack": [
       "**/*.node",

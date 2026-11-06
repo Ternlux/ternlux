@@ -2,7 +2,7 @@ name: Release (Windows & Linux)
 
 # Builds the unsigned Windows (NSIS) and Linux (AppImage) artifacts on their
 # native runners and publishes them + the electron-updater manifests to the
-# Ternlux/releases repo. macOS is intentionally excluded — it is built and
+# Ternlux/ternlux repo. macOS is intentionally excluded — it is built and
 # notarized locally, and the macOS runner is 10x the Actions minute cost.
 #
 # Trigger: push a version tag (e.g. `v1.0.1`), or run manually from the
@@ -14,9 +14,9 @@ on:
       - "v*"
   workflow_dispatch:
 
-# The built-in token only needs to read THIS repo for checkout. Publishing
-# goes to a different repo (Ternlux/releases) using the GH_TOKEN secret, so
-# no write permission is required on the workflow token itself.
+# The built-in token only needs to read this repo for checkout. Publishing
+# uses the GH_TOKEN secret, so no write permission is required on the
+# workflow token itself.
 permissions:
   contents: read
 
@@ -97,7 +97,7 @@ jobs:
 
       # Reuses the existing release:win / release:linux scripts, which run
       # react-scripts build -> minify-dist -> electron-builder --publish always.
-      # electron-builder reads GH_TOKEN from the env to upload to Ternlux/releases.
+      # electron-builder reads GH_TOKEN from the env to upload to Ternlux/ternlux.
       # CI is forced false so react-scripts does not treat lint warnings as
       # build-breaking errors (GitHub Actions sets CI=true by default).
       - name: Build & publish ${{ matrix.platform }}
