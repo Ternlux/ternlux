@@ -18,3 +18,7 @@ resources/duckdb-extensions/
 /index.html
 /aiProviders.js
 *.log
+
+# Local tool state and logs
+.claude/settings.local.json
+*.log
