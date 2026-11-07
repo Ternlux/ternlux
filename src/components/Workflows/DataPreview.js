@@ -473,10 +473,14 @@ const DataPreview = ({
           ? (readsTarget ? config.targetPreviewSql : config.sourcePreviewSql)
           : null;
         // Get table name for SQL queries — and, for a workbook, the sheet.
+        // A REST API source names its table in `sourceCollection`. Without it the
+        // reader fell back to the file's FIRST table — every API source in a
+        // workflow shares one DuckDB file, so the second one previewed the first.
         const tableName = isSqlStore
           ? (readsTarget
             ? (config.targetTableName || config.targetCollection)
-            : (config.sourceTableName || config.table))
+            : (config.sourceTableName || config.table
+              || (config.sourceDbCategory === 'API' ? config.sourceCollection : null)))
           : null;
         // console.log('sqlPreview: ', sqlPreview)
         const result = await window.electronAPI.db.readLocalCollection(localPath, 1000, storageType, sqlPreview, tableName);

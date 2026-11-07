@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Modal, message, Spin } from 'antd';
 import { C, MONO, SANS, I, fullscreenModalProps } from './_designShared';
 import { CONNECTION_TYPES, ConnectorLogo } from './connections/connectorCatalog';
+import { resolveConnectorPlugin, splitConnectorKey } from './connections/apiPresets';
 
 const SECTIONS = [
   { key: 'file',     title: 'Local Files',          desc: 'Files and local databases, queried where they are', buttonText: 'Select',  tagText: 'Ready' },
@@ -190,9 +191,11 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
     }
   };
 
+  // A vendor preset tile ('rest-api:github') is installed when its plugin is
+  // and that plugin version ships the preset.
   const isPluginInstalled = (key) => {
     if (NO_PLUGIN_REQUIRED.includes(key)) return true;
-    return installedPlugins.some((p) => p.id === key);
+    return Boolean(resolveConnectorPlugin(installedPlugins, key));
   };
 
   const handleInstallPlugin = async (type) => {
@@ -202,7 +205,7 @@ const ConnectionTypeSelector = ({ open, onClose, onSelectType }) => {
         message.error('Plugin installation not available');
         return;
       }
-      const result = await window.electronAPI.plugins.install(type.key);
+      const result = await window.electronAPI.plugins.install(splitConnectorKey(type.key).pluginId);
       if (result.success) {
         message.success(`${type.title} connector installed successfully!`);
         await loadInstalledPlugins();

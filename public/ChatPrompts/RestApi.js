@@ -180,6 +180,12 @@ const RestApiPrompts = {
     // The table this node already writes, when it is being rebuilt. Downstream
     // nodes read it by name, so the model is told to keep it.
     currentCollectionName = null,
+    // Endpoint reference for a connection made from a vendor preset
+    // (lib/apiPresets.js). Null for a hand-built REST connection.
+    presetReference = null,
+    // The endpoint the user picked in the Data Source form:
+    // { method, path, label, rows, params, notes }.
+    selectedEndpoint = null,
   }) => {
     const authType = connectionAuthType || 'none';
     const paramKeys = Array.isArray(connectionParamKeys) ? connectionParamKeys : [];
@@ -206,7 +212,20 @@ you only use placeholder tokens in your output.
 - Base URL: ${connectionBaseUrl || '(not set — user must supply full URLs)'}
 - Saved parameter keys: ${paramKeys.length ? paramKeys.map(k => `"${k}"`).join(', ') : '(none)'}
 - Legacy auth type: ${authType}
+${presetReference ? `
+**Vendor API reference**
+This connection was set up from a vendor preset. Use these endpoints, headers,
+row locations and pagination rules instead of guessing them. The user's request
+still decides WHICH endpoint and filters to use; ask when it does not say.
 
+${presetReference}
+` : ''}${selectedEndpoint ? `
+**Endpoint picked in the node form**
+The user chose ${selectedEndpoint.method || 'GET'} ${selectedEndpoint.path}${selectedEndpoint.operation ? ` — the ${selectedEndpoint.operation} query` : ''} (${selectedEndpoint.label}) in the
+Data Source form. Use it unless the current request clearly asks for something else.
+Its variables (path values such as {owner}, filters, fields) come from the user's
+chat request — ask for any required path value the request does not give.
+` : ''}
 **Current user request**
 "${userRequest}"
 

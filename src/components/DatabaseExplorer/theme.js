@@ -44,8 +44,7 @@ export const DB_META = {
   mssql:     { label: 'SQL Server', color: '#a4373a' },
   mongodb:   { label: 'MongoDB',    color: '#00a550' },
   snowflake: { label: 'Snowflake',  color: '#29b5e8' },
-  // Redshift disabled for now — see connections/connectorCatalog.js.
-  // redshift:  { label: 'Redshift',   color: '#8c4fff' },
+  redshift:  { label: 'Redshift',   color: '#8c4fff' },
   bigquery:  { label: 'BigQuery',   color: '#4285f4' },
   sqlite:    { label: 'SQLite',     color: '#0f80cc' },
   // DuckDB's brand yellow (#fff000) is unreadable as a label on white, so this

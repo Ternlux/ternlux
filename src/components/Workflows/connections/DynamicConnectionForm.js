@@ -31,6 +31,14 @@ const DynamicConnectionForm = ({
     [plugin]
   );
 
+  // A vendor preset's credential fields (see connections/apiPresets.js). Each
+  // one is saved as a single `apiParams` pair keyed by the preset's key name,
+  // so the connection resolves exactly like a hand-built REST API one.
+  const presetCredentialFields = useMemo(
+    () => (plugin.configSchema?.fields || []).filter(f => f.type === 'presetCredential'),
+    [plugin]
+  );
+
   useEffect(() => {
     if (editingConnection?.dbConfig) {
       const dbConfig = { ...editingConnection.dbConfig };
@@ -101,6 +109,17 @@ const DynamicConnectionForm = ({
       values[f.name] = pairs;
       if (f.publicKeysField) values[f.publicKeysField] = pairs.map(p => p.key);
     });
+    if (presetCredentialFields.length > 0) {
+      // A blank value while editing means "keep the stored one" — the save
+      // path merges it back in, the same as a blank keyValue row.
+      const pairs = presetCredentialFields.map(f => ({
+        key: f.paramKey,
+        value: values[f.name] == null ? '' : String(values[f.name]),
+      }));
+      presetCredentialFields.forEach(f => { delete values[f.name]; });
+      values.apiParams = pairs;
+      values.apiParamKeys = pairs.map(p => p.key);
+    }
     return values;
   };
 
@@ -320,6 +339,23 @@ const DynamicConnectionForm = ({
           </Form.Item>
         );
 
+      case 'presetCredential':
+        return (
+          <Form.Item
+            key={field.name}
+            name={field.name}
+            label={field.label}
+            // Not required on edit: the stored value stays unless re-typed.
+            rules={editingConnection ? [] : rules}
+            extra={field.helpText}
+          >
+            <Input.Password
+              placeholder={editingConnection ? 'Leave blank to keep the saved value' : field.placeholder}
+              autoComplete="new-password"
+            />
+          </Form.Item>
+        );
+
       case 'keyValue':
         return (
           <KeyValueFields
@@ -435,7 +471,7 @@ const DynamicConnectionForm = ({
             uniqueNameRule(existingConnections, editingConnection),
           ]}
         >
-          <Input placeholder={`${plugin.name} Database`} />
+          <Input placeholder={plugin.presetId ? plugin.name : `${plugin.name} Database`} />
         </Form.Item>
 
         <Form.Item

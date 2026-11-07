@@ -8,8 +8,7 @@ const ENGINE_OPTIONS = [
   { value: 'sqlite',     label: 'SQLite' },
   { value: 'oracle',     label: 'Oracle' },
   { value: 'db2',        label: 'IBM Db2' },
-  // Redshift disabled for now — see connectorCatalog.js.
-  // { value: 'redshift',   label: 'Amazon Redshift' },
+  { value: 'redshift',   label: 'Amazon Redshift' },
   { value: 'bigquery',   label: 'Google BigQuery' },
   { value: 'snowflake',  label: 'Snowflake' },
   { value: 'cockroach',  label: 'CockroachDB' },

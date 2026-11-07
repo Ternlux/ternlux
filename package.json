@@ -38,6 +38,7 @@
     "build": "react-scripts build",
     "test": "react-scripts test",
     "test:unit": "node --test --test-timeout=30000 testing/unit/*.test.js",
+    "test:integration": "node --test testing/integration/*.test.js",
     "eject": "react-scripts eject",
     "electron-dev": "concurrently \"cross-env BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3000 && electron .\"",
     "minify-dist": "node scripts/minify-dist.js",

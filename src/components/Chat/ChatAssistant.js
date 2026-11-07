@@ -2964,7 +2964,12 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // saving a REST API connection, since the request is authored here via
   // build_dataSource.
   useEffect(() => {
-    const handler = () => setOpen(true);
+    const handler = (e) => {
+      setOpen(true);
+      // Pre-fill only an empty box — never overwrite something the user typed.
+      const draft = e?.detail?.draft;
+      if (draft) setInput((prev) => (String(prev || '').trim() ? prev : draft));
+    };
     window.addEventListener('ternlux:open-chat', handler);
     return () => window.removeEventListener('ternlux:open-chat', handler);
   }, []);

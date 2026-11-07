@@ -831,7 +831,13 @@ function connectionCatalogText(connections) {
     if (Array.isArray(c.apiParamKeys) && c.apiParamKeys.length) {
       extras.push(`saved parameter names: ${c.apiParamKeys.map((k) => `'${k}'`).join(', ')}`);
     }
-    return `- "${c.name}"${kind ? ` (${kind})` : ''}${extras.length ? ` — ${extras.join(' — ')}` : ''}`;
+    const line = `- "${c.name}"${kind ? ` (${kind})` : ''}${extras.length ? ` — ${extras.join(' — ')}` : ''}`;
+    // A connection made from a vendor preset: its endpoints, headers and paging
+    // rules, so the function calls the real API instead of a guessed one.
+    if (typeof c.apiReference === 'string' && c.apiReference) {
+      return `${line}\n${c.apiReference.split('\n').map((l) => `    ${l}`).join('\n')}`;
+    }
+    return line;
   });
   return lines.join('\n')
     || '(no connections are configured — say so with ask_questions rather than inventing a name)';
