@@ -23,7 +23,7 @@ number of workflows.
 | Local file | A file read in place by DuckDB | CSV / Excel, JSON, Parquet, Avro, DuckDB, SQLite, LanceDB |
 | Database | Plugin-driven database connection | PostgreSQL, MySQL / MariaDB, SQL Server, MongoDB, BigQuery, Snowflake |
 | Cloud storage | Bucket-style storage with object pickers | S3, Google Cloud Storage, Azure Blob, Dropbox, Google Drive, OneDrive, Google Sheets |
-| API | REST API base URL plus your own key/value credentials | Auth headers, API keys, tenant ids, query parameters |
+| API | REST API base URL plus your own key/value credentials, or a ready-made vendor connection | Auth headers, API keys, tenant ids; [GitHub, HubSpot, Stripe, Notion and more](../plugins/connectors/api-presets/README.md) |
 | Vector | Vector index | Pinecone (cloud), LanceDB (local, under Local file) |
 
 Adding a local file does not import or convert it. Ternlux asks DuckDB

@@ -39,10 +39,7 @@ none.
 | [BigQuery](bigquery.md) | Google data warehouse, OAuth, `dataset.table` naming, larger write batches (each call is a load job) |
 | [Snowflake](snowflake.md) | Cloud warehouse, account identifier, warehouse + role context |
 
-<!-- Redshift ships but is not loaded — see the disabled-connector note in
-     plugins/plugin-manager.md. Restore this row when it is re-enabled:
 | [Redshift](redshift.md) | AWS warehouse, JDBC URL parsing |
--->
 
 ### Document databases
 
@@ -95,6 +92,7 @@ File picker and object listing screens. See
 | Connector | Notes |
 | --- | --- |
 | [REST API](rest-api.md) | Base URL plus your own key/value credentials; the request itself is generated per Data Source node |
+| [Vendor API connections](api-presets/README.md) | GitHub, HubSpot, Stripe, Notion, Airtable, Jira, Pipedrive, SendGrid, Klaviyo, Intercom, Linear, Mailchimp, Freshdesk, Calendly, Typeform — the REST API connector with the vendor filled in, plus a step-by-step key guide for each |
 
 ### Local files
 
