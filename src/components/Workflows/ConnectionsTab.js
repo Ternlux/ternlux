@@ -9,6 +9,7 @@ import DynamicConnectionForm from './connections/DynamicConnectionForm';
 import LocalFileConnectionForm from './connections/LocalFileConnectionForm';
 import { isDuplicateConnectionName } from './connections/connectionNameRule';
 import { connectorVisual, ConnectorLogo } from './connections/connectorCatalog';
+import { connectorKeyFor, resolveConnectorPlugin } from './connections/apiPresets';
 
 import DatabaseExplorer from '../DatabaseExplorer/DatabaseExplorer';
 
@@ -41,6 +42,19 @@ const CONN_TYPE_CFG = {
   shopify:  { label: 'Shopify',    color: C.green,   bg: C.gD,                    border: 'rgba(5,150,105,0.18)' },
   clover_pos: { label: 'Clover POS', color: C.green, bg: C.gD,                    border: 'rgba(5,150,105,0.18)' },
   square_pos: { label: 'Square POS', color: C.violet, bg: C.vD,                   border: 'rgba(124,58,237,0.18)' },
+  'rest-api': { label: 'REST API', color: C.accent, bg: C.aD,                     border: 'rgba(37,99,235,0.18)' },
+  // Vendor presets of the REST API connector — keyed like their picker tiles.
+  'rest-api:github':  { label: 'GitHub',  color: '#24292f', bg: 'rgba(36,41,47,0.06)',  border: 'rgba(36,41,47,0.2)' },
+  'rest-api:hubspot': { label: 'HubSpot', color: '#ff7a59', bg: 'rgba(255,122,89,0.08)', border: 'rgba(255,122,89,0.25)' },
+};
+
+// Every other vendor preset: its catalog tile's title and colour, so a new
+// preset needs no entry here.
+const presetTypeCfg = (subType) => {
+  if (!String(subType).startsWith('rest-api:')) return null;
+  const tile = connectorVisual(subType);
+  if (!tile) return null;
+  return { label: tile.title, color: tile.tone, bg: C.s2, border: C.border };
 };
 
 // A file connection's `dbType` records the engine that reads it — DuckDB for
@@ -65,11 +79,21 @@ const originalFileType = (conn) => {
   return EXT_FILE_TYPE[name.toLowerCase().slice(dot)] || null;
 };
 
+// A vendor-preset REST connection is its own type ('rest-api:github'), so it
+// gets its own chip, logo and Type filter instead of reading "rest-api".
 const subTypeOf = (conn) =>
-  originalFileType(conn) || conn.dbType || conn.fileType || conn.apiType || conn.connectionType || 'file';
+  originalFileType(conn)
+  || (conn.dbConfig?.presetId ? connectorKeyFor(conn) : null)
+  || conn.dbType || conn.fileType || conn.apiType || conn.connectionType || 'file';
+
+// Which category pill a connection files under. REST API connections are
+// stored with connectionType 'database' (every plugin form saves that), so the
+// plugin's dbCategory is what puts GitHub, HubSpot and REST under APIs.
+const categoryOf = (conn) =>
+  (conn.dbCategory === 'API' || conn.dbType === 'rest-api' ? 'api' : (conn.connectionType || 'file'));
 
 const typeCfgFor = (subType) =>
-  CONN_TYPE_CFG[subType] || { label: subType, color: C.muted, bg: C.s2, border: C.border };
+  CONN_TYPE_CFG[subType] || presetTypeCfg(subType) || { label: subType, color: C.muted, bg: C.s2, border: C.border };
 
 // Plugin dbCategory values that have no useful Explore/Preview action.
 const NO_MIDDLE_ACTION_CATEGORIES = new Set(['Vector', 'CloudStorage', 'API']);
@@ -78,6 +102,7 @@ const NO_MIDDLE_ACTION_CATEGORIES = new Set(['Vector', 'CloudStorage', 'API']);
 // An unrecognised type (a custom plugin, a legacy record) keeps the generic
 // file/database glyph tinted by its category.
 const ConnIcon = ({ conn }) => {
+  // A vendor-preset REST connection wears the vendor's tile, not the REST one.
   const visual = connectorVisual(subTypeOf(conn));
   if (visual) return <ConnectorLogo c={visual} size={32} imgSize={20} letterSize={9} />;
 
@@ -674,7 +699,7 @@ const ConnectionsTab = ({
     setEditingConnection(connection);
     setDroppedFile(null);
     if (connection.connectionType === 'database') {
-      setActiveDbType(connection.dbType);
+      setActiveDbType(connectorKeyFor(connection));
     } else if (connection.connectionType === 'file') {
       // A local file's form follows the format the user picked (fileType), not
       // the engine reading it — every local file reports dbType 'duckdb', which
@@ -833,7 +858,7 @@ const ConnectionsTab = ({
 
   const getModalTitle = (dbType) => {
     if (LOCAL_FILE_MODAL_TITLES[dbType]) return LOCAL_FILE_MODAL_TITLES[dbType];
-    const plugin = installedPlugins.find(p => p.id === dbType);
+    const plugin = resolveConnectorPlugin(installedPlugins, dbType);
     if (plugin) return `Connect to ${plugin.metadata?.displayName || plugin.name}`;
     return 'Connect to Database';
   };
@@ -852,7 +877,7 @@ const ConnectionsTab = ({
         />
       );
     }
-    const plugin = installedPlugins.find(p => p.id === activeDbType);
+    const plugin = resolveConnectorPlugin(installedPlugins, activeDbType);
     if (plugin) {
       return () => (
         <DynamicConnectionForm
@@ -873,7 +898,7 @@ const ConnectionsTab = ({
   // Filter options come from what is actually connected, so the bar never
   // offers a type that would match nothing.
   const categoryOptions = useMemo(() => {
-    const present = new Set(connections.map(c => c.connectionType || 'file'));
+    const present = new Set(connections.map(categoryOf));
     return ['database', 'file', 'api'].filter(c => present.has(c));
   }, [connections]);
 
@@ -883,7 +908,7 @@ const ConnectionsTab = ({
   }, [connections]);
 
   const filteredConnections = useMemo(() => connections.filter(conn => {
-    if (filters.category && (conn.connectionType || 'file') !== filters.category) return false;
+    if (filters.category && categoryOf(conn) !== filters.category) return false;
     if (filters.types.length > 0 && !filters.types.includes(subTypeOf(conn))) return false;
     if (filters.search) {
       const needle = filters.search.toLowerCase();

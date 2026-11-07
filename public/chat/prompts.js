@@ -249,6 +249,9 @@ ${candidates || '- (no saved connections)'}
   add('Current JavaScript function', c.transformFunction || c.apiFetchCode);
   if (c.nosqlOperation) add('Current NoSQL operation', typeof c.nosqlOperation === 'string' ? c.nosqlOperation : JSON.stringify(c.nosqlOperation));
   add('Explanation', c.targetSqlExplanation);
+  if (c.apiPresetEndpoint) {
+    add('Endpoint picked in the form', `${c.apiPresetEndpoint.method || 'GET'} ${c.apiPresetEndpoint.path} (${c.apiPresetEndpoint.label})`);
+  }
   const detailBlock = details.length ? `\nCurrent configuration of this node:\n${details.join('\n\n')}\n` : '\nThis node is NOT configured yet.\n';
 
   return `# Node in focus — use ${buildToolName}

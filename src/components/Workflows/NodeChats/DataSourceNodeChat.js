@@ -28,6 +28,10 @@ import GoogleDrivePicker from '../GoogleDrivePicker';
 import GoogleSheetsPicker from '../GoogleSheetsPicker';
 import ConnectionTypeSelector from '../ConnectionTypeSelector';
 import DynamicConnectionForm from '../connections/DynamicConnectionForm';
+import {
+  resolveConnectorPlugin, presetForConnection, endpointKey, endpointRequestDraft, endpointVariables,
+} from '../connections/apiPresets';
+import { connectorVisual, ConnectorLogo } from '../connections/connectorCatalog';
 import LocalFileConnectionForm from '../connections/LocalFileConnectionForm';
 import {
   FORM_ACCENT,
@@ -198,10 +202,20 @@ const byName = (a, b) => String(a).localeCompare(String(b), undefined, {
   sensitivity: 'base', numeric: true,
 });
 
+// The picker tile ('rest-api:github') a vendor-preset connection was made from.
+const presetVisualOf = (conn) => (conn?.dbConfig?.presetId
+  ? connectorVisual(`${conn.dbType}:${conn.dbConfig.presetId}`)
+  : null);
+
 const getConnectionIcon = (connection) => {
   if (!connection) return null;
   const kind = connKindOf(connection);
-  if (kind === 'api') return <ApiOutlined style={{ fontSize: 16 }} />;
+  if (kind === 'api') {
+    // A vendor-preset REST connection wears the vendor's tile.
+    const visual = presetVisualOf(connection);
+    if (visual) return <ConnectorLogo c={visual} size={18} imgSize={14} letterSize={7} />;
+    return <ApiOutlined style={{ fontSize: 16 }} />;
+  }
   if (kind === 'vector') {
     const IconComponent = getDbIcon(connection.dbType);
     return IconComponent ? <IconComponent /> : <AppstoreOutlined style={{ fontSize: 16 }} />;
@@ -238,6 +252,8 @@ const connMeta = (conn) => {
     const kindLabel = kind === 'sql' || kind === 'ready' ? 'Local file' : (KIND_LABEL[kind] || 'File');
     return `${FILE_TYPE_LABEL[fileType] || fileType} · ${kindLabel}`;
   }
+  const preset = presetVisualOf(conn);
+  if (preset) return `${preset.title} · ${KIND_LABEL[kind]}`;
   return `${conn.dbType || conn.connectionType} · ${KIND_LABEL[kind] || 'Other'}`;
 };
 
@@ -304,6 +320,13 @@ const DataSourceNodeChat = ({
   const [activeDbType, setActiveDbType] = useState(null);
   const [installedPlugins, setInstalledPlugins] = useState([]);
 
+  // Vendor-preset API connection: the endpoint picked here, handed to the chat
+  // as a reference. Its variables (owner/repo, filters…) are given in the chat,
+  // which writes the request.
+  const [apiEndpoint, setApiEndpoint] = useState(
+    initialConfig?.apiPresetEndpoint ? endpointKey(initialConfig.apiPresetEndpoint) : '',
+  );
+
   const [dirty, setDirty] = useState(false);
   const [attempted, setAttempted] = useState(false);
   // Saving here is synchronous, so a "saving…" flag can't guard a double
@@ -313,6 +336,10 @@ const DataSourceNodeChat = ({
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
   const connKind = connKindOf(selConn);
+  const selPreset = connKind === 'api' ? presetForConnection(installedPlugins, selConn) : null;
+  const selEndpoint = selPreset
+    ? (selPreset.endpoints || []).find((e) => endpointKey(e) === apiEndpoint) || null
+    : null;
 
   // ── Connection loading ───────────────────────────────────────────────────
 
@@ -502,6 +529,8 @@ const DataSourceNodeChat = ({
     setTableSchema(null);
     setLatestWithSQL(null);
     setImportedFile(null);
+    // An endpoint belongs to one preset; a different connection starts over.
+    if (conn?.id !== selConn?.id) setApiEndpoint('');
 
     const kind = connKindOf(conn);
 
@@ -1076,7 +1105,7 @@ const DataSourceNodeChat = ({
       avro: 'Upload Avro File',
     };
     if (titleMap[dbType]) return titleMap[dbType];
-    const plugin = installedPlugins.find((p) => p.id === dbType);
+    const plugin = resolveConnectorPlugin(installedPlugins, dbType);
     if (plugin) return `Connect to ${plugin.metadata?.displayName || plugin.name}`;
     return 'Connect to Database';
   };
@@ -1095,7 +1124,7 @@ const DataSourceNodeChat = ({
         />
       );
     }
-    const plugin = installedPlugins.find((p) => p.id === activeDbType);
+    const plugin = resolveConnectorPlugin(installedPlugins, activeDbType);
     if (plugin) {
       return () => (
         <DynamicConnectionForm
@@ -1304,6 +1333,10 @@ const DataSourceNodeChat = ({
           // resolved in the main process at fetch time.
           apiParamKeys: conn.dbConfig?.apiParamKeys || [],
         },
+        // What the user picked in this form for a vendor-preset connection.
+        // Read by build_dataSource as a reference; null when nothing was picked.
+        apiPresetId: conn.dbConfig?.presetId || null,
+        apiPresetEndpoint: selEndpoint,
       });
       if (sameApi && initialConfig?.sourceTableSchema) {
         config.sourceTableSchema = initialConfig.sourceTableSchema;
@@ -1494,7 +1527,11 @@ const DataSourceNodeChat = ({
 
     // A REST API source has no form fields left to fill — the request is
     // described in the chat, which opens with this node in focus.
-    if (connKind === 'api') onRequestChatHandoff?.(node.id);
+    if (connKind === 'api') {
+      onRequestChatHandoff?.(node.id, {
+        draft: selPreset && selEndpoint ? endpointRequestDraft(selPreset, selEndpoint) : '',
+      });
+    }
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
@@ -1740,6 +1777,58 @@ const DataSourceNodeChat = ({
         )}
 
         {/* API → save, then the chat opens with this node in focus */}
+        {connKind === 'api' && selPreset && (
+          <Card label="Endpoint">
+            <Fields>
+              <Field
+                label="Endpoint"
+                hint={selEndpoint
+                  ? [`Rows: ${selEndpoint.rows}.`, selEndpoint.notes || ''].filter(Boolean).join(' ')
+                  : `Optional. Pick what to pull from ${selPreset.title}, or describe it in the chat instead.`}
+              >
+                <SearchSelect
+                  value={apiEndpoint}
+                  placeholder={`Select a ${selPreset.title} endpoint…`}
+                  searchPlaceholder="Filter endpoints…"
+                  options={(selPreset.endpoints || []).map((e) => ({
+                    label: `${e.label} — ${endpointKey(e)}`,
+                    value: endpointKey(e),
+                  }))}
+                  onChange={(v) => { setDirty(true); setApiEndpoint(v); }}
+                />
+              </Field>
+              {selEndpoint && (() => {
+                // Shown, not asked for: the values are given in the chat, which
+                // writes the request around them.
+                const vars = endpointVariables(selEndpoint);
+                return (
+                  <Field label="Variables">
+                    {vars.required.length > 0 && (
+                      <div className="tlx-hint">
+                        <strong>Required</strong> (in the path):{' '}
+                        {vars.required.map((v, i) => (
+                          <React.Fragment key={v.name}>
+                            {i > 0 ? ', ' : ''}<code>{v.name}</code>
+                            {v.choices ? <> (one of {v.choices.join(', ')})</> : null}
+                          </React.Fragment>
+                        ))}
+                      </div>
+                    )}
+                    {vars.optional && (
+                      <div className="tlx-hint"><strong>Optional</strong>: {vars.optional}</div>
+                    )}
+                    <Note>
+                      {vars.required.length > 0 || vars.optional
+                        ? <>Give these values in the <strong>chat assistant</strong> after you save — it asks for any required one you leave out and writes the request.</>
+                        : <>No variables. The <strong>chat assistant</strong> writes the request after you save.</>}
+                    </Note>
+                  </Field>
+                );
+              })()}
+            </Fields>
+          </Card>
+        )}
+
         {connKind === 'api' && (
           <Card label="API request">
             <Handoff color={FORM_ACCENT.transform} icon={<IconChat />} title="Continues in chat after you save">
@@ -1749,7 +1838,10 @@ const DataSourceNodeChat = ({
                 ) : null}
                 Auth is stored on the connection. <strong>Press Save and the chat opens with this
                 node in focus</strong>, where you describe the request — endpoint, method, filtering.
-                You can come back and modify the request at any time.
+                {selEndpoint
+                  ? <> The chat box is pre-filled with a request for <strong>{selEndpoint.label}</strong>; edit it before sending.</>
+                  : null}
+                {' '}You can come back and modify the request at any time.
               </HandoffBody>
               {initialConfig?.apiFetchCode ? (
                 <Picked>

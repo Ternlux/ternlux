@@ -85,6 +85,17 @@ module.exports = {
   name: 'Amazon Redshift',
   icon: './icon.svg',
   dbCategory: 'SQL',
+  // How a join may write "update the rows that match, insert the rest" here
+  // (join write mode "merge"). Read by the join builder and shown to the model
+  // that writes the statement; nothing here is executed. Redshift's MERGE
+  // takes a subquery source when it carries an alias, and needs a WHEN clause.
+  mergeSupport: {
+    statements: ['MERGE'],
+    guidance: 'MERGE INTO {{TARGET}} USING (<the joined SELECT>) AS s ON {{TARGET}}.<key> = s.<key> '
+      + 'WHEN MATCHED THEN UPDATE SET <col> = s.<col>, … WHEN NOT MATCHED THEN INSERT (<cols>) VALUES (s.<cols>). '
+      + 'Give the subquery an alias. Redshift has no INSERT … ON CONFLICT, and its primary keys are not '
+      + 'enforced, so the ON condition alone decides what matches.',
+  },
 
   /**
    * Column types for a CREATE TABLE this app generates. See the note on
@@ -122,6 +133,30 @@ module.exports = {
     DECIMAL: (p, s) => (p && p <= 38 ? `DECIMAL(${p},${s || 0})` : null),
     TIMESTAMPTZ: () => 'TIMESTAMPTZ',
     TIME: () => 'TIME',
+  },
+
+  /**
+   * This engine's type for a column (a getColumns entry) as a canonical type —
+   * what an Output writing a copy of this table elsewhere builds its column
+   * from. See public/NodeExecution/columnTypes.js. Same names as PostgreSQL's
+   * information_schema, plus Redshift's SUPER (semi-structured).
+   */
+  toCanonicalType: (column) => {
+    const t = String(column?.type || '').toLowerCase();
+    if (t === 'smallint' || t === 'integer') return { kind: 'INTEGER' };
+    if (t === 'bigint') return { kind: 'BIGINT' };
+    if (t === 'real' || t === 'double precision') return { kind: 'DOUBLE' };
+    if (t === 'numeric') {
+      return { kind: 'DECIMAL', precision: column.precision ?? null, scale: column.scale ?? null };
+    }
+    if (t === 'boolean') return { kind: 'BOOLEAN' };
+    if (t === 'date') return { kind: 'DATE_ONLY' };
+    if (t === 'timestamp with time zone') return { kind: 'TIMESTAMPTZ' };
+    if (t === 'timestamp without time zone') return { kind: 'TIMESTAMP' };
+    if (t.startsWith('time')) return { kind: 'TIME' };
+    if (t === 'super') return { kind: 'OBJECT' };
+    // character varying, character, geometry, varbyte…
+    return { kind: 'STRING', length: column?.maxLength ?? null };
   },
 
   /**
@@ -201,7 +236,10 @@ module.exports = {
           column_name AS name,
           data_type AS type,
           is_nullable AS nullable,
-          column_default AS default_value
+          column_default AS default_value,
+          character_maximum_length AS max_length,
+          numeric_precision AS precision,
+          numeric_scale AS scale
         FROM information_schema.columns
         WHERE table_schema = $1 AND table_name = $2
         ORDER BY ordinal_position
@@ -214,7 +252,12 @@ module.exports = {
           type: row.type,
           nullable: row.nullable === 'YES',
           isPrimary: false, // Redshift doesn't enforce primary keys
-          defaultValue: row.default_value
+          defaultValue: row.default_value,
+          // Size and precision, so a copy elsewhere can keep them (see
+          // toCanonicalType). null where the type has none.
+          maxLength: row.max_length,
+          precision: row.precision,
+          scale: row.scale,
         }))
       };
     } catch (error) {
@@ -405,7 +448,9 @@ module.exports = {
           // lower case either way by default, so this is the form that keeps
           // working if enable_case_sensitive_identifier is ever on.
           const insertSql = `INSERT INTO ${module.exports.quoteIdentifier(tableName)} `
-            + `(${columns.join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
+            // Columns quoted one by one, as in the PostgreSQL connector — bare,
+            // a column called `order` or `first name` was a syntax error.
+            + `(${columns.map((c) => module.exports.quoteColumn(c)).join(', ')}) VALUES ${valuePlaceholders.join(', ')}`;
 
           // Flatten all values into a single array
           const allValues = slice.flatMap(row =>
@@ -436,6 +481,32 @@ module.exports = {
       }
     } catch (error) {
       return queryError(error);
+    }
+  },
+
+  /**
+   * Run several statements as ONE transaction — all commit, or none do.
+   * A truncate-and-load swap needs its DELETE and INSERT committed together so
+   * the table is never left empty. Same contract as the PostgreSQL connector.
+   */
+  runInTransaction: async (config, connectionId, statements) => {
+    let client;
+    try {
+      const pool = await getPool(config, connectionId);
+      client = await pool.connect();
+    } catch (error) {
+      return queryError(error);
+    }
+    try {
+      await client.query('BEGIN');
+      for (const sql of statements) await client.query(sql);
+      await client.query('COMMIT');
+      return { success: true };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return queryError(error);
+    } finally {
+      client.release();
     }
   },
 
@@ -747,6 +818,12 @@ module.exports = {
    * @param {object} config - Database configuration (not used for Redshift)
    * @returns {string} Properly quoted identifier
    */
+  /**
+   * Quote a COLUMN name. Unlike quoteIdentifier this never splits on a dot —
+   * a column called "e.mail" is one identifier.
+   */
+  quoteColumn: (name) => `"${String(name).replace(/"/g, '""')}"`,
+
   quoteIdentifier: (identifier, schema = null, config = null) => {
     if (!identifier) return identifier;
     // Already quoted — hand it back untouched. Callers pass identifiers that

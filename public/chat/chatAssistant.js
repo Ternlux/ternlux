@@ -36,6 +36,7 @@ const { toolsForTurn } = require('./toolSchemas');
 // when the window is being packed.
 const { estimateTokens } = require('../aiProviders');
 const { stripVectors } = require('../lib/promptSanitize');
+const { presetReferenceForCtx } = require('../lib/apiPresets');
 // Every prompt this module sends is built here. buildPrompt(kind, params)
 // returns { text, meta }: `text` is sent to the model, `meta` describes the
 // same call as parameters and is what the dev prompt log records instead of the
@@ -743,7 +744,15 @@ const SHARED_TOOLS = {
     if (safeFileInfo && Array.isArray(safeFileInfo.tables) && safeFileInfo.tables.length === 0) {
       delete safeFileInfo.tables;
     }
-    return { ...safe, ...(safeFileInfo ? { fileInfo: safeFileInfo } : {}), dbConfig: safeConfig };
+    // A connection made from a vendor preset carries its endpoint reference, so
+    // the planner can name the right endpoint and saved key in run_javascript.
+    const apiReference = presetReferenceForCtx(c);
+    return {
+      ...safe,
+      ...(safeFileInfo ? { fileInfo: safeFileInfo } : {}),
+      dbConfig: safeConfig,
+      ...(apiReference ? { apiReference } : {}),
+    };
   },
   async list_executions({ getDb }, args) {
     const db = getDb('executions');
@@ -1013,6 +1022,8 @@ function describeConnectionForCode(c) {
     ? c.dbConfig.apiParams.map((p) => p && p.key).filter(Boolean)
     : (Array.isArray(c.dbConfig?.apiParamKeys) ? c.dbConfig.apiParamKeys : null);
   if (keys && keys.length) out.apiParamKeys = keys;
+  const apiReference = presetReferenceForCtx(c);
+  if (apiReference) out.apiReference = apiReference;
   return out;
 }
 
@@ -1528,6 +1539,9 @@ function formatNodeDetails(config) {
   add('Current JavaScript function', c.transformFunction || c.apiFetchCode);
   if (c.nosqlOperation) add('Current NoSQL operation', typeof c.nosqlOperation === 'string' ? c.nosqlOperation : JSON.stringify(c.nosqlOperation));
   add('Explanation', c.targetSqlExplanation);
+  if (c.apiPresetEndpoint) {
+    add('Endpoint picked in the form', `${c.apiPresetEndpoint.method || 'GET'} ${c.apiPresetEndpoint.path} (${c.apiPresetEndpoint.label})`);
+  }
   return details.join('\n\n');
 }
 

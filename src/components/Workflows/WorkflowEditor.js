@@ -1793,9 +1793,11 @@ const WorkflowEditor = ({
   // node panel and the assistant share the same corner, so the assistant is
   // hidden while it is open) and open the assistant, which picks this node up
   // through the ternlux:node-focus broadcast below.
-  const handleRequestChatHandoff = useCallback((nodeId) => {
+  // `draft` pre-fills the chat box (the Data Source form builds one from the
+  // endpoint picked for a vendor-preset API connection).
+  const handleRequestChatHandoff = useCallback((nodeId, { draft = '' } = {}) => {
     setIsSidebarOpen(false);
-    window.dispatchEvent(new CustomEvent('ternlux:open-chat', { detail: { nodeId } }));
+    window.dispatchEvent(new CustomEvent('ternlux:open-chat', { detail: { nodeId, draft } }));
   }, []);
 
   // Load database tables (called from DataSourceNodeChat)

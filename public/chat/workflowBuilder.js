@@ -91,6 +91,7 @@ const ChatPrompts = {
 const { handleExecuteApiFetch, describeApiTable } = require('../NodeExecution/ApiFetch');
 const { qualifierFor } = require('../lib/tableRef');
 const targetShape = require('../lib/targetShape');
+const { presetReferenceForPlaceholders } = require('../lib/apiPresets');
 const { parseNoSQLOperation, sourceCollectionOf } = require('../joins/joinExecutionHelpers');
 
 // A local node's output is a table in its workflow's database. Compute the path
@@ -1791,6 +1792,8 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       // Key names only — the values stay encrypted and never reach the model.
       connectionParamKeys: conn.dbConfig?.apiParamKeys || [],
       currentCollectionName: currentCollection,
+      presetReference: presetReferenceForPlaceholders(conn),
+      selectedEndpoint: existingConfig?.apiPresetEndpoint || null,
     });
     const out = await callJsonResumable(helpers, restPrompt, { chatHistory: chatToHistory(chat) }, { stage: 'dataSource:restAnalysis', resumed: resumedCalls });
     if (out.action !== 'create_plan' || !out.code) {
@@ -1833,6 +1836,10 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       // endpoints, so every card used to show the same URL.
       apiEndpoint: typeof out.endpoint === 'string' ? out.endpoint.trim().slice(0, 300) : '',
       apiFetchCode: out.code || '',
+      // The endpoint picked in the form for a vendor-preset connection, kept
+      // so reopening the node shows it and a rebuild reads it again.
+      apiPresetId: conn.dbConfig?.presetId || null,
+      apiPresetEndpoint: existingConfig?.apiPresetEndpoint || null,
       apiConnectionPublicConfig: {
         baseUrl: conn.dbConfig?.baseUrl || '',
         authType: conn.dbConfig?.authType || 'none',

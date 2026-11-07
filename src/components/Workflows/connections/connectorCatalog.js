@@ -25,10 +25,7 @@ export const CONNECTION_TYPES = [
   { key: 'mysql',     title: 'MySQL / MariaDB', description: 'Connect to a MySQL or MariaDB database',          category: 'database', img: LOGO_PREFIX + 'MySQL.png',                tone: '#e48b00' },
   { key: 'mssql',     title: 'SQL Server',      description: 'Connect to a Microsoft SQL Server database',      category: 'database', img: LOGO_PREFIX + 'Microsoft_SQL_Server.png', tone: '#0078d4' },
   { key: 'mongodb',   title: 'MongoDB',         description: 'Connect to a MongoDB database or Atlas cluster',  category: 'database', img: LOGO_PREFIX + 'MongoDB.png',              tone: '#00a550' },
-  // Redshift is disabled for now — re-enable by uncommenting this entry and the
-  // matching lines in GenericSQLConnectionForm, nodeCardShared, DatabaseExplorer
-  // theme, and the DISABLED_CONNECTORS set in public/pluginManager.js.
-  // { key: 'redshift',  title: 'Amazon Redshift', description: 'Connect to an Amazon Redshift data warehouse',    category: 'database', img: LOGO_PREFIX + 'Amazon_Redshift.png',      tone: '#ff9900' },
+  { key: 'redshift',  title: 'Amazon Redshift', description: 'Connect to an Amazon Redshift data warehouse',    category: 'database', img: LOGO_PREFIX + 'Amazon_Redshift.png',      tone: '#ff9900' },
   { key: 'bigquery',  title: 'Google BigQuery', description: 'Connect to Google BigQuery data warehouse',       category: 'database', img: LOGO_PREFIX + 'Google_BigQuery.png',      tone: '#4285f4' },
   { key: 'snowflake', title: 'Snowflake',       description: 'Connect to a Snowflake data warehouse',           category: 'database', img: LOGO_PREFIX + 'Snowflake.png',            tone: '#29b5e8' },
 
@@ -45,6 +42,23 @@ export const CONNECTION_TYPES = [
 
   // APIs
   { key: 'rest-api',      title: 'REST API',      description: 'Generic HTTP endpoint — URL + your own key/value credentials here, request authored on the node', category: 'api', letters: 'API', tone: '#2563eb' },
+  // Vendor presets of the REST API connector (plugins/connectors/rest-api/presets).
+  // Same plugin, a form that asks only for the vendor's token.
+  { key: 'rest-api:github',  title: 'GitHub',  description: 'Repos, issues, pull requests, commits and Actions runs — personal access token', category: 'api', letters: 'GH', tone: '#24292f' },
+  { key: 'rest-api:hubspot', title: 'HubSpot', description: 'Contacts, companies, deals, tickets and owners — service key',                    category: 'api', letters: 'HS', tone: '#ff7a59' },
+  { key: 'rest-api:stripe', title: 'Stripe', description: 'Customers, charges, invoices, subscriptions and payouts — secret or restricted key', category: 'api', letters: 'ST', tone: '#635bff' },
+  { key: 'rest-api:notion', title: 'Notion', description: 'Pages, databases (data sources), blocks and comments — integration secret', category: 'api', letters: 'NO', tone: '#191919' },
+  { key: 'rest-api:airtable', title: 'Airtable', description: 'Bases, tables and records — personal access token', category: 'api', letters: 'AT', tone: '#d18f00' },
+  { key: 'rest-api:jira', title: 'Jira', description: 'Issues by JQL, projects, comments, worklogs and sprints — email + API token', category: 'api', letters: 'JI', tone: '#0052cc' },
+  { key: 'rest-api:pipedrive', title: 'Pipedrive', description: 'Deals, persons, organizations, activities and leads — API token', category: 'api', letters: 'PD', tone: '#017737' },
+  { key: 'rest-api:sendgrid', title: 'SendGrid', description: 'Lists, single sends, stats and suppressions — API key', category: 'api', letters: 'SG', tone: '#1a82e2' },
+  { key: 'rest-api:klaviyo', title: 'Klaviyo', description: 'Profiles, events, lists, segments, campaigns and flows — private API key', category: 'api', letters: 'KL', tone: '#232426' },
+  { key: 'rest-api:intercom', title: 'Intercom', description: 'Contacts, companies, conversations and tickets — access token', category: 'api', letters: 'IC', tone: '#1f8ded' },
+  { key: 'rest-api:linear', title: 'Linear', description: 'Issues, projects, cycles and teams (GraphQL) — API key', category: 'api', letters: 'LN', tone: '#5e6ad2' },
+  { key: 'rest-api:mailchimp', title: 'Mailchimp', description: 'Audiences, members, campaigns and reports — API key', category: 'api', letters: 'MC', tone: '#b8960c' },
+  { key: 'rest-api:freshdesk', title: 'Freshdesk', description: 'Tickets, conversations, contacts and agents — API key', category: 'api', letters: 'FD', tone: '#25c16f' },
+  { key: 'rest-api:calendly', title: 'Calendly', description: 'Scheduled events, invitees and event types — personal access token', category: 'api', letters: 'CA', tone: '#006bff' },
+  { key: 'rest-api:typeform', title: 'Typeform', description: 'Forms, responses and workspaces — personal access token', category: 'api', letters: 'TF', tone: '#262627' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', letters: 'PC', tone: '#0f172a' },

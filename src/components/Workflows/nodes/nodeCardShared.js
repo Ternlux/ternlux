@@ -221,8 +221,7 @@ export const targetDatasetOf = (config = {}) => {
  */
 export const CONNECTOR_ICONS = {
   postgres: PostgresIcon,
-  // Redshift disabled for now — see connections/connectorCatalog.js.
-  // redshift: PostgresIcon,   // Redshift is Postgres-derived and ships no mark of its own
+  redshift: PostgresIcon,   // Redshift is Postgres-derived and ships no mark of its own
   mysql: MysqlIcon,
   mssql: MssqlIcon,
   mongodb: MongodbIcon,

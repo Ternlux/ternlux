@@ -17,7 +17,7 @@ const { traceCall, isTracing, safeConfig, batchRowRange } = require('./NodeExecu
  * registers. To bring one back, drop it from this set and uncomment its UI
  * entries (see src/components/Workflows/connections/connectorCatalog.js).
  */
-const DISABLED_CONNECTORS = new Set(['redshift']);
+const DISABLED_CONNECTORS = new Set([]);
 
 /**
  * Connector methods worth tracing, and how to describe a call to each.
@@ -374,7 +374,9 @@ class PluginManager {
       description: plugin.metadata?.description || '',
       dbCategory: plugin.dbCategory || null,
       storageType: plugin.storageType || null,
-      authType: plugin.authType || null
+      authType: plugin.authType || null,
+      // Vendor presets (rest-api) — plain data the picker turns into tiles.
+      presets: Array.isArray(plugin.presets) ? plugin.presets : null
     }));
   }
 

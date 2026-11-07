@@ -16,6 +16,9 @@
  */
 
 const axios = require('axios');
+const {
+  PRESETS, getPreset, resolveCredentialKeys, buildPresetHeaders, valueAt,
+} = require('./presets');
 
 // Upper bound on the key/value list the connection form offers. Kept here
 // because the form reads it off the schema.
@@ -54,6 +57,87 @@ function headersFromConfig(config, extra = {}) {
   return headers;
 }
 
+/**
+ * Test a vendor-preset connection. Unlike a hand-built connection, a preset
+ * knows where each saved key goes, so this sends the real credentials to an
+ * endpoint that needs them and reports a rejected token as a failure.
+ */
+async function testPresetConnection(preset, config) {
+  const saved = {};
+  for (const p of (Array.isArray(config.apiParams) ? config.apiParams : [])) {
+    if (p && p.key) saved[String(p.key)] = p.value == null ? '' : String(p.value);
+  }
+  // Keyed by the preset's credential names, read from whatever name the
+  // connection saved each one under.
+  const keyMap = resolveCredentialKeys(preset, Object.keys(saved));
+  const valuesByKey = Object.fromEntries(
+    Object.entries(keyMap).map(([presetKey, savedKey]) => [presetKey, saved[savedKey] || '']),
+  );
+  const { headers, missing } = buildPresetHeaders(preset, valuesByKey);
+  if (missing.length > 0) {
+    return {
+      success: false,
+      message: `Enter the ${missing.join(', ')} to test this connection. A saved value is not `
+        + 're-read for a test, so re-type it when testing an existing connection.',
+    };
+  }
+  const baseUrl = String(config.baseUrl || preset.baseUrl || '').trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(baseUrl)) {
+    return {
+      success: false,
+      message: `Enter your ${preset.title} base URL (e.g. ${preset.baseUrlPlaceholder || preset.baseUrl}) to test this connection.`,
+    };
+  }
+  const res = await axios({
+    method: preset.test.method || 'GET',
+    url: `${baseUrl}${preset.test.path}`,
+    headers: preset.test.body ? { 'Content-Type': 'application/json', ...headers } : headers,
+    data: preset.test.body,
+    timeout: 10_000,
+    validateStatus: () => true,
+  });
+  // A GraphQL API answers 200 with an `errors` array when it refuses a request.
+  const graphqlErrors = res.data && typeof res.data === 'object' && Array.isArray(res.data.errors) && !res.data.data;
+  if (res.status >= 200 && res.status < 300 && !graphqlErrors) {
+    const who = preset.test.identityField ? valueAt(res.data, preset.test.identityField) : null;
+    return { success: true, message: who ? `Connected to ${preset.title} as ${who}.` : `Connected to ${preset.title}.` };
+  }
+  const detail = errorDetail(res.data);
+  const said = detail ? ` ${detail}` : '';
+  if (res.status === 401 || graphqlErrors) {
+    return { success: false, message: `${preset.title} rejected the credentials (HTTP ${res.status}).${said}` };
+  }
+  if (res.status === 403) {
+    // Some vendors (Typeform) answer a bad token with 403 rather than 401, so
+    // this cannot claim the credentials were accepted.
+    return { success: false, message: `${preset.title} refused access (HTTP 403) — the credentials are wrong or missing a scope.${said}` };
+  }
+  if (res.status === 404 && !preset.baseUrl) {
+    return { success: false, message: `${preset.title} answered 404 — check the base URL (${baseUrl}).${said}` };
+  }
+  return { success: false, message: `${preset.title} responded with HTTP ${res.status}.${said}` };
+}
+
+/**
+ * The human part of an API error body. Vendors disagree on where it lives:
+ * message (GitHub, HubSpot, Notion), error.message (Stripe, Airtable),
+ * errors[0].message|detail (SendGrid, Intercom, Klaviyo, Linear),
+ * errorMessages[0] (Jira), description (Freshdesk, Typeform), detail (Mailchimp).
+ */
+function errorDetail(data) {
+  if (!data || typeof data !== 'object') return '';
+  const first = Array.isArray(data.errors) ? data.errors[0] : null;
+  const text = data.message
+    || (data.error && typeof data.error === 'object' ? data.error.message : data.error)
+    || (first && (first.message || first.detail || first.title))
+    || (Array.isArray(data.errorMessages) ? data.errorMessages[0] : null)
+    || data.description
+    || data.detail
+    || data.title
+    || '';
+  return String(typeof text === 'string' ? text : JSON.stringify(text)).slice(0, 200);
+}
+
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -73,6 +157,9 @@ module.exports = {
    */
   async testConnection(config /*, connectionId */) {
     try {
+      const preset = getPreset(config && config.presetId);
+      if (preset) return await testPresetConnection(preset, config);
+
       const baseUrl = config && config.baseUrl && String(config.baseUrl).trim();
       if (!baseUrl) {
         return {
@@ -220,8 +307,19 @@ module.exports = {
         type: 'internal',
         sensitive: false,
       },
+      {
+        // Set when the connection was made from a vendor preset (see
+        // ./presets). Written by the preset form; never rendered.
+        name: 'presetId',
+        type: 'internal',
+        sensitive: false,
+      },
     ],
   },
+
+  // Vendor presets: plain data, listed to the renderer with the plugin so the
+  // connector picker can offer one tile per vendor.
+  presets: PRESETS,
 
   metadata: {
     displayName: 'REST API',
