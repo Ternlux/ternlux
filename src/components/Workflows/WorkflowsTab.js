@@ -116,6 +116,14 @@ const WorkflowsTab = ({
     fetchWorkflows();
   }, []);
 
+  // A workflow built outside this window (from Telegram) joins the list
+  // without a reload.
+  useEffect(() => {
+    if (!window.electronAPI?.onWorkflowsChanged) return undefined;
+    return window.electronAPI.onWorkflowsChanged(() => { fetchWorkflows(); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Refresh the list from the local store and open one workflow in the editor.
   // Returns whether that workflow was found. `isCancelled` lets callers abandon
   // the open if their effect was torn down while the read was in flight.

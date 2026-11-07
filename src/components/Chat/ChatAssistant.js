@@ -314,6 +314,38 @@ const collectPriorActions = (msgs) => {
 const nowTs = () => new Date().toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' });
 const newConvoId = () => `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const newMsgId = () => `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+// Conversations that happened in a chat app, labelled in the history list.
+const SOURCE_BADGE = {
+  telegram: { label: 'Telegram', color: '#229ed9', bg: 'rgba(34,158,217,0.1)' },
+  slack: { label: 'Slack', color: '#611f69', bg: 'rgba(97,31,105,0.08)' },
+};
+
+// A stored chatSessions row as the panel holds it. Used when the history
+// loads and when the main process reports a session it saved (Telegram).
+const restoreConvo = (r) => ({
+  id: r.id || r._id,
+  title: r.title || 'New chat',
+  messages: Array.isArray(r.messages)
+    ? r.messages.map((mm) => {
+        const withId = (mm && mm.id) ? mm : { ...mm, id: newMsgId() };
+        // A node run that was in flight when the app closed has no
+        // promise waiting on it any more — offer the button again
+        // rather than leaving a spinner that never resolves.
+        return withId.run?.state === 'running'
+          ? { ...withId, run: { ...withId.run, state: 'pending' } }
+          : withId;
+      })
+    : [],
+  agentMode: r.agentMode || 'main',
+  workflowSession: r.workflowSession || null,
+  pendingBuild: r.pendingBuild || null,
+  // Where a conversation came from when it was not this panel ({ platform:
+  // 'telegram', … }). Kept off the persisted doc's $set, so it survives.
+  source: r.source || null,
+  updatedAt: r.updatedAt || Date.now(),
+  createdAt: r.createdAt || Date.now(),
+});
+
 const blankConvo = () => {
   const now = Date.now();
   return {
@@ -2223,6 +2255,13 @@ const HistorySidebar = ({
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {c.title}
                   </span>
+                  {SOURCE_BADGE[c.source?.platform] && (
+                    <span title={`This conversation happened in ${SOURCE_BADGE[c.source.platform].label}`} style={{
+                      flexShrink: 0, fontSize: 9, fontWeight: 600, padding: '1px 5px', borderRadius: 3,
+                      color: SOURCE_BADGE[c.source.platform].color,
+                      background: SOURCE_BADGE[c.source.platform].bg, letterSpacing: 0,
+                    }}>{SOURCE_BADGE[c.source.platform].label}</span>
+                  )}
                 </div>
                 <div style={{
                   fontSize: 10, marginTop: 2,
@@ -2972,26 +3011,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         );
         if (cancelled) return;
         if (Array.isArray(rows) && rows.length > 0) {
-          const restored = rows.map((r) => ({
-            id: r.id || r._id,
-            title: r.title || 'New chat',
-            messages: Array.isArray(r.messages)
-              ? r.messages.map((mm) => {
-                  const withId = (mm && mm.id) ? mm : { ...mm, id: newMsgId() };
-                  // A node run that was in flight when the app closed has no
-                  // promise waiting on it any more — offer the button again
-                  // rather than leaving a spinner that never resolves.
-                  return withId.run?.state === 'running'
-                    ? { ...withId, run: { ...withId.run, state: 'pending' } }
-                    : withId;
-                })
-              : [],
-            agentMode: r.agentMode || 'main',
-            workflowSession: r.workflowSession || null,
-            pendingBuild: r.pendingBuild || null,
-            updatedAt: r.updatedAt || Date.now(),
-            createdAt: r.createdAt || Date.now(),
-          }));
+          const restored = rows.map(restoreConvo);
           setConversations(restored);
           setActiveId(restored[0].id);
         }
@@ -3014,9 +3034,46 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
   // Switching chats changes activeConvo's reference, which fires this for the
   // newly-focused chat (so even a brand-new chat from "+ New chat" is persisted
   // as soon as it is selected).
+  // A conversation the main process saved on its own — a Telegram chat, run
+  // by public/messaging/conversation.js. The history above is read once, at
+  // startup, so without this a Telegram conversation only appeared after a
+  // reload. Each save sends its id; re-read that one session and put it at the
+  // top of the list. A conversation THIS panel is mid-turn on is left alone —
+  // its own loop is writing it.
+  const busyIdsRef = useRef(busyConvoIds);
+  busyIdsRef.current = busyConvoIds;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  useEffect(() => {
+    if (!window.electronAPI?.onChatSessionsChanged || !window.electronAPI?.db?.find) return undefined;
+    return window.electronAPI.onChatSessionsChanged(async ({ id }) => {
+      if (!id || busyIdsRef.current.has(id)) return;
+      try {
+        const rows = await window.electronAPI.db.find('chatSessions', { id }, null, 1, 0);
+        const row = Array.isArray(rows) ? rows[0] : null;
+        if (!row) return;
+        const fresh = restoreConvo(row);
+        setConversations((prev) => {
+          if (busyIdsRef.current.has(id)) return prev;
+          const rest = prev.filter((c) => c.id !== id);
+          // Drop the empty placeholder chat a fresh panel starts with.
+          const kept = rest.filter((c) => c.messages.length > 0 || c.id === activeIdRef.current);
+          return [fresh, ...kept];
+        });
+      } catch (err) {
+        console.warn('[ChatAssistant] could not refresh a chat session:', err.message);
+      }
+    });
+  }, []);
+
   const convosToPersist = useMemo(() => {
     const ids = new Set([activeId, ...busyConvoIds]);
-    return conversations.filter((c) => ids.has(c.id));
+    // A Telegram or Slack conversation is written by the main process. Merely having it
+    // open must not write the panel's copy back — that copy can be a moment
+    // older than the main process's last save and would overwrite it. Only a
+    // turn THIS panel runs in it (busy) writes it from here.
+    return conversations.filter((c) => ids.has(c.id)
+      && (!c.source?.platform || busyConvoIds.has(c.id)));
   }, [conversations, activeId, busyConvoIds]);
 
   useEffect(() => {
@@ -4863,15 +4920,34 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
         }),
       }}>
       {/* {!expanded && <IconGrip color={C.dim} size={11} />} */}
-      {/* History sits on the left, where the expanded layout keeps its
-          conversation sidebar — the popup overlay opens from the same corner. */}
-
-      <div style={{
-        width: 28, height: 28, borderRadius: 5, background: C.aD,
-        border: '1px solid #bfdbfe', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-      }}>
-        {I('compass', C.accent, 14)}
-      </div>
+      {/* Back to the chat history, on the left where the expanded layout keeps
+          its conversation sidebar — the history overlay opens from the same
+          corner. Expanded already shows that sidebar, so it keeps the badge. */}
+      {expanded ? (
+        <div style={{
+          width: 28, height: 28, borderRadius: 5, background: C.aD,
+          border: '1px solid #bfdbfe', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+        }}>
+          {I('compass', C.accent, 14)}
+        </div>
+      ) : (
+        <button type="button" onClick={() => setHistoryOpen((v) => !v)}
+          title={historyOpen ? 'Back to chat' : 'Back to chat history'}
+          aria-label={historyOpen ? 'Back to chat' : 'Back to chat history'}
+          style={{
+            width: 28, height: 28, padding: 0, borderRadius: 5, flexShrink: 0,
+            background: historyOpen ? C.aD : '#fff',
+            border: `1px solid ${historyOpen ? '#bfdbfe' : C.border}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+            color: historyOpen ? C.accent : C.text,
+          }}>
+          {/* chevron-left */}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        </button>
+      )}
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 13, fontWeight: 600, color: C.text, letterSpacing: '-0.01em',
                       overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -4894,18 +4970,6 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
                 : 'Ternlux Assistant · ready')}
         </div>
       </div>
-      {!expanded && (
-        <button type="button" onClick={() => setHistoryOpen((v) => !v)}
-          title={historyOpen ? 'Back to chat' : 'Chat history'}
-          style={{
-            padding: 6, borderRadius: 4,
-            background: historyOpen ? C.aD : 'transparent',
-            border: 'none', cursor: 'pointer',
-            color: historyOpen ? C.accent : C.muted, display: 'flex', flexShrink: 0,
-          }}>
-          {I('clock', historyOpen ? C.accent : C.muted, 14)}
-        </button>
-      )}
       <button type="button" onClick={restartChat}
         title="Restart current chat"
         disabled={!messages.length}

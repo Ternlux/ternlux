@@ -191,6 +191,14 @@ const announceConnectionsChanged = () => {
   try { window.dispatchEvent(new Event(CONNECTIONS_CHANGED_EVENT)); } catch (_) { /* no window (tests) */ }
 };
 
+// The main process can add a connection on its own (a file sent to the
+// Telegram bot); pass that on to everything already listening for this event.
+try {
+  if (typeof window !== 'undefined' && window.electronAPI?.onConnectionsChanged) {
+    window.electronAPI.onConnectionsChanged(announceConnectionsChanged);
+  }
+} catch (_) { /* no window (tests) */ }
+
 export const connectionsDb = {
   /**
    * Insert a new connection.

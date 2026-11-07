@@ -5,12 +5,16 @@ import {
   UserOutlined,
   RobotOutlined,
   CloseOutlined,
-  SafetyOutlined
+  SafetyOutlined,
+  SendOutlined,
+  SlackOutlined
 } from '@ant-design/icons';
 import ProviderSettings from './ProviderSettings';
 import ApiKeySetup from '../ApiKeySetup/ApiKeySetup';
 import PrivacySettings from './PrivacySettings';
 import CommunityLink from '../ui_components/CommunityLink';
+import TelegramSettings from './TelegramSettings';
+import SlackSettings from './SlackSettings';
 import './Settings.css';
 
 const { Sider, Content } = Layout;
@@ -28,6 +32,16 @@ const Settings = ({ onClose, initialTab = 'account' }) => {
       key: 'provider',
       icon: <RobotOutlined />,
       label: 'AI Provider'
+    },
+    {
+      key: 'telegram',
+      icon: <SendOutlined />,
+      label: 'Telegram'
+    },
+    {
+      key: 'slack',
+      icon: <SlackOutlined />,
+      label: 'Slack'
     },
     {
       key: 'privacy',
@@ -48,6 +62,10 @@ const Settings = ({ onClose, initialTab = 'account' }) => {
         return <ProviderSettings />;
       case 'account':
         return <ApiKeySetup isSettingsMode={true} onComplete={handleApiKeyComplete} />;
+      case 'telegram':
+        return <TelegramSettings />;
+      case 'slack':
+        return <SlackSettings />;
       case 'privacy':
         return <PrivacySettings />;
       default:
