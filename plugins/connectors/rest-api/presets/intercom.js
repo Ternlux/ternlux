@@ -34,9 +34,9 @@ module.exports = {
     + 'with starting_after=<it> (for POST …/search, put it in the body as pagination: { per_page, starting_after }).',
 
   endpoints: [
-    { path: '/contacts', rows: '`data` array', label: 'Contacts (users and leads)', params: 'per_page, starting_after' },
+    { path: '/contacts', rows: '`data` array', label: 'Contacts (users and leads)', params: 'per_page, starting_after', notes: 'contact.companies is only a reference list — { data: [{ id, type, url }], total_count } with no names. For company names, page through /companies (not /companies/scroll) and join on id; a contact with total_count 0 has no company.' },
     { method: 'POST', path: '/contacts/search', rows: '`data` array', label: 'Contacts matching a filter', params: 'JSON body: { query: { field: "updated_at", operator: ">", value: <unix seconds> }, pagination: { per_page, starting_after } }' },
-    { path: '/companies', rows: '`data` array', label: 'Companies', params: 'per_page, page', notes: 'Page-numbered and capped at 10,000; use GET /companies/scroll (scroll_param) for more.' },
+    { path: '/companies', rows: '`data` array', label: 'Companies', params: 'per_page (max 60 — more is a 400), page', notes: 'Page-numbered: request page=1,2,… until pages.next is null. Use this for company lists and names. Only past 10,000 companies use GET /companies/scroll, and carefully: a workspace allows ONE open scroll (a second answers 400 scroll_exists), and the loop must stop on the first page whose data is empty — it always returns a scroll_param, and calling on after the end fails.' },
     { path: '/conversations', rows: '`conversations` array', label: 'Conversations', params: 'per_page, starting_after' },
     { method: 'POST', path: '/conversations/search', rows: '`conversations` array', label: 'Conversations matching a filter', params: 'JSON body: { query: { field: "updated_at", operator: ">", value: <unix seconds> }, pagination }' },
     { path: '/conversations/{id}', rows: 'single object', label: 'One conversation with its parts (messages)' },

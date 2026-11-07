@@ -129,6 +129,11 @@ function describePreset(preset, { credentialRef = (key) => `{${key}}` } = {}) {
     headerLines ? `Send these headers on every request:\n${headerLines}` : '',
     basicLine,
     `Pagination: ${preset.pagination}`,
+    // "response.data.data" in the pagination text once became
+    // response.data.data.data in generated code — read as the body, plus one.
+    'Paths: in the pagination text `response` is the axios response, so `response.data` IS the parsed JSON '
+      + 'body — `response.data.data` is the body\'s own `data` field, never `response.data.data.data`. Each '
+      + 'endpoint\'s "rows" names a field of that body.',
     `Endpoints:\n${endpointLines}`,
     noteLines ? `Notes:\n${noteLines}` : '',
   ].filter(Boolean).join('\n\n');
