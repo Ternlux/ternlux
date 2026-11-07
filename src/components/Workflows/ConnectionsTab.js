@@ -12,7 +12,7 @@ import { connectorVisual, ConnectorLogo } from './connections/connectorCatalog';
 
 import DatabaseExplorer from '../DatabaseExplorer/DatabaseExplorer';
 
-import { connectionsDb } from '../../utils/localDb';
+import { connectionsDb, CONNECTIONS_CHANGED_EVENT } from '../../utils/localDb';
 import { C, MONO, SANS, I, Btn, Tag, MoreMenu, PageHeader } from './_designShared';
 import {
   detectFileType, collectDroppableFiles, fileDragHandlers, FileDropOverlay,
@@ -447,6 +447,15 @@ const ConnectionsTab = ({
     //   message.error('Failed to load connections');
     // }
   };
+
+  // A connection added outside this tab — a file sent to the Telegram bot —
+  // shows up without a reload.
+  useEffect(() => {
+    const reload = () => { fetchConnections().catch(() => {}); };
+    window.addEventListener(CONNECTIONS_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(CONNECTIONS_CHANGED_EVENT, reload);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleConnectionTypeSelect = (type) => {
     cancelledRef.current = false;

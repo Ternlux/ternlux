@@ -206,6 +206,60 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('list-lancedb-tables', dbPath),
 
   /**
+   * Called when the main process added or changed a connection on its own —
+   * e.g. a file sent to the Telegram bot. Returns an unsubscribe function.
+   */
+  onConnectionsChanged: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = () => callback();
+    ipcRenderer.on('connections:changed', listener);
+    return () => ipcRenderer.removeListener('connections:changed', listener);
+  },
+
+  /**
+   * Called with { id } when the main process saved a chat session on its own
+   * (a Telegram conversation). Returns an unsubscribe function.
+   */
+  onChatSessionsChanged: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_e, payload) => callback(payload || {});
+    ipcRenderer.on('chat:sessions-changed', listener);
+    return () => ipcRenderer.removeListener('chat:sessions-changed', listener);
+  },
+
+  /**
+   * Called with { workflowId, workflowName } when a workflow was created or
+   * changed outside this window (a build run from Telegram).
+   */
+  onWorkflowsChanged: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_e, payload) => callback(payload || {});
+    ipcRenderer.on('workflows:changed', listener);
+    return () => ipcRenderer.removeListener('workflows:changed', listener);
+  },
+
+  /** Slack bridge settings (see public/slack/index.js). */
+  slack: {
+    status: () => ipcRenderer.invoke('slack:status'),
+    manifest: (name) => ipcRenderer.invoke('slack:manifest', { name }),
+    setTokens: (appToken, botToken) => ipcRenderer.invoke('slack:set-tokens', { appToken, botToken }),
+    clear: () => ipcRenderer.invoke('slack:clear'),
+    setEnabled: (enabled) => ipcRenderer.invoke('slack:set-enabled', { enabled }),
+    newPairingCode: () => ipcRenderer.invoke('slack:new-pairing-code'),
+    removeUser: (userId) => ipcRenderer.invoke('slack:remove-user', { userId }),
+  },
+
+  /** Telegram bridge settings (see public/telegram/index.js). */
+  telegram: {
+    status: () => ipcRenderer.invoke('telegram:status'),
+    setToken: (token) => ipcRenderer.invoke('telegram:set-token', { token }),
+    clearToken: () => ipcRenderer.invoke('telegram:clear-token'),
+    setEnabled: (enabled) => ipcRenderer.invoke('telegram:set-enabled', { enabled }),
+    newPairingCode: () => ipcRenderer.invoke('telegram:new-pairing-code'),
+    removeUser: (userId) => ipcRenderer.invoke('telegram:remove-user', { userId }),
+  },
+
+  /**
    * Direct database connections (runs in main process via native drivers).
    * No backend server required.
    */

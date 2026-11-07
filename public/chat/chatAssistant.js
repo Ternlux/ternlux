@@ -3453,6 +3453,9 @@ async function runStep({
   // chat title alongside the answer, and it comes back as `chatTitle` — one
   // call instead of the separate naming round-trip.
   isNewChat = false,
+  // Where the conversation is happening when it is not the in-app panel:
+  // { platform: 'telegram' | 'slack' } from a chat-app bridge.
+  channel = null,
   getDb,
   helpers,
 }) {
@@ -3616,6 +3619,7 @@ async function runStep({
       // that also names it — see the "Name this conversation" section in the
       // main prompt and `chatTitle` on the way back out.
       isNewChat,
+      channel,
     });
     runOneTool = (name, args, baseCtx) => runMainTool(name, args, baseCtx);
   }

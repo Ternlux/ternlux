@@ -29,7 +29,10 @@ const PUBLIC_ENTRIES = [
   'imports',
   'joins',
   'lib',
+  'messaging',
   'NodeExecution',
+  'slack',
+  'telegram',
   'transfomers',
   'triggers',
   'workflows'
@@ -98,5 +101,17 @@ for (const entry of PUBLIC_ENTRIES) {
 }
 
 walk(path.join(ROOT, 'plugins'), path.join(OUT, 'plugins'));
+
+// Chart.js for public/messaging/chartImage.js, which draws chart images for
+// the Telegram bridge in the main process. chart.js is a devDependency (the
+// renderer bundles it), so node_modules does not ship it — copy its
+// self-contained UMD build next to the module instead.
+{
+  const umd = path.join(path.dirname(require.resolve('chart.js')), 'chart.umd.min.js');
+  const dest = path.join(OUT, 'public', 'messaging', 'vendor', 'chart.umd.min.js');
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(umd, dest);
+  copied++;
+}
 
 console.log(`[minify-dist] ${minified} js files minified, ${copied} other files copied -> dist-min/`);

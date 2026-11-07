@@ -1,7 +1,10 @@
 # Chat assistant
 
-The chat assistant is the app-wide conversation panel. It talks about
-your whole workspace — your saved workflows, your connections, your
+The chat assistant is the app-wide conversation panel. (The same assistant
+can be reached from Telegram or Slack — see [Chat apps](../chat-apps/README.md);
+this page is about the panel inside the app.)
+
+It talks about your whole workspace — your saved workflows, your connections, your
 execution history — runs live queries and requests to answer questions
 with real data, builds and modifies workflows, and configures the two
 node types that have no form of their own.

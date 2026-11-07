@@ -80,6 +80,8 @@ const { registerAllWorkflowTriggers } = require('./triggers/registerAllTriggers'
 const { registerLocalFile, listFileTables } = require('./imports/registerFile');
 
 const chatAssistant = require('./chat/chatAssistant');
+const { createTelegramService } = require('./telegram');
+const { createSlackService } = require('./slack');
 const workflowBuilder = require('./chat/workflowBuilder');
 
 // Data Explorer IPC. Every `explorer:*` channel lives in public/database/,
@@ -2703,6 +2705,34 @@ ipcMain.handle('chat:discard-javascript', async (_event, { runToken } = {}) => {
     return { success: false, message: err.message };
   }
 });
+
+/**
+ * Telegram bridge — talk to the chat assistant from a Telegram DM, and send
+ * it files to add as connections. See public/telegram/index.js. Started in
+ * app.whenReady once the plugins are loaded; settings IPC is telegram:*.
+ */
+const telegram = createTelegramService({
+  app, safeStorage, BrowserWindow, getDb, buildSkillHelpers, chatAssistant, registerLocalFile,
+  // Let open windows refresh what the bridge changed (a new connection).
+  broadcast: (channel, payload) => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send(channel, payload);
+    }
+  },
+});
+telegram.registerIpc(ipcMain);
+
+// Slack bridge — the same chat assistant from a Slack DM with this computer's
+// own Slack app. See public/slack/index.js; settings IPC is slack:*.
+const slack = createSlackService({
+  app, safeStorage, BrowserWindow, getDb, buildSkillHelpers, chatAssistant, registerLocalFile,
+  broadcast: (channel, payload) => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send(channel, payload);
+    }
+  },
+});
+slack.registerIpc(ipcMain);
 
 /**
  * ai:continue — the one place a cut-off answer gets finished.
@@ -5465,6 +5495,11 @@ app.whenReady().then(async () => {
   // is not executing. Close them out as failed.
   await reconcileOrphanedExecutions();
 
+  // The Telegram bridge, when it is set up and switched on. Never let a bad
+  // token or a network problem stop the app from starting.
+  try { telegram.start(); } catch (err) { console.warn('[telegram] not started:', err.message); }
+  try { slack.start(); } catch (err) { console.warn('[slack] not started:', err.message); }
+
   // Register all workflow triggers (CRON jobs and file watchers)
   await registerAllWorkflowTriggers(getDb, executeWorkflowFromTrigger);
 
@@ -5488,6 +5523,8 @@ app.on('before-quit', async (event) => {
   // Stop all CRON jobs
   console.log('[Electron] Stopping all CRON jobs...');
   stopAllCronJobs();
+  telegram.stop();
+  slack.stop();
 
   // Stop all file watchers
   console.log('[Electron] Stopping all file watchers...');

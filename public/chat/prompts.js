@@ -312,6 +312,42 @@ ${detailBlock}`;
  * from a request whether it came from a data engineer or someone who has never
  * written a query. Kept short on purpose — it is a habit to apply, not a topic.
  */
+// Where the conversation is happening when it is not the in-app chat panel:
+// a direct message with the user's Ternlux bot in a chat app. Questions about
+// "the chat" are then about that app, and its own doc answers them.
+const CHAT_APPS = {
+  telegram: {
+    label: 'Telegram',
+    doc: 'chat-apps/telegram.md',
+    commands: '/new (new conversation), /cancel (stop what you are doing), /help',
+  },
+  slack: {
+    label: 'Slack',
+    doc: 'chat-apps/slack.md',
+    commands: '"new", "cancel" and "help", sent as the whole message with NO slash (Slack keeps a leading "/" for its own commands)',
+  },
+};
+
+function chatAppSection(channel) {
+  const app = channel && CHAT_APPS[channel.platform];
+  if (!app) return '';
+  return `# Where this conversation is happening: ${app.label}
+The user is writing to you from ${app.label} — a direct message with their Ternlux
+bot — NOT from the chat panel inside the Ternlux app.
+- Questions about this chat — starting a new chat, commands, approvals, buttons,
+  sending files, pairing, why a message was not answered — are about ${app.label}.
+  read_doc ${app.doc} (and chat-apps/README.md) and answer from that. Do NOT answer
+  from chat-assistant/README.md: it describes the in-app panel and its buttons
+  (new-chat button, history, Accept plan), none of which exist in ${app.label}.
+- ${app.label} commands: ${app.commands}.
+- Approvals and plans arrive as buttons in the message (Run it / Don't run,
+  Build it / Cancel). Never tell the user to click something in the app's panel.
+- Your reply is shown in ${app.label}: no Markdown tables (they arrive as raw
+  pipes) — use short lists, and put rows in a "table" visual, which arrives as
+  a CSV file. Charts arrive as images.
+`;
+}
+
 const AUDIENCE_SECTION = `# Who you are talking to
 
 Users range from data engineers to people who have never written a query, and
@@ -396,12 +432,13 @@ function renderSkillList(skills) {
 function buildMainSystemPrompt({
   docIndex = [], readme, contextSummary, snapshot, systemContext, maxActions,
   focusedNode = null, toolMode = false, isNewChat = false, contextUnsaved = false,
-  contextOutline = null,
+  contextOutline = null, channel = null,
 }) {
   return `You are the Ternlux Assistant — an in-app helper that answers questions about the
 user's data workflows, saved connections, and execution history, and can run queries
 against those connections to fetch live data.
 
+${chatAppSection(channel)}
 ${turnContract({ toolMode, maxActions, withVisuals: true })}
 
 ${VISUALS_SECTION}
@@ -2156,6 +2193,7 @@ const PROMPTS = {
       toolMode: !!p.toolMode,
       maxActions: p.maxActions ?? null,
       isNewChat: !!p.isNewChat,
+      channel: p.channel?.platform || null,
       hasContextSummary: !!p.contextSummary,
       contextUnsaved: !!p.contextUnsaved,
       contextOutlineChars: len(p.contextOutline),
@@ -2284,6 +2322,7 @@ function buildPrompt(kind, params = {}) {
 
 module.exports = {
   buildPrompt,
+  chatAppSection,
   PROMPT_KINDS: Object.keys(PROMPTS),
   // Prompt-facing limits — imported by chatAssistant.js rather than duplicated.
   MAX_QUERY_ROWS,

@@ -50,6 +50,7 @@ anywhere except to the service the connection actually targets.
 | [AI providers](ai-providers/README.md) | Which AI providers Ternlux supports and how it uses them |
 | [Nodes](nodes/README.md) | What each node type does and how it behaves at run time |
 | [Chat assistant](chat-assistant/README.md) | The app-wide AI assistant that answers questions, runs queries, and builds workflows |
+| [Chat apps](chat-apps/README.md) | Using the assistant from Telegram or Slack: setup, commands, approvals, files |
 | [Chat prompts](chat-prompts/README.md) | The templates that turn a description into a concrete operation |
 | [Triggers](triggers/README.md) | Scheduled and file-based automation |
 
