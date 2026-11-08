@@ -16,6 +16,15 @@ hit and how to paginate.
   parameters — into one key/value list, and let the generated function
   decide where each belongs.
 
+## Vendor presets
+
+For popular services you don't fill this form in yourself: pick the
+service's own tile (GitHub, HubSpot, Stripe, Notion…) and paste a key.
+The preset supplies the base URL, how the key is sent, pagination, a
+connection test and the endpoint list the Data Source sidebar shows. See
+[Vendor API connections](api-presets/README.md), which also has a
+step-by-step guide to getting each service's key.
+
 ## Connection form
 
 | Field | Required | Sensitive | Notes |

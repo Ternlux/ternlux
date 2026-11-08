@@ -7,18 +7,20 @@ import { C, MONO } from '../_designShared';
 // badge saved connections with their provider logo.
 
 export const LOGO_PREFIX = 'http://www.ternlux.com/wp-content/uploads/2026/04/';
+// Logos added with the API presets and the remaining file/storage connectors.
+export const LOGO_PREFIX_2026_11 = 'http://www.ternlux.com/wp-content/uploads/2026/11/';
 
-// `img` is set only for connectors covered by the ternlux.com logo list;
-// everything else falls back to monogram letters.
+// `img` points at a logo hosted on ternlux.com; `letters` is the monogram shown
+// when there's no logo or it can't load.
 export const CONNECTION_TYPES = [
   // Local files
   { key: 'spreadsheet', title: 'CSV / Excel',     description: 'Query CSV or Excel files in place, no import step',     category: 'file', img: LOGO_PREFIX + 'CSV.png',  fileBased: true, tone: '#1890ff' },
   { key: 'json',        title: 'JSON',            description: 'Query JSON files in place, no import step',             category: 'file', img: LOGO_PREFIX + 'JSON.png', fileBased: true, tone: '#fa8c16' },
-  { key: 'duckdb',      title: 'DuckDB',          description: 'Connect to an existing DuckDB database file',           category: 'file', letters: 'DD', tone: '#fff100', fileBased: true },
-  { key: 'sqlite',      title: 'SQLite',          description: 'Connect to an existing SQLite database file',           category: 'file', letters: 'SQ', tone: '#0f80cc', fileBased: true },
+  { key: 'duckdb',      title: 'DuckDB',          description: 'Connect to an existing DuckDB database file',           category: 'file', img: LOGO_PREFIX_2026_11 + 'DuckDB.png', letters: 'DD', tone: '#fff100', fileBased: true },
+  { key: 'sqlite',      title: 'SQLite',          description: 'Connect to an existing SQLite database file',           category: 'file', img: LOGO_PREFIX + 'SQLite.png', letters: 'SQ', tone: '#0f80cc', fileBased: true },
   { key: 'lancedb',     title: 'LanceDB',         description: 'Connect to local LanceDB vector database',             category: 'file', img: LOGO_PREFIX + 'LanceDB.png', tone: '#7c3aed', fileBased: true },
-  { key: 'parquet',     title: 'Parquet',         description: 'Query Parquet files in place, no import step',          category: 'file', letters: 'PQ', tone: '#9254de', fileBased: true },
-  { key: 'avro',        title: 'Avro',            description: 'Query Avro files in place, no import step',            category: 'file', letters: 'AV', tone: '#eb2f96', fileBased: true },
+  { key: 'parquet',     title: 'Parquet',         description: 'Query Parquet files in place, no import step',          category: 'file', img: LOGO_PREFIX_2026_11 + 'Parquet.png', letters: 'PQ', tone: '#9254de', fileBased: true },
+  { key: 'avro',        title: 'Avro',            description: 'Query Avro files in place, no import step',            category: 'file', img: LOGO_PREFIX_2026_11 + 'Avro.png', letters: 'AV', tone: '#eb2f96', fileBased: true },
 
   // Databases
   { key: 'postgres',  title: 'PostgreSQL',      description: 'Connect to a PostgreSQL database',                category: 'database', img: LOGO_PREFIX + 'PostgreSQL.png',           tone: '#336791' },
@@ -34,8 +36,8 @@ export const CONNECTION_TYPES = [
   { key: 'gcs',          title: 'Google Cloud Storage', description: 'Connect to Google Cloud Storage',     category: 'storage', img: LOGO_PREFIX + 'Google_Cloud_Storage.png', tone: '#4285f4' },
   { key: 'azure-blob',   title: 'Azure Blob Storage',   description: 'Connect to Azure Blob Storage',       category: 'storage', img: LOGO_PREFIX + 'Azure_blob.png',           tone: '#0078d4' },
   { key: 'dropbox',      title: 'Dropbox',              description: 'Connect to Dropbox cloud storage',    category: 'storage', img: 'http://www.ternlux.com/wp-content/uploads/2026/05/Dropbox-scaled.png', letters: 'DB', tone: '#0061ff' },
-  { key: 'google-drive', title: 'Google Drive',         description: 'Connect to Google Drive',             category: 'storage', letters: 'GD', tone: '#34a853' },
-  { key: 'onedrive',     title: 'OneDrive',             description: 'Connect to Microsoft OneDrive',       category: 'storage', letters: 'OD', tone: '#0078d4' },
+  { key: 'google-drive', title: 'Google Drive',         description: 'Connect to Google Drive',             category: 'storage', img: LOGO_PREFIX_2026_11 + 'Google_Drive.png', letters: 'GD', tone: '#34a853' },
+  { key: 'onedrive',     title: 'OneDrive',             description: 'Connect to Microsoft OneDrive',       category: 'storage', img: LOGO_PREFIX_2026_11 + 'OneDrive.png', letters: 'OD', tone: '#0078d4' },
   // Browsed spreadsheet-then-tab, and written like any other cloud target —
   // 'storage' is the section key the Cloud Storage group filters on.
   { key: 'google-sheets', title: 'Google Sheets',        description: 'Connect to Google Sheets via OAuth2.0', category: 'storage', img: LOGO_PREFIX + 'Google_Sheets.png', tone: '#34a853' },
@@ -44,24 +46,24 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api',      title: 'REST API',      description: 'Generic HTTP endpoint — URL + your own key/value credentials here, request authored on the node', category: 'api', letters: 'API', tone: '#2563eb' },
   // Vendor presets of the REST API connector (plugins/connectors/rest-api/presets).
   // Same plugin, a form that asks only for the vendor's token.
-  { key: 'rest-api:github',  title: 'GitHub',  description: 'Repos, issues, pull requests, commits and Actions runs — personal access token', category: 'api', letters: 'GH', tone: '#24292f' },
-  { key: 'rest-api:hubspot', title: 'HubSpot', description: 'Contacts, companies, deals, tickets and owners — service key',                    category: 'api', letters: 'HS', tone: '#ff7a59' },
-  { key: 'rest-api:stripe', title: 'Stripe', description: 'Customers, charges, invoices, subscriptions and payouts — secret or restricted key', category: 'api', letters: 'ST', tone: '#635bff' },
-  { key: 'rest-api:notion', title: 'Notion', description: 'Pages, databases (data sources), blocks and comments — integration secret', category: 'api', letters: 'NO', tone: '#191919' },
-  { key: 'rest-api:airtable', title: 'Airtable', description: 'Bases, tables and records — personal access token', category: 'api', letters: 'AT', tone: '#d18f00' },
-  { key: 'rest-api:jira', title: 'Jira', description: 'Issues by JQL, projects, comments, worklogs and sprints — email + API token', category: 'api', letters: 'JI', tone: '#0052cc' },
-  { key: 'rest-api:pipedrive', title: 'Pipedrive', description: 'Deals, persons, organizations, activities and leads — API token', category: 'api', letters: 'PD', tone: '#017737' },
-  { key: 'rest-api:sendgrid', title: 'SendGrid', description: 'Lists, single sends, stats and suppressions — API key', category: 'api', letters: 'SG', tone: '#1a82e2' },
-  { key: 'rest-api:klaviyo', title: 'Klaviyo', description: 'Profiles, events, lists, segments, campaigns and flows — private API key', category: 'api', letters: 'KL', tone: '#232426' },
-  { key: 'rest-api:intercom', title: 'Intercom', description: 'Contacts, companies, conversations and tickets — access token', category: 'api', letters: 'IC', tone: '#1f8ded' },
-  { key: 'rest-api:linear', title: 'Linear', description: 'Issues, projects, cycles and teams (GraphQL) — API key', category: 'api', letters: 'LN', tone: '#5e6ad2' },
-  { key: 'rest-api:mailchimp', title: 'Mailchimp', description: 'Audiences, members, campaigns and reports — API key', category: 'api', letters: 'MC', tone: '#b8960c' },
-  { key: 'rest-api:freshdesk', title: 'Freshdesk', description: 'Tickets, conversations, contacts and agents — API key', category: 'api', letters: 'FD', tone: '#25c16f' },
-  { key: 'rest-api:calendly', title: 'Calendly', description: 'Scheduled events, invitees and event types — personal access token', category: 'api', letters: 'CA', tone: '#006bff' },
-  { key: 'rest-api:typeform', title: 'Typeform', description: 'Forms, responses and workspaces — personal access token', category: 'api', letters: 'TF', tone: '#262627' },
+  { key: 'rest-api:github',  title: 'GitHub',  description: 'Repos, issues, pull requests, commits and Actions runs — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'GitHub.png', letters: 'GH', tone: '#24292f' },
+  { key: 'rest-api:hubspot', title: 'HubSpot', description: 'Contacts, companies, deals, tickets and owners — service key',                    category: 'api', img: LOGO_PREFIX + 'HubSpot.png', letters: 'HS', tone: '#ff7a59' },
+  { key: 'rest-api:stripe', title: 'Stripe', description: 'Customers, charges, invoices, subscriptions and payouts — secret or restricted key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Stripe.png', letters: 'ST', tone: '#635bff' },
+  { key: 'rest-api:notion', title: 'Notion', description: 'Pages, databases (data sources), blocks and comments — integration secret', category: 'api', img: LOGO_PREFIX_2026_11 + 'Notion.png', letters: 'NO', tone: '#191919' },
+  { key: 'rest-api:airtable', title: 'Airtable', description: 'Bases, tables and records — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Airtable.png', letters: 'AT', tone: '#d18f00' },
+  { key: 'rest-api:jira', title: 'Jira', description: 'Issues by JQL, projects, comments, worklogs and sprints — email + API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Jira.png', letters: 'JI', tone: '#0052cc' },
+  { key: 'rest-api:pipedrive', title: 'Pipedrive', description: 'Deals, persons, organizations, activities and leads — API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Pipedrive.png', letters: 'PD', tone: '#017737' },
+  { key: 'rest-api:sendgrid', title: 'SendGrid', description: 'Lists, single sends, stats and suppressions — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'SendGrid.png', letters: 'SG', tone: '#1a82e2' },
+  { key: 'rest-api:klaviyo', title: 'Klaviyo', description: 'Profiles, events, lists, segments, campaigns and flows — private API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Klaviyo.png', letters: 'KL', tone: '#232426' },
+  { key: 'rest-api:intercom', title: 'Intercom', description: 'Contacts, companies, conversations and tickets — access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Intercom.png', letters: 'IC', tone: '#1f8ded' },
+  { key: 'rest-api:linear', title: 'Linear', description: 'Issues, projects, cycles and teams (GraphQL) — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Linear.png', letters: 'LN', tone: '#5e6ad2' },
+  { key: 'rest-api:mailchimp', title: 'Mailchimp', description: 'Audiences, members, campaigns and reports — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Mailchimp.png', letters: 'MC', tone: '#b8960c' },
+  { key: 'rest-api:freshdesk', title: 'Freshdesk', description: 'Tickets, conversations, contacts and agents — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Freshdesk.png', letters: 'FD', tone: '#25c16f' },
+  { key: 'rest-api:calendly', title: 'Calendly', description: 'Scheduled events, invitees and event types — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Calendly.png', letters: 'CA', tone: '#006bff' },
+  { key: 'rest-api:typeform', title: 'Typeform', description: 'Forms, responses and workspaces — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Typeform.png', letters: 'TF', tone: '#262627' },
 
   // Vector
-  { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', letters: 'PC', tone: '#0f172a' },
+  { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },
 ];
 
 const BY_KEY = CONNECTION_TYPES.reduce((acc, c) => { acc[c.key] = c; return acc; }, {});
@@ -71,10 +73,10 @@ const BY_KEY = CONNECTION_TYPES.reduce((acc, c) => { acc[c.key] = c; return acc;
 // are only ever reached through a plugin. Those get their badge here.
 const EXTRA_VISUALS = {
   csv:        { key: 'csv',        title: 'CSV',        img: LOGO_PREFIX + 'CSV.png', tone: '#1890ff' },
-  excel:      { key: 'excel',      title: 'Excel',      letters: 'XL', tone: '#217346' },
-  shopify:    { key: 'shopify',    title: 'Shopify',    letters: 'SH', tone: '#95bf47' },
-  clover_pos: { key: 'clover_pos', title: 'Clover POS', letters: 'CL', tone: '#059669' },
-  square_pos: { key: 'square_pos', title: 'Square POS', letters: 'SQ', tone: '#7c3aed' },
+  excel:      { key: 'excel',      title: 'Excel',      img: LOGO_PREFIX_2026_11 + 'Excel.png', letters: 'XL', tone: '#217346' },
+  shopify:    { key: 'shopify',    title: 'Shopify',    img: LOGO_PREFIX_2026_11 + 'Shopify.png', letters: 'SH', tone: '#95bf47' },
+  clover_pos: { key: 'clover_pos', title: 'Clover POS', img: LOGO_PREFIX_2026_11 + 'Clover_POS.png', letters: 'CL', tone: '#059669' },
+  square_pos: { key: 'square_pos', title: 'Square POS', img: LOGO_PREFIX_2026_11 + 'Square.png', letters: 'SQ', tone: '#7c3aed' },
 };
 
 // Type names that mean the same connector under a different spelling.

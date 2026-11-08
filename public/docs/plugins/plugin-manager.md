@@ -13,8 +13,8 @@ saved workflows always know which plugin to use.
 
 A connector can be shipped but deliberately switched off. Such a plugin
 is skipped at load, so nothing downstream — the assistant's connector
-list, the IPC handlers, the transform prompts — ever sees it. (Redshift
-is currently in that state.)
+list, the IPC handlers, the transform prompts — ever sees it. No connector
+is switched off at the moment.
 
 ## Validation
 

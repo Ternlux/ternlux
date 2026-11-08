@@ -18,6 +18,11 @@
 
 const MAX_STEPS = 8;
 
+// What a batched call held back behind a code approval says (chatAssistant.js),
+// and what it says once that approval is settled — same wording as the window.
+const HELD_BACK = /^Not run: an earlier call in this step is waiting for the user to approve/;
+const HELD_BACK_SETTLED = 'Not run: it was held back while an earlier call in this step waited for the user to approve its code. That approval is now settled and its result is in this step. Call this again now if you still need it — there is nothing left for the user to approve.';
+
 const newId = (prefix) => `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const nowTs = () => new Date().toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' });
 
@@ -243,6 +248,10 @@ function createConversationRunner({
           };
           (slot?.actions || []).filter((a, _i, list) => isSlot(a, list)).slice(0, 1).forEach(patch);
           (stepMsg?.actions || []).filter((a, _i, list) => isSlot(a, list)).slice(0, 1).forEach(patch);
+          // A call held back behind this approval no longer waits on anything.
+          for (const a of [...(slot?.actions || []), ...(stepMsg?.actions || [])]) {
+            if (HELD_BACK.test(a.error || '')) a.error = HELD_BACK_SETTLED;
+          }
           await save(convo);
           continue;
         }

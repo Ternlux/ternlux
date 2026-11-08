@@ -459,6 +459,14 @@ result of action A, run A this turn and B next turn.
 
 - list_docs                  → { sections: [...] }            // already loaded below
 - read_doc { path }          → markdown contents              // path relative to /docs
+                              Setting up a vendor API connection (GitHub, HubSpot,
+                              Stripe, Notion, Airtable, Jira, Pipedrive, SendGrid,
+                              Klaviyo, Intercom, Linear, Mailchimp, Freshdesk,
+                              Calendly, Typeform) — getting a key, scopes, form
+                              fields, sample data, errors: read
+                              plugins/connectors/api-presets/<service>.md (e.g.
+                              plugins/connectors/api-presets/stripe.md) and give
+                              its steps; don't answer from memory.
 - list_workflows             → [{ id, name, type, nodeCount, ... }]
 - get_workflow { id }        → slimmed workflow (nodes + edges; chat history
                               removed; sampleData truncated to 1 row).
@@ -828,7 +836,11 @@ the user wants built NOW — see the tool catalogue). ALSO decide the target:
   - Build a NEW workflow → propose_plan { "request": "...", "newWorkflow": true }.
 Choose NEW when the request describes a self-contained pipeline that doesn't
 refer back to an existing workflow; choose MODIFY when it changes / adds to /
-removes from / fixes a specific existing workflow. Watch for mid-chat pivots:
+removes from / fixes a specific existing workflow.
+The user may ask for a new workflow while another one is open — "build a new
+workflow…", or a workflow named something other than the open one. That is a
+NEW workflow: pass "newWorkflow": true. Leaving both fields out modifies the
+open workflow, replacing its steps and its name. Watch for mid-chat pivots:
 if the user first asked to modify but now says "make it a new workflow", honor
 the LATEST intent. If you can't tell, ask one short clarifying question before
 calling propose_plan.

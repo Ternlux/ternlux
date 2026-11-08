@@ -354,6 +354,13 @@ const FilterBar = ({ filters, setFilters, categories, types }) => {
   );
 };
 
+// Put a just-saved connection at the top of the list. The save also fires
+// CONNECTIONS_CHANGED_EVENT, whose reload may already have added it.
+const withConnection = (list, saved) => [
+  saved,
+  ...list.filter(c => (c.id || c._id) !== (saved.id || saved._id)),
+];
+
 const ConnectionsTab = ({
   onContextChange = () => {},
   pendingFiles = null,              // { files, bump } — handed over by a drop on another tab
@@ -645,7 +652,7 @@ const ConnectionsTab = ({
           } else {
             const saved = await connectionsDb.save(safeConnectionData);
             await window.electronAPI.dbCredentials.save(saved.id, sensitiveFields);
-            setConnections(prev => [saved, ...prev]);
+            setConnections(prev => withConnection(prev, saved));
             message.success('Connection saved securely.');
           }
         } else {
@@ -656,7 +663,7 @@ const ConnectionsTab = ({
             message.success('Connection updated.');
           } else {
             const saved = await connectionsDb.save(connectionData);
-            setConnections(prev => [saved, ...prev]);
+            setConnections(prev => withConnection(prev, saved));
             message.success('Connection saved.');
           }
         }

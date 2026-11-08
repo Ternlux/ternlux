@@ -262,3 +262,31 @@ test('Test Connection: GraphQL POST, and errors returned with HTTP 200', async (
     await srv.close();
   }
 });
+
+test('every preset has a setup guide, linked from the presets page, with working links', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = path.join(__dirname, '../../public/docs/plugins/connectors/api-presets');
+  const index = fs.readFileSync(path.join(dir, 'README.md'), 'utf8');
+  assert.ok(presets.PRESETS.length >= 15, `expected the 15 presets, got ${presets.PRESETS.length}`);
+  for (const preset of presets.PRESETS) {
+    const { id } = preset;
+    const file = path.join(dir, `${id}.md`);
+    assert.ok(fs.existsSync(file), `missing guide ${id}.md`);
+    assert.match(index, new RegExp(`\\(${id}\\.md\\)`), `${id}.md not linked from README.md`);
+    const doc = fs.readFileSync(file, 'utf8');
+    for (const heading of ['## Add the connection', '## Sample data', '## Troubleshooting']) {
+      assert.ok(doc.includes(heading), `${id}.md has no "${heading}"`);
+    }
+    // Every credential the form asks for is named in the guide's form table.
+    for (const c of preset.credentials || []) {
+      assert.ok(doc.includes(`| ${c.label || c.key} |`), `${id}.md doesn't name the "${c.label || c.key}" field`);
+    }
+  }
+  for (const f of fs.readdirSync(dir)) {
+    const doc = fs.readFileSync(path.join(dir, f), 'utf8');
+    for (const [, link] of doc.matchAll(/\]\(([^)#]+\.md)\)/g)) {
+      assert.ok(fs.existsSync(path.join(dir, link)), `${f} links to missing ${link}`);
+    }
+  }
+});
