@@ -855,6 +855,11 @@ const AgentChip = ({ label, onClear, disabled }) => (
 // `live` is what makes the buttons real — it's true only while the agent loop
 // is actually parked on THIS approval. A bubble that was superseded still
 // renders its record, but can never offer a button that does nothing.
+// What a batched call held back behind a code approval says (public/chat/
+// chatAssistant.js), and what it says once that approval is settled.
+const HELD_BACK = /^Not run: an earlier call in this step is waiting for the user to approve/;
+const HELD_BACK_SETTLED = 'Not run: it was held back while an earlier call in this step waited for the user to approve its code. That approval is now settled and its result is in this step. Call this again now if you still need it — there is nothing left for the user to approve.';
+
 const ApprovalPanel = ({ approval, live, onApprove, onDecline, approveLabel = 'Run this code', note = 'Runs locally and read-only. Sending a new message cancels it.' }) => {
   // Collapsed by default. The explanation is what the approval decision turns
   // on; the source is there for whoever wants to read it before allowing the
@@ -4735,6 +4740,12 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           const outcome = execResp?.success
             ? { ok: true, result: execResp.result }
             : { ok: false, error: failure(execResp?.message || 'The approved code failed to run.') };
+          // A call batched after this one was held back with "waiting for the
+          // user to approve". That is no longer true; left as is, the model read
+          // it as still pending and asked the user to approve again instead of
+          // making the call.
+          const settleHeldBack = (a) => (HELD_BACK.test(a?.error || '') ? { ...a, error: HELD_BACK_SETTLED } : a);
+          for (const a of slot?.actions || []) if (HELD_BACK.test(a.error || '')) a.error = HELD_BACK_SETTLED;
           if (action) {
             if (outcome.ok) {
               delete action.error;
@@ -4755,7 +4766,7 @@ const ChatAssistant = ({ activeContext: incomingContext = null, onWorkflowBuilt 
           if (stepMsgId && action) {
             patchMessage(stepMsgId, {
               actions: (resp.actions || []).map((a, i, list) => {
-                if (!isSlot(a, i, list)) return a;
+                if (!isSlot(a, i, list)) return settleHeldBack(a);
                 const { result, error, ...rest } = a;
                 return outcome.ok
                   ? { ...rest, ok: true, result: outcome.result }

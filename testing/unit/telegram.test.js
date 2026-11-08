@@ -212,6 +212,31 @@ test('runner: approved code runs and its result reaches the next step', async ()
   assert.strictEqual(db.docs[0].messages.find((m) => m.kind === 'step').approval.state, 'approved');
 });
 
+test('runner: a call held back behind an approval is marked settled once it is approved', async () => {
+  const db = memoryDb();
+  const held = 'Not run: an earlier call in this step is waiting for the user to approve its code. Nothing batched after it runs until you have seen that result — call this again then, using what it returned.';
+  const actions = () => [
+    { id: 'a1', tool: 'run_javascript', args: {}, ok: true, result: { ran: false } },
+    { id: 'a2', tool: 'run_javascript', args: {}, ok: false, error: held },
+  ];
+  const steps = [
+    { success: true, done: false, actions: actions(), step: { index: 1, thought: '', actions: actions() },
+      pendingApproval: { runToken: 'rt1', actionId: 'a1', transformFunction: 'f', explanation: 'x' } },
+    { success: true, done: true, finalAnswer: 'done' },
+  ];
+  const calls = [];
+  const chatAssistant = {
+    runStep: async (args) => { calls.push(structuredClone(args.scratchpad)); return steps.shift(); },
+    runApprovedJavascript: async () => ({ rows: [] }),
+    discardPendingJavascript: () => {},
+  };
+  const runner = createConversationRunner({ chatAssistant, getDb: () => db, buildSkillHelpers: async () => ({}) });
+  await runner.runTurn({ convoId: 'c9', text: 'go', requestApproval: async () => true });
+  const second = calls[1][0].actions.find((a) => a.id === 'a2');
+  assert.match(second.error, /approval is now settled/);
+  assert.doesNotMatch(second.error, /is waiting for the user/);
+});
+
 test('runner: declined code is discarded and the turn ends', async () => {
   const db = memoryDb();
   let discarded = null;
