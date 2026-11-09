@@ -62,4 +62,27 @@ module.exports = {
     'Dates inside `properties` are ISO-8601 strings; search filters on dates take millisecond epoch values.',
     'On 429, wait for the `Retry-After` header before retrying. 403 usually means the key is missing a scope.',
   ],
+
+  // What an Output (or a Join with this destination) may write. Facts from
+  // HubSpot's CRM v3 docs; batch endpoints take at most 100 inputs.
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/crm/v3/objects/contacts/batch/upsert', label: 'Contacts — create or update by email', batch: 100, upsert: 'email',
+        body: '{ inputs: [{ id: "<email>", idProperty: "email", properties: { email, firstname, lastname, company, … } }] }' },
+      { method: 'POST', path: '/crm/v3/objects/{companies|deals|tickets|products}/batch/upsert', label: 'Companies, deals, tickets, products — create or update by a unique property', batch: 100, upsert: 'a property with "unique values" turned on',
+        body: '{ inputs: [{ id: "<value>", idProperty: "<unique property>", properties: { … } }] }',
+        notes: 'Only works when the object has a custom property marked unique; name/domain are not unique. Without one, use batch/create.' },
+      { method: 'POST', path: '/crm/v3/objects/{contacts|companies|deals|tickets|products}/batch/create', label: 'Create records', batch: 100, upsert: null,
+        body: '{ inputs: [{ properties: { … }, associations?: [{ to: { id }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId }] }] }] }',
+        notes: 'Every run creates new records — reruns duplicate. Deal → company association type id is 5, contact → company 279.' },
+      { method: 'POST', path: '/crm/v3/objects/{object}/batch/update', label: 'Update records by HubSpot id', batch: 100, upsert: 'hs_object_id',
+        body: '{ inputs: [{ id: "<record id>", properties: { … } }] }' },
+    ],
+    notes: [
+      'Properties are sent by INTERNAL name (firstname, dealname, dealstage, amount, closedate) and must already exist on the object; a custom one is created in HubSpot settings first.',
+      'Values are strings or numbers. Dates: ISO-8601 or epoch milliseconds. dealstage takes a stage id (closedwon, appointmentscheduled…), pipeline "default" unless told otherwise.',
+      'A batch with some bad rows answers HTTP 207 with `errors` listing them; count those as failed.',
+      'Writing needs the matching .write scope on the key (crm.objects.contacts.write, …); a missing scope is a 403.',
+    ],
+  },
 };

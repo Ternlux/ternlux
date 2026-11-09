@@ -1278,13 +1278,18 @@ const WORKFLOW_TOOLS = new Set([
   'exit_workflow_mode',
 ]);
 
+// A connection a join may name as its destination: a store it writes into, or a
+// REST API it sends the joined rows to (workflowBuilder.buildJoinConfig).
+const canJoinInto = (c) => workflowBuilder.isJoinDestinationConnection(c) || workflowBuilder.isApiConnection(c);
+
 // The build tool exposed to the main agent for the node currently in focus.
 // Only the focused node type's builder is offered:
 //   transformer                 → build_transformer
 //   join                        → build_join
 //   dataSource that is REST API → build_dataSource
-// File/Database data sources, Start, and Output are form-configured (no chat
-// build tool). Returns the tool name to offer, or null.
+//   output writing to a REST API → build_output (the code that sends the rows)
+// File/Database data sources, Start, and every other Output are
+// form-configured (no chat build tool). Returns the tool name to offer, or null.
 function focusedBuildTool(targetNode) {
   if (!targetNode) return null;
   if (targetNode.type === 'transformer') return 'build_transformer';
@@ -1295,9 +1300,12 @@ function focusedBuildTool(targetNode) {
       || targetNode.connectionType === 'api';
     return isApi ? 'build_dataSource' : null;
   }
+  if (targetNode.type === 'output') {
+    return targetNode.isApi === true || targetNode.config?.outputSettings?.outputType === 'api' ? 'build_output' : null;
+  }
   return null;
 }
-const BUILD_TOOL_NAMES = new Set(['build_transformer', 'build_join', 'build_dataSource']);
+const BUILD_TOOL_NAMES = new Set(['build_transformer', 'build_join', 'build_dataSource', 'build_output']);
 // A Join has to know where it writes before anything can be built for it — the
 // destination decides the SQL dialect, whether the result is staged in temp
 // tables, and where the output file lands. Until it is set, build_join refuses
@@ -1338,15 +1346,16 @@ async function setJoinDestinationTool(ctx, args) {
   // DuckDB otherwise. Never collapse a requested vector table into DuckDB.
   const localToken = /lance|vector/i.test(ref) ? LOCAL_VECTOR_JOIN_DESTINATION : LOCAL_JOIN_DESTINATION;
   // Only stores a join can write to are offered or accepted — see
-  // isJoinDestinationConnection in workflowBuilder.js.
-  const names = connections.filter(workflowBuilder.isJoinDestinationConnection)
+  // isJoinDestinationConnection in workflowBuilder.js — plus REST API
+  // connections, which the joined rows are sent to.
+  const names = connections.filter(canJoinInto)
     .map((c) => `${c.id || c._id} (${c.name})`).join(', ') || '(none saved)';
   const localHint = `Or use "${LOCAL_JOIN_DESTINATION}" for a table in this workflow's local DuckDB database, or "${LOCAL_VECTOR_JOIN_DESTINATION}" for a local LanceDB vector table.`;
   if (!isLocal && !conn) {
     throw new Error(`No saved connection matches "${ref}". Destinations: ${names}. ${localHint}`);
   }
-  if (conn && !workflowBuilder.isJoinDestinationConnection(conn)) {
-    throw new Error(`"${conn.name}" is a ${conn.dbType} connection, which cannot hold a join result — a join writes to a database or a vector store. Destinations: ${names}. ${localHint}`);
+  if (conn && !canJoinInto(conn)) {
+    throw new Error(`"${conn.name}" is a ${conn.dbType} connection, which cannot hold a join result — a join writes to a database, a vector store or a REST API. Destinations: ${names}. ${localHint}`);
   }
 
   const isLocalVector = isLocal && localToken === LOCAL_VECTOR_JOIN_DESTINATION;
@@ -1826,7 +1835,7 @@ async function buildNodeTool(ctx, args) {
       nodeId: tn.nodeId,
       // Carries the router's note: `tn.config` was updated in place above.
       existingConfig: tn.config || null,
-      // Data Source (REST API) needs its API connection id; transformer/join don't.
+      // A REST API Data Source or Output needs its API connection id; transformer/join don't.
       connectionId: tn.connectionId || null,
       // Scopes any file this build writes (the REST API fetch materialises rows
       // into local DuckDB) under this workflow.
@@ -2154,9 +2163,15 @@ async function runWorkflowTool(name, args, ctx) {
     //
     // So it is checked here, against what actually ran. Refusing returns a tool
     // error, which the model must relay rather than plan around.
+    // A REST API the workflow only SENDS rows to has no response shape to
+    // learn — nothing downstream is built from it — so it is not probed.
+    const writeOnly = new Set((Array.isArray(args.writesToApis) ? args.writesToApis : [])
+      .map((n) => String(n || '').trim().toLowerCase()).filter(Boolean));
     const apiGate = apiProbeGate({
       request: `${description}\n${original}`,
-      connections: ctx.helpers?.connections || [],
+      connections: (ctx.helpers?.connections || []).filter((c) => !(
+        writeOnly.has(String(c.name || '').trim().toLowerCase())
+        || writeOnly.has(String(c.id || c._id || '').trim().toLowerCase()))),
       scratchpad: ctx.scratchpad,
       history: ctx.rawHistory,
     });
@@ -3627,7 +3642,7 @@ async function runStep({
       // offers nothing set_join_destination would refuse.
       focusedNode: focusedNodeParams(
         targetNode, buildToolName,
-        (helpers.connections || []).filter(workflowBuilder.isJoinDestinationConnection),
+        (helpers.connections || []).filter(canJoinInto),
       ),
       // A brand-new conversation has no history yet, so this turn is the one
       // that also names it — see the "Name this conversation" section in the

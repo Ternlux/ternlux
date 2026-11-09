@@ -104,7 +104,7 @@ function valueAt(obj, path) {
  * value: a `{{PLACEHOLDER}}` token for a DataSource node, a
  * ctx.apiCredentials lookup for a chat run.
  */
-function describePreset(preset, { credentialRef = (key) => `{${key}}` } = {}) {
+function describePreset(preset, { credentialRef = (key) => `{${key}}`, mode = 'read' } = {}) {
   const refs = Object.fromEntries((preset.credentials || []).map((c) => [c.key, credentialRef(c.key)]));
   const headerLines = Object.entries(preset.headers || {})
     .map(([name, template]) => `- ${name}: ${fillTemplate(template, refs)}`)
@@ -123,6 +123,26 @@ function describePreset(preset, { credentialRef = (key) => `{${key}}` } = {}) {
     return parts.join('\n');
   }).join('\n');
   const noteLines = (preset.notes || []).map((n) => `- ${n}`).join('\n');
+
+  if (mode === 'write') {
+    const writes = preset.writes || { endpoints: [], notes: [] };
+    const writeLines = writes.endpoints.map((e) => {
+      const parts = [`- ${e.method} ${e.path}${e.operation ? ` (${e.operation})` : ''} — ${e.label}; `
+        + `up to ${e.batch} record${e.batch === 1 ? '' : 's'} per request; `
+        + (e.upsert ? `matches existing records on ${e.upsert}` : 'creates new records (a re-run duplicates them)')];
+      if (e.body) parts.push(`  body: ${e.body}`);
+      if (e.notes) parts.push(`  note: ${e.notes}`);
+      return parts.join('\n');
+    }).join('\n');
+    const writeNotes = (writes.notes || []).map((n) => `- ${n}`).join('\n');
+    return [
+      `${preset.title} API reference for WRITING (preset "${preset.id}"). ${baseLine}. Docs: ${preset.docsUrl}`,
+      headerLines ? `Send these headers on every request:\n${headerLines}` : '',
+      basicLine,
+      writeLines ? `Write endpoints:\n${writeLines}` : `${preset.title} has no write endpoints in this reference.`,
+      writeNotes ? `Notes:\n${writeNotes}` : '',
+    ].filter(Boolean).join('\n\n');
+  }
 
   return [
     `${preset.title} API reference (preset "${preset.id}"). ${baseLine}. Docs: ${preset.docsUrl}`,

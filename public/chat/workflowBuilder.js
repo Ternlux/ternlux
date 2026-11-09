@@ -82,6 +82,7 @@ const ChatPrompts = {
   join:       sanitizePromptModule(require('../ChatPrompts/Join').join),
   transfomer: sanitizePromptModule(require('../ChatPrompts/Transfomer').transfomer),
   restApi:    sanitizePromptModule(require('../ChatPrompts/RestApi')),
+  restApiWrite: sanitizePromptModule(require('../ChatPrompts/RestApiWrite')),
 };
 
 // REST API data sources are materialised locally by running the AI-authored
@@ -3748,6 +3749,8 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   const destinationCandidates = [
     ...(helpers.connections || []).filter(isJoinDestinationConnection)
       .map((c) => `- ${c.id || c._id}: ${c.name} (${c.dbType}, ${c.connectionType || 'file'})${mergeNote(c.dbType)}`),
+    ...(helpers.connections || []).filter(isApiConnection)
+      .map((c) => `- ${c.id || c._id}: ${c.name} (REST API) — the joined rows are SENT to this API after the join; merge: yes (= update matching records), append = create new records`),
     `- local-duckdb: a table in this workflow's own DuckDB database${mergeNote('duckdb')}`,
     '- local-lancedb: a local LanceDB vector table — merge: no (new_table replaces it; append upserts by id)',
     // Saved connections a join CANNOT write to, named so the analyser can say
@@ -3755,7 +3758,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     // was mapped to the nearest thing that was listed — local-duckdb, which is
     // a different database — and the destination moved without a word (BUG-11).
     ...(() => {
-      const refused = (helpers.connections || []).filter((c) => !isJoinDestinationConnection(c));
+      const refused = (helpers.connections || []).filter((c) => !isJoinDestinationConnection(c) && !isApiConnection(c));
       if (!refused.length) return [];
       return [
         '',
@@ -3778,6 +3781,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // an earlier build did. Whether it is a vector store decides which join
   // scenarios the analyser may choose, so it has to be told.
   const knownDestination = connectionId
+    || existingConfig?.apiDestination?.connectionId
     || existingConfig?.joinSettings?.destinationSelection
     || existingConfig?.targetConnectionId
     || null;
@@ -3796,6 +3800,9 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     if (knownDestination === 'local-duckdb') return 'local-duckdb (a table in this workflow\'s DuckDB database)';
     if (knownDestination === 'local-lancedb') return 'local-lancedb (a local LanceDB vector table)';
     const destConn = (helpers.connections || []).find((c) => (c.id || c._id) === knownDestination);
+    if (isApiConnection(destConn)) {
+      return `local-duckdb (a table in this workflow's DuckDB database) — its rows are then sent to the REST API "${destConn.name}"`;
+    }
     return destConn ? `${destConn.name} (${destConn.dbType}, ${destConn.dbCategory || destConn.connectionType || 'database'})` : null;
   })();
   const availableJoinSkills = (() => {
@@ -3933,7 +3940,9 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // question the user has already answered. An analyser that DOES name a
   // destination still wins — that is the user asking to move the output.
   if (!inferred.destinationSelection) {
-    inferred.destinationSelection = prevJoin.destinationSelection
+    // An API destination first: the join itself records local-duckdb.
+    inferred.destinationSelection = existingConfig?.apiDestination?.connectionId
+      || prevJoin.destinationSelection
       || existingConfig?.targetConnectionId
       || null;
   }
@@ -3954,6 +3963,19 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
   // local placeholder). resolveTargetConnection returns a fallback SOURCE
   // connection for local tokens, which would wrongly mark every source as
   // "already in the destination", so skip it for local.
+  // A REST API destination: the join itself is built against this workflow's
+  // DuckDB — a table replaced on every run — and the rows in it are then SENT
+  // to the API by the shared writer (buildApiWriteSpec below; the executor
+  // sends them after the join runs). The join's write mode becomes the API's:
+  // merge = update matching records (on mergeKeys), anything else = create.
+  // A rebuild of a join that sends to an API: the analyser sees the local
+  // table the join writes and may name "local-duckdb" — that is the same
+  // destination, not a request to stop sending.
+  if (existingConfig?.apiDestination?.connectionId && inferred.destinationSelection === 'local-duckdb') {
+    inferred.destinationSelection = existingConfig.apiDestination.connectionId;
+  }
+  const apiDestConn = apiConnectionFor(inferred.destinationSelection, helpers.connections);
+  if (apiDestConn) inferred.destinationSelection = 'local-duckdb';
   const isLocalStorage = String(inferred.destinationSelection || '').startsWith('local-');
   const targetConn = isLocalStorage
     ? null
@@ -4013,6 +4035,17 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     targetTableName,
     selectedColumns: inferred.selectedColumns || {},
   };
+  if (apiDestConn) {
+    joinSettings.apiWriteMode = joinSettings.operationMode === 'merge' ? 'upsert' : 'create';
+    joinSettings.apiUpsertKeys = joinSettings.mergeKeys || null;
+    // The local table is a hand-off, rebuilt each run; the API decides what
+    // is kept between runs.
+    joinSettings.operationMode = 'new_table';
+    delete joinSettings.mergeKeys;
+    // destinationSelection stays local-duckdb: it is what the join itself
+    // writes (assembleJoinConfig reads it). The API is recorded beside it.
+    joinSettings.apiDestinationId = apiDestConn.id || apiDestConn._id;
+  }
 
   // Merge is only buildable where the destination declares it, for a SQL join
   // (a function join's rows are batch-inserted; a document store has no
@@ -4478,7 +4511,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     })
     : null;
 
-  return assembleJoinConfig({
+  const joined = await assembleJoinConfig({
     sources, stepPrompt, joinSettings, gen, warnings, chat,
     targetConn, isNoSQL, isLocalStorage, targetTableName, helpers,
     workflowId, nodeId,
@@ -4488,6 +4521,27 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
     requiresFunctionFlag: !!inferred.requiresFunction,
     requiresFunction,
   });
+  if (!apiDestConn) {
+    delete joined.apiDestination;
+    return joined;
+  }
+  joined.apiDestination = await buildApiWriteSpec({
+    conn: apiDestConn,
+    stepPrompt,
+    sourceColumns: joined.targetTableSchema?.columns || [],
+    writeMode: joinSettings.apiWriteMode,
+    upsertKeys: joinSettings.apiUpsertKeys,
+    existingSpec: existingConfig?.apiDestination || null,
+    chat, nodeId, helpers, resumedCalls, apiFetchApproval,
+    stage: 'join:apiWrite',
+    clarificationKind: 'join.api_write',
+    alsoReplay: {
+      ...(analysis ? { 'join:analysis': JSON.parse(JSON.stringify(analysis)) } : {}),
+      ...(genAsGenerated ? { 'join:gen': genAsGenerated } : {}),
+    },
+  });
+  pushBotMsg(chat, `The joined rows are then sent to ${apiDestConn.name}: ${joined.apiDestination.apiWriteExplanation || 'see the code on the node.'}`);
+  return joined;
 }
 
 /**
@@ -5135,10 +5189,149 @@ function resolveTargetConnection(ref, connections, fallbackSource) {
 }
 
 // ---------------------------------------------------------------------------
+// API destinations — rows SENT to a REST API connection. Shared by an Output
+// node writing to one and a Join whose destination is one (the join lands in
+// the workflow's DuckDB, then this code sends that table on). The executor is
+// NodeExecution/ApiWrite.js.
+// ---------------------------------------------------------------------------
+
+const isApiConnection = (c) => !!c && (c.dbType === 'rest-api' || c.dbCategory === 'API');
+
+function apiConnectionFor(ref, connections) {
+  if (!ref || String(ref).startsWith('local-')) return null;
+  const conn = (connections || []).find((c) => (c.id || c._id) === ref)
+    || (connections || []).find((c) => c.name === ref);
+  return isApiConnection(conn) ? conn : null;
+}
+
+/**
+ * Generate (and, in a plan build, have approved) the sendBatch function that
+ * writes rows to `conn`. Returns the spec stored on the node:
+ *   { connectionId, connectionName, apiWriteCode, apiWriteExplanation,
+ *     apiEndpoint, apiBatchSize, apiWriteMode, apiFieldMapping, … }
+ *
+ * Approval: a plan build pauses (ApprovalNeeded, kind 'api_write') until the
+ * user approves this exact code — nothing is sent then, but it is code that
+ * will send their data with their credentials on every run. A node built from
+ * its own chat is approved by "Run this node", the first time it writes.
+ */
+async function buildApiWriteSpec({
+  conn, stepPrompt, sourceColumns = [], sampleRows = [], writeMode = null, upsertKeys = null,
+  existingSpec = null, selectedEndpoint = null, chat, nodeId, helpers, resumedCalls = null,
+  apiFetchApproval = null, stage, clarificationKind,
+  // Other calls of this step to replay on resume with the approved code — a
+  // join's analysis and generation, so it is rebuilt exactly as approved.
+  alsoReplay = null,
+}) {
+  const prompt = ChatPrompts.restApiWrite.restApiWriteRequest({
+    userRequest: stepPrompt,
+    connectionName: conn.name,
+    connectionAuthType: conn.dbConfig?.authType || 'none',
+    connectionBaseUrl: conn.dbConfig?.baseUrl || '',
+    connectionApiKeyName: conn.dbConfig?.apiKeyName || '',
+    connectionBasicUser: conn.dbConfig?.basicUser || '',
+    // Key names only — the values stay encrypted and never reach the model.
+    connectionParamKeys: conn.dbConfig?.apiParamKeys || [],
+    presetReference: presetReferenceForPlaceholders(conn, { mode: 'write' }),
+    sourceColumns,
+    sampleRows,
+    writeMode,
+    upsertKeys,
+    selectedEndpoint,
+    currentCode: existingSpec?.apiWriteCode || null,
+  });
+  const out = await callJsonResumable(helpers, prompt, { chatHistory: chatToHistory(chat) }, { stage, resumed: resumedCalls });
+  if (out.action !== 'create_plan' || !out.code) {
+    const q = clarificationQuestionFrom(out);
+    const answer = q ? findClarificationAnswer(chat, q) : null;
+    if (q && !answer) throw new ClarificationNeeded(q, { nodeId, kind: clarificationKind });
+    throw new Error(
+      `Writing to "${conn.name}" could not be built: the AI returned no send function`
+      + `${q ? ` (it said: ${q})` : ''}. Say which records to create or update and from which columns, then try again.`,
+    );
+  }
+
+  if (apiFetchApproval?.route === 'plan') {
+    const approvedHere = typeof apiFetchApproval.approvedCode === 'string' && apiFetchApproval.approvedCode === out.code;
+    if (!approvedHere) {
+      throw new ApprovalNeeded(
+        `Approve the code that will send these rows to "${conn.name}". Nothing is sent now — it runs when the workflow runs.`,
+        {
+          nodeId,
+          kind: clarificationKind.replace(/\.[^.]+$/, '.api_write_approval'),
+          approval: {
+            kind: 'api_write',
+            connectionName: conn.name,
+            code: out.code,
+            explanation: out.explanation || '',
+            endpoint: typeof out.endpoint === 'string' ? out.endpoint.trim().slice(0, 300) : '',
+            // Replayed on resume, so the function saved is the one approved.
+            resumedCalls: { ...(alsoReplay || {}), [stage]: out },
+          },
+        },
+      );
+    }
+  }
+
+  const batch = Math.floor(Number(out.batchSize));
+  return {
+    connectionId: conn.id || conn._id,
+    connectionName: conn.name,
+    apiWriteCode: out.code,
+    apiWriteExplanation: out.explanation || '',
+    apiEndpoint: typeof out.endpoint === 'string' ? out.endpoint.trim().slice(0, 300) : '',
+    apiBatchSize: Number.isFinite(batch) && batch > 0 ? batch : 100,
+    apiWriteMode: out.writeMode === 'upsert' ? 'upsert' : 'create',
+    apiFieldMapping: out.fieldMapping && typeof out.fieldMapping === 'object' ? out.fieldMapping : null,
+    apiPresetId: conn.dbConfig?.presetId || null,
+    apiWriteEndpoint: selectedEndpoint || existingSpec?.apiWriteEndpoint || null,
+    apiConnectionPublicConfig: {
+      baseUrl: conn.dbConfig?.baseUrl || '',
+      authType: conn.dbConfig?.authType || 'none',
+      apiKeyName: conn.dbConfig?.apiKeyName || '',
+      basicUser: conn.dbConfig?.basicUser || '',
+      apiParamKeys: conn.dbConfig?.apiParamKeys || [],
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Output — pure config of where rows go.
 // ---------------------------------------------------------------------------
 
-async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, chat }) {
+/**
+ * An Output node that sends its rows to a REST API connection. The settings are
+ * the shared write spec (buildApiWriteSpec) under outputType 'api'.
+ */
+async function assembleApiOutput(config, {
+  conn, stepPrompt, savedOs, sourceTableSchema, helpers, chat, nodeId, resumedCalls, apiFetchApproval,
+}) {
+  const spec = await buildApiWriteSpec({
+    conn,
+    stepPrompt,
+    sourceColumns: sourceTableSchema?.columns || [],
+    sampleRows: Array.isArray(sourceTableSchema?.sampleData) ? sourceTableSchema.sampleData.slice(0, 3) : [],
+    writeMode: savedOs?.writeMode === 'upsert' || savedOs?.writeMode === 'create' ? savedOs.writeMode : null,
+    upsertKeys: Array.isArray(savedOs?.upsertKeys) ? savedOs.upsertKeys : null,
+    existingSpec: savedOs?.outputType === 'api' ? savedOs : null,
+    selectedEndpoint: savedOs?.apiWriteEndpoint || null,
+    chat, nodeId, helpers, resumedCalls, apiFetchApproval,
+    stage: 'output:apiWrite',
+    clarificationKind: 'output.api_write',
+  });
+  config.outputSettings = {
+    outputType: 'api',
+    ...spec,
+    // The node's write mode is the code's: an upsert endpoint or a create.
+    writeMode: spec.apiWriteMode,
+    format: null, savePath: null, tableName: null, sheetName: null,
+  };
+  pushBotMsg(chat, `Configured output to ${conn.name}: ${spec.apiWriteExplanation || 'sends the rows to the API.'}`,
+    { metadata: { apiWriteCode: spec.apiWriteCode, endpoint: spec.apiEndpoint } });
+  return config;
+}
+
+async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, chat, nodeId = null, connectionId = null, existingConfig = null, resumedCalls = null, apiFetchApproval = null }) {
   if (!upstreamNode) throw new Error('Output needs an upstream source node.');
   const source = copySourceFromUpstream(upstreamNode);
   // Read the upstream's columns as they are now rather than as they were when
@@ -5183,6 +5376,20 @@ async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, 
     sourceTableName: source.sourceTableName || sourceTableSchema?.tableName,
     sourceCollection: source.sourceCollection || sourceTableSchema?.tableName,
   };
+
+  // An API destination already chosen — in the Output form (the node's saved
+  // settings) or by the chat focusing this node — skips the settings call: the
+  // only thing left to decide is the code that sends the rows.
+  const savedOs = existingConfig?.outputSettings || null;
+  const chosenApi = apiConnectionFor(
+    (savedOs?.outputType === 'api' && savedOs.connectionId) || connectionId,
+    helpers.connections,
+  );
+  if (chosenApi) {
+    return assembleApiOutput(config, {
+      conn: chosenApi, stepPrompt, savedOs, sourceTableSchema, helpers, chat, nodeId, resumedCalls, apiFetchApproval,
+    });
+  }
 
   const connectionList = summarizeConnections(helpers.connections || []);
   // Whether the rows arriving here already carry vectors (an embedding step or a
@@ -5244,6 +5451,13 @@ saved LanceDB connection) or a local "lancedb" file. Add these fields:
   null — ids then come from a hash of the whole row, so a row whose fields
   change becomes a new record and the old one stays until a truncate.
 
+For a REST API connection (dbType "rest-api") — the rows are SENT to that API,
+creating or updating records there (a CRM, a spreadsheet app, a mailing list):
+{ "outputSettings": { "outputType": "api", "connectionId": "<id-from-list>", "writeMode": "create"|"upsert", "upsertKeys": ["<source column>"]|null } }
+- writeMode "upsert" when re-runs should update what is already there (match on
+  an email or external id column), "create" when every row is a new record.
+- The code that sends the rows is written in a separate step; do not describe it.
+
 For a local file output:
 { "outputSettings": { "outputType": "local", "format": "json"|"csv"|"excel"|"duckdb"|"sqlite"|"lancedb"|"parquet"|"avro", "savePath": "<absolute path>", "connectionId": null, "tableName": "<table name, sqlite/duckdb/lancedb only>", "sheetName": null } }
 - lancedb: a local vector DATABASE DIRECTORY at savePath (a name ending in
@@ -5272,6 +5486,15 @@ For a local file output:
 Return ONLY the JSON object.`;
   const out = await timedCall('output:gen', prompt, () => callJson(helpers, prompt));
   console.log('buildOutputConfig: ', out)
+  if (out.outputSettings?.outputType === 'api') {
+    const conn = apiConnectionFor(out.outputSettings.connectionId, helpers.connections);
+    if (!conn) {
+      throw new Error(`Output: "${out.outputSettings.connectionId}" is not a saved REST API connection. Pick one of the API connections and build again.`);
+    }
+    return assembleApiOutput(config, {
+      conn, stepPrompt, savedOs: out.outputSettings, sourceTableSchema, helpers, chat, nodeId, resumedCalls, apiFetchApproval,
+    });
+  }
   config.outputSettings = out.outputSettings || { outputType: null, format: null, savePath: null, connectionId: null, tableName: null, sheetName: null };
   // Only two values mean anything downstream, and the safe one wins when the
   // model answers with something else (or nothing) — appending can be undone
@@ -5782,6 +6005,20 @@ Never invent secrets / tokens / auth headers in a prompt — connections
 own those server-side. Never invent connection ids — refer to connections
 by their 'name'. Never invent column names — if you don't know them, ask.
 
+# REST API connections as DESTINATIONS (sending rows to an app)
+
+A REST API connection (a CRM, Airtable, a mailing list, any saved API) can
+receive rows: they are SENT to it as records it creates or updates.
+- After a transformer or a data source: add an OUTPUT step whose prompt names
+  the API connection and says what each row becomes there ("each row is a
+  HubSpot contact; update existing contacts by email").
+- From a join: set the join's connectionId to the API connection's id. The join
+  lands in this workflow's DuckDB and its rows are then sent to the API — no
+  Output step after it. Say in the join's prompt what each row becomes there.
+- The code that sends the rows is generated during the build and shown to the
+  user for approval; the plan only has to say WHAT is written WHERE (object /
+  table / list, field mapping, create vs update-if-exists).
+
 # Picker-based connections can't be CONFIGURED by chat (cloud storage & Google Sheets)
 
 Cloud-storage (GCS / Amazon S3 / Dropbox / Google Drive) and spreadsheet-service
@@ -6005,6 +6242,9 @@ IS the table's name, so use it.
   Set it to ONE of:
   - The EXACT id of a saved connection from the connections list
     (the join result is written to that connection), OR
+  - The EXACT id of a saved REST API connection — the joined rows are SENT
+    to that API (records created or updated there: a CRM, Airtable, a mailing
+    list). Use it when the user wants the result pushed into such an app, OR
   - The literal token "local-duckdb" — write to a local DuckDB table, OR
   - The literal token "local-lancedb" — write to a local LanceDB vector
     table on disk (the join's rows are embedded and upserted as vectors).
@@ -6469,13 +6709,15 @@ function validatePlanEnvelope(out, { mode, wfSummary, connections }) {
       }
       const isLocal = s.connectionId === 'local-duckdb' || s.connectionId === 'local-lancedb';
       // Only a store a join can write to — see isJoinDestinationConnection.
-      const joinTargets = (connections || []).filter(isJoinDestinationConnection);
+      // A REST API connection is accepted too: the join lands locally and is
+      // sent on to it (see buildJoinConfig).
+      const joinTargets = (connections || []).filter((c) => isJoinDestinationConnection(c) || isApiConnection(c));
       const joinTargetIds = joinTargets.map((c) => c.id || c._id).filter(Boolean);
       if (!isLocal && !joinTargetIds.includes(s.connectionId)) {
         const named = (connections || []).find((c) => (c.id || c._id) === s.connectionId);
         throw new Error(`Step ${i} (join) connectionId "${s.connectionId}" ${named
           ? `is a ${named.dbType} connection, which cannot hold a join result`
-          : 'is not a saved connection'}. A join writes to a database or vector store, or to "local-duckdb" / "local-lancedb". Pick one of: ${[...joinTargetIds, 'local-duckdb', 'local-lancedb'].join(', ')}.`);
+          : 'is not a saved connection'}. A join writes to a database, a vector store or a REST API connection, or to "local-duckdb" / "local-lancedb". Pick one of: ${[...joinTargetIds, 'local-duckdb', 'local-lancedb'].join(', ')}.`);
       }
     }
 
@@ -6971,8 +7213,8 @@ async function buildNodeConfig({
   existingConfig = null, connectionId = null, bypassSkills = false,
   workflowId = null,
 }) {
-  if (nodeType !== 'transformer' && nodeType !== 'join' && nodeType !== 'dataSource') {
-    throw new Error(`buildNodeConfig supports only 'transformer', 'join', or 'dataSource' (REST API), got "${nodeType}".`);
+  if (!['transformer', 'join', 'dataSource', 'output'].includes(nodeType)) {
+    throw new Error(`buildNodeConfig supports only 'transformer', 'join', 'dataSource' (REST API) or 'output' (REST API), got "${nodeType}".`);
   }
   const fn = builderFor(nodeType);
   const warnings = [];
@@ -7967,6 +8209,8 @@ module.exports = {
   buildSystemContext,
   runSkillTurn,
   isJoinDestinationConnection,
+  isApiConnection,
+  buildApiWriteSpec,
   // Join source naming — checkable without a model call.
   applySourceSlots,
   ensureInPlaceSteps,

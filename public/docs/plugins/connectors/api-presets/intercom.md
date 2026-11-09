@@ -55,6 +55,10 @@ teams, tags and segments.
   company list to name them.
 - Searches use Intercom's query format (`field`, `operator`, `value`).
 
+## Writing to Intercom
+
+An Output node or a Join can send rows to Intercom (see [Sending rows to an API](README.md#sending-rows-to-an-api)). The access token can write. A company's standard fields (industry, size, plan, website) are top-level fields, not custom attributes; custom attributes must exist in Intercom first. Companies update by `company_id`. Intercom's search takes about a minute to show new contacts.
+
 ## Troubleshooting
 
 - **401:** the token was regenerated, or the workspace is in another

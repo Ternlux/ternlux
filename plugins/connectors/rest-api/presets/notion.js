@@ -50,4 +50,18 @@ module.exports = {
     'An integration only sees pages and databases shared with it; a 404 usually means "not shared", not "missing".',
     'Rate limit is about 3 requests per second; on 429 wait for Retry-After.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/v1/pages', label: 'Add a row to a database', batch: 1, upsert: null,
+        body: '{ parent: { data_source_id }, properties: { <title prop>: { title: [{ text: { content } }] }, <select>: { select: { name } }, <number>: { number }, <date>: { date: { start } }, <rich_text>: { rich_text: [{ text: { content } }] } } }' },
+      { method: 'PATCH', path: '/v1/pages/{page_id}', label: 'Update a row', batch: 1, upsert: 'page id', body: '{ properties: { … } }' },
+      { method: 'POST', path: '/v1/data_sources/{data_source_id}/query', label: 'Find existing rows (for updates)', batch: 1, upsert: null,
+        body: '{ filter: { property, rich_text|title: { equals } } }' },
+    ],
+    notes: [
+      'Read the data source first (GET /v1/data_sources/{id}) for its property names and types — each value is written in its type\'s shape.',
+      'About 3 requests per second: pause ~350 ms between rows. The database must be shared with the integration, which needs Insert content.',
+    ],
+  },
 };

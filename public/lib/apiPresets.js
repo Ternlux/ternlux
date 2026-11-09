@@ -41,7 +41,7 @@ function savedKeysOf(conn) {
   return Array.isArray(d.apiParamKeys) ? d.apiParamKeys : [];
 }
 
-function presetReferenceForPlaceholders(conn) {
+function presetReferenceForPlaceholders(conn, { mode = 'read' } = {}) {
   const found = presetFor(conn);
   if (!found) return null;
   const keyMap = found.mod.resolveCredentialKeys(found.preset, savedKeysOf(conn));
@@ -49,6 +49,7 @@ function presetReferenceForPlaceholders(conn) {
   const tokens = new Map(buildParamTokens(savedKeys).map(({ key, token }) => [key, `{{${token}}}`]));
   return found.mod.describePreset(found.preset, {
     credentialRef: (key) => tokens.get(keyMap[key]) || key,
+    mode,
   });
 }
 

@@ -286,6 +286,7 @@ const BUILD_TOOL_DESCRIPTIONS = {
   build_transformer: 'Build, change, fix or refine the Transformer node currently in focus.',
   build_join: 'Build, change, fix or refine the Join node currently in focus.',
   build_dataSource: 'Build, change, fix or refine the REST API Data Source node currently in focus.',
+  build_output: 'Build, change, fix or refine the Output node in focus that SENDS its rows to a REST API — the code that creates or updates records there.',
 };
 
 function buildToolSchema(name) {
@@ -354,6 +355,11 @@ const WORKFLOW_ONLY_TOOLS = [
           + 'wants, synthesized from the conversation so far.' },
         workflowId: { type: 'string', description: 'Modify this workflow.' },
         newWorkflow: { type: 'boolean', description: 'Build a brand-new workflow, ignoring any open one.' },
+        writesToApis: {
+          type: 'array', items: { type: 'string' },
+          description: 'Names of REST API connections this workflow only SENDS rows to (an Output or a Join '
+            + 'destination), never reads from. They need no run_javascript call before planning.',
+        },
       },
       required: ['request'],
       additionalProperties: false,

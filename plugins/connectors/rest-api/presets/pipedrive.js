@@ -53,4 +53,22 @@ module.exports = {
     'Custom fields come back as 40-character hash keys; map them to names with /v1/dealFields, /v1/personFields or /v1/organizationFields.',
     'On 429, wait for the Retry-After / x-ratelimit-reset header.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/api/v2/persons', label: 'Create a person', batch: 1, upsert: null,
+        body: '{ name, emails: [{ value, primary: true, label: "work" }], phones?: [...], org_id? }' },
+      { method: 'POST', path: '/api/v2/organizations', label: 'Create an organization', batch: 1, upsert: null, body: '{ name, address? }' },
+      { method: 'POST', path: '/api/v2/deals', label: 'Create a deal', batch: 1, upsert: null,
+        body: '{ title, value, currency, stage_id?, status?: "open"|"won"|"lost", person_id?, org_id?, expected_close_date? }' },
+      { method: 'PATCH', path: '/api/v2/{persons|organizations|deals}/{id}', label: 'Update a record by id', batch: 1, upsert: 'id', body: '{ …fields to change }' },
+      { method: 'GET', path: '/api/v2/{persons|organizations|deals}/search', label: 'Find a record first (to update instead of duplicating)', batch: 1, upsert: null,
+        body: 'query: term=<value>, fields=email|name, exact_match=true' },
+    ],
+    notes: [
+      'No upsert endpoint: to avoid duplicates on re-runs, search first (exact_match) and PATCH the match, else POST.',
+      'One record per request. Custom fields go under custom_fields keyed by their 40-character hash (see /v1/personFields, /v1/dealFields).',
+      'org_id / person_id are numeric ids — create or look up the organization or person before the deal.',
+    ],
+  },
 };

@@ -1176,7 +1176,9 @@ const WorkflowEditor = ({
     const cfg = node.data?.config || {};
     const isApiDS = type === 'dataSource' &&
       (cfg.sourceConnectionType === 'api' || cfg.sourceDbType === 'rest-api' || cfg.dbType === 'rest-api');
-    if (type !== 'transformer' && type !== 'join' && !isApiDS) return null;
+    // An Output sending its rows to a REST API: its send code is chat-built.
+    const isApiOut = type === 'output' && cfg.outputSettings?.outputType === 'api';
+    if (type !== 'transformer' && type !== 'join' && !isApiDS && !isApiOut) return null;
     try {
       const upstreamNodes = edges
         .filter((e) => e.target === node.id)
@@ -1194,8 +1196,9 @@ const WorkflowEditor = ({
         label: nodeDisplayName(type, node.data || {}, node.data?.label || type),
         config: toCloneable(node.data?.config || {}, 'targetNode.config'),
         upstreamNodes: toCloneable(upstreamNodes, 'targetNode.upstream'),
-        connectionId: isApiDS ? (cfg.sourceApiConnectionId || cfg.sourceConnectionId || null) : null,
-        isApi: !!isApiDS,
+        connectionId: isApiDS ? (cfg.sourceApiConnectionId || cfg.sourceConnectionId || null)
+          : isApiOut ? (cfg.outputSettings.connectionId || null) : null,
+        isApi: !!(isApiDS || isApiOut),
       };
     } catch (e) {
       console.warn('[WorkflowEditor] could not build targetNode payload:', e);

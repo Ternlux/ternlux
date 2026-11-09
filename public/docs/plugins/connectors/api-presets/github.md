@@ -56,6 +56,10 @@ organization members and teams.
 - Rate limit: 5,000 requests an hour per token.
 - Timestamps are ISO-8601 in UTC.
 
+## Writing to GitHub
+
+An Output node or a Join can send rows to GitHub (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Give the fine-grained token **Issues: Read and write**. Issues created on a public repository are public.
+
 ## Troubleshooting
 
 - **401:** the token expired or was revoked — generate a new one.

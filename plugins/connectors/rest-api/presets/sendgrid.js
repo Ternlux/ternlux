@@ -50,4 +50,13 @@ module.exports = {
     'Full contact exports are asynchronous (POST /v3/marketing/contacts/exports, then poll) — prefer lists, stats and suppressions.',
     'Suppression "created" values are Unix seconds.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'PUT', path: '/v3/marketing/contacts', label: 'Add or update contacts (optionally into lists)', batch: 30000, upsert: 'email',
+        body: '{ list_ids?: ["<list id>"], contacts: [{ email, first_name?, last_name?, city?, country?, custom_fields?: { <field id>: value } }] }',
+        notes: 'Asynchronous: 202 with a job_id; contacts appear shortly after. Up to 30,000 contacts or 6 MB per request.' },
+    ],
+    notes: ['custom_fields are keyed by field id (GET /v3/marketing/field_definitions). Needs Marketing write access on the key.'],
+  },
 };

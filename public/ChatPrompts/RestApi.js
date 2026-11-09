@@ -328,3 +328,5 @@ Return ONLY the JSON object. No markdown fences, no commentary.
 module.exports = RestApiPrompts;
 module.exports.default = RestApiPrompts;
 module.exports.placeholdersFor = placeholdersFor;
+module.exports.paramGuidance = paramGuidance;
+module.exports.authGuidance = authGuidance;

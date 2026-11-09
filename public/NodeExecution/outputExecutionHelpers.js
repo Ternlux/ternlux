@@ -12,6 +12,7 @@ const { batchChunkSizeFor } = require('../lib/batchChunkSize');
 const { throwIfCancelled, isCancelledError } = require('./executionCancel');
 const { setBatchWindow } = require('./executionLog');
 const { openSourcePages, readSourceSchema } = require('./sourcePages');
+const { writeRowsToApi } = require('./ApiWrite');
 const {
   destinationType, valueConverters, convertRow, zonedInstantColumns,
 } = require('./columnTypes');
@@ -569,6 +570,30 @@ async function executeOutput(
       && !(await isVectorDestination(outputSettings, pluginManager, getDb))) {
       console.log('[Output] Vector source → non-vector destination: dropping vector and embedding bookkeeping columns');
       pages = withoutVectorColumns(pages);
+    }
+
+    // A REST API destination: the node's generated sendBatch function writes
+    // the rows, a batch at a time, straight from the page reader. No table,
+    // no write mode — whether a re-run updates or duplicates is decided by the
+    // endpoint the code calls (an upsert, or a create).
+    if (outputType === 'api') {
+      if (!outputSettings.apiWriteCode) {
+        return {
+          success: false,
+          message: `This output has no code for writing to ${outputSettings.connectionName || 'the API'} yet. `
+            + 'Select the node and describe in the chat assistant what to send, then run it again.',
+        };
+      }
+      const result = await writeRowsToApi({
+        pages,
+        apiConnectionId: connectionId,
+        apiConnectionConfig: outputSettings.apiConnectionPublicConfig || {},
+        apiWriteCode: outputSettings.apiWriteCode,
+        batchSize: outputSettings.apiBatchSize,
+        destinationName: outputSettings.connectionName || 'the API',
+      });
+      console.log(`[Output] ${result.message}`);
+      return { ...result, recordCount: result.rowCount };
     }
 
     // Whether the destination can take rows a page at a time, or needs the

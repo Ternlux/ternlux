@@ -1946,7 +1946,22 @@ const Bubble = ({ m, onAction, onEdit, onRetry, onContinue, onApproveCode, onDec
           {/* A plan build parked on generated code it wants to run (a REST API
               fetch whose columns the next steps are built from). Nothing runs
               until Run is clicked; Don't run stops the build. */}
-          {m.buildApproval && (m.buildApproval.kind === 'target_rebuild' ? (
+          {m.buildApproval && m.buildApproval.kind === 'api_write' ? (
+            <ApprovalPanel
+              approval={{
+                ...m.buildApproval,
+                explanation: [
+                  m.buildApproval.endpoint ? `Sends to ${m.buildApproval.endpoint}` : null,
+                  m.buildApproval.explanation || null,
+                ].filter(Boolean).join(' — '),
+              }}
+              live={m.buildApproval.state === 'pending' && !stale}
+              approveLabel="Approve this code"
+              note={`Nothing is sent now. Each time this node runs, this code sends its rows to ${m.buildApproval.connectionName || 'the API'} with the connection's saved credentials. Don't run stops the build.`}
+              onApprove={() => onBuildApproval && onBuildApproval(m, true)}
+              onDecline={() => onBuildApproval && onBuildApproval(m, false)}
+            />
+          ) : m.buildApproval && (m.buildApproval.kind === 'target_rebuild' ? (
             <ApprovalPanel
               approval={m.buildApproval}
               live={m.buildApproval.state === 'pending' && !stale}

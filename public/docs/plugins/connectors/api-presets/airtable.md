@@ -50,6 +50,10 @@ records (with views, formulas and sorts), and single records.
   missing from some rows.
 - Rate limit: 5 requests a second per base.
 
+## Writing to Airtable
+
+An Output node or a Join can send rows to Airtable (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Add the `data.records:write` scope to the token (the token itself stays the same) and make sure your account is an Editor of the base. Rows can update on a field you name ("update rows with the same Name").
+
 ## Troubleshooting
 
 - **403 on the test:** the token is missing `user.email:read`.

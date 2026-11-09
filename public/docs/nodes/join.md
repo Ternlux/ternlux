@@ -108,11 +108,11 @@ destination puts a picker in front of the conversation. You can also just
 name the destination in the chat.
 
 The picker lists only connections a join can write to — databases (SQL
-and MongoDB) and vector stores — grouped by category and de-duplicated,
-so you never see the same connection twice. Cloud storage and API
-connections have no table to create, and a local file connection is not
-written to, so none of those are offered, and naming one in the chat or
-in a plan is refused with the list of real destinations. Alongside your saved connections
+and MongoDB), vector stores and REST APIs — grouped by category and
+de-duplicated, so you never see the same connection twice. Cloud storage
+has no table to create, and a local file connection is not written to, so
+neither is offered, and naming one in the chat or in a plan is refused
+with the list of real destinations. Alongside your saved connections
 there is one local option, which writes the joined rows as a table in the
 workflow's own DuckDB database.
 
@@ -169,6 +169,19 @@ collection, and two Mongo sources can collide with each other on it.
 This is what lets Ternlux join data that lives in entirely different
 systems — a relational source with a document source, for example — into
 a single collection.
+
+### API destination
+
+A REST API connection (HubSpot, Airtable, a custom API…) as the
+destination: the join itself runs as a **local** join — its result is a
+table in the workflow's DuckDB, rebuilt every run — and the rows in that
+table are then **sent** to the API by code the assistant writes for this
+node, exactly as an [Output to an API](output.md#api-destination) sends
+them: in batches, credentials filled in by the background engine, stopped
+by a batch the API rejects. The join's write mode becomes the API's:
+**merge** updates records that match the merge key and creates the rest,
+**append** (or replace) creates a record for every row. In a plan build
+the send code is shown for approval before the build goes on.
 
 ### Vector destination
 

@@ -56,6 +56,10 @@ and the issues in a sprint.
   turn them into plain text.
 - Dates are ISO-8601 with an offset.
 
+## Writing to Jira
+
+An Output node or a Join can send rows to Jira (see [Sending rows to an API](README.md#sending-rows-to-an-api)). The API token acts as you, so you need permission to create issues in the project. Up to 50 issues per request.
+
 ## Troubleshooting
 
 - **401:** wrong email or token, or the email isn't the token owner's.

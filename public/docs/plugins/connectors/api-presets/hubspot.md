@@ -61,6 +61,10 @@ with their stages; marketing forms; account users.
 - Deal stages are ids (for example `closedwon`); read the deal pipelines
   to get their names.
 
+## Writing to HubSpot
+
+An Output node or a Join can send rows to HubSpot (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Add the matching **.write** scopes to the service key: `crm.objects.contacts.write`, `crm.objects.companies.write`, `crm.objects.deals.write` (and `tickets` for tickets). Contacts update by email; other objects update only on a property with *unique values* turned on — otherwise every run creates new records.
+
 ## Troubleshooting
 
 - **401:** the key was deleted or pasted wrong.

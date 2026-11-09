@@ -320,8 +320,9 @@ export const destinationOf = (type, config = {}, connections = null) => {
       ? connections.get(String(out.connectionId))
       : null;
     return {
-      store: conn?.name || (out.connectionId ? 'Connection' : null),
-      table: out.objectPath || out.tableName || null,
+      store: conn?.name || out.connectionName || (out.connectionId ? 'Connection' : null),
+      // An API destination has no table: the endpoint it calls stands in.
+      table: out.outputType === 'api' ? (out.apiEndpoint || null) : (out.objectPath || out.tableName || null),
       dbType: conn?.dbType || null,
       isLocal: false,
     };
@@ -481,6 +482,10 @@ export const writeModeOf = (type, config = {}) => {
   if (type === 'output') {
     const os = c.outputSettings || {};
     if (!os.outputType) return null;
+    // An API keeps its records; the code either updates or creates them.
+    if (os.outputType === 'api') {
+      return { value: 'append_merge', label: WRITE_MODE_LABEL.append_merge, detail: os.writeMode === 'upsert' ? 'update or create records' : 'create records' };
+    }
     // A file is rewritten whole every run, whatever the setting — except a
     // LanceDB file, which appends (upserts) like a vector connection.
     const isFile = os.outputType === 'local' && os.format !== 'lancedb';

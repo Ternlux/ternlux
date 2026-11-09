@@ -32,15 +32,17 @@ export const categorizeConnection = (conn) => {
  * isJoinDestinationConnection in public/chat/workflowBuilder.js — the builder
  * refuses anything this lets through, so the two must agree.
  *
- * A database (SQL or Mongo) or a vector store. Cloud storage and API
- * connections have no table to create, and a local FILE connection is not
- * written to (a DuckDB-type file routes to the workflow's own database, which
- * is what the "Local file" option already means). Local LanceDB is a vector
- * store, so it stays.
+ * A database (SQL or Mongo), a vector store, or a REST API — the joined rows
+ * are SENT to an API (they land in the workflow's DuckDB first). Cloud storage
+ * has no table to create, and a local FILE connection is not written to (a
+ * DuckDB-type file routes to the workflow's own database, which is what the
+ * "Local file" option already means). Local LanceDB is a vector store, so it
+ * stays.
  */
 export const isJoinDestination = (conn) => {
   if (!conn) return false;
-  if (conn.dbCategory === 'CloudStorage' || conn.dbCategory === 'API' || conn.dbType === 'rest-api') return false;
+  if (conn.dbCategory === 'API' || conn.dbType === 'rest-api') return true;
+  if (conn.dbCategory === 'CloudStorage') return false;
   if (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType)) return true;
   return conn.connectionType === 'database';
 };
@@ -80,7 +82,7 @@ export const loadJoinDestinations = async () => {
       id: conn.id,
       label: conn.name,
       value: conn.id,
-      description: `Store in ${conn.name} (${conn.dbType})`,
+      description: group === 'APIs' ? `Send the rows to ${conn.name} (API)` : `Store in ${conn.name} (${conn.dbType})`,
       connection: conn,
       group,
       groupColor: DESTINATION_GROUP_COLOR[group] || DESTINATION_GROUP_COLOR.Other,

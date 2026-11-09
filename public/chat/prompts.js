@@ -238,8 +238,10 @@ ${candidates || '- (no saved connections)'}
 `;
   }
 
-  const typeLabel = { transformer: 'Transformer', join: 'Join', dataSource: 'Data Source (REST API)' }[targetNode.type] || targetNode.type;
-  const configured = !!(c.targetSql || c.joinSql || c.transformFunction || c.nosqlOperation || c.apiFetchCode);
+  const typeLabel = { transformer: 'Transformer', join: 'Join', dataSource: 'Data Source (REST API)', output: 'Output (sends rows to a REST API)' }[targetNode.type] || targetNode.type;
+  const os = c.outputSettings || {};
+  const apiWrite = os.outputType === 'api' ? os : (c.apiDestination || null);
+  const configured = !!(c.targetSql || c.joinSql || c.transformFunction || c.nosqlOperation || c.apiFetchCode || apiWrite?.apiWriteCode);
 
   // Current logic on the node, so the model can refine it precisely.
   const details = [];
@@ -249,6 +251,13 @@ ${candidates || '- (no saved connections)'}
   add('Current JavaScript function', c.transformFunction || c.apiFetchCode);
   if (c.nosqlOperation) add('Current NoSQL operation', typeof c.nosqlOperation === 'string' ? c.nosqlOperation : JSON.stringify(c.nosqlOperation));
   add('Explanation', c.targetSqlExplanation);
+  if (apiWrite) {
+    add(`Sends its rows to ${apiWrite.connectionName || 'a REST API'} with this function`, apiWrite.apiWriteCode);
+    add('What it sends', apiWrite.apiWriteExplanation);
+    if (apiWrite.apiWriteEndpoint) {
+      add('Endpoint picked in the form', `${apiWrite.apiWriteEndpoint.method || 'POST'} ${apiWrite.apiWriteEndpoint.path} (${apiWrite.apiWriteEndpoint.label})`);
+    }
+  }
   if (c.apiPresetEndpoint) {
     add('Endpoint picked in the form', `${c.apiPresetEndpoint.method || 'GET'} ${c.apiPresetEndpoint.path} (${c.apiPresetEndpoint.label})`);
   }
@@ -850,6 +859,13 @@ calling propose_plan.
 A database source tells you its shape — get_tables and get_columns answer for
 it. A REST API does not: the only way to know what it returns is to call it.
 
+This is about READING from an API. A REST API connection can also be a
+DESTINATION: an Output step, or a join's connectionId, SENDS rows to it
+(records created or updated there — HubSpot contacts, Airtable rows, Mailchimp
+members). Nothing is built from a destination's response, so it needs no call
+first: name it in propose_plan's "writesToApis" and propose straight away. The
+send code is written and shown to the user for approval during the build.
+
 So when the workflow reads from a REST API connection, run_javascript FIRST,
 in an earlier turn, and only then call propose_plan:
 
@@ -960,7 +976,7 @@ Calling an API (the only thing you may RUN):
          The workflow's own API call is built by propose_plan, separately.
 
 Plan generation:
-- propose_plan { request, workflowId?, newWorkflow? }
+- propose_plan { request, workflowId?, newWorkflow?, writesToApis? }
        Submit the build to the workflow planner.
        • request (REQUIRED): a short, self-contained description of the
          workflow the user CURRENTLY wants, synthesized from the latest
@@ -991,6 +1007,8 @@ Plan generation:
        • workflowId (optional): MODIFY that existing workflow (the planner
          produces the complete target step list for it).
        • newWorkflow (optional): true → build a brand-NEW, separate workflow.
+       • writesToApis (optional): names of REST API connections the workflow
+         only SENDS rows to (Output or join destination) — not probed first.
        If you pass neither workflowId nor newWorkflow, it defaults to the open
        workflow when one was open (modify), else a new workflow — prefer being
        explicit so an open workflow is never modified by accident.

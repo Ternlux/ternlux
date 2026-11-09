@@ -53,6 +53,10 @@ segments and their profiles, campaigns, flows and templates.
 - Responses follow JSON:API: values sit under `attributes`; generated
   fetches flatten them.
 
+## Writing to Klaviyo
+
+An Output node or a Join can send rows to Klaviyo (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Create a private key with **Full access** for Profiles and Lists (a read-only key answers 403). Profiles update by email.
+
 ## Troubleshooting
 
 - **401:** a public key was used, or the private key was revoked.

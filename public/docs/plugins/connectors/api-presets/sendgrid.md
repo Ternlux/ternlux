@@ -46,6 +46,10 @@ invalid emails and unsubscribe groups.
 - Suppression `created` values are Unix seconds.
 - Stats endpoints need a `start_date` (YYYY-MM-DD).
 
+## Writing to SendGrid
+
+An Output node or a Join can send rows to SendGrid (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Give the key **Full Access** to Marketing (contacts are added asynchronously — they appear a minute or so later).
+
 ## Troubleshooting
 
 - **401:** the key was deleted, or isn't the full `SG.…` string.

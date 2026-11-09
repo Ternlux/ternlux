@@ -60,4 +60,17 @@ module.exports = {
     'Dates are ISO-8601 strings with an offset, e.g. 2026-01-05T10:31:00.000+0000.',
     'On 429, wait for Retry-After.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/rest/api/3/issue/bulk', label: 'Create issues', batch: 50, upsert: null,
+        body: '{ issueUpdates: [{ fields: { project: { key }, summary, issuetype: { name: "Task" }, description?: <ADF doc>, priority?: { name }, labels?: [] } }] }',
+        notes: 'Answers 201 with `issues` created and `errors` for rejected entries (failedElementNumber) — count those as failed.' },
+      { method: 'PUT', path: '/rest/api/3/issue/{issueIdOrKey}', label: 'Update an issue', batch: 1, upsert: 'issue key', body: '{ fields: { … } }' },
+    ],
+    notes: [
+      'description is Atlassian Document Format: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] }.',
+      'issuetype names come from the project (Task, Bug, Story…); read /rest/api/3/project/{key} if unsure.',
+    ],
+  },
 };

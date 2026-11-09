@@ -8,6 +8,8 @@ const fs = require('fs');
 const { handleTransformNoSQL, handleTransformSQL, handleExecuteJoin, handleExecuteBranch } = require('./NodeExecution');
 const { handleExecuteApiFetch, describeApiTable } = require('./ApiFetch');
 const { executeOutput } = require('./outputExecutionHelpers');
+const { openSourcePages } = require('./sourcePages');
+const { writeRowsToApi } = require('./ApiWrite');
 const { isCancelledError } = require('./executionCancel');
 const targetShape = require('../lib/targetShape');
 const { qualifierFor } = require('../lib/tableRef');
@@ -1444,6 +1446,44 @@ async function executeJoinNode(node, nodeMap, edges, helpers) {
       nodeId: node.id
     });
 
+    // A REST API destination: the join has just written its local table; the
+    // rows in it are now sent on with the node's generated code — the same
+    // writer an Output to an API uses (NodeExecution/ApiWrite.js).
+    const apiDest = config.apiDestination;
+    if (result.success && apiDest) {
+      if (!apiDest.apiWriteCode) {
+        return {
+          success: false,
+          message: `The join ran, but it has no code for sending its rows to ${apiDest.connectionName || 'the API'}. Select the join and describe in the chat what to send.`,
+          recordsProcessed: 0,
+        };
+      }
+      const { pages } = openSourcePages({
+        sourceConnection: {
+          id: 'local-duckdb', dbType: 'duckdb', connectionType: 'file',
+          localPath: result.localPath || config.targetLocalPath,
+        },
+        sourceTableSchema: { tableName: config.targetTableName },
+        pluginManager: helpers.pluginManager,
+        getFullConfig: helpers.getFullConfig,
+      });
+      const sent = await writeRowsToApi({
+        pages,
+        apiConnectionId: apiDest.connectionId,
+        apiConnectionConfig: apiDest.apiConnectionPublicConfig || {},
+        apiWriteCode: apiDest.apiWriteCode,
+        batchSize: apiDest.apiBatchSize,
+        destinationName: apiDest.connectionName || 'the API',
+      });
+      console.log(`[Join] ${sent.message}`);
+      return {
+        success: sent.success,
+        warning: !!sent.warning,
+        message: `Joined into ${config.targetTableName}. ${sent.message}`,
+        recordsProcessed: sent.rowCount || 0,
+      };
+    }
+
     return {
       success: result.success,
       // Set by the DuckDB join when the table it wrote came out empty.
@@ -1748,10 +1788,12 @@ function connectionRefsOf(node) {
     case 'join':
       (Array.isArray(c.sources) ? c.sources : []).forEach((src) => add(src?.sourceConnectionId, src?.sourceConnectionName, 'reads from'));
       add(c.targetConnectionId, c.targetConnectionName, 'writes to');
+      if (c.apiDestination?.connectionId) add(c.apiDestination.connectionId, c.apiDestination.connectionName, 'sends to');
       break;
     case 'output':
       add(c.sourceConnectionId, c.sourceConnectionName, 'reads from');
       if (c.outputSettings?.outputType === 'connection') add(c.outputSettings.connectionId, null, 'writes to');
+      if (c.outputSettings?.outputType === 'api') add(c.outputSettings.connectionId, c.outputSettings.connectionName, 'sends to');
       break;
     default:
       break;

@@ -49,4 +49,22 @@ module.exports = {
     'status and priority are numbers (status 2=Open, 3=Pending, 4=Resolved, 5=Closed; priority 1=Low … 4=Urgent).',
     'Custom fields are under custom_fields (cf_…). On 429, wait for Retry-After.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/contacts', label: 'Create a contact', batch: 1, upsert: null,
+        body: '{ name, email, phone?, company_id?, custom_fields? }',
+        notes: 'An existing email answers 409 — look it up with GET /contacts?email=<email> and PUT /contacts/{id} instead.' },
+      { method: 'PUT', path: '/contacts/{id}', label: 'Update a contact', batch: 1, upsert: 'id', body: '{ …fields to change }' },
+      { method: 'POST', path: '/companies', label: 'Create a company', batch: 1, upsert: null, body: '{ name, domains?: [], description? }' },
+      { method: 'POST', path: '/tickets', label: 'Create a ticket', batch: 1, upsert: null,
+        body: '{ subject, description, email, priority: 1-4, status: 2-5 }',
+        notes: 'Freshdesk emails the requester when a ticket is created — say so before writing tickets.' },
+    ],
+    notes: [
+      'One record per request; the rate limit depends on the plan (50+ per minute). On 429 wait for Retry-After.',
+      'A duplicate answers 409 with errors[0].additional_info naming the existing record (company_id for a company name, user_id for a contact email) — use that id rather than failing the row.',
+      'To find a company by name first: GET /companies/autocomplete?name=<name> (returns { companies: [{ id, name }] }).',
+    ],
+  },
 };

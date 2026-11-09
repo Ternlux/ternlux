@@ -149,6 +149,29 @@ function strictAxios() {
   return instance;
 }
 
+/**
+ * Resolve an AI-written API function against a saved connection: decrypt its
+ * credentials (main process only), fill in the {{PLACEHOLDER}} tokens and
+ * evaluate the source. Returns { fn } or { error }. Shared with ApiWrite.js,
+ * which sends rows with a function written the same way.
+ *
+ * The resolved source holds the user's keys, so it is never returned or logged.
+ */
+async function loadApiFunction({ apiConnectionId, apiConnectionConfig = {}, code }) {
+  if (!getFullConfig) return { error: 'ApiFetch not initialized (getFullConfig missing)' };
+  if (!code || typeof code !== 'string') return { error: 'Missing API function code' };
+  const fullConfig = await getFullConfig(apiConnectionId, apiConnectionConfig);
+  const resolvedCode = substituteCode(code, buildPlaceholderMap(fullConfig));
+  let fn;
+  try {
+    fn = new Function(`return (${resolvedCode});`)();
+  } catch (err) {
+    return { error: `Failed to load the API function: ${err.message}` };
+  }
+  if (typeof fn !== 'function') return { error: 'The API code did not resolve to a function' };
+  return { fn };
+}
+
 /** An empty object is no data — e.g. `{}` from an endpoint that does not exist. */
 const isEmptyRow = (r) => !!r && typeof r === 'object' && !Array.isArray(r) && Object.keys(r).length === 0;
 
@@ -302,4 +325,6 @@ module.exports = {
   initialize,
   handleExecuteApiFetch,
   describeApiTable,
+  loadApiFunction,
+  strictAxios,
 };
