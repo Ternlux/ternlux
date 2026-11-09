@@ -53,4 +53,21 @@ module.exports = {
     'Filters use Klaviyo syntax: equals(field,"x"), greater-than(field,2026-01-01T00:00:00Z), any(field,["a","b"]) — URL-encode them.',
     'On 429, wait for Retry-After.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/api/profile-import', label: 'Create or update one profile', batch: 1, upsert: 'email, phone_number or external_id',
+        body: '{ data: { type: "profile", attributes: { email, first_name, last_name, organization, properties: { … } } } }',
+        notes: 'Send Content-Type: application/vnd.api+json. Answers 201 created or 200 updated.' },
+      { method: 'POST', path: '/api/profile-bulk-import-jobs', label: 'Bulk create or update profiles (optionally into a list)', batch: 10000, upsert: 'email, phone_number or external_id',
+        body: '{ data: { type: "profile-bulk-import-job", attributes: { profiles: { data: [{ type: "profile", attributes: { … } }] } }, relationships?: { lists: { data: [{ type: "list", id }] } } } }',
+        notes: 'Asynchronous: 202 means accepted, the profiles appear shortly after. Prefer it above a few hundred rows.' },
+      { method: 'POST', path: '/api/lists/{id}/relationships/profiles', label: 'Add existing profiles to a list', batch: 1000, upsert: 'profile id',
+        body: '{ data: [{ type: "profile", id }] }' },
+    ],
+    notes: [
+      'Write requests need Content-Type: application/vnd.api+json and the same revision header.',
+      'A private key needs profiles:write (and lists:write for lists); a read-only key answers 403.',
+    ],
+  },
 };

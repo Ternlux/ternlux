@@ -43,6 +43,10 @@ unsubscribes and classic automations.
 - Mailchimp allows about 10 simultaneous connections per key, so fetches
   run one request at a time.
 
+## Writing to Mailchimp
+
+An Output node or a Join can send rows to Mailchimp (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Any API key can write. Members are added or updated by email; Mailchimp refuses addresses that look made up and never re-subscribes someone who unsubscribed. It can also ignore name changes on some contacts (the account owner's own address, for one) while reporting success.
+
 ## Troubleshooting
 
 - **401 or "API key invalid":** the data center in the base URL doesn't

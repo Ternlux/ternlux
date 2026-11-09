@@ -47,6 +47,10 @@ Each endpoint in the sidebar is one GraphQL query; the request is
 - Rate limits count requests and query complexity, so lean field lists
   go further.
 
+## Writing to Linear
+
+An Output node or a Join can send rows to Linear (see [Sending rows to an API](README.md#sending-rows-to-an-api)). A personal API key with write access (not limited to *Read*). Each row becomes one issue; team, state and label names are looked up as ids.
+
 ## Troubleshooting
 
 - **401 / "Authentication required":** the key was revoked.

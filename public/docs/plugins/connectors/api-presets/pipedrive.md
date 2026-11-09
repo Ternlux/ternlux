@@ -49,6 +49,10 @@ stages (API v2), plus leads, notes, users and deal field definitions.
   `won_time`.
 - Stage ids map to names through `/api/v2/stages`.
 
+## Writing to Pipedrive
+
+An Output node or a Join can send rows to Pipedrive (see [Sending rows to an API](README.md#sending-rows-to-an-api)). The personal API token can write. Pipedrive has no upsert, so the assistant looks a person or organization up first and updates it, which keeps re-runs from duplicating.
+
 ## Troubleshooting
 
 - **401:** the token was reset — copy it again from the API page.

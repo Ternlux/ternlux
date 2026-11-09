@@ -54,6 +54,10 @@ properties, page content blocks, comments and workspace users.
   fetches flatten them into plain columns.
 - Rate limit: about 3 requests a second.
 
+## Writing to Notion
+
+An Output node or a Join can send rows to Notion (see [Sending rows to an API](README.md#sending-rows-to-an-api)). In the integration's **Capabilities**, turn on *Insert content* and *Update content*, and share the database with it. Rows are written one at a time (about three a second).
+
 ## Troubleshooting
 
 - **Search returns nothing, or 404 on a database:** the page isn't shared

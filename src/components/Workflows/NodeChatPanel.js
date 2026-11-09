@@ -330,6 +330,9 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
         } else if (out.outputType === 'connection') {
           summaryText += '\n**Type:** Connection';
           if (out.tableName) summaryText += `\n**Target:** ${out.tableName}`;
+        } else if (out.outputType === 'api') {
+          summaryText += `\n**Type:** API — ${out.connectionName || 'REST API'}`;
+          summaryText += out.apiWriteCode ? `\n**Sends:** ${out.apiWriteExplanation || out.apiEndpoint}` : '\n**Next:** describe in the chat what to send';
         }
         if (config.analysisPrompt) summaryText += `\n**Prompt:** ${config.analysisPrompt}`;
         if (config.emailAddress) summaryText += `\n**Email:** ${config.emailAddress}`;
@@ -826,6 +829,7 @@ const NodeChatPanel =({ isOpen, node, nodes, edges, currentWorkflowId, workflowS
             onCancel={onClose}
             onDirtyChange={setFormDirty}
             executing={executing}
+            onRequestChatHandoff={onRequestChatHandoff}
           />
         );
 

@@ -44,4 +44,21 @@ module.exports = {
     'baseId starts with "app", table ids with "tbl"; both appear in the Airtable URL. A table name works in place of its id (URL-encode it).',
     'Rate limit: 5 requests per second per base; on 429 wait 30 seconds.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'PATCH', path: '/v0/{baseId}/{tableIdOrName}', label: 'Create or update records by matching fields', batch: 10, upsert: 'fieldsToMergeOn',
+        body: '{ performUpsert: { fieldsToMergeOn: ["<field>"] }, records: [{ fields: { … } }], typecast: true }',
+        notes: 'A record whose merge fields match is updated, others are created.' },
+      { method: 'POST', path: '/v0/{baseId}/{tableIdOrName}', label: 'Create records', batch: 10, upsert: null,
+        body: '{ records: [{ fields: { … } }], typecast: true }' },
+    ],
+    notes: [
+      'At most 10 records per request and 5 requests per second per base — pause ~250 ms between requests.',
+      'Field names are the column names exactly as shown in Airtable. typecast: true lets text match select options and creates missing ones.',
+      'A linked-record field takes an array of record ids (rec…), not names. Dates as YYYY-MM-DD or ISO-8601.',
+      'Needs the data.records:write scope and Editor access to the base.',
+      'A base named by the user is found by GET /v0/meta/bases (bases[].name → id); a table can be addressed by its name (URL-encoded).',
+    ],
+  },
 };

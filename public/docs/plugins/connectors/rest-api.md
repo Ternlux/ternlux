@@ -25,6 +25,14 @@ connection test and the endpoint list the Data Source sidebar shows. See
 [Vendor API connections](api-presets/README.md), which also has a
 step-by-step guide to getting each service's key.
 
+## Sending rows to an API
+
+A REST API connection is also a destination: an Output node or a Join can
+send rows to it, and the chat writes the code that does it — a
+`sendBatch` function that receives a batch of rows and makes the
+requests, with the same `{{PLACEHOLDER}}` credentials as a fetch. See
+[Output — API destination](../../nodes/output.md#api-destination).
+
 ## Connection form
 
 | Field | Required | Sensitive | Notes |

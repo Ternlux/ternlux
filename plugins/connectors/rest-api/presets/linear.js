@@ -48,4 +48,17 @@ module.exports = {
     'Nested objects (state, assignee, team) come back as objects — flatten the fields you select into columns.',
     'Rate limits are by request count and query complexity; ask only for the fields you need.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/graphql', operation: 'issueCreate', label: 'Create an issue', batch: 1, upsert: null,
+        body: '{ query: "mutation($i: IssueCreateInput!) { issueCreate(input: $i) { success issue { id identifier } } }", variables: { i: { teamId, title, description?, priority?: 0-4, estimate?, stateId?, labelIds?, projectId? } } }' },
+      { method: 'POST', path: '/graphql', operation: 'issueUpdate', label: 'Update an issue', batch: 1, upsert: 'issue id',
+        body: '{ query: "mutation($id: String!, $i: IssueUpdateInput!) { issueUpdate(id: $id, input: $i) { success } }", variables: { id, i: { … } } }' },
+    ],
+    notes: [
+      'teamId, stateId and labelIds are ids — read teams, workflowStates and issueLabels first and map names to ids.',
+      'A mutation that fails answers HTTP 200 with `errors` — treat that as a failed row.',
+    ],
+  },
 };

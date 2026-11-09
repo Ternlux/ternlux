@@ -52,6 +52,10 @@ sessions, coupons and events (last 30 days).
 - Filters use bracketed parameters, such as `created[gte]=1735689600`.
 - A test key only sees test data, and a live key only live data.
 
+## Writing to Stripe
+
+An Output node or a Join can send rows to Stripe (see [Sending rows to an API](README.md#sending-rows-to-an-api)). Writing with a secret key creates real objects in that mode — use a **test-mode** key (`sk_test_…`) unless you mean it. Customers are found by email first so re-runs update them. Charges and payments are never created.
+
 ## Troubleshooting
 
 - **401:** wrong key, or a publishable key (`pk_…`) — use the secret one.

@@ -13,6 +13,10 @@ own replace / append modes; a Transformer has none).
 Either a **local file** or a **saved connection**. The questions the form
 asks change completely between the two.
 
+A saved connection can be a database, a vector store, cloud storage — or a
+**REST API** (a vendor connection such as HubSpot or Airtable, or a custom
+one). See [API destination](#api-destination).
+
 ## Loading the source
 
 The source is read in **pages**, with no row limit. How hard Ternlux
@@ -121,6 +125,26 @@ vector connection.
   extension and uploads one object, which replaces whatever was there.
 - **Google Sheets destination** — the rows are written into the tab the
   picker chose.
+
+## API destination
+
+An Output to a REST API connection SENDS its rows: each becomes a record
+the service creates or updates. The form asks for the connection, an
+optional write endpoint (for a vendor connection) and whether rows that
+already exist are **updated or created** or always **created**; the code
+that sends them is written in the chat, like an API data source's fetch,
+and saved on the node.
+
+At run time the source is read in pages and handed to that code in
+batches of the service's per-request limit. The credentials are filled in
+by the background engine and never appear in the code or the chat. A
+batch the API rejects stops the node: the batches before it have already
+been written (there is nothing to roll back), and the message says how
+many rows that was. Rows the API rejects individually inside an accepted
+batch are counted, listed and fail the node once every batch has been
+tried. A rate-limit answer (HTTP 429) is retried after the wait the API
+asks for. Write mode below does not apply — whether a re-run duplicates
+records depends on whether the code updates or creates.
 
 ## Write mode
 

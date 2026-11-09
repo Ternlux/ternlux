@@ -23,6 +23,8 @@ const OutputNode = ({ data, selected }) => {
       return `Export to ${format}`;
     } else if (outputSettings.outputType === 'connection') {
       return outputSettings.objectName || outputSettings.tableName || 'Database Export';
+    } else if (outputSettings.outputType === 'api') {
+      return `Send to ${outputSettings.connectionName || 'API'}`;
     }
 
     return 'Output';
@@ -40,7 +42,7 @@ const OutputNode = ({ data, selected }) => {
   const getOutputIcon = () => {
     const outputSettings = data.config?.outputSettings;
 
-    if (outputSettings?.outputType === 'connection') {
+    if (outputSettings?.outputType === 'connection' || outputSettings?.outputType === 'api') {
       return <MailOutlined style={{ fontSize: 12, color: COLOR }} />;
     }
 
@@ -72,6 +74,10 @@ const OutputNode = ({ data, selected }) => {
       // A cloud object is uploaded, not inserted into.
       if (outputSettings.objectPath) return `Upload to ${outputSettings.objectPath}`;
       return `Insert data into ${outputSettings.tableName}`;
+    } else if (outputSettings.outputType === 'api') {
+      // Sent by generated code; until the chat has written it, say so.
+      if (!outputSettings.apiWriteCode) return 'Describe in the chat what to send';
+      return truncate(outputSettings.apiWriteExplanation || outputSettings.apiEndpoint || 'Send rows to the API');
     }
 
     return 'Output configured';

@@ -7,8 +7,11 @@ auth), how its pages are walked, a one-call connection test and the list
 of endpoints you can read. You paste a key; nothing else needs setting
 up.
 
-They are read-only sources. A Data Source node pulls rows from them; they
-are not offered as an Output destination.
+They work in both directions. A **Data Source** node pulls rows from them,
+and an **Output** node — or a **Join** whose destination is one of them —
+sends rows to them, creating or updating records there (see
+[Sending rows to an API](#sending-rows-to-an-api) below). Calendly and
+Typeform are read-only: their APIs do not take records.
 
 ## The connections
 
@@ -56,6 +59,48 @@ new account, and what usually goes wrong.
 - **In the chat assistant:** ask a question about the data ("what was the
   last deal closed?"). The assistant writes a fetch for that question,
   asks you to approve it, then answers from the rows.
+
+## Sending rows to an API
+
+An Output node can write to any API connection, and so can a Join: pick
+the connection as the destination. The rows are sent as records the
+service creates or updates — HubSpot contacts, Airtable rows, Mailchimp
+members, Jira issues.
+
+1. In the Output form choose **Connection**, then the API connection under
+   *APIs*. For a vendor connection you can pick a write endpoint, and
+   choose **Update or create** (re-runs update what is there, matched on
+   an email or id) or **Always create**.
+2. Save. The chat opens with the node in focus: say which records to write
+   and which columns go where. The assistant writes the code that sends
+   the rows and shows it to you; in a plan build you approve it before the
+   build goes on. Nothing is sent until the node or workflow runs.
+3. Run. Rows go out in batches of the service's per-request limit (100 for
+   HubSpot, 10 for Airtable, 500 for Mailchimp, one at a time for
+   Pipedrive, Intercom, Freshdesk, Notion and Linear). A batch the API
+   rejects stops the run, and the message says how many rows had already
+   been sent — an API has no transaction to roll back, so prefer **Update
+   or create**, which makes a re-run safe. Rows the service rejects one by
+   one (an unknown property, an invalid email) are listed and fail the node.
+
+Writing needs a key with **write** access. Each service's page says which
+scope that is.
+
+| Service | What it can receive |
+| --- | --- |
+| HubSpot | Contacts (upsert by email), companies, deals, tickets, products (create, or upsert on a unique property) |
+| Airtable | Records in any table (create, or upsert on chosen fields) |
+| Mailchimp | Audience members (upsert by email) and tags |
+| Klaviyo | Profiles (upsert by email), list membership |
+| SendGrid | Marketing contacts (upsert by email) |
+| Pipedrive | Persons, organizations, deals (create; update after a lookup) |
+| Intercom | Contacts (create or update), companies (upsert by company id) |
+| Freshdesk | Contacts, companies, tickets |
+| Notion | Rows of a shared database |
+| Linear, Jira | Issues |
+| Stripe | Customers (use a test-mode key unless you mean it) |
+| GitHub | Issues (public on a public repository) |
+| REST API (custom) | Whatever endpoint you describe |
 
 ## When a test fails
 

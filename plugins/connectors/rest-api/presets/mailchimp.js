@@ -48,4 +48,19 @@ module.exports = {
     'Member ids are the MD5 hash of the lower-cased email address.',
     'Mailchimp allows about 10 concurrent connections per key; keep requests sequential.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/lists/{list_id}', label: 'Add or update audience members', batch: 500, upsert: 'email_address',
+        body: '{ members: [{ email_address, status_if_new: "subscribed", status?, merge_fields: { FNAME, LNAME }, tags: [] }], update_existing: true }',
+        notes: 'Answers 200 even when some members fail: response.data.errors lists them (count as failed); new_members / updated_members are the successes.' },
+      { method: 'POST', path: '/lists/{list_id}/members/{subscriber_hash}/tags', label: 'Add or remove tags on one member', batch: 1, upsert: 'subscriber_hash (MD5 of the lower-cased email)',
+        body: '{ tags: [{ name, status: "active" | "inactive" }] }' },
+    ],
+    notes: [
+      'Mailchimp rejects addresses that look fake (example.com and similar) and addresses that unsubscribed before cannot be re-subscribed by API.',
+      'Adding a member does not send anything; a campaign does.',
+      'An audience named by the user is found by GET /lists?count=1000 (lists[].name → id).',
+    ],
+  },
 };

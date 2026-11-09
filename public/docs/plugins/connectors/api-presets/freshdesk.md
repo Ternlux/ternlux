@@ -46,6 +46,10 @@ field definitions.
   `updated_since` date is given.
 - Custom fields are under `custom_fields` (`cf_…`).
 
+## Writing to Freshdesk
+
+An Output node or a Join can send rows to Freshdesk (see [Sending rows to an API](README.md#sending-rows-to-an-api)). The API key can write. Contacts and companies are found first so re-runs update rather than duplicate. Creating a **ticket** emails the requester — prefer contacts and companies for test runs.
+
 ## Troubleshooting
 
 - **401:** wrong key.

@@ -27,7 +27,9 @@ import {
   FormScope, FormBody, FormFooter, Card, Fields, Field,
   Segmented, SelectInput, TextInput, PathPicker, Note, Handoff, HandoffBody,
   Picked, CloudButton, EmptyState, ConnList, ConnGroupToggle, ConnRow, IconFolder,
+  SearchSelect, IconChat,
 } from './_formShared';
+import { presetForConnection, endpointKey } from '../connections/apiPresets';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output Node configuration form
@@ -100,6 +102,14 @@ const sanitizeTableName = (name, fallback = 'data') => {
 };
 
 const GROUP_ORDER = ['Databases', 'Vector', 'Cloud Storage', 'APIs', 'Local Files', 'Other'];
+
+const isApiConn = (conn) => !!conn && (conn.dbCategory === 'API' || conn.dbType === 'rest-api');
+
+// The fields an API destination's build writes into outputSettings
+// (workflowBuilder.buildApiWriteSpec) — carried through the form untouched.
+const apiFieldsOf = (os) => (os?.outputType === 'api'
+  ? Object.fromEntries(Object.entries(os).filter(([k]) => k.startsWith('api') || k === 'connectionName' || k === 'upsertKeys'))
+  : {});
 
 /**
  * Undo the pre-quoting an earlier build applied before saving. The executor
@@ -179,6 +189,9 @@ const OutputNodeChat = ({
   // panel header, not from here; this only keeps the form's own controls from
   // being edited or re-saved underneath a run in flight.
   executing = false,
+  // Opens the chat assistant with this node in focus (and a draft request) —
+  // an API destination's send code is written there, like an API data source.
+  onRequestChatHandoff,
 }) => {
   const initialized = useRef(false);
 
@@ -195,7 +208,12 @@ const OutputNodeChat = ({
   const [pluginManager, setPluginManager] = useState(null);
 
   const saved = initialConfig?.outputSettings || null;
+  const [installedPlugins, setInstalledPlugins] = useState([]);
   const [outputSettings, setOutputSettings] = useState({
+    // An API destination's generated send code and its details (apiWriteCode,
+    // apiEndpoint, apiBatchSize…) are kept as they are, so re-saving the form
+    // does not throw away what the chat built.
+    ...apiFieldsOf(saved),
     outputType: saved?.outputType || 'local',
     format: saved?.format || null,
     savePath: saved?.savePath || null,
@@ -356,6 +374,7 @@ const OutputNodeChat = ({
         const pluginsResult = await window.electronAPI.dbConnect.listPlugins();
         if (pluginsResult.success && pluginsResult.connectors) {
           pluginsResult.connectors.forEach((plugin) => pluginsMap.set(plugin.id, plugin));
+          setInstalledPlugins(pluginsResult.connectors);
           setPluginManager({
             getConnector: (dbType) => pluginsResult.connectors.find((c) => c.id === dbType) || null,
           });
@@ -373,12 +392,12 @@ const OutputNodeChat = ({
       return { ...conn, dbCategory: plugin?.dbCategory || conn.dbCategory || null, storageType: plugin?.storageType || null };
     });
 
-    // Only databases, vector stores and cloud storage can receive output. A
-    // REST API is read-only as far as the output node is concerned, and it can
-    // carry connectionType 'database', so exclude it explicitly.
+    // Databases, vector stores, cloud storage and REST APIs can receive output.
+    // An API connection can carry connectionType 'database', so it is matched
+    // first — its rows are SENT by generated code, not inserted into a table.
     const destinations = enriched
-      .filter((conn) => conn.dbCategory !== 'API' && conn.dbType !== 'rest-api')
-      .filter((conn) => conn.connectionType === 'database'
+      .filter((conn) => isApiConn(conn)
+        || conn.connectionType === 'database'
         || conn.dbCategory === 'CloudStorage'
         || conn.dbCategory === 'Vector')
       .map((conn) => {
@@ -388,7 +407,9 @@ const OutputNodeChat = ({
         return {
           id: conn.id,
           name: conn.name,
-          meta: isCloudStorage
+          meta: isApiConn(conn)
+            ? `Send rows to ${conn.name} (API)`
+            : isCloudStorage
             ? `Upload to ${conn.name} (${conn.dbType})`
             : isVector
               ? `Insert vectors into ${conn.name} (${conn.dbType})`
@@ -437,6 +458,7 @@ const OutputNodeChat = ({
   const destKind = useMemo(() => {
     if (!selectedDestination) return null;
     const group = selectedDestination.group;
+    if (group === 'APIs') return 'api';
     if (group === 'Cloud Storage') return 'cloud';
     if (group === 'Vector') return 'vector';
     return 'database';
@@ -510,6 +532,8 @@ const OutputNodeChat = ({
       if (TABLE_FORMATS.has(outputSettings.format) && !String(outputSettings.tableName || '').trim()) {
         out.tableName = true;
       }
+    } else if (outputSettings.outputType === 'api') {
+      if (!outputSettings.connectionId) out.connectionId = true;
     } else {
       if (!outputSettings.connectionId) out.connectionId = true;
       else if (!outputSettings.tableName) out.tableName = true;
@@ -589,9 +613,33 @@ const OutputNodeChat = ({
   };
 
   const changeDestination = (conn) => {
-    patch({ connectionId: conn.id, tableName: null, objectPath: null, objectName: null });
+    const api = isApiConn(conn.connection);
+    // A different API means different send code: drop what was built for the
+    // old one. Picking the same one again keeps it.
+    const keepApi = api && conn.id === outputSettings.connectionId;
+    setOutputSettings((prev) => {
+      const next = { ...prev };
+      if (!keepApi) Object.keys(apiFieldsOf(prev)).forEach((k) => { delete next[k]; });
+      return next;
+    });
+    patch({
+      outputType: api ? 'api' : 'connection',
+      connectionId: conn.id,
+      ...(api ? { connectionName: conn.name, writeMode: keepApi ? outputSettings.writeMode : 'upsert' } : {}),
+      ...(!api && outputSettings.outputType === 'api' ? { writeMode: 'append' } : {}),
+      tableName: null, objectPath: null, objectName: null,
+    });
     setAttempted(false);
   };
+
+  // An API destination made from a vendor preset: the write endpoints it lists.
+  const apiPreset = destKind === 'api'
+    ? presetForConnection(installedPlugins, selectedDestination?.connection)
+    : null;
+  const writeEndpoints = apiPreset?.writes?.endpoints || [];
+  const pickedWriteEndpoint = outputSettings.apiWriteEndpoint
+    ? writeEndpoints.find((e) => endpointKey(e) === endpointKey(outputSettings.apiWriteEndpoint)) || outputSettings.apiWriteEndpoint
+    : null;
 
   const browseSavePath = async () => {
     if (!outputSettings.format) {
@@ -685,6 +733,19 @@ const OutputNodeChat = ({
     // Saved — this is what enables Run, and what takes the unsaved marker off.
     setDirty(false);
     setAttempted(false);
+
+    // An API destination continues in the chat, which writes the send code.
+    if (outputSettings.outputType === 'api') {
+      const target = selectedDestination?.name || 'the API';
+      const what = pickedWriteEndpoint
+        ? `${pickedWriteEndpoint.label} (${endpointKey(pickedWriteEndpoint)})`
+        : 'records';
+      onRequestChatHandoff?.(node.id, {
+        draft: outputSettings.apiWriteCode
+          ? ''
+          : `Send each row to ${target} as ${what}${outputSettings.writeMode === 'upsert' ? ', updating records that already exist' : ''}. Map the columns: `,
+      });
+    }
   };
 
   // Running lives in the panel header, next to the unsaved marker — see
@@ -724,7 +785,7 @@ const OutputNodeChat = ({
               hint="Export to a local file, or insert into a saved connection."
             >
               <Segmented
-                value={outputSettings.outputType}
+                value={outputSettings.outputType === 'api' ? 'connection' : outputSettings.outputType}
                 options={[
                   { label: 'Local Environment', value: 'local' },
                   { label: 'Connection', value: 'connection' },
@@ -838,10 +899,73 @@ const OutputNodeChat = ({
                   ))}
                 </ConnList>
                 <div className="tlx-hint" style={{ marginTop: 8 }}>
-                  Only database, vector and cloud-storage connections can receive output.
+                  Database, vector, cloud-storage and API connections can receive output.
+                  An API receives the rows as records it creates or updates.
                 </div>
               </>
             )}
+          </Card>
+        )}
+
+        {!isLocal && destKind === 'api' && (
+          <Card label="Send to API">
+            <Fields>
+              {writeEndpoints.length > 0 && (
+                <Field
+                  label="Endpoint"
+                  hint={pickedWriteEndpoint
+                    ? [
+                      `Up to ${pickedWriteEndpoint.batch} record${pickedWriteEndpoint.batch === 1 ? '' : 's'} per request.`,
+                      pickedWriteEndpoint.upsert ? `Matches existing records on ${pickedWriteEndpoint.upsert}.` : 'Creates new records each run.',
+                      pickedWriteEndpoint.notes || '',
+                    ].filter(Boolean).join(' ')
+                    : `Optional. Pick what to write in ${apiPreset.title}, or describe it in the chat instead.`}
+                >
+                  <SearchSelect
+                    value={pickedWriteEndpoint ? endpointKey(pickedWriteEndpoint) : ''}
+                    placeholder={`Select a ${apiPreset.title} write endpoint…`}
+                    searchPlaceholder="Filter endpoints…"
+                    options={writeEndpoints.map((e) => ({ label: `${e.label} — ${endpointKey(e)}`, value: endpointKey(e) }))}
+                    onChange={(v) => {
+                      const e = writeEndpoints.find((x) => endpointKey(x) === v) || null;
+                      patch({
+                        apiWriteEndpoint: e ? { method: e.method, path: e.path, operation: e.operation || null, label: e.label } : null,
+                        ...(e ? { writeMode: e.upsert ? 'upsert' : 'create' } : {}),
+                      });
+                    }}
+                  />
+                </Field>
+              )}
+              <Field
+                label="Records that already exist"
+                hint={outputSettings.writeMode === 'upsert'
+                  ? 'A row whose key (an email, an external id) matches an existing record updates it; the rest are created. Re-running is safe.'
+                  : 'Every row becomes a new record. Re-running creates them again.'}
+              >
+                <Segmented
+                  value={outputSettings.writeMode === 'create' ? 'create' : 'upsert'}
+                  options={[
+                    { label: 'Update or create', value: 'upsert' },
+                    { label: 'Always create', value: 'create' },
+                  ]}
+                  onChange={(v) => patch({ writeMode: v })}
+                />
+              </Field>
+            </Fields>
+            <Handoff color={FORM_ACCENT.transform} icon={<IconChat />} title="Continues in chat after you save">
+              <HandoffBody>
+                The credentials stay on the connection. <strong>Press Save and the chat opens with this
+                node in focus</strong>: say which records to write and from which columns. The assistant
+                writes the code that sends the rows, a batch at a time, and shows it to you; nothing is
+                sent until you run the node or the workflow.
+              </HandoffBody>
+              {outputSettings.apiWriteCode ? (
+                <Picked>
+                  Send code ready{outputSettings.apiEndpoint ? <> — <code>{outputSettings.apiEndpoint}</code></> : null}
+                  {outputSettings.apiWriteExplanation ? <><br />{outputSettings.apiWriteExplanation}</> : null}
+                </Picked>
+              ) : null}
+            </Handoff>
           </Card>
         )}
 

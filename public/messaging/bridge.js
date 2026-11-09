@@ -365,8 +365,11 @@ class MessagingBridge {
         }
         if (r.kind === 'approval') {
           const isRebuild = r.approval.kind === 'target_rebuild';
+          const isWrite = r.approval.kind === 'api_write';
           const approved = await this.requestApproval(chatId, userId, {
-            title: isRebuild ? `Recreate ${r.approval.table}?` : 'Run this API call to build the workflow?',
+            title: isRebuild ? `Recreate ${r.approval.table}?`
+              : isWrite ? `Approve the code that sends rows to ${r.approval.connectionName || 'the API'}? (Nothing is sent now.)`
+                : 'Run this API call to build the workflow?',
             explanation: r.approval.explanation || r.question,
             code: r.approval.code || '',
           });
@@ -374,7 +377,8 @@ class MessagingBridge {
           if (!approved) {
             const text = isRebuild
               ? `Not approved — the build stopped, nothing was saved, and ${r.approval.table} was left as it is.`
-              : 'Not run — the build stopped before calling the API, and nothing was saved.';
+              : isWrite ? 'Not approved — the build stopped and nothing was saved or sent.'
+                : 'Not run — the build stopped before calling the API, and nothing was saved.';
             await this.adapter.sendPlain(chatId, text);
             await this.runner.note(convoId, [{ role: 'assistant', kind: 'final', text, agentSource: 'builder' }], { pendingBuild: null },
               { planStatus: { kind: 'error', message: isRebuild ? `Stopped — recreating ${r.approval.table} was not approved.` : 'Stopped — the API call was not approved.' } });

@@ -52,4 +52,23 @@ module.exports = {
     'EU and Australian workspaces use api.eu.intercom.io / api.au.intercom.io — change the Base URL for those.',
     'On 429, wait until the X-RateLimit-Reset time.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/contacts', label: 'Create a contact (user or lead)', batch: 1, upsert: null,
+        body: '{ role: "user" | "lead", email, name?, phone?, external_id?, custom_attributes? }',
+        notes: 'A user whose email or external_id already exists answers 409 — search, then PUT /contacts/{id} to update.' },
+      { method: 'PUT', path: '/contacts/{id}', label: 'Update a contact', batch: 1, upsert: 'id', body: '{ …fields to change }' },
+      { method: 'POST', path: '/contacts/search', label: 'Find contacts (for updates)', batch: 1, upsert: null,
+        body: '{ query: { field: "email", operator: "=", value } }' },
+      { method: 'POST', path: '/companies', label: 'Create or update a company', batch: 1, upsert: 'company_id',
+        body: '{ company_id, name, plan?, size?, website?, custom_attributes? }' },
+      { method: 'POST', path: '/contacts/{id}/companies', label: 'Attach a contact to a company', batch: 1, upsert: null, body: '{ id: "<company id>" }' },
+    ],
+    notes: [
+      'One record per request. custom_attributes must already be defined in Intercom (Settings → Data); an unknown one is a 400.',
+      'A company\'s standard fields go at the TOP level, not in custom_attributes: company_id, name, plan, size (employee count, integer), website, industry, monthly_spend, remote_created_at.',
+      'A contact\'s standard fields are top level too: role, external_id, email, phone, name, avatar, signed_up_at, last_seen_at, owner_id, unsubscribed_from_emails.',
+    ],
+  },
 };

@@ -69,4 +69,13 @@ module.exports = {
     'Rate limit: 5,000 requests/hour per token. On 403 or 429 with `Retry-After` or `X-RateLimit-Reset`, wait before retrying.',
     'Timestamps are ISO-8601 strings in UTC.',
   ],
+
+  writes: {
+    endpoints: [
+      { method: 'POST', path: '/repos/{owner}/{repo}/issues', label: 'Create an issue', batch: 1, upsert: null,
+        body: '{ title, body?, labels?: [], assignees?: [] }', notes: 'On a public repository the issue is public.' },
+      { method: 'PATCH', path: '/repos/{owner}/{repo}/issues/{issue_number}', label: 'Update an issue', batch: 1, upsert: 'issue number', body: '{ title?, body?, state?, labels? }' },
+    ],
+    notes: ['Content creation has a secondary rate limit — pause about a second between issues. Needs Issues: Read and write on the token.'],
+  },
 };
