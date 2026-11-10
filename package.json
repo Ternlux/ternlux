@@ -40,7 +40,7 @@
     "test:unit": "node --test --test-timeout=30000 testing/unit/*.test.js",
     "test:integration": "node --test testing/integration/*.test.js",
     "eject": "react-scripts eject",
-    "electron-dev": "concurrently \"cross-env BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3000 && electron .\"",
+    "electron-dev": "concurrently \"cross-env PORT=3100 BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3100 && cross-env ELECTRON_DEV_URL=http://localhost:3100 electron .\"",
     "minify-dist": "node scripts/minify-dist.js",
     "electron-pack": "node scripts/fetch-duckdb-extensions.js && react-scripts build && node scripts/minify-dist.js && electron-builder",
     "dist:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",

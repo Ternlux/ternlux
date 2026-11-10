@@ -1991,6 +1991,17 @@ ipcMain.handle('oauth:start-callback-server', async (_event, { port = 3000 }) =>
         }
       });
 
+      // Port taken (another app, or a dev server on 3000): say so instead of
+      // crashing the main process with an unhandled 'error' event.
+      server.on('error', (err) => {
+        cleanupAndResolve({
+          success: false,
+          message: err.code === 'EADDRINUSE'
+            ? `Port ${port} is in use, so the sign-in callback cannot be received. Close the program using it and authorize again.`
+            : `Could not start the sign-in callback server: ${err.message}`,
+        });
+      });
+
       server.listen(port, () => {
         console.log(`[OAuth] Callback server listening on port ${port}`);
       });
@@ -5417,7 +5428,10 @@ function createWindow() {
   });
 
   if (!app.isPackaged) {
-    win.loadURL('http://localhost:3000');
+    // electron-dev serves the renderer on 3100, leaving port 3000 free for
+    // the OAuth callback server (every OAuth app registers
+    // http://localhost:3000/oauth/callback).
+    win.loadURL(process.env.ELECTRON_DEV_URL || 'http://localhost:3000');
     win.webContents.openDevTools();
   } else {
     win.loadFile(path.join(__dirname, '../build/index.html'));
