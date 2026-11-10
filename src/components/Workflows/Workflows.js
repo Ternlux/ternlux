@@ -3,6 +3,7 @@ import WorkflowsTab from './WorkflowsTab';
 import ConnectionsTab from './ConnectionsTab';
 import ExecutionTab from './ExecutionTab';
 import Settings from '../Settings/Settings';
+import FeedbackModal from '../Feedback/FeedbackModal';
 import { C, SANS } from './_designShared';
 import './Workflows.css';
 
@@ -16,6 +17,7 @@ const Workflows = ({
 }) => {
   const [activeTab, setActiveTab] = useState('workflows');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState('account');
 
   // Deeply nested components can request Settings via this window event
@@ -246,6 +248,32 @@ const Workflows = ({
         <div style={{ flex: 1 }} />
         <button
           type="button"
+          onClick={() => setIsFeedbackOpen(true)}
+          title="Send feedback"
+          aria-label="Send feedback"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            alignSelf: 'center', height: 28, padding: '0 8px', marginRight: 4, borderRadius: 4,
+            background: 'none', border: 'none', cursor: 'pointer',
+            fontSize: 12, fontFamily: SANS, fontWeight: 500,
+            color: C.muted, transition: 'background 0.15s, color 0.15s',
+          }}
+          onMouseOver={e => {
+            e.currentTarget.style.background = C.s2;
+            e.currentTarget.style.color = C.text;
+          }}
+          onMouseOut={e => {
+            e.currentTarget.style.background = 'none';
+            e.currentTarget.style.color = C.muted;
+          }}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+          Feedback
+        </button>
+        <button
+          type="button"
           onClick={() => { setSettingsTab('account'); setIsSettingsOpen(true); }}
           title="Settings"
           aria-label="Settings"
@@ -276,6 +304,8 @@ const Workflows = ({
       <div style={{ flex: 1, overflow: 'hidden' }}>
         {active.render()}
       </div>
+
+      <FeedbackModal open={isFeedbackOpen} onClose={() => setIsFeedbackOpen(false)} />
 
       {isSettingsOpen && (
         <Settings initialTab={settingsTab} onClose={() => setIsSettingsOpen(false)} />
