@@ -16,7 +16,9 @@
 // displaces the other, so `npm run electron-dev` keeps working throughout.
 // sqlite3 needs nothing here either: dist:win lets electron-builder run
 // @electron/rebuild, which fetches sqlite3's own win32 prebuild (verified — the
-// shipped node_sqlite3.node is a PE32+ DLL). That is why only these two are
+// shipped node_sqlite3.node is a PE32+ DLL). That rebuild happens IN PLACE in
+// node_modules, so dist:win / release:win end with `electron-builder
+// install-app-deps` to put the mac build back for `npm run electron-dev`. That is why only these two are
 // handled, and why dist:linux, which passes -c.npmRebuild=false, has to stage
 // sqlite3 by hand and this does not.
 //
