@@ -13,7 +13,9 @@
  * Fields a preset can carry (github.js and hubspot.js show the common shape):
  *   baseUrl            fixed API root, or null when it is per account — then
  *                      baseUrlPlaceholder / baseUrlHelp tell the user what to type
- *   credentials        [{ key, label, placeholder, helpText }] saved as apiParams
+ *   credentials        [{ key, label, placeholder, helpText, optional?, usedIn? }] saved as apiParams;
+ *                      usedIn 'query'|'body' marks one the requests carry outside the headers
+ *                      (Mixpanel's project id, Plausible's site), optional one only writes need
  *   headers            { Name: 'template' } — `{Key}` is the value saved under Key
  *   basicAuth          { username, password } templates for HTTP Basic auth
  *   test               { path, method?, body?, identityField? } for Test Connection
@@ -77,11 +79,16 @@ function resolveCredentialKeys(preset, savedKeys = []) {
  */
 function buildPresetHeaders(preset, valuesByKey = {}) {
   const missing = (preset.credentials || [])
+    .filter((c) => !c.optional)
     .map((c) => c.key)
     .filter((k) => !valuesByKey[k]);
   const headers = {};
   for (const [name, template] of Object.entries(preset.headers || {})) {
-    headers[name] = fillTemplate(template, valuesByKey);
+    const value = fillTemplate(template, valuesByKey);
+    // A header built only from an optional credential the user left blank
+    // is left out rather than sent with the "{Key}" text in it.
+    if (/\{[^{}]+\}/.test(value)) continue;
+    headers[name] = value;
   }
   if (preset.basicAuth) {
     const user = fillTemplate(preset.basicAuth.username, valuesByKey);
@@ -162,6 +169,7 @@ function describePreset(preset, { credentialRef = (key) => `{${key}}`, mode = 'r
 module.exports = {
   PRESETS,
   getPreset,
+  fillTemplate,
   resolveCredentialKeys,
   buildPresetHeaders,
   valueAt,

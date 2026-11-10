@@ -49,7 +49,9 @@ const TIER1 = ['github', 'hubspot', 'stripe', 'notion', 'airtable', 'jira', 'pip
   'klaviyo', 'intercom', 'linear', 'mailchimp', 'freshdesk', 'calendly', 'typeform'];
 
 test('every preset is complete and survives IPC (structured clone)', () => {
-  assert.deepStrictEqual(presets.PRESETS.map((p) => p.id), TIER1);
+  // The first presets keep their order; later ones are checked one by one below.
+  assert.deepStrictEqual(presets.PRESETS.slice(0, TIER1.length).map((p) => p.id), TIER1);
+  assert.strictEqual(new Set(presets.PRESETS.map((p) => p.id)).size, presets.PRESETS.length, 'preset ids are unique');
   for (const p of presets.PRESETS) {
     assert.ok(p.title && p.docsUrl, `${p.id}: title/docsUrl`);
     assert.ok(p.baseUrl ? p.baseUrl.startsWith('https://') : (p.baseUrlPlaceholder && p.baseUrlHelp),
@@ -214,7 +216,12 @@ test('every preset sends every credential it asks for', () => {
     const sent = JSON.stringify(headers)
       + (headers.Authorization && headers.Authorization.startsWith('Basic ')
         ? Buffer.from(headers.Authorization.slice(6), 'base64').toString() : '');
-    for (const v of Object.values(values)) assert.ok(sent.includes(v), `${p.id} never sends ${v}`);
+    // Optional credentials only writes need, and ones the request carries in
+    // its URL or body (usedIn), are not headers.
+    p.credentials.forEach((c, i) => {
+      if (c.optional || c.usedIn) return;
+      assert.ok(sent.includes(`v${i}secret`), `${p.id} never sends ${c.key}`);
+    });
   }
 });
 

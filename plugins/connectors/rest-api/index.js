@@ -17,7 +17,7 @@
 
 const axios = require('axios');
 const {
-  PRESETS, getPreset, resolveCredentialKeys, buildPresetHeaders, valueAt,
+  PRESETS, getPreset, resolveCredentialKeys, buildPresetHeaders, valueAt, fillTemplate,
 } = require('./presets');
 
 // Upper bound on the key/value list the connection form offers. Kept here
@@ -88,11 +88,14 @@ async function testPresetConnection(preset, config) {
       message: `Enter your ${preset.title} base URL (e.g. ${preset.baseUrlPlaceholder || preset.baseUrl}) to test this connection.`,
     };
   }
+  // A test path or body may name a non-secret credential — Plausible's site
+  // domain, Twilio's Account SID — filled in the same way as a header.
+  const fill = (v) => (v == null ? v : JSON.parse(fillTemplate(JSON.stringify(v), valuesByKey)));
   const res = await axios({
     method: preset.test.method || 'GET',
-    url: `${baseUrl}${preset.test.path}`,
+    url: `${baseUrl}${fillTemplate(preset.test.path, valuesByKey)}`,
     headers: preset.test.body ? { 'Content-Type': 'application/json', ...headers } : headers,
-    data: preset.test.body,
+    data: fill(preset.test.body),
     timeout: 10_000,
     validateStatus: () => true,
   });
