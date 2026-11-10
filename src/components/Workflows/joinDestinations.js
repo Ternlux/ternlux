@@ -39,9 +39,21 @@ export const categorizeConnection = (conn) => {
  * "Local file" option already means). Local LanceDB is a vector store, so it
  * stays.
  */
-export const isJoinDestination = (conn) => {
+/**
+ * An API connector whose reference lists no write endpoints (GA4, Search
+ * Console, the ad platforms' read-only connectors) cannot receive rows, so it
+ * is not offered as a destination. `plugin` is the connector's listing from
+ * listPlugins; a REST connection or a connector without a reference can.
+ */
+export const apiAcceptsRows = (plugin) => {
+  const ref = plugin && plugin.apiReference;
+  if (!ref) return true;
+  return !!(ref.writes && Array.isArray(ref.writes.endpoints) && ref.writes.endpoints.length);
+};
+
+export const isJoinDestination = (conn, plugin = null) => {
   if (!conn) return false;
-  if (conn.dbCategory === 'API' || conn.dbType === 'rest-api') return true;
+  if (conn.dbCategory === 'API' || conn.dbType === 'rest-api') return conn.dbType === 'rest-api' || apiAcceptsRows(plugin);
   if (conn.dbCategory === 'CloudStorage') return false;
   if (conn.dbCategory === 'Vector' || VECTOR_DB_TYPES.has(conn.dbType)) return true;
   return conn.connectionType === 'database';
@@ -71,12 +83,20 @@ export const loadJoinDestinations = async () => {
     console.warn('[joinDestinations] could not load connections:', err.message);
   }
 
+  const plugins = new Map();
+  try {
+    const listed = window.electronAPI?.dbConnect?.listPlugins ? await window.electronAPI.dbConnect.listPlugins() : null;
+    (listed?.connectors || []).forEach((p) => plugins.set(p.id, p));
+  } catch (err) {
+    console.warn('[joinDestinations] could not list connector plugins:', err.message);
+  }
+
   const destinations = [];
   const seen = new Set();
   allConnections.forEach((conn) => {
     if (!conn || seen.has(conn.id)) return;
     seen.add(conn.id);
-    if (!isJoinDestination(conn)) return;
+    if (!isJoinDestination(conn, plugins.get(conn.dbType) || null)) return;
     const group = categorizeConnection(conn);
     destinations.push({
       id: conn.id,

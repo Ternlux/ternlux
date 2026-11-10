@@ -24,9 +24,13 @@ export const connectorKeyFor = (conn) => {
 // The preset a saved connection was made from, read off the installed REST API
 // plugin. Null for any other connection, or when the plugin is not installed.
 export const presetForConnection = (installedPlugins, conn) => {
-  const presetId = conn?.dbConfig?.presetId;
-  if (!presetId) return null;
+  if (!conn) return null;
   const plugin = (installedPlugins || []).find((p) => p.id === conn.dbType);
+  // An API connector (Salesforce, GA4…) carries its own endpoint reference in
+  // the preset shape, so the endpoint pickers work for it unchanged.
+  if (plugin?.apiReference && conn.dbType !== 'rest-api') return { id: plugin.id, title: plugin.name, ...plugin.apiReference };
+  const presetId = conn.dbConfig?.presetId;
+  if (!presetId) return null;
   return (plugin?.presets || []).find((p) => p.id === presetId) || null;
 };
 
@@ -75,7 +79,9 @@ const presetConfigSchema = (preset) => ({
       label: c.label,
       placeholder: c.placeholder,
       helpText: c.helpText,
-      required: true,
+      // An optional credential (Customer.io's Track API key, used only for
+      // writes) may be left blank.
+      required: !c.optional,
     })),
     // A fixed API root is pre-filled; a per-account one (Jira, Freshdesk,
     // Mailchimp) is left empty with an example of what to type.

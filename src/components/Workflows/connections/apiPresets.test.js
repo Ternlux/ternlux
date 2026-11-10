@@ -102,3 +102,24 @@ describe('endpoint picker helpers', () => {
       .toBe('Pull Repositories the token can see from GitHub (GET /user/repos).');
   });
 });
+
+describe('API connectors (own sign-in)', () => {
+  const sf = { id: 'salesforce', name: 'Salesforce', apiReference: { title: 'Salesforce REST API', endpoints: [{ path: '/query', label: 'SOQL', rows: 'records' }], writes: { endpoints: [{ method: 'POST', path: '/composite/sobjects', label: 'Create' }] } } };
+  const ga = { id: 'google-analytics', name: 'Google Analytics 4', apiReference: { endpoints: [], writes: { endpoints: [] } } };
+
+  test('presetForConnection returns the connector reference for its connections', () => {
+    const ref = presetForConnection([sf], { dbType: 'salesforce', dbConfig: {} });
+    expect(ref.title).toBe('Salesforce REST API');
+    expect(ref.endpoints[0].path).toBe('/query');
+  });
+
+  test('a read-only connector is not a destination; one with write endpoints is', () => {
+    // eslint-disable-next-line global-require
+    const { apiAcceptsRows, isJoinDestination } = require('../joinDestinations');
+    expect(apiAcceptsRows(ga)).toBe(false);
+    expect(apiAcceptsRows(sf)).toBe(true);
+    expect(isJoinDestination({ dbType: 'google-analytics', dbCategory: 'API' }, ga)).toBe(false);
+    expect(isJoinDestination({ dbType: 'salesforce', dbCategory: 'API' }, sf)).toBe(true);
+    expect(isJoinDestination({ dbType: 'rest-api', dbCategory: 'API' }, null)).toBe(true);
+  });
+});

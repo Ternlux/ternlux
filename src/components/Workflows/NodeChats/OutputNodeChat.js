@@ -30,6 +30,7 @@ import {
   SearchSelect, IconChat,
 } from './_formShared';
 import { presetForConnection, endpointKey } from '../connections/apiPresets';
+import { apiAcceptsRows } from '../joinDestinations';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output Node configuration form
@@ -396,8 +397,8 @@ const OutputNodeChat = ({
     // An API connection can carry connectionType 'database', so it is matched
     // first — its rows are SENT by generated code, not inserted into a table.
     const destinations = enriched
-      .filter((conn) => isApiConn(conn)
-        || conn.connectionType === 'database'
+      .filter((conn) => (isApiConn(conn) && (conn.dbType === 'rest-api' || apiAcceptsRows(pluginsMap.get(conn.dbType))))
+        || (!isApiConn(conn) && conn.connectionType === 'database')
         || conn.dbCategory === 'CloudStorage'
         || conn.dbCategory === 'Vector')
       .map((conn) => {

@@ -163,8 +163,9 @@ const DynamicConnectionForm = ({
       setAuthorizing(true);
       const values = form.getFieldsValue();
 
-      // Validate required OAuth fields (clientId, clientSecret)
-      const requiredFields = ['clientId', 'clientSecret'];
+      // Validate required OAuth fields (clientId, clientSecret unless the
+      // connector says otherwise — a PKCE-only app has no secret).
+      const requiredFields = Array.isArray(plugin.oauthRequiredFields) ? plugin.oauthRequiredFields : ['clientId', 'clientSecret'];
       const missingFields = requiredFields.filter(field => !values[field]);
       if (missingFields.length > 0) {
         message.error(`Please fill in: ${missingFields.join(', ')}`);
@@ -235,7 +236,14 @@ const DynamicConnectionForm = ({
       }
       // console.log('tokenResult: ', tokenResult)
       // Step 6: Update form with tokens
+      // Plus whatever else the provider told us that the requests need
+      // (Salesforce's instance URL, Zoho's API domain, Amazon's profile) —
+      // only into fields the connector declares, so the save path knows
+      // whether each one is secret.
+      const declared = new Set(((plugin.configSchema && plugin.configSchema.fields) || []).map((f) => f.name));
+      const extra = Object.fromEntries(Object.entries(tokenResult.extra || {}).filter(([k]) => declared.has(k)));
       form.setFieldsValue({
+        ...extra,
         accessToken: tokenResult.tokens.accessToken,
         refreshToken: tokenResult.tokens.refreshToken,
         expiryDate: tokenResult.tokens.expiryDate,
