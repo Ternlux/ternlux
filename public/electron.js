@@ -98,6 +98,8 @@ const { registerDatabaseIpc } = require('./database');
 // rows are otherwise serialised in full, and one 1536-dim embedding is ~8k
 // tokens of digits the model has no use for. See public/lib/promptSanitize.js.
 const { stripVectors, sanitizePromptModule } = require('./lib/promptSanitize');
+const { ensureFreshOAuthConfig } = require('./lib/oauthTokens');
+const { resolveConnectorConfig } = require('./lib/apiConnectors');
 const CHAT_PROMPT_MODULES = {
   join: sanitizePromptModule(require('./ChatPrompts/Join').join),
   transfomer: sanitizePromptModule(require('./ChatPrompts/Transfomer').transfomer),
@@ -1326,7 +1328,7 @@ ipcMain.handle('list-lancedb-tables', async (_event, dbPath) => {
  * @param {Object} baseConfig - The base config with non-sensitive data
  * @returns {Object} - Merged config with credentials
  */
-async function getFullConfig(connectionId, baseConfig = {}) {
+async function getFullConfig(connectionId, baseConfig = {}, options = {}) {
   if (!connectionId) {
     // If no connectionId, assume baseConfig already has everything (e.g., test connection before saving)
     console.log('[getFullConfig] No connectionId, returning baseConfig:');
@@ -1385,12 +1387,52 @@ async function getFullConfig(connectionId, baseConfig = {}) {
       ...baseConfig,
       ...credentials
     };
-    // console.log('[getFullConfig] merged fullConfig:', fullConfig);
-    return fullConfig;
+    // An OAuth connection's access token expires; refresh it here (and save
+    // the result) so every caller gets a working token. See lib/oauthTokens.
+    return await freshOAuthConfig(connectionId, fullConfig, options);
   } catch (err) {
     console.error('[getFullConfig]', err);
     return baseConfig;
   }
+}
+
+/**
+ * Save what an OAuth refresh returned: the tokens into the connection's
+ * encrypted credentials, the expiry (and any public value such as an instance
+ * URL) into its connection record.
+ */
+async function persistOAuthRefresh(connectionId, secretFields, publicFields) {
+  const allCreds = loadAllCredentials();
+  allCreds[connectionId] = { ...(allCreds[connectionId] || {}), ...secretFields };
+  const saved = saveAllCredentials(allCreds);
+  if (saved && saved.success === false) throw new Error(saved.error || 'could not save credentials');
+
+  const set = {};
+  for (const [k, v] of Object.entries(publicFields || {})) set[`dbConfig.${k}`] = v;
+  if (Object.keys(set).length) {
+    await getDb('connections').updateAsync(
+      { $or: [{ id: connectionId }, { _id: connectionId }] },
+      { $set: set },
+      {},
+    );
+  }
+}
+
+async function freshOAuthConfig(connectionId, fullConfig, { forceRefresh = false } = {}) {
+  const conn = (await loadConnectionsFromDb()).find((c) => (c.id || c._id) === connectionId);
+  const plugin = conn && conn.dbType && pluginManager.hasConnector(conn.dbType)
+    ? pluginManager.getConnector(conn.dbType)
+    : null;
+  const fresh = await ensureFreshOAuthConfig({
+    connectionId,
+    config: fullConfig,
+    plugin,
+    persist: persistOAuthRefresh,
+    force: forceRefresh,
+  });
+  // An API connector's request code needs its base URL and header values
+  // worked out from the (now fresh) config. See lib/apiConnectors.
+  return resolveConnectorConfig(plugin, fresh);
 }
 
 /**
@@ -1792,15 +1834,18 @@ ipcMain.handle('oauth:get-authorization-url', async (_event, { dbType, config })
     // Generate random state for CSRF protection
     const state = require('crypto').randomBytes(16).toString('hex');
 
-    const result = plugin.getAuthorizationUrl({ ...config, state });
+    const result = await plugin.getAuthorizationUrl({ ...config, state });
 
     if (result.success) {
-      // Store state for verification
+      // Store state for verification. A PKCE verifier stays here in the main
+      // process until the code is exchanged; the renderer only gets the URL.
       pendingOAuthStates.set(state, {
         dbType,
         config,
+        codeVerifier: result.codeVerifier || null,
         timestamp: Date.now()
       });
+      delete result.codeVerifier;
 
       // Clean up old states (older than 10 minutes)
       for (const [key, value] of pendingOAuthStates.entries()) {
@@ -1839,7 +1884,10 @@ ipcMain.handle('oauth:exchange-code', async (_event, { dbType, config, code, sta
       return { success: false, message: 'Connector does not support OAuth' };
     }
     
-    const result = await plugin.exchangeCodeForTokens(config, code);
+    const result = await plugin.exchangeCodeForTokens(
+      pendingState.codeVerifier ? { ...config, codeVerifier: pendingState.codeVerifier } : config,
+      code,
+    );
     return result;
   } catch (error) {
     console.error('[oauth:exchange-code]', error);
@@ -3573,6 +3621,7 @@ async function buildSkillHelpers(defaultDbPath = null) {
     appSqliteDbPath,
     pluginManager,
     getFullConfig,
+    fetchTools: require('./lib/fetchTools'),
     // Start-node trigger registration, bound to executeWorkflowFromTrigger so
     // the headless workflow builder can register a CRON job / file watcher the
     // same way StartNodeChat.handleSave does in the renderer. Mirrors the

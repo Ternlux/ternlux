@@ -6,6 +6,11 @@
 const fs = require('fs');
 const path = require('path');
 const { traceCall, isTracing, safeConfig, batchRowRange } = require('./NodeExecution/executionLog');
+const { completeApiConnector } = require('./lib/apiConnectors');
+
+// Plain data only: a reference crosses IPC to the renderer, and a function in
+// it (a test's identity reader) would make the structured clone throw.
+const plainData = (value) => (value == null ? null : JSON.parse(JSON.stringify(value)));
 
 /**
  * Connector plugin folders that are shipped but deliberately not loaded.
@@ -239,8 +244,9 @@ class PluginManager {
       throw new Error(`index.js not found in ${pluginFolder}`);
     }
 
-    // Load the plugin module
-    const plugin = require(indexPath);
+    // Load the plugin module. An API connector declares its OAuth flow and
+    // endpoints as data; the methods it leaves out are generated from them.
+    const plugin = completeApiConnector(require(indexPath));
 
     // Validate plugin type
     if (plugin.type !== 'connector') {
@@ -376,7 +382,12 @@ class PluginManager {
       storageType: plugin.storageType || null,
       authType: plugin.authType || null,
       // Vendor presets (rest-api) — plain data the picker turns into tiles.
-      presets: Array.isArray(plugin.presets) ? plugin.presets : null
+      presets: Array.isArray(plugin.presets) ? plugin.presets : null,
+      // An API connector's endpoint reference (same shape as a preset), for
+      // the Data Source endpoint picker and the Output write-endpoint picker.
+      apiReference: plugin.apiReference ? plainData(plugin.apiReference) : null,
+      // Which form fields the OAuth button needs before it can start.
+      oauthRequiredFields: plugin.oauth ? (plugin.oauth.requiredFields || ['clientId', 'clientSecret']) : null,
     }));
   }
 
