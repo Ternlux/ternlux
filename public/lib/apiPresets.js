@@ -66,7 +66,96 @@ function presetReferenceForCtx(conn) {
   });
 }
 
+// ── API connectors (own sign-in: Salesforce, GA4, the ad platforms…) ──────
+
+const {
+  isApiConnector, templateFields, fieldToken, connectorPlaceholderNames, liveContextFor,
+} = require('./apiConnectors');
+
+function connectorPluginFor(conn) {
+  if (!conn || !conn.dbType || conn.dbType === 'rest-api') return null;
+  try {
+    // Required lazily: the plugin manager is a main-process singleton.
+    // eslint-disable-next-line global-require
+    const pluginManager = require('../pluginManager');
+    const plugin = pluginManager.hasConnector(conn.dbType) ? pluginManager.getConnector(conn.dbType) : null;
+    return isApiConnector(plugin) ? plugin : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+// The connector's reference in the preset shape describePreset renders.
+function connectorAsPreset(plugin) {
+  const ref = plugin.apiReference;
+  return {
+    ...ref,
+    id: plugin.id,
+    // describePreset appends " API reference"; ref.title ("Salesforce REST
+    // API") is kept for the docs link line instead.
+    title: plugin.name,
+    credentials: templateFields(ref).map((key) => ({ key })),
+    // A per-account host (Salesforce instance, Dynamics environment, Zoho
+    // data centre) is worked out from the signed-in account at run time.
+    baseUrl: ref.baseUrl || `{{BASE_URL}} (this account's own address, e.g. ${ref.baseUrlPlaceholder}, filled in at run time)`,
+  };
+}
+
+function describeConnector(plugin, { credentialRef, mode }) {
+  const mod = loadPresets();
+  if (!mod) return null;
+  return mod.describePreset(connectorAsPreset(plugin), { credentialRef, mode });
+}
+
+/** {{PLACEHOLDER}} names an API connector's generated code may use. */
+function connectorPlaceholders(conn) {
+  const plugin = connectorPluginFor(conn);
+  return plugin ? connectorPlaceholderNames(plugin) : [];
+}
+
+/**
+ * Endpoint reference for a node's generated code: a REST preset's, or an API
+ * connector's (its header values named as placeholders). Null for a
+ * hand-built REST connection.
+ */
+function apiReferenceForPlaceholders(conn, { mode = 'read' } = {}) {
+  const preset = presetReferenceForPlaceholders(conn, { mode });
+  if (preset) return preset;
+  const plugin = connectorPluginFor(conn);
+  if (!plugin) return null;
+  return describeConnector(plugin, { credentialRef: (key) => `{{${fieldToken(key)}}}`, mode });
+}
+
+/** The same for a chat run, where values come from ctx.apiCredentials. */
+function apiReferenceForCtx(conn) {
+  const preset = presetReferenceForCtx(conn);
+  if (preset) return preset;
+  const plugin = connectorPluginFor(conn);
+  if (!plugin) return null;
+  const text = describeConnector(plugin, {
+    credentialRef: (key) => `<values['${key}'] from ctx.apiCredentials('${conn.name}')>`,
+    mode: 'read',
+  });
+  return text && `${text}\n\nAuth: \`const { baseUrl, headers } = await ctx.apiCredentials('${conn.name}')\` gives the base URL and EVERY header these requests need (the access token is already refreshed) — send \`headers\` as-is on each request.`;
+}
+
+/**
+ * Live details of the user's account for the AI, fetched now with their
+ * token (see liveContextFor). '' for a preset or plain REST connection.
+ */
+async function liveApiContext(conn, helpers, { request = '', mode = 'read' } = {}) {
+  const plugin = connectorPluginFor(conn);
+  if (!plugin || !helpers || typeof helpers.getFullConfig !== 'function') return '';
+  const id = conn.id || conn._id;
+  const config = await helpers.getFullConfig(id, conn.dbConfig || {});
+  return liveContextFor(plugin, id, config, { request, mode });
+}
+
 module.exports = {
   presetReferenceForPlaceholders,
   presetReferenceForCtx,
+  apiReferenceForPlaceholders,
+  apiReferenceForCtx,
+  connectorPlaceholders,
+  liveApiContext,
 };

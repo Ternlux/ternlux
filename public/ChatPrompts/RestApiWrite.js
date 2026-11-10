@@ -12,7 +12,7 @@
  * inside string literals, values filled in by the main process.
  */
 
-const { placeholdersFor, paramGuidance, authGuidance } = require('./RestApi');
+const { placeholdersFor, paramGuidance, authGuidance, liveContextSection } = require('./RestApi');
 
 function columnsText(columns) {
   const list = (columns || []).map((c) => (typeof c === 'string' ? c : `${c.name}${c.type ? ` (${c.type})` : ''}`));
@@ -50,10 +50,14 @@ const RestApiWritePrompts = {
     upsertKeys = null,
     selectedEndpoint = null,
     currentCode = null,
+    // An API connector's own placeholders and its live account details
+    // (see RestApi.restApiAnalysisRequest).
+    connectorPlaceholders = [],
+    liveContext = '',
   }) => {
     const authType = connectionAuthType || 'none';
     const paramKeys = Array.isArray(connectionParamKeys) ? connectionParamKeys : [];
-    const vocabulary = placeholdersFor(authType, paramKeys);
+    const vocabulary = [...new Set([...placeholdersFor(authType, paramKeys), ...(connectorPlaceholders || [])])];
     const params = paramGuidance(paramKeys);
     const legacyAuth = (authType === 'none' && params) ? '' : authGuidance({
       authType, apiKeyName: connectionApiKeyName, basicUser: connectionBasicUser,
@@ -80,7 +84,9 @@ ${presetReference}
 This is a generic REST connection: there is no vendor reference. Use the
 endpoint and body the user describes; ask when the request does not say which
 URL to call or what a record's body looks like.
-`}${selectedEndpoint ? `
+`}${liveContext ? `
+${liveContextSection(liveContext)}
+` : ''}${selectedEndpoint ? `
 **Endpoint picked in the Output form**
 ${selectedEndpoint.method || 'POST'} ${selectedEndpoint.path}${selectedEndpoint.operation ? ` (${selectedEndpoint.operation})` : ''} — ${selectedEndpoint.label || ''}. Use it unless the
 request clearly asks for something else.
@@ -115,6 +121,9 @@ async function sendBatch({ axios, rows, batchIndex, state }) {
 \`\`\`
 
 **Contract**
+- It also receives \`tools\`: \`tools.sha256(value)\` (hex — for APIs that take hashed
+  emails or phones; normalise first, usually trim + lowercase), \`tools.sleep(ms)\`,
+  \`tools.parseCsv\`, \`tools.gunzip\`, \`tools.unzip\`, \`tools.parseJsonLines\`.
 - The runtime calls it once per batch: \`rows\` holds at most \`batchSize\` rows
   (you choose batchSize below — the API's per-request maximum for the endpoint
   you call, e.g. 100 for a HubSpot batch, 10 for Airtable, 1 for an endpoint

@@ -92,7 +92,7 @@ const ChatPrompts = {
 const { handleExecuteApiFetch, describeApiTable } = require('../NodeExecution/ApiFetch');
 const { qualifierFor } = require('../lib/tableRef');
 const targetShape = require('../lib/targetShape');
-const { presetReferenceForPlaceholders } = require('../lib/apiPresets');
+const { apiReferenceForPlaceholders, connectorPlaceholders, liveApiContext } = require('../lib/apiPresets');
 const { parseNoSQLOperation, sourceCollectionOf } = require('../joins/joinExecutionHelpers');
 
 // A local node's output is a table in its workflow's database. Compute the path
@@ -1780,7 +1780,9 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
 
   // Branch 1 — REST API. Generates an async fetch function via the existing
   // RestApi prompt. No table step; the runner materialises rows into DuckDB.
-  if (conn.dbType === 'rest-api') {
+  // An API connector (Salesforce, GA4, the ad platforms…) is built the same
+  // way: AI-written request code, with the connector's own sign-in.
+  if (isApiConnection(conn)) {
     // The table a rebuilt node already writes. Downstream nodes read it by
     // name, so the prompt is told to keep it and the builder falls back to it.
     const currentCollection = existingConfig?.sourceCollection || existingConfig?.sourceDataset || null;
@@ -1793,8 +1795,12 @@ async function buildDataSourceConfig({ stepPrompt, helpers, warnings, connection
       // Key names only — the values stay encrypted and never reach the model.
       connectionParamKeys: conn.dbConfig?.apiParamKeys || [],
       currentCollectionName: currentCollection,
-      presetReference: presetReferenceForPlaceholders(conn),
+      presetReference: apiReferenceForPlaceholders(conn),
       selectedEndpoint: existingConfig?.apiPresetEndpoint || null,
+      connectorPlaceholders: connectorPlaceholders(conn),
+      // Fresh from the account each build — a GA4 custom dimension or a
+      // Salesforce field added since the connection was made is listed.
+      liveContext: await liveApiContext(conn, helpers, { request: stepPrompt, mode: 'read' }),
     });
     const out = await callJsonResumable(helpers, restPrompt, { chatHistory: chatToHistory(chat) }, { stage: 'dataSource:restAnalysis', resumed: resumedCalls });
     if (out.action !== 'create_plan' || !out.code) {
@@ -5232,7 +5238,9 @@ async function buildApiWriteSpec({
     connectionBasicUser: conn.dbConfig?.basicUser || '',
     // Key names only — the values stay encrypted and never reach the model.
     connectionParamKeys: conn.dbConfig?.apiParamKeys || [],
-    presetReference: presetReferenceForPlaceholders(conn, { mode: 'write' }),
+    presetReference: apiReferenceForPlaceholders(conn, { mode: 'write' }),
+    connectorPlaceholders: connectorPlaceholders(conn),
+    liveContext: await liveApiContext(conn, helpers, { request: stepPrompt, mode: 'write' }),
     sourceColumns,
     sampleRows,
     writeMode,

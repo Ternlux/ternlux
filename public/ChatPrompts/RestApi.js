@@ -41,6 +41,16 @@ function placeholdersFor(authType, paramKeys = []) {
   return [...BASE_PLACEHOLDERS, ...auth, ...custom];
 }
 
+// The account details an API connector fetched for this build.
+function liveContextSection(text) {
+  return `**The user's account right now**
+Fetched moments ago with the user's own token. Use these exact IDs, names and
+field API names instead of guessing them; a value the request names that is
+not listed here probably does not exist in this account — ask.
+
+${text}`;
+}
+
 // Describes the user's own key/value entries: what each token is called and
 // which key it came from, so the model can pick the right one by name.
 function paramGuidance(paramKeys) {
@@ -186,10 +196,15 @@ const RestApiPrompts = {
     // The endpoint the user picked in the Data Source form:
     // { method, path, label, rows, params, notes }.
     selectedEndpoint = null,
+    // An API connector's own placeholders ({{ACCESS_TOKEN}}, {{DEVELOPER_TOKEN}}…).
+    connectorPlaceholders = [],
+    // The user's account as it is right now (properties, objects, custom
+    // fields…), fetched with their token for this build. '' when none.
+    liveContext = '',
   }) => {
     const authType = connectionAuthType || 'none';
     const paramKeys = Array.isArray(connectionParamKeys) ? connectionParamKeys : [];
-    const vocabulary = placeholdersFor(authType, paramKeys);
+    const vocabulary = [...new Set([...placeholdersFor(authType, paramKeys), ...(connectorPlaceholders || [])])];
     const params = paramGuidance(paramKeys);
     // The legacy authType block only applies to connections saved before the
     // key/value editor. When the user has their own entries, those ARE the
@@ -219,6 +234,8 @@ row locations and pagination rules instead of guessing them. The user's request
 still decides WHICH endpoint and filters to use; ask when it does not say.
 
 ${presetReference}
+` : ''}${liveContext ? `
+${liveContextSection(liveContext)}
 ` : ''}${selectedEndpoint ? `
 **Endpoint picked in the node form**
 The user chose ${selectedEndpoint.method || 'GET'} ${selectedEndpoint.path}${selectedEndpoint.operation ? ` — the ${selectedEndpoint.operation} query` : ''} (${selectedEndpoint.label}) in the
@@ -237,7 +254,11 @@ related endpoints — put any looping logic inside the function itself.
 
 **Function contract**
 - It is an async function expression. It may be named or anonymous.
-- It takes one argument: \`{ axios }\`.
+- It takes one argument: \`{ axios, tools }\`. \`tools\` has helpers for report
+  APIs: \`tools.gunzip(data)\` (a body fetched with responseType 'arraybuffer' →
+  text), \`tools.unzip(data)\` (→ [{ name, text }]), \`tools.parseCsv(text, { skipRows })\`,
+  \`tools.parseJsonLines(text)\`, \`tools.sha256(value)\` (hex) and \`await tools.sleep(ms)\`
+  between status polls. Use them only when needed.
 - It returns an array of plain objects (one per row). If the API returns a
   single object, wrap it as \`[obj]\`. If it returns nothing, return \`[]\`.
 - No \`require\`, no \`import\`, no module exports, no top-level statements
@@ -330,3 +351,4 @@ module.exports.default = RestApiPrompts;
 module.exports.placeholdersFor = placeholdersFor;
 module.exports.paramGuidance = paramGuidance;
 module.exports.authGuidance = authGuidance;
+module.exports.liveContextSection = liveContextSection;

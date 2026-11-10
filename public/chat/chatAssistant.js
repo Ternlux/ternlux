@@ -36,7 +36,7 @@ const { toolsForTurn } = require('./toolSchemas');
 // when the window is being packed.
 const { estimateTokens } = require('../aiProviders');
 const { stripVectors } = require('../lib/promptSanitize');
-const { presetReferenceForCtx } = require('../lib/apiPresets');
+const { apiReferenceForCtx } = require('../lib/apiPresets');
 // Every prompt this module sends is built here. buildPrompt(kind, params)
 // returns { text, meta }: `text` is sent to the model, `meta` describes the
 // same call as parameters and is what the dev prompt log records instead of the
@@ -746,7 +746,7 @@ const SHARED_TOOLS = {
     }
     // A connection made from a vendor preset carries its endpoint reference, so
     // the planner can name the right endpoint and saved key in run_javascript.
-    const apiReference = presetReferenceForCtx(c);
+    const apiReference = apiReferenceForCtx(c);
     return {
       ...safe,
       ...(safeFileInfo ? { fileInfo: safeFileInfo } : {}),
@@ -1022,7 +1022,7 @@ function describeConnectionForCode(c) {
     ? c.dbConfig.apiParams.map((p) => p && p.key).filter(Boolean)
     : (Array.isArray(c.dbConfig?.apiParamKeys) ? c.dbConfig.apiParamKeys : null);
   if (keys && keys.length) out.apiParamKeys = keys;
-  const apiReference = presetReferenceForCtx(c);
+  const apiReference = apiReferenceForCtx(c);
   if (apiReference) out.apiReference = apiReference;
   return out;
 }
@@ -1297,6 +1297,7 @@ function focusedBuildTool(targetNode) {
   if (targetNode.type === 'dataSource') {
     const isApi = targetNode.isApi === true
       || targetNode.dbType === 'rest-api'
+      || targetNode.dbCategory === 'API'
       || targetNode.connectionType === 'api';
     return isApi ? 'build_dataSource' : null;
   }
@@ -2065,7 +2066,7 @@ function apiProbeGate({ request, connections, scratchpad, history }) {
   const mentions = (term) => !!term
     && new RegExp(`(^|[^a-z0-9])${escape(term)}($|[^a-z0-9])`, 'i').test(haystack);
   const named = (connections || [])
-    .filter((c) => c && c.dbType === 'rest-api')
+    .filter((c) => c && (c.dbType === 'rest-api' || c.dbCategory === 'API'))
     .filter((c) => {
       const name = String(c.name || '').trim().toLowerCase();
       const id = String(c.id || c._id || '').trim().toLowerCase();

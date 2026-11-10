@@ -469,13 +469,21 @@ result of action A, run A this turn and B next turn.
 - list_docs                  → { sections: [...] }            // already loaded below
 - read_doc { path }          → markdown contents              // path relative to /docs
                               Setting up a vendor API connection (GitHub, HubSpot,
-                              Stripe, Notion, Airtable, Jira, Pipedrive, SendGrid,
-                              Klaviyo, Intercom, Linear, Mailchimp, Freshdesk,
-                              Calendly, Typeform) — getting a key, scopes, form
-                              fields, sample data, errors: read
+                              Stripe, Shopify, Zendesk, Asana, Mixpanel, PostHog…
+                              — 40 in all, listed in
+                              plugins/connectors/api-presets/README.md) — getting a
+                              key, scopes, form fields, sample data, errors: read
                               plugins/connectors/api-presets/<service>.md (e.g.
-                              plugins/connectors/api-presets/stripe.md) and give
-                              its steps; don't answer from memory.
+                              plugins/connectors/api-presets/stripe.md). For an
+                              OAuth connector (Salesforce, Google Analytics 4,
+                              Search Console, Google Ads, YouTube Analytics, Meta
+                              Ads, Facebook Pages & Instagram, LinkedIn Ads/Pages,
+                              Dynamics 365, Zoho CRM, Outreach, Salesloft, TikTok,
+                              Microsoft Advertising, Pinterest, Snapchat, Amazon
+                              Ads) — creating the OAuth app, redirect URL, scopes:
+                              read plugins/connectors/oauth-connectors/<id>.md
+                              (e.g. oauth-connectors/salesforce.md). Give its
+                              steps; don't answer from memory.
 - list_workflows             → [{ id, name, type, nodeCount, ... }]
 - get_workflow { id }        → slimmed workflow (nodes + edges; chat history
                               removed; sampleData truncated to 1 row).
