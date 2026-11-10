@@ -23,6 +23,8 @@ const axios = require('axios');
 const duck = require('../duckdb');
 const { resolveOutputPath } = require('../transfomers/DuckDB');
 const { normaliseParams, buildParamTokens } = require('../lib/apiPlaceholders');
+const { isAuthRejection } = require('../lib/oauthTokens');
+const fetchTools = require('../lib/fetchTools');
 
 // Wired by initialize() from electron.js main.
 let getFullConfig = null;
@@ -69,8 +71,17 @@ function buildPlaceholderMap(fullConfig) {
   buildParamTokens(normaliseParams(fullConfig.apiParams))
     .forEach(({ token, value }) => { paramMap[token] = value; });
 
+  // An API connector (Salesforce, GA4, the ad platforms…) signs in itself:
+  // its header values, the OAuth access token first, are each a placeholder
+  // ({{ACCESS_TOKEN}}, {{DEVELOPER_TOKEN}}) worked out by lib/apiConnectors.
+  // They win over user keys of the same name — the connector owns them.
+  const connectorTokens = fullConfig.connectorTokens && typeof fullConfig.connectorTokens === 'object'
+    ? fullConfig.connectorTokens
+    : {};
+
   return {
     ...paramMap,
+    ...connectorTokens,
     BASE_URL: fullConfig.baseUrl ? String(fullConfig.baseUrl) : '',
     AUTH_HEADER_NAME: authHeaderName,
     AUTH_HEADER_VALUE: authHeaderValue,
@@ -212,22 +223,22 @@ async function handleExecuteApiFetch({
       return { success: false, error: 'Missing targetCollection' };
     }
 
-    // 1. Merge public config with decrypted secrets (main-process only).
-    const fullConfig = await getFullConfig(apiConnectionId, apiConnectionConfig);
-
-    // 2. Substitute the parameterised placeholders (base URL, auth header,
-    //    API keys, etc.) with the actual decrypted values before evaluating
-    //    the code.
-    const map = buildPlaceholderMap(fullConfig);
-    const resolvedCode = substituteCode(apiFetchCode, map);
-
-    // 3. Turn the resolved source into a callable function. Wrapping in
-    //    parentheses converts a function declaration into a function
-    //    expression, so the AI may return either form.
+    // 1–4. Merge the decrypted secrets, fill in the placeholders, evaluate the
+    //      function and call it. An OAuth token that the provider rejects
+    //      (revoked early, or expired with no recorded expiry) gets one forced
+    //      refresh and one retry — see lib/oauthTokens.
+    const load = async (options) => {
+      const fullConfig = await getFullConfig(apiConnectionId, apiConnectionConfig, options);
+      const resolvedCode = substituteCode(apiFetchCode, buildPlaceholderMap(fullConfig));
+      // Wrapping in parentheses turns a function declaration into an
+      // expression, so the AI may return either form.
+      const fn = new Function(`return (${resolvedCode});`)();
+      return { fn, fullConfig };
+    };
     let fetchFn;
+    let loadedConfig;
     try {
-      const factory = new Function(`return (${resolvedCode});`);
-      fetchFn = factory();
+      ({ fn: fetchFn, fullConfig: loadedConfig } = await load());
     } catch (err) {
       return { success: false, error: `Failed to load fetch function: ${err.message}` };
     }
@@ -237,13 +248,22 @@ async function handleExecuteApiFetch({
     // NB: do not log `fetchFn` — at this point the placeholders have been
     // replaced with the decrypted credentials, so printing the source puts the
     // user's keys in the console/log output.
-    // 4. Invoke it with axios. The function is responsible for any looping /
-    //    pagination and returns either an array of rows or a single object.
+    // The function is responsible for any looping / pagination and returns
+    // either an array of rows or a single object.
     let rawResult;
     try {
-      rawResult = await fetchFn({ axios: strictAxios() });
+      rawResult = await fetchFn({ axios: strictAxios(), tools: fetchTools });
     } catch (err) {
-      return { success: false, error: `Fetch function threw: ${err.message}` };
+      if (isAuthRejection(err) && loadedConfig && loadedConfig.refreshToken) {
+        try {
+          const retry = await load({ forceRefresh: true });
+          rawResult = await retry.fn({ axios: strictAxios(), tools: fetchTools });
+        } catch (err2) {
+          return { success: false, error: `Fetch function threw: ${err2.message}` };
+        }
+      } else {
+        return { success: false, error: `Fetch function threw: ${err.message}` };
+      }
     }
 
     const rows = normaliseRows(rawResult).filter((r) => !isEmptyRow(r));

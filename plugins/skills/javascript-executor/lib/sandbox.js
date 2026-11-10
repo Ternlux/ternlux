@@ -77,11 +77,24 @@ function buildContext(helpers, secrets = null) {
         if (secrets && value) secrets.add(value);
       });
 
-      return { baseUrl: full.baseUrl || '', params };
+      // An API connector (Salesforce, GA4, the ad platforms…) signs in itself:
+      // `headers` is every header its requests need, the OAuth bearer token
+      // included and already refreshed; `values` are the same values by name.
+      const values = full.connectorValues && typeof full.connectorValues === 'object' ? full.connectorValues : {};
+      const headers = full.connectorHeaders && typeof full.connectorHeaders === 'object' ? full.connectorHeaders : {};
+      if (secrets) {
+        Object.values(values).forEach((v) => { if (v) secrets.add(String(v)); });
+        Object.values(headers).forEach((v) => { if (v) secrets.add(String(v)); });
+      }
+
+      return { baseUrl: full.baseUrl || '', params, values, headers };
     },
 
     // Misc.
     axios: helpers.axios,
+    // gunzip / parseCsv / parseJsonLines / sleep, for report APIs that hand
+    // back a compressed file to download (see public/lib/fetchTools.js).
+    tools: helpers.fetchTools || null,
     log: (...args) => console.log('[js-skill]', ...args)
   };
 }

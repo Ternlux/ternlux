@@ -27,6 +27,7 @@
  */
 
 const { loadApiFunction, strictAxios } = require('./ApiFetch');
+const fetchTools = require('../lib/fetchTools');
 
 const DEFAULT_BATCH = 100;
 const MAX_BATCH = 10000;
@@ -113,7 +114,7 @@ async function writeRowsToApi({
     let outcome = null;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        outcome = readOutcome(await send({ axios, rows, batchIndex, state }), rows.length);
+        outcome = readOutcome(await send({ axios, rows, batchIndex, state, tools: fetchTools }), rows.length);
         break;
       } catch (err) {
         const wait = retryAfterMs(err);
