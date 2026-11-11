@@ -46,6 +46,7 @@ the assistant only sees field names, never values.
 | [Zoho CRM](zoho-crm.md) | Every module by record list or COQL; create, update and upsert records | Yes |
 | [Outreach](outreach.md) | Prospects, accounts, sequences, mailings, calls and tasks; create and update prospects and accounts | Yes |
 | [Salesloft](salesloft.md) | People, accounts, cadences, emails, calls and meetings; create and update people and accounts | Yes |
+| [TikTok Ads](tiktok-ads.md) | Campaigns, ad groups, ads and reports by any dimensions — spend, impressions, clicks, conversions, audience breakdowns | No |
 
 ## Adding one
 
