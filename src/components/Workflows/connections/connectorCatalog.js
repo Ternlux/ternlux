@@ -63,6 +63,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:typeform', title: 'Typeform', description: 'Forms, responses and workspaces — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Typeform.png', letters: 'TF', tone: '#262627' },
   { key: 'rest-api:close', title: 'Close', description: 'Leads, contacts, opportunities, calls, emails and tasks — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Close.png', letters: 'CL', tone: '#1463ff' },
   { key: 'rest-api:attio', title: 'Attio', description: 'Records of any object, lists, notes and tasks — access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Attio.png', letters: 'AT', tone: '#111111' },
+  { key: 'rest-api:activecampaign', title: 'ActiveCampaign', description: 'Contacts, lists, campaigns, automations and deals — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'ActiveCampaign.png', letters: 'AC', tone: '#356ae6' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },

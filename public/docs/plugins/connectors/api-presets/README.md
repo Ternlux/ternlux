@@ -37,6 +37,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Typeform](typeform.md) | Forms, questions, responses | Personal access token | Free plan |
 | [Close](close.md) | Leads, contacts, opportunities, calls, emails, tasks | API key | 14-day trial |
 | [Attio](attio.md) | Records of any object, lists, notes, tasks | Access token | Free plan |
+| [ActiveCampaign](activecampaign.md) | Contacts, lists, campaigns, automations, deals | API key, account URL | 14-day trial |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a

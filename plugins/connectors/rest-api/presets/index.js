@@ -42,6 +42,7 @@ const PRESETS = [
   require('./typeform'),
   require('./close'),
   require('./attio'),
+  require('./activecampaign'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
