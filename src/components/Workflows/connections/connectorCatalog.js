@@ -68,6 +68,7 @@ export const CONNECTION_TYPES = [
   { key: 'google-ads', title: 'Google Ads', description: 'Any GAQL report and offline conversion uploads — OAuth + developer token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Ads.png', letters: 'GA', tone: '#fbbc04' },
   { key: 'youtube-analytics', title: 'YouTube Analytics', description: 'Views, watch time, subscribers, traffic sources and video stats — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'YouTube.png', letters: 'YT', tone: '#ff0000' },
   { key: 'meta-ads', title: 'Meta Ads', description: 'Facebook and Instagram campaigns, ads and Insights; audiences and Conversions API — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Meta.png', letters: 'MA', tone: '#0866ff' },
+  { key: 'facebook-pages', title: 'Facebook Pages & Instagram', description: 'Page posts and insights; Instagram media and insights — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Facebook.png', letters: 'FB', tone: '#1877f2' },
   { key: 'salesforce', title: 'Salesforce', description: 'Any object by SOQL or Bulk API; create, update and upsert records — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Salesforce.png', letters: 'SF', tone: '#00a1e0' },
 
   // Vector

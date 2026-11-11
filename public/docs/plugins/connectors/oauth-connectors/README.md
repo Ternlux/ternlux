@@ -38,6 +38,7 @@ the assistant only sees field names, never values.
 | [Google Ads](google-ads.md) | Any GAQL report — campaigns, ads, keywords, search terms, conversions — and offline conversion uploads | Yes |
 | [YouTube Analytics](youtube-analytics.md) | Views, watch time, subscribers, traffic sources and demographics, plus every video's statistics | No |
 | [Meta Ads](meta-ads.md) | Facebook and Instagram ad accounts, campaigns, ads and Insights; custom audiences and Conversions API | Yes |
+| [Facebook Pages & Instagram](facebook-pages.md) | Page posts, comments and insights; Instagram profile, media and insights | No |
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
 
 ## Adding one
