@@ -43,6 +43,7 @@ const PRESETS = [
   require('./close'),
   require('./attio'),
   require('./activecampaign'),
+  require('./apollo'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
