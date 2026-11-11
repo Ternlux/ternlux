@@ -1,0 +1,15 @@
+{
+  "name": "@ternlux/connector-salesloft",
+  "version": "1.0.0",
+  "description": "Salesloft connector for Ternlux",
+  "main": "index.js",
+  "ternlux": {
+    "type": "connector",
+    "id": "salesloft",
+    "displayName": "Salesloft",
+    "minAppVersion": "1.2.0"
+  },
+  "dependencies": {},
+  "author": "Ternlux",
+  "license": "Apache-2.0"
+}

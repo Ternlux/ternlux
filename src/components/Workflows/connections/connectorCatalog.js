@@ -75,6 +75,7 @@ export const CONNECTION_TYPES = [
   { key: 'microsoft-dynamics', title: 'Microsoft Dynamics 365', description: 'Every Dataverse table — read, create, update and upsert — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Dynamics_365.png', letters: 'D3', tone: '#0b53ce' },
   { key: 'zoho-crm', title: 'Zoho CRM', description: 'Every module by records or COQL; create, update and upsert — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Zoho_CRM.png', letters: 'ZC', tone: '#e42527' },
   { key: 'outreach', title: 'Outreach', description: 'Prospects, sequences, mailings, calls and tasks; create and update — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Outreach.png', letters: 'OU', tone: '#5951ff' },
+  { key: 'salesloft', title: 'Salesloft', description: 'People, cadences, emails, calls and meetings; create and update — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Salesloft.png', letters: 'SL', tone: '#0a5b35' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },
