@@ -41,6 +41,7 @@ const PRESETS = [
   require('./calendly'),
   require('./typeform'),
   require('./close'),
+  require('./attio'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));

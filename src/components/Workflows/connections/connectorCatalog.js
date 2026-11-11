@@ -62,6 +62,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:calendly', title: 'Calendly', description: 'Scheduled events, invitees and event types — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Calendly.png', letters: 'CA', tone: '#006bff' },
   { key: 'rest-api:typeform', title: 'Typeform', description: 'Forms, responses and workspaces — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Typeform.png', letters: 'TF', tone: '#262627' },
   { key: 'rest-api:close', title: 'Close', description: 'Leads, contacts, opportunities, calls, emails and tasks — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Close.png', letters: 'CL', tone: '#1463ff' },
+  { key: 'rest-api:attio', title: 'Attio', description: 'Records of any object, lists, notes and tasks — access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Attio.png', letters: 'AT', tone: '#111111' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },
