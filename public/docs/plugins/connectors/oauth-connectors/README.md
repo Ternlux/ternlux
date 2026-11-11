@@ -39,6 +39,7 @@ the assistant only sees field names, never values.
 | [YouTube Analytics](youtube-analytics.md) | Views, watch time, subscribers, traffic sources and demographics, plus every video's statistics | No |
 | [Meta Ads](meta-ads.md) | Facebook and Instagram ad accounts, campaigns, ads and Insights; custom audiences and Conversions API | Yes |
 | [Facebook Pages & Instagram](facebook-pages.md) | Page posts, comments and insights; Instagram profile, media and insights | No |
+| [LinkedIn Ads](linkedin-ads.md) | Ad accounts, campaigns, creatives and ad analytics by campaign, company, job function, seniority and country | No |
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
 
 ## Adding one
