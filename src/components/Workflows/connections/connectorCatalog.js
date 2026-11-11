@@ -72,6 +72,7 @@ export const CONNECTION_TYPES = [
   { key: 'linkedin-ads', title: 'LinkedIn Ads', description: 'Campaigns, creatives and ad analytics by company, job function and seniority — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'LinkedIn.png', letters: 'LI', tone: '#0a66c2' },
   { key: 'linkedin-pages', title: 'LinkedIn Pages', description: 'Company page followers, post statistics and page views — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'LinkedIn.png', letters: 'LP', tone: '#0a66c2' },
   { key: 'salesforce', title: 'Salesforce', description: 'Any object by SOQL or Bulk API; create, update and upsert records — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Salesforce.png', letters: 'SF', tone: '#00a1e0' },
+  { key: 'microsoft-dynamics', title: 'Microsoft Dynamics 365', description: 'Every Dataverse table — read, create, update and upsert — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Dynamics_365.png', letters: 'D3', tone: '#0b53ce' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },

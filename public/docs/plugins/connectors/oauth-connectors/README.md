@@ -42,6 +42,7 @@ the assistant only sees field names, never values.
 | [LinkedIn Ads](linkedin-ads.md) | Ad accounts, campaigns, creatives and ad analytics by campaign, company, job function, seniority and country | No |
 | [LinkedIn Pages](linkedin-pages.md) | Company page followers, follower demographics, post statistics, page views and posts | No |
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
+| [Microsoft Dynamics 365](microsoft-dynamics.md) | Every Dataverse table — accounts, contacts, leads, opportunities, cases, custom tables — read, create, update and upsert | Yes |
 
 ## Adding one
 
