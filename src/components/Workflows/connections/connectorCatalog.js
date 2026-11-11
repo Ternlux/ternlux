@@ -61,6 +61,9 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:freshdesk', title: 'Freshdesk', description: 'Tickets, conversations, contacts and agents — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Freshdesk.png', letters: 'FD', tone: '#25c16f' },
   { key: 'rest-api:calendly', title: 'Calendly', description: 'Scheduled events, invitees and event types — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Calendly.png', letters: 'CA', tone: '#006bff' },
   { key: 'rest-api:typeform', title: 'Typeform', description: 'Forms, responses and workspaces — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Typeform.png', letters: 'TF', tone: '#262627' },
+  // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
+  // with the user's own app, request code written on the node like a REST API.
+  { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },
