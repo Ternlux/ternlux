@@ -49,6 +49,7 @@ the assistant only sees field names, never values.
 | [TikTok Ads](tiktok-ads.md) | Campaigns, ad groups, ads and reports by any dimensions — spend, impressions, clicks, conversions, audience breakdowns | No |
 | [Microsoft Advertising](microsoft-ads.md) | Bing Ads accounts, campaigns, ad groups, ads, keywords and performance reports | No |
 | [Pinterest Ads](pinterest-ads.md) | Ad accounts, campaigns, ad groups, ads and their analytics; boards, pins and organic analytics | No |
+| [Snapchat Ads](snapchat-ads.md) | Ad accounts, campaigns, ad squads, ads and creatives, with daily, hourly and lifetime stats | No |
 
 ## Adding one
 

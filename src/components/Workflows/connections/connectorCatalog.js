@@ -79,6 +79,7 @@ export const CONNECTION_TYPES = [
   { key: 'tiktok-ads', title: 'TikTok Ads', description: 'Campaigns, ad groups, ads and reports with audience breakdowns — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'TikTok.png', letters: 'TT', tone: '#010101' },
   { key: 'microsoft-ads', title: 'Microsoft Advertising', description: 'Bing Ads campaigns, keywords and performance reports — OAuth + developer token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Microsoft_Advertising.png', letters: 'MS', tone: '#00809d' },
   { key: 'pinterest-ads', title: 'Pinterest Ads', description: 'Campaigns, ads and analytics; boards, pins and organic analytics — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Pinterest.png', letters: 'PI', tone: '#e60023' },
+  { key: 'snapchat-ads', title: 'Snapchat Ads', description: 'Campaigns, ad squads, ads and daily or hourly stats — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Snapchat.png', letters: 'SN', tone: '#fffc00' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },
