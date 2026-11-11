@@ -34,6 +34,7 @@ the assistant only sees field names, never values.
 | Connector | What you can read | Receives rows |
 | --- | --- | --- |
 | [Google Analytics 4](google-analytics.md) | GA4 reports — any dimensions and metrics, realtime, pivots — via your own Google OAuth client | No |
+| [Google Search Console](google-search-console.md) | Clicks, impressions, CTR and position by query, page, country and device — via your own Google OAuth client | No |
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
 
 ## Adding one
