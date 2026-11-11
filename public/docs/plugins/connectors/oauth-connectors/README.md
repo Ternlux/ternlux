@@ -40,6 +40,7 @@ the assistant only sees field names, never values.
 | [Meta Ads](meta-ads.md) | Facebook and Instagram ad accounts, campaigns, ads and Insights; custom audiences and Conversions API | Yes |
 | [Facebook Pages & Instagram](facebook-pages.md) | Page posts, comments and insights; Instagram profile, media and insights | No |
 | [LinkedIn Ads](linkedin-ads.md) | Ad accounts, campaigns, creatives and ad analytics by campaign, company, job function, seniority and country | No |
+| [LinkedIn Pages](linkedin-pages.md) | Company page followers, follower demographics, post statistics, page views and posts | No |
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
 
 ## Adding one
