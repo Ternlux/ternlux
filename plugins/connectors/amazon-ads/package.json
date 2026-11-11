@@ -1,0 +1,15 @@
+{
+  "name": "@ternlux/connector-amazon-ads",
+  "version": "1.0.0",
+  "description": "Amazon Ads connector for Ternlux",
+  "main": "index.js",
+  "ternlux": {
+    "type": "connector",
+    "id": "amazon-ads",
+    "displayName": "Amazon Ads",
+    "minAppVersion": "1.2.0"
+  },
+  "dependencies": {},
+  "author": "Ternlux",
+  "license": "Apache-2.0"
+}

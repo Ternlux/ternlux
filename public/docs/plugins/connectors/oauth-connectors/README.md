@@ -50,6 +50,7 @@ the assistant only sees field names, never values.
 | [Microsoft Advertising](microsoft-ads.md) | Bing Ads accounts, campaigns, ad groups, ads, keywords and performance reports | No |
 | [Pinterest Ads](pinterest-ads.md) | Ad accounts, campaigns, ad groups, ads and their analytics; boards, pins and organic analytics | No |
 | [Snapchat Ads](snapchat-ads.md) | Ad accounts, campaigns, ad squads, ads and creatives, with daily, hourly and lifetime stats | No |
+| [Amazon Ads](amazon-ads.md) | Sponsored Products, Brands and Display campaigns, ad groups, keywords, targets and v3 reports | No |
 
 ## Adding one
 
