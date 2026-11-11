@@ -44,6 +44,7 @@ the assistant only sees field names, never values.
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
 | [Microsoft Dynamics 365](microsoft-dynamics.md) | Every Dataverse table — accounts, contacts, leads, opportunities, cases, custom tables — read, create, update and upsert | Yes |
 | [Zoho CRM](zoho-crm.md) | Every module by record list or COQL; create, update and upsert records | Yes |
+| [Outreach](outreach.md) | Prospects, accounts, sequences, mailings, calls and tasks; create and update prospects and accounts | Yes |
 
 ## Adding one
 
