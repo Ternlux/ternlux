@@ -48,6 +48,7 @@ the assistant only sees field names, never values.
 | [Salesloft](salesloft.md) | People, accounts, cadences, emails, calls and meetings; create and update people and accounts | Yes |
 | [TikTok Ads](tiktok-ads.md) | Campaigns, ad groups, ads and reports by any dimensions — spend, impressions, clicks, conversions, audience breakdowns | No |
 | [Microsoft Advertising](microsoft-ads.md) | Bing Ads accounts, campaigns, ad groups, ads, keywords and performance reports | No |
+| [Pinterest Ads](pinterest-ads.md) | Ad accounts, campaigns, ad groups, ads and their analytics; boards, pins and organic analytics | No |
 
 ## Adding one
 

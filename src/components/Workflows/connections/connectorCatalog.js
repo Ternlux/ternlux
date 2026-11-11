@@ -78,6 +78,7 @@ export const CONNECTION_TYPES = [
   { key: 'salesloft', title: 'Salesloft', description: 'People, cadences, emails, calls and meetings; create and update — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Salesloft.png', letters: 'SL', tone: '#0a5b35' },
   { key: 'tiktok-ads', title: 'TikTok Ads', description: 'Campaigns, ad groups, ads and reports with audience breakdowns — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'TikTok.png', letters: 'TT', tone: '#010101' },
   { key: 'microsoft-ads', title: 'Microsoft Advertising', description: 'Bing Ads campaigns, keywords and performance reports — OAuth + developer token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Microsoft_Advertising.png', letters: 'MS', tone: '#00809d' },
+  { key: 'pinterest-ads', title: 'Pinterest Ads', description: 'Campaigns, ads and analytics; boards, pins and organic analytics — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Pinterest.png', letters: 'PI', tone: '#e60023' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },

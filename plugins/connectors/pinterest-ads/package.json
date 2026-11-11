@@ -1,0 +1,15 @@
+{
+  "name": "@ternlux/connector-pinterest-ads",
+  "version": "1.0.0",
+  "description": "Pinterest Ads connector for Ternlux",
+  "main": "index.js",
+  "ternlux": {
+    "type": "connector",
+    "id": "pinterest-ads",
+    "displayName": "Pinterest Ads",
+    "minAppVersion": "1.2.0"
+  },
+  "dependencies": {},
+  "author": "Ternlux",
+  "license": "Apache-2.0"
+}
