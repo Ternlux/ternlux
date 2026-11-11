@@ -36,6 +36,7 @@ the assistant only sees field names, never values.
 | [Google Analytics 4](google-analytics.md) | GA4 reports — any dimensions and metrics, realtime, pivots — via your own Google OAuth client | No |
 | [Google Search Console](google-search-console.md) | Clicks, impressions, CTR and position by query, page, country and device — via your own Google OAuth client | No |
 | [Google Ads](google-ads.md) | Any GAQL report — campaigns, ads, keywords, search terms, conversions — and offline conversion uploads | Yes |
+| [YouTube Analytics](youtube-analytics.md) | Views, watch time, subscribers, traffic sources and demographics, plus every video's statistics | No |
 | [Salesforce](salesforce.md) | Any object by SOQL (Bulk API for large extracts); create, update and upsert records — via your own External Client App | Yes |
 
 ## Adding one
