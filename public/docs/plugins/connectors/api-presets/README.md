@@ -39,6 +39,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Attio](attio.md) | Records of any object, lists, notes, tasks | Access token | Free plan |
 | [ActiveCampaign](activecampaign.md) | Contacts, lists, campaigns, automations, deals | API key, account URL | 14-day trial |
 | [Apollo.io](apollo.md) | Your contacts, accounts, deals, sequences; people and company search | API key | Free plan |
+| [Zendesk](zendesk.md) | Tickets, comments, users, organizations, metrics, CSAT | Email + API token, Zendesk URL | 14-day trial |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
