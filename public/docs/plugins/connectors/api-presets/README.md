@@ -11,7 +11,10 @@ They work in both directions. A **Data Source** node pulls rows from them,
 and an **Output** node — or a **Join** whose destination is one of them —
 sends rows to them, creating or updating records there (see
 [Sending rows to an API](#sending-rows-to-an-api) below). Calendly and
-Typeform are read-only: their APIs do not take records.
+Typeform are read-only: their APIs do not take records, and neither do
+Plausible or (here) Sentry beyond resolving issues. Services that sign in
+with OAuth — Salesforce, Google Analytics, the ad platforms — are their
+own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 
 ## The connections
 
@@ -32,6 +35,7 @@ Typeform are read-only: their APIs do not take records.
 | [Freshdesk](freshdesk.md) | Tickets, conversations, contacts, agents | API key, helpdesk URL | Free plan |
 | [Calendly](calendly.md) | Scheduled events, invitees, event types | Personal access token | Free plan |
 | [Typeform](typeform.md) | Forms, questions, responses | Personal access token | Free plan |
+| [Close](close.md) | Leads, contacts, opportunities, calls, emails, tasks | API key | 14-day trial |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
