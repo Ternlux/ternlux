@@ -73,6 +73,7 @@ export const CONNECTION_TYPES = [
   { key: 'linkedin-pages', title: 'LinkedIn Pages', description: 'Company page followers, post statistics and page views — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'LinkedIn.png', letters: 'LP', tone: '#0a66c2' },
   { key: 'salesforce', title: 'Salesforce', description: 'Any object by SOQL or Bulk API; create, update and upsert records — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Salesforce.png', letters: 'SF', tone: '#00a1e0' },
   { key: 'microsoft-dynamics', title: 'Microsoft Dynamics 365', description: 'Every Dataverse table — read, create, update and upsert — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Dynamics_365.png', letters: 'D3', tone: '#0b53ce' },
+  { key: 'zoho-crm', title: 'Zoho CRM', description: 'Every module by records or COQL; create, update and upsert — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Zoho_CRM.png', letters: 'ZC', tone: '#e42527' },
 
   // Vector
   { key: 'pinecone', title: 'Pinecone', description: 'Connect to Pinecone vector database', category: 'vector', img: LOGO_PREFIX_2026_11 + 'Pinecone.png', letters: 'PC', tone: '#0f172a' },

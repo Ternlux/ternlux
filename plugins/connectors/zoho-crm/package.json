@@ -1,0 +1,15 @@
+{
+  "name": "@ternlux/connector-zoho-crm",
+  "version": "1.0.0",
+  "description": "Zoho CRM connector for Ternlux",
+  "main": "index.js",
+  "ternlux": {
+    "type": "connector",
+    "id": "zoho-crm",
+    "displayName": "Zoho CRM",
+    "minAppVersion": "1.2.0"
+  },
+  "dependencies": {},
+  "author": "Ternlux",
+  "license": "Apache-2.0"
+}
