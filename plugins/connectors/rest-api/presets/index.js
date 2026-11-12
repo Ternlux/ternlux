@@ -53,6 +53,7 @@ const PRESETS = [
   require('./gitlab'),
   require('./sentry'),
   require('./smartsheet'),
+  require('./brevo'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
