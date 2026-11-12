@@ -49,6 +49,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Sentry](sentry.md) | Issues, events, releases, Discover queries | Auth token, Sentry URL | Free Developer plan |
 | [Smartsheet](smartsheet.md) | Sheets, rows, reports, workspaces | Access token | 30-day trial |
 | [Brevo](brevo.md) | Contacts, lists, email and SMS campaigns, CRM | API key | Free plan |
+| [Customer.io](customer-io.md) | Campaigns, newsletters, segments, messages | App API key (+ Track keys to send) | 14-day trial |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
