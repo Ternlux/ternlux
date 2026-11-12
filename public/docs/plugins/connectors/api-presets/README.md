@@ -47,6 +47,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [ClickUp](clickup.md) | Spaces, lists, tasks, comments, time entries | Personal API token | Free plan |
 | [GitLab](gitlab.md) | Projects, issues, merge requests, pipelines, deployments | Access token, GitLab URL | Free plan |
 | [Sentry](sentry.md) | Issues, events, releases, Discover queries | Auth token, Sentry URL | Free Developer plan |
+| [Smartsheet](smartsheet.md) | Sheets, rows, reports, workspaces | Access token | 30-day trial |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
