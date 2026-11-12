@@ -48,6 +48,7 @@ const PRESETS = [
   require('./front'),
   require('./gorgias'),
   require('./asana'),
+  require('./monday'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));

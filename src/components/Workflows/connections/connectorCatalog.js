@@ -69,6 +69,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:front', title: 'Front', description: 'Conversations, messages, inboxes, contacts and events — API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Front.png', letters: 'FR', tone: '#a857f1' },
   { key: 'rest-api:gorgias', title: 'Gorgias', description: 'Tickets, messages, customers and satisfaction surveys — email + API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Gorgias.png', letters: 'GO', tone: '#161616' },
   { key: 'rest-api:asana', title: 'Asana', description: 'Projects, sections, tasks, subtasks and comments — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Asana.png', letters: 'AS', tone: '#f06a6a' },
+  { key: 'rest-api:monday', title: 'monday.com', description: 'Boards, items with column values, updates and activity (GraphQL) — API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Monday.png', letters: 'MO', tone: '#ff3d57' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },
