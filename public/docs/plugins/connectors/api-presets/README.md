@@ -56,6 +56,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Segment](segment.md) | Sources, destinations, warehouses, usage (metadata) | Public API token (+ write key to send) | Free plan |
 | [Plausible](plausible.md) | Visitors, pageviews, goals by page, source, country | Stats API key + site | 30-day trial |
 | [Shopify](shopify.md) | Orders, refunds, customers, products, inventory | Admin API access token, store URL | Development store |
+| [WooCommerce](woocommerce.md) | Orders, refunds, customers, products, coupons | Consumer key + secret, store URL | Your own site |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
