@@ -62,6 +62,7 @@ const PRESETS = [
   require('./plausible'),
   require('./shopify'),
   require('./woocommerce'),
+  require('./square'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
