@@ -44,6 +44,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Gorgias](gorgias.md) | Tickets, messages, customers, satisfaction surveys | Email + API key, helpdesk URL | 7-day trial |
 | [Asana](asana.md) | Projects, sections, tasks, subtasks, comments | Personal access token | Free plan |
 | [monday.com](monday.md) | Boards, items with column values, updates (GraphQL) | API token | Free plan |
+| [ClickUp](clickup.md) | Spaces, lists, tasks, comments, time entries | Personal API token | Free plan |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
