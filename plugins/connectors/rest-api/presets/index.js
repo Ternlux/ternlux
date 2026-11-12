@@ -56,6 +56,7 @@ const PRESETS = [
   require('./brevo'),
   require('./customer-io'),
   require('./mixpanel'),
+  require('./amplitude'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));

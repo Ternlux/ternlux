@@ -51,6 +51,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Brevo](brevo.md) | Contacts, lists, email and SMS campaigns, CRM | API key | Free plan |
 | [Customer.io](customer-io.md) | Campaigns, newsletters, segments, messages | App API key (+ Track keys to send) | 14-day trial |
 | [Mixpanel](mixpanel.md) | Raw events, profiles, segmentation, funnels, retention | Service account + project id | Free plan |
+| [Amplitude](amplitude.md) | Segmentation, funnels, retention, active users | API key + secret key | Free plan |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
