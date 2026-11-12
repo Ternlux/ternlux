@@ -76,6 +76,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:smartsheet', title: 'Smartsheet', description: 'Sheets, rows, reports and workspaces; add and update rows — access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Smartsheet.png', letters: 'SS', tone: '#0073ec' },
   { key: 'rest-api:brevo', title: 'Brevo', description: 'Contacts, lists, email and SMS campaigns, CRM deals — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Brevo.png', letters: 'BR', tone: '#0b996e' },
   { key: 'rest-api:customer-io', title: 'Customer.io', description: 'Campaigns, newsletters, segments and messages; identify and track — API keys', category: 'api', img: LOGO_PREFIX_2026_11 + 'CustomerIO.png', letters: 'CI', tone: '#7131ff' },
+  { key: 'rest-api:mixpanel', title: 'Mixpanel', description: 'Raw events, profiles, segmentation, funnels and retention — service account', category: 'api', img: LOGO_PREFIX_2026_11 + 'Mixpanel.png', letters: 'MP', tone: '#7856ff' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },

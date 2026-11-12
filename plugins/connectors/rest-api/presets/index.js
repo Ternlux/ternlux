@@ -55,6 +55,7 @@ const PRESETS = [
   require('./smartsheet'),
   require('./brevo'),
   require('./customer-io'),
+  require('./mixpanel'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
