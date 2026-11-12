@@ -58,6 +58,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [Shopify](shopify.md) | Orders, refunds, customers, products, inventory | Admin API access token, store URL | Development store |
 | [WooCommerce](woocommerce.md) | Orders, refunds, customers, products, coupons | Consumer key + secret, store URL | Your own site |
 | [Square](square.md) | Payments, orders, customers, catalog, inventory, shifts | Access token | Free sandbox |
+| [BambooHR](bamboohr.md) | Employees, custom reports, time off, timesheets | API key, company URL | 7-day trial |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a

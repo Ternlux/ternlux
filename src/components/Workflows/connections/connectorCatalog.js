@@ -84,6 +84,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:shopify', title: 'Shopify', description: 'Orders, refunds, customers, products and inventory — Admin API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Shopify.png', letters: 'SH', tone: '#95bf47' },
   { key: 'rest-api:woocommerce', title: 'WooCommerce', description: 'Orders, refunds, customers, products and coupons — consumer key + secret', category: 'api', img: LOGO_PREFIX_2026_11 + 'WooCommerce.png', letters: 'WC', tone: '#7f54b3' },
   { key: 'rest-api:square', title: 'Square', description: 'Payments, orders, customers, catalog, inventory and shifts — access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Square.png', letters: 'SQ', tone: '#3e4348' },
+  { key: 'rest-api:bamboohr', title: 'BambooHR', description: 'Employees, custom reports, time off and timesheets — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'BambooHR.png', letters: 'BH', tone: '#73c41d' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },
