@@ -78,6 +78,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:customer-io', title: 'Customer.io', description: 'Campaigns, newsletters, segments and messages; identify and track — API keys', category: 'api', img: LOGO_PREFIX_2026_11 + 'CustomerIO.png', letters: 'CI', tone: '#7131ff' },
   { key: 'rest-api:mixpanel', title: 'Mixpanel', description: 'Raw events, profiles, segmentation, funnels and retention — service account', category: 'api', img: LOGO_PREFIX_2026_11 + 'Mixpanel.png', letters: 'MP', tone: '#7856ff' },
   { key: 'rest-api:amplitude', title: 'Amplitude', description: 'Segmentation, funnels, retention and active users; send events — API + secret key', category: 'api', img: LOGO_PREFIX_2026_11 + 'Amplitude.png', letters: 'AM', tone: '#1e61f0' },
+  { key: 'rest-api:posthog', title: 'PostHog', description: 'HogQL over events and persons, insights and flags; capture events — API key', category: 'api', img: LOGO_PREFIX_2026_11 + 'PostHog.png', letters: 'PH', tone: '#f54e00' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },
