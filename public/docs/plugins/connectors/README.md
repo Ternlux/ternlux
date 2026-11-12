@@ -92,7 +92,8 @@ File picker and object listing screens. See
 | Connector | Notes |
 | --- | --- |
 | [REST API](rest-api.md) | Base URL plus your own key/value credentials; the request itself is generated per Data Source node |
-| [Vendor API connections](api-presets/README.md) | GitHub, HubSpot, Stripe, Notion, Airtable, Jira, Pipedrive, SendGrid, Klaviyo, Intercom, Linear, Mailchimp, Freshdesk, Calendly, Typeform — the REST API connector with the vendor filled in, plus a step-by-step key guide for each |
+| [Vendor API connections](api-presets/README.md) | 40 SaaS APIs (GitHub, HubSpot, Stripe, Shopify, Zendesk, Asana, Mixpanel, PostHog…) — the REST API connector with the vendor filled in, plus a step-by-step key guide for each |
+| [OAuth connectors](oauth-connectors/README.md) | Google Analytics 4, Search Console, Google Ads, YouTube Analytics, Meta Ads, Facebook Pages & Instagram, LinkedIn Ads and Pages, Salesforce, Dynamics 365, Zoho CRM, Outreach, Salesloft, TikTok, Microsoft Advertising, Pinterest, Snapchat, Amazon Ads — sign in with OAuth, tokens kept fresh, live account details for the assistant |
 
 ### Local files
 
