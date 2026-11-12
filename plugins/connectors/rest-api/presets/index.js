@@ -59,6 +59,7 @@ const PRESETS = [
   require('./amplitude'),
   require('./posthog'),
   require('./segment'),
+  require('./plausible'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
