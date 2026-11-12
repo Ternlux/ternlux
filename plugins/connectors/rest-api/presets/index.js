@@ -64,6 +64,7 @@ const PRESETS = [
   require('./woocommerce'),
   require('./square'),
   require('./bamboohr'),
+  require('./twilio'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));

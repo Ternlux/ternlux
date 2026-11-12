@@ -59,6 +59,7 @@ own connectors: see [OAuth connectors](../oauth-connectors/README.md).
 | [WooCommerce](woocommerce.md) | Orders, refunds, customers, products, coupons | Consumer key + secret, store URL | Your own site |
 | [Square](square.md) | Payments, orders, customers, catalog, inventory, shifts | Access token | Free sandbox |
 | [BambooHR](bamboohr.md) | Employees, custom reports, time off, timesheets | API key, company URL | 7-day trial |
+| [Twilio](twilio.md) | Messages, calls, recordings, usage and costs | Account SID + auth token | Free trial credit |
 
 Each page has the same sections: getting a key step by step, what to
 put in the connection form, how to test it, how to add sample data to a
