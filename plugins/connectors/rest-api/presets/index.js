@@ -58,6 +58,7 @@ const PRESETS = [
   require('./mixpanel'),
   require('./amplitude'),
   require('./posthog'),
+  require('./segment'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));
