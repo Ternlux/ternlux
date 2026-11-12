@@ -50,6 +50,7 @@ const PRESETS = [
   require('./asana'),
   require('./monday'),
   require('./clickup'),
+  require('./gitlab'),
 ];
 
 const BY_ID = new Map(PRESETS.map((p) => [p.id, p]));

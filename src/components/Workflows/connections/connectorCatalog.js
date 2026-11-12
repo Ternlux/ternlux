@@ -71,6 +71,7 @@ export const CONNECTION_TYPES = [
   { key: 'rest-api:asana', title: 'Asana', description: 'Projects, sections, tasks, subtasks and comments — personal access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Asana.png', letters: 'AS', tone: '#f06a6a' },
   { key: 'rest-api:monday', title: 'monday.com', description: 'Boards, items with column values, updates and activity (GraphQL) — API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'Monday.png', letters: 'MO', tone: '#ff3d57' },
   { key: 'rest-api:clickup', title: 'ClickUp', description: 'Spaces, lists, tasks with custom fields, comments and time entries — API token', category: 'api', img: LOGO_PREFIX_2026_11 + 'ClickUp.png', letters: 'CU', tone: '#7b68ee' },
+  { key: 'rest-api:gitlab', title: 'GitLab', description: 'Projects, issues, merge requests, pipelines and deployments — access token', category: 'api', img: LOGO_PREFIX_2026_11 + 'GitLab.png', letters: 'GL', tone: '#fc6d26' },
   // SaaS connectors with their own sign-in (plugins/connectors/<id>): OAuth
   // with the user's own app, request code written on the node like a REST API.
   { key: 'google-analytics', title: 'Google Analytics 4', description: 'GA4 reports — any dimensions and metrics, realtime and pivots — OAuth', category: 'api', img: LOGO_PREFIX_2026_11 + 'Google_Analytics.png', letters: 'GA', tone: '#e37400' },
