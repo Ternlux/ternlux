@@ -23,7 +23,10 @@ export const OPENAI_COMPAT_PROVIDERS = {
   nvidia:     { name: 'NVIDIA AI', baseURL: 'https://integrate.api.nvidia.com/v1', requiresKey: true, color: '#76B900', placeholderModel: 'meta/llama-3.1-70b-instruct', docsUrl: 'https://build.nvidia.com/' },
   ollama:     { name: 'Ollama',     baseURL: 'http://localhost:11434/v1', requiresKey: false, color: '#000000', placeholderModel: 'llama3.1', docsUrl: 'https://ollama.com/download' },
   lmstudio:   { name: 'LM Studio',  baseURL: 'http://localhost:1234/v1', requiresKey: false, color: '#4B5563', placeholderModel: 'local-model', docsUrl: 'https://lmstudio.ai/docs/local-server' },
-  custom:     { name: 'Custom (OpenAI-compatible)', baseURL: '', requiresKey: false, color: '#8C8C8C', placeholderModel: '', docsUrl: '' }
+  custom:     { name: 'Custom (OpenAI-compatible)', baseURL: '', requiresKey: false, color: '#8C8C8C', placeholderModel: '', docsUrl: '' },
+  // Models downloaded into Ternlux (Settings → AI Provider → Local Models).
+  // Set up there, never through the "Others" form.
+  local:      { name: 'Local model', baseURL: '', requiresKey: false, color: '#7C3AED', placeholderModel: '', docsUrl: '' }
 };
 
 export function isOpenAICompatProvider(provider) {

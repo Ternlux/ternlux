@@ -1514,7 +1514,7 @@ ${indent(VECTOR_QUERY_GUIDE, 6)}
   node's local output is a *.duckdb database — there, use the node's
   targetTableName.
      ctx.askAi(prompt, opts?)  → string                 // LLM judgement (EXPENSIVE)
-     ctx.vectorize(texts, opts?)                        // embeddings
+     ctx.vectorize(texts)                               // embeddings (user's Settings embedding model)
      ctx.axios(config) → { status, data, ... }          // external HTTP
      ctx.log(...args)
      ctx.requestCounts → { ai, http }                   // how many you've made so far

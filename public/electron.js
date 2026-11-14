@@ -61,6 +61,9 @@ analytics.patchIpcMain(ipcMain);
 // and shared with every skill via the helpers bundle, so no skill ever has
 // to require across plugin directories.
 const vectorEmbeddings = require('./lib/embeddings');
+const localModelStore   = require('./lib/localModels/store');
+const localModelCatalog = require('./lib/localModels/catalog');
+const localModelRuntime = require('./lib/localModels/runtime');
 const vectorLanceDB    = require('./lib/lancedb');
 const localSQLite      = require('./lib/sqlite');
 const localDuckDB      = require('./lib/duckdb');
@@ -256,6 +259,26 @@ function withPersistedAiDefaults(options = {}) {
     ...(model ? { model } : {}),
     ...(maxTokens ? { maxTokens } : {}),
   };
+}
+
+// The user's default embedding model (Settings → AI Provider → Embedding
+// model): `{ provider, model, dimensions }`, each null when unset. Stored in
+// ai-prefs.json next to the chat default, and only ever written after
+// ai:setEmbeddingDefault has proved the model returns vectors.
+function loadEmbeddingDefaults() {
+  const prefs = loadAiPrefs();
+  return {
+    provider: prefs.embeddingProvider || null,
+    model: prefs.embeddingModel || null,
+    dimensions: prefs.embeddingDimensions || null,
+  };
+}
+
+// Provider + model for one embedding call: what the caller named, else the
+// saved default, else the first configured provider. See
+// embeddings.resolveEmbeddingChoice for the precedence rules.
+function resolveEmbeddingChoice(args = {}, apiKeys = loadApiKeys() || {}) {
+  return vectorEmbeddings.resolveEmbeddingChoice(args, { apiKeys, defaults: loadEmbeddingDefaults() });
 }
 
 // Encrypt and persist the full provider-key map to llm-config.dat.
@@ -2522,6 +2545,204 @@ ipcMain.handle('ai:listModels', async (_event, { provider } = {}) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Local models (llama-server). Models are downloaded into the app and served
+// by the in-app proxy in lib/localModels/runtime.js; to the rest of the app
+// they are the OpenAI-compatible provider `local`.
+// ---------------------------------------------------------------------------
+
+function broadcast(channel, payload) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    try { w.webContents.send(channel, payload); } catch (_) { /* window closing */ }
+  }
+}
+
+// Mark installed models in a catalog list, so the picker can show "Installed".
+function withInstalled(list) {
+  const installed = localModelStore.list();
+  return list.map((m) => ({
+    ...m,
+    installedId: installed.find((i) => i.repo === m.repo && i.file === m.file.split('/').pop())?.id || null,
+  }));
+}
+
+/** Store the `local` provider entry (no key; the base URL is resolved live). */
+function ensureLocalProviderEntry(chatModelId) {
+  const allKeys = loadApiKeys() || {};
+  const existing = allKeys.local && typeof allKeys.local === 'object' ? allKeys.local : {};
+  allKeys.local = { apiKey: '', baseURL: '', model: chatModelId !== undefined ? chatModelId : (existing.model || '') };
+  writeApiKeys(allKeys);
+}
+
+ipcMain.handle('local:status', async () => {
+  const keys = loadApiKeys() || {};
+  const prefs = loadAiPrefs();
+  return {
+    success: true,
+    ...localModelRuntime.status(),
+    installed: localModelStore.list(),
+    downloads: localModelStore.downloads(),
+    chatModel: keys.local?.model || null,
+    chatIsDefault: String(prefs.defaultProvider || '') === 'local',
+    embeddingModel: prefs.embeddingProvider === 'local' ? prefs.embeddingModel : null,
+  };
+});
+
+ipcMain.handle('local:recommended', async (_event, { role } = {}) => {
+  try {
+    return { success: true, models: withInstalled(await localModelCatalog.recommended(role)) };
+  } catch (err) {
+    return { success: false, error: err.message, models: [] };
+  }
+});
+
+ipcMain.handle('local:search', async (_event, { role, query = '' } = {}) => {
+  try {
+    return { success: true, models: withInstalled(await localModelCatalog.search(role, { query })) };
+  } catch (err) {
+    return { success: false, error: err.message, models: [] };
+  }
+});
+
+/** Resolve a Hugging Face repo the user typed or pasted ("owner/name" or URL). */
+ipcMain.handle('local:resolveRepo', async (_event, { repo, role } = {}) => {
+  try {
+    const id = String(repo || '').trim().replace(/^https?:\/\/huggingface\.co\//i, '').split(/[?#]/)[0].split('/').slice(0, 2).join('/');
+    const model = await localModelCatalog.resolveRepo(id, role);
+    if (!model) return { success: false, error: 'No single-file GGUF model found in that repository (or it is gated).' };
+    return { success: true, model: withInstalled([model])[0] };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+/** Download a model. Progress arrives as `local:progress` events. */
+ipcMain.handle('local:download', async (_event, model = {}) => {
+  try {
+    const entry = await localModelStore.download(model, (p) => broadcast('local:progress', p));
+    return { success: true, model: entry };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('local:cancel', async (_event, { id } = {}) => ({ success: localModelStore.cancel(id) }));
+
+ipcMain.handle('local:delete', async (_event, { id } = {}) => {
+  try {
+    await localModelRuntime.release(id);
+    localModelStore.remove(id);
+    // A deleted model can no longer be anyone's default.
+    const keys = loadApiKeys() || {};
+    if (keys.local?.model === id) ensureLocalProviderEntry('');
+    const prefs = loadAiPrefs();
+    if (prefs.embeddingProvider === 'local' && prefs.embeddingModel === id) {
+      prefs.embeddingProvider = null; prefs.embeddingModel = null; prefs.embeddingDimensions = null;
+      fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+    }
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+/**
+ * Use an installed model: a chat model becomes the Default AI Provider's model,
+ * an embedding model becomes the Default Embedding Model (after the same
+ * vector check Settings runs for any provider).
+ */
+ipcMain.handle('local:use', async (_event, { id } = {}) => {
+  try {
+    const model = localModelStore.get(id);
+    if (!model) return { success: false, error: 'That model is not installed.' };
+    if (model.role === 'chat') {
+      ensureLocalProviderEntry(model.id);
+      const prefs = loadAiPrefs();
+      prefs.defaultProvider = 'local';
+      prefs.defaultModel = null;          // compat providers keep their model in the key entry
+      prefs.defaultModelProvider = null;
+      fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+      return { success: true, role: 'chat' };
+    }
+    ensureLocalProviderEntry(undefined);
+    const probe = await vectorEmbeddings.probeEmbeddingModel('local', model.id, loadApiKeys() || {});
+    const prefs = loadAiPrefs();
+    prefs.embeddingProvider = probe.provider;
+    prefs.embeddingModel = probe.model;
+    prefs.embeddingDimensions = probe.dimensions;
+    fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+    return { success: true, role: 'embedding', dimensions: probe.dimensions };
+  } catch (err) {
+    console.error('[local:use]', err?.message || err);
+    return { success: false, error: err.message };
+  }
+});
+
+/**
+ * ai:listEmbeddingProviders — configured providers whose own model list has
+ * embedding models, with those models. Discovered live, so a chat-only
+ * provider (Claude, Groq, …) or a local server that is not running is absent.
+ * Returns { success, providers: [{ id, label, models: [{ value, label }] }] }.
+ */
+ipcMain.handle('ai:listEmbeddingProviders', async () => {
+  try {
+    const providers = await vectorEmbeddings.listEmbeddingProviders(loadApiKeys() || {});
+    return { success: true, providers };
+  } catch (err) {
+    console.error('[ai:listEmbeddingProviders]', err?.message || err);
+    return { success: false, error: err.message, providers: [] };
+  }
+});
+
+/**
+ * ai:listEmbeddingModels — the EMBEDDING models a provider offers (chat models
+ * filtered out). Returns { success, models: [{ value, label }] }.
+ */
+ipcMain.handle('ai:listEmbeddingModels', async (_event, { provider } = {}) => {
+  try {
+    if (!provider) return { success: false, error: 'provider is required' };
+    const models = await vectorEmbeddings.listEmbeddingModels(provider, loadApiKeys() || {});
+    return { success: true, models };
+  } catch (err) {
+    console.error(`[ai:listEmbeddingModels] ${provider}:`, err?.message || err);
+    return { success: false, error: err.message };
+  }
+});
+
+/** ai:getEmbeddingDefault — the saved { provider, model, dimensions }. */
+ipcMain.handle('ai:getEmbeddingDefault', async () => {
+  return { success: true, ...loadEmbeddingDefaults() };
+});
+
+/**
+ * ai:setEmbeddingDefault — save the default embedding provider + model. The
+ * model is embedded once first: a model that does not return a vector (a chat
+ * model, a typo, a local model that is not pulled) is refused, so the saved
+ * default is always a working embedding model. Passing no provider clears it.
+ * Returns { success, provider, model, dimensions } or { success: false, error }.
+ */
+ipcMain.handle('ai:setEmbeddingDefault', async (_event, { provider, model } = {}) => {
+  try {
+    const prefs = loadAiPrefs();
+    if (!provider) {
+      prefs.embeddingProvider = null;
+      prefs.embeddingModel = null;
+      prefs.embeddingDimensions = null;
+      fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+      return { success: true, provider: null, model: null, dimensions: null };
+    }
+    const probe = await vectorEmbeddings.probeEmbeddingModel(provider, String(model || '').trim(), loadApiKeys() || {});
+    prefs.embeddingProvider = probe.provider;
+    prefs.embeddingModel = probe.model;
+    prefs.embeddingDimensions = probe.dimensions;
+    fs.writeFileSync(getAiPrefsPath(), JSON.stringify(prefs), 'utf8');
+    return { success: true, ...probe };
+  } catch (err) {
+    console.error('[ai:setEmbeddingDefault]', err?.message || err);
+    return { success: false, error: err.message };
+  }
+});
+
 /**
  * ai:getDefaultProvider — the persisted "Default AI Provider" choice: provider,
  * its model and Max Tokens (each null when unset).
@@ -3587,24 +3808,52 @@ async function buildSkillHelpers(defaultDbPath = null) {
     return !!picked && aiProviders.providerSupportsTools(picked.provider);
   }
 
-  /** Generate embeddings using the shared vector-embeddings library. */
-  async function vectorize(texts, options = {}) {
+  // Every embedding a skill, join or transformer makes goes through this: a
+  // node that recorded its model when it was built keeps it, anything else
+  // uses the user's Default Embedding Model from Settings, and the key / base
+  // URL always come from the stored provider config — so no caller has to know
+  // which provider keeps its key where.
+  const embeddingDefault = loadEmbeddingDefaults();
+  const resolveEmbedding = (args = {}) => vectorEmbeddings.resolveEmbeddingChoice(
+    { provider: args.provider, model: args.model },
+    { apiKeys, defaults: embeddingDefault }
+  );
+  const embeddings = {
+    ...vectorEmbeddings,
+    generateEmbeddings: (args = {}) => vectorEmbeddings.generateEmbeddings({
+      ...args,
+      ...resolveEmbedding(args),
+      apiKeys,
+    }),
+  };
+
+  /**
+   * Generate embeddings with the user's Default Embedding Model. Options are
+   * ignored on purpose: AI-written join / executor code must not pick its own
+   * model, or its vectors would not match the ones stored with the default.
+   */
+  async function vectorize(texts) {
     if (!Array.isArray(texts) || texts.length === 0) return [];
-    // OpenAI is the only embedding provider.
-    const provider = options.provider || 'openai';
-    if (provider !== 'openai') throw new Error(`Unsupported embedding provider "${provider}". Only "openai" is supported.`);
-    const apiKey = apiKeys.chatgpt || apiKeys.openai;
-    if (!apiKey) throw new Error('No OpenAI API key is configured for embeddings. Add one in Settings.');
-    const model = options.model || 'text-embedding-3-small';
     const data = texts.map((t, idx) => ({ __idx: idx, text: typeof t === 'string' ? t : String(t) }));
-    const result = await vectorEmbeddings.generateEmbeddings({ data, columnToEmbed: 'text', provider, model, apiKey });
+    const result = await embeddings.generateEmbeddings({ data, columnToEmbed: 'text' });
     return result.map((r) => r.vector);
   }
+
+  const resolvedDefault = resolveEmbedding({});
 
   return {
     apiKeys,                                   // raw map (read-only use; do NOT echo to renderer)
     aiProviders: aiProviders.listAvailableProviders(apiKeys),
-    embeddingProviders: (apiKeys.chatgpt || apiKeys.openai) ? ['openai'] : [],
+    embeddingProviders: resolvedDefault.provider ? [resolvedDefault.provider] : [],
+    // The one embedding model every new step is built with (null when none is
+    // set). Dimensions are known only for a model saved through Settings,
+    // which measures them.
+    embeddingDefault: resolvedDefault.provider
+      ? {
+        ...resolvedDefault,
+        dimensions: (resolvedDefault.model === embeddingDefault.model) ? embeddingDefault.dimensions : null,
+      }
+      : null,
     connections,                               // [{ _id/id, name, dbType, dbCategory, dbConfig, ... }]
     getConnection: requireConnection,
     callAI,
@@ -3618,7 +3867,7 @@ async function buildSkillHelpers(defaultDbPath = null) {
     // Full vector-lib modules — exposed so skills like vector-db-executor can
     // use every export (estimateOpenAICost, listTables, ...) without having
     // to require across plugin directories.
-    embeddings: vectorEmbeddings,
+    embeddings,
     lancedb: vectorLanceDB,
     // Cooperative stop, for the loops a skill runs itself. Injected for the
     // same reason the vector libs above are: a plugin has its own
@@ -3687,6 +3936,7 @@ ipcMain.handle('skills:buildPrompt', async (_event, { skillId, params }) => {
     // Backward compatibility for vector-db-executor (kept until it migrates to helpers).
     if (skillId === 'vector-db-executor') {
       params.apiKeys = params.helpers.apiKeys;
+      params.embeddingDefault = params.helpers.embeddingDefault;
       params.vectorConnectors = pluginManager.listConnectors()
         .filter((c) => c.dbCategory === 'Vector')
         .map((c) => ({ id: c.id, name: c.name }));
@@ -3743,19 +3993,11 @@ ipcMain.handle('skills:execute', async (_event, { skillId, params }) => {
   try {
     const helpers = await buildSkillHelpers();
 
-    // Backward compatibility for vector-db-executor (kept until it migrates to helpers).
-    let embeddingApiKey = params.embeddingApiKey;
-    if (skillId === 'vector-db-executor' && !embeddingApiKey && params.embeddingProvider) {
-      const apiKeys = helpers.apiKeys;
-      if (params.embeddingProvider === 'openai') embeddingApiKey = apiKeys.chatgpt || apiKeys.openai;
-    }
-
+    // Embedding keys are resolved per provider inside helpers.embeddings, so
+    // vector-db-executor no longer needs one handed in here.
     const enhancedParams = {
       ...params,
       helpers,
-      // Legacy keys still consumed by vector-db-executor; new skills should
-      // read everything from `helpers`.
-      embeddingApiKey: embeddingApiKey || params.embeddingApiKey,
       pluginManager,
       getFullConfig,
       appSqliteDbPath,
@@ -5551,6 +5793,21 @@ app.whenReady().then(async () => {
   // Load connector plugins
   pluginManager.loadPlugins();
 
+  // Local models: the model store, and the in-app proxy that starts
+  // llama-server only when a local model is used. Never blocks start-up.
+  try {
+    localModelStore.init(app.getPath('userData'));
+    const localURL = await localModelRuntime.start({
+      resourcesPath: process.resourcesPath,
+      appRoot: path.join(__dirname, '..'),
+      isPackaged: app.isPackaged,
+      getDefaultChatModel: () => (loadApiKeys() || {}).local?.model || null,
+    });
+    aiProviders.setLocalBaseURL(localURL);
+  } catch (err) {
+    console.warn('[local-models] not started:', err.message);
+  }
+
   // Nothing survives a process exit, so any execution still marked 'running'
   // when we start belongs to a previous session that was quit or crashed
   // mid-run. Left alone it is a permanent ghost: the editor's "a run is in
@@ -5588,6 +5845,9 @@ app.on('before-quit', async (event) => {
   stopAllCronJobs();
   telegram.stop();
   slack.stop();
+
+  // Stop any running local model servers.
+  try { await localModelRuntime.shutdown(); } catch (_) { /* quitting anyway */ }
 
   // Stop all file watchers
   console.log('[Electron] Stopping all file watchers...');

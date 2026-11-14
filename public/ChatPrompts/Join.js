@@ -63,7 +63,7 @@ The user wants embeddings or similarity search to participate in the join logic 
 - Once the function returns, the executor inserts the rows it returned into the destination. The destination DB does NO compute here — it is only the place the final rows get written.
 - This means **every destination is valid for Scenario B** — MongoDB, a local vector table, a local table, or a SQL database — even though none of them can embed from SQL. For a table destination the returned rows are simply written as the table. **Do NOT ask the user to pick Postgres+pgvector / Snowflake / "a vector engine that can run the embedding"** — none of that matters; the embedding and search happen in the function before insert.
 - Do not try to express the embedding/search as a fixed SQL search query or a one-shot \`searchQuery\` — emit a \`javascriptFunction\` instead.
-- Confirm with the user only what's actually needed for their intent: which column to embed / search by, which vector source to query, an embedding provider/model if there's a choice, and the desired \`topK\`. Do not ask the user to change the destination for this — any destination works.
+- Confirm with the user only what's actually needed for their intent: which column to embed / search by, which vector source to query, and the desired \`topK\`. (The embedding model is the user's Settings default — never ask about it.) Do not ask the user to change the destination for this — any destination works.
 
 Always handle vector cases inline — set \`usesSkill: false\`.
 ` : `
@@ -205,7 +205,7 @@ CRITICAL RULES FOR JOINS:
 5b. Vector / embedding scenarios (only when there is a vector source/destination or the user mentions embeddings, similarity, vectorising):
    - First, decide which scenario applies (see "Vector / embedding context detected" above): A) treat the vector DB as a regular DB, or B) do embedding/similarity search inside the join.
    - For Scenario A: ask only what's needed for a normal join (which metadata columns to match, join type, columns to keep). The vector source will be fetched with a metadata filter and treated like any NoSQL source.
-   - For Scenario B: confirm with the user what should be embedded and against what (e.g. "for each customer, search the article index using customer.bio for the top 5 matches") and pick an embedding provider/model if there is choice. Any destination works — the join runs as a \`javascriptFunction\`.
+   - For Scenario B: confirm with the user what should be embedded and against what (e.g. "for each customer, search the article index using customer.bio for the top 5 matches") — the embedding model is always the user's Settings default, so never ask about it. Any destination works — the join runs as a \`javascriptFunction\`.
    - Do not invent the embedding/search logic in static SQL. The actual embedding & similarity-search code is generated as part of the \`javascriptFunction\` in the join-generation step.
 
 5c. SQL or a JavaScript function — the "requiresFunction" flag. It depends on the
@@ -460,8 +460,8 @@ Function contract:
 The \`ctx\` argument is appended after all source-data arrays. It exposes simple async helpers (same surface as the javascript-executor skill):
 
 - ctx.connections                 -> [{ id, name, dbType, dbCategory }]
-- ctx.aiProviders                 -> available providers, e.g. ['openai']
-- ctx.embeddingProviders          -> available embedding providers
+- ctx.aiProviders                 -> available chat providers, e.g. ['openai']
+- ctx.embeddingProviders          -> [the provider of the user's embedding model], or [] when none is set
 - await ctx.runQuery(connection, queryStringOrObject, dbPath?)
     Saved connection (dbPath omitted):
       SQL:    ctx.runQuery('warehouse', 'SELECT id, email FROM users')
@@ -477,7 +477,8 @@ The \`ctx\` argument is appended after all source-data arrays. It exposes simple
 - await ctx.getTables(connection, dbPath?)
 - await ctx.getColumns(connection, table, schema?, dbPath?)
 - await ctx.askAi(prompt, { provider?, model?, systemPrompt?, maxTokens? })
-- await ctx.vectorize(['text', ...], { provider?, model? })   -> array of vectors aligned with the input texts
+- await ctx.vectorize(['text', ...])                         -> array of vectors aligned with the input texts,
+    always made with the user's Default Embedding Model from Settings (no options — you never pick a model).
 - ctx.axios                                                   -> axios module for arbitrary HTTP
 - ctx.log(...args)
 
@@ -520,7 +521,7 @@ Pattern for similarity search joins (per-row, semantic match):
   async function joinData(customers, ctx) {
     // 1. Embed the driving column once per unique value.
     const queries = [...new Set(customers.map(c => c.bio).filter(Boolean))];
-    const queryVectors = await ctx.vectorize(queries, { provider: 'openai', model: 'text-embedding-3-small' });
+    const queryVectors = await ctx.vectorize(queries);
     const byQuery = new Map(queries.map((q, i) => [q, queryVectors[i]]));
 
     // 2. For each customer, search the vector connection for top-K neighbours.
@@ -561,8 +562,6 @@ You MUST emit a \`javascriptFunction\` (no SQL) plus these top-level vector dest
     "vectorDbType": "lancedb" | "pinecone" | "<other>",
     "targetTable": "<index/table name>",
     "columnToEmbed": "<column from the joined output>",
-    "embeddingProvider": "openai",
-    "embeddingModel": "<provider-specific model id>",
     "idColumn": "<joined-output column that is the row's primary key>",   // omit if there isn't one
     "indexName": "<lowercase-with-hyphens>",   // Pinecone only
     "namespace": "<optional>"                    // Pinecone only
@@ -616,8 +615,6 @@ All sources are loaded into memory and joined with JavaScript. The skill embeds 
     "vectorDbType": "lancedb",
     "targetTable": "${destinationConfig.tableName}",
     "columnToEmbed": "<column-from-joined-output>",
-    "embeddingProvider": "openai",
-    "embeddingModel": "text-embedding-3-small",
     "idColumn": "<joined-output primary-key column — omit if none>"
   }
 }

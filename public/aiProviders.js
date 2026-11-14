@@ -130,8 +130,20 @@ const OPENAI_COMPAT_PROVIDERS = {
   nvidia:     { label: 'NVIDIA AI', baseURL: 'https://integrate.api.nvidia.com/v1', defaultModel: 'meta/llama-3.1-70b-instruct', requiresKey: true },
   ollama:     { label: 'Ollama',     baseURL: 'http://localhost:11434/v1', defaultModel: 'llama3.1', requiresKey: false },
   lmstudio:   { label: 'LM Studio',  baseURL: 'http://localhost:1234/v1', defaultModel: 'local-model', requiresKey: false },
-  custom:     { label: 'Custom (OpenAI-compatible)', baseURL: '', defaultModel: '', requiresKey: false }
+  custom:     { label: 'Custom (OpenAI-compatible)', baseURL: '', defaultModel: '', requiresKey: false },
+  // Models downloaded into Ternlux and run by its bundled llama-server
+  // (public/lib/localModels). The base URL is the in-app proxy's, known only
+  // at run time — see setLocalBaseURL.
+  local:      { label: 'Local model', baseURL: '', defaultModel: '', requiresKey: false }
 };
+
+// Live base URL of the in-app local model proxy (null when this build has no
+// llama-server). Overrides whatever the stored `local` entry says, because the
+// proxy's port is chosen fresh on every launch.
+let localBaseURL = null;
+function setLocalBaseURL(url) {
+  localBaseURL = url || null;
+}
 
 // Built-in providers first (preferred when several are configured), then any
 // configured OpenAI-compatible provider as a fallback.
@@ -202,6 +214,15 @@ const AI_MAX_RETRIES = 1;
 /** Client options every SDK construction in this file shares. */
 function sdkClientOptions(extra = {}) {
   return { timeout: AI_TIMEOUT_MS, maxRetries: AI_MAX_RETRIES, ...extra };
+}
+
+// A local model runs on the user's own CPU/GPU: the first request also loads
+// it into memory, and a long JSON answer on a laptop CPU can take minutes. Ten
+// minutes is still a "this will never finish" limit for that hardware.
+const LOCAL_AI_TIMEOUT_MS = Math.max(AI_TIMEOUT_MS, 10 * 60 * 1000);
+const isLocalBaseURL = (url) => !!url && !!localBaseURL && url === localBaseURL;
+function timeoutFor(provider, baseURL) {
+  return (String(provider || '').toLowerCase() === 'local' || isLocalBaseURL(baseURL)) ? LOCAL_AI_TIMEOUT_MS : AI_TIMEOUT_MS;
 }
 
 /**
@@ -650,7 +671,7 @@ async function callOpenAI(prompt, model, maxTokens, apiKey, systemPrompt = null,
   const OpenAICtor = OpenAI.default || OpenAI;
   // Local servers (Ollama, LM Studio) need no real key, but the SDK rejects an
   // empty apiKey — pass a placeholder when none was supplied.
-  const clientOptions = sdkClientOptions({ apiKey: apiKey || 'not-needed' });
+  const clientOptions = sdkClientOptions({ apiKey: apiKey || 'not-needed', timeout: timeoutFor(null, baseURL) });
   if (baseURL) clientOptions.baseURL = baseURL;
   const openai = new OpenAICtor(clientOptions);
 
@@ -802,7 +823,11 @@ async function listModels(provider, { apiKey, baseURL } = {}) {
   const page = await openai.models.list();
   // OpenAI's /models carries no token limits — the UI falls back to a fixed
   // ladder when maxOutputTokens is null.
+  // A server that types its models (Together, LM Studio, Ternlux's local
+  // proxy) says outright which ones are embedding models; for the rest the id
+  // pattern is all there is.
   const models = (page.data || [])
+    .filter((m) => !/^embedding/i.test(String(m.type || '')))
     .map((m) => ({ value: m.id, label: m.id, maxOutputTokens: null, maxInputTokens: null }))
     .filter((m) => !OPENAI_NON_CHAT.test(m.value));
   models.sort((a, b) => a.value.localeCompare(b.value));
@@ -988,7 +1013,7 @@ async function callAI(prompt, options = {}) {
           return callOpenAI(prompt, model, sendMaxTokens, apiKey, systemPrompt, trimmedHistory, url, onUsage, jsonMode);
         }
       }
-    })(), AI_TIMEOUT_MS, providerLabel(provider));
+    })(), timeoutFor(provider, baseURL), providerLabel(provider));
   } catch (err) {
     callError = err;
   }
@@ -1116,7 +1141,7 @@ function resolveProviderEntry(provider, apiKeys = {}) {
     if (!stored) return null; // never auto-enable a compat provider
     const entry = typeof stored === 'object' ? stored : { apiKey: stored };
     const apiKey = entry.apiKey || entry.key || '';
-    const baseURL = entry.baseURL || conf.baseURL || '';
+    const baseURL = (p === 'local' ? localBaseURL : null) || entry.baseURL || conf.baseURL || '';
     const model = entry.model || conf.defaultModel || undefined;
     if (conf.requiresKey && !apiKey) return null;
     if (!baseURL) return null; // custom provider needs a URL
@@ -1750,6 +1775,8 @@ async function callAIToolsWithKeys(options = {}) {
 module.exports = {
   stripMarkdownCodeBlocks,
   humanizeAIError,
+  providerLabel,
+  setLocalBaseURL,
   // Exported to be testable on its own, and so a caller can report the same
   // limit it will be held to.
   withTimeout,

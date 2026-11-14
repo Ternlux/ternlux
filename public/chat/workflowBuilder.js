@@ -2609,6 +2609,7 @@ async function runSkillTurn(helpers, skillId, { userRequest, currentState = {}, 
   // even when keys are configured.
   if (skillId === 'vector-db-executor') {
     if (helpers.apiKeys) params.apiKeys = helpers.apiKeys;
+    if (helpers.embeddingDefault) params.embeddingDefault = helpers.embeddingDefault;
     params.pluginManager = helpers.pluginManager;
     if (typeof helpers.getFullConfig === 'function') {
       params.getFullConfig = helpers.getFullConfig;
@@ -3146,7 +3147,7 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
         `The "${activeSkillId}" skill could not resolve this transformation`
         + `${asks && question ? ` — it is still asking: ${question}` : ''}. `
         + 'Embedding is only possible through that skill, so there is no other way to build this node. '
-        + 'Answer what it asked in one message naming every setting (column to embed, embedding model, '
+        + 'Answer what it asked in one message naming every setting (column to embed, '
         + 'vector database, target table), or configure the node in the editor. '
         + 'The workflow has been left as it was.',
       );
@@ -3281,6 +3282,25 @@ async function buildTransformerConfig({ stepPrompt, upstreamNode, helpers, nodeI
 // an identical config shape downstream. `gen` is the operation envelope
 // (sql/ddl/nosqlOperation/transformFunction); `skillInfo` is set when the
 // transformer was built by a skill.
+/**
+ * The embedding provider + model a new embedding step is built with: always
+ * the user's Default Embedding Model from Settings, never one the AI names.
+ *
+ * Recorded on the node (not looked up at run time) because vectors are only
+ * comparable with vectors from the SAME model: a step keeps the model its
+ * stored vectors were made with even after the user changes the default.
+ *
+ * @returns {{ embeddingProvider, embeddingModel } | null} null when none is set
+ */
+function defaultEmbeddingFields(helpers) {
+  const def = helpers?.embeddingDefault;
+  return def?.provider && def?.model
+    ? { embeddingProvider: def.provider, embeddingModel: def.model }
+    : null;
+}
+
+const NO_EMBEDDING_MODEL_WARNING = 'No embedding model is set — choose a Default Embedding Model in Settings → AI Provider before running this step.';
+
 async function assembleTransformerConfig({
   base, dbType, isNoSQL, helpers,
   operationMode, storageLocation, targetTableName, targetConn,
@@ -3351,6 +3371,24 @@ async function assembleTransformerConfig({
       if (ep.embeddingModel)           config.embeddingModel    = ep.embeddingModel;
       if (ep.embeddingApiKey)          config.embeddingApiKey   = ep.embeddingApiKey;
       if (ep.columnToEmbed)            config.columnToEmbed     = ep.columnToEmbed;
+      // The embedding model is the user's Settings default, never the AI's
+      // pick. An embedding WRITE records it on the node (skillParams are
+      // spread last by the executor, so they get it too). A similarity SEARCH
+      // records nothing: at run time it embeds the query with the model the
+      // stored vectors carry, which is the only model they can be compared to.
+      if (skillInfo.skillId === 'vector-db-executor') {
+        delete config.embeddingProvider;
+        delete config.embeddingModel;
+        const { embeddingProvider: _p, embeddingModel: _m, ...restParams } = config.skillParams || {};
+        config.skillParams = restParams;
+        if (ep.columnToEmbed) {
+          const pinned = defaultEmbeddingFields(helpers);
+          if (pinned) {
+            Object.assign(config, pinned);
+            config.skillParams = { ...config.skillParams, ...pinned };
+          }
+        }
+      }
       if (ep.targetLocalPath)          config.targetLocalPath   = ep.targetLocalPath;
       if (ep.namespace)                config.namespace         = ep.namespace;
       if (ep.indexName)                config.indexName         = ep.indexName;
@@ -4156,7 +4194,7 @@ async function buildJoinConfig({ stepPrompt, upstreamNodes, helpers, nodeId, war
           `The "${activeSkillId}" skill could not resolve this join's vector step`
           + `${asks && question ? ` — it is still asking: ${question}` : ''}. `
           + 'Embedding is only possible through that skill, so there is no other way to build this node. '
-          + 'Answer what it asked in one message naming every setting (column to embed, embedding model, '
+          + 'Answer what it asked in one message naming every setting (column to embed, '
           + 'vector database, target table), or configure the node in the editor. '
           + 'The workflow has been left as it was.',
         );
@@ -5079,6 +5117,14 @@ async function assembleJoinConfig({
       targetLocalPath: config.targetLocalPath,
     };
   }
+  // The join embeds with the user's Default Embedding Model (never one the AI
+  // named), recorded here so its stored vectors stay on that one model.
+  if (config.vectorDestination) {
+    const { embeddingProvider: _p, embeddingModel: _m, ...vd } = config.vectorDestination;
+    const pinned = defaultEmbeddingFields(helpers);
+    config.vectorDestination = { ...vd, ...(pinned || {}) };
+    if (!pinned && Array.isArray(warnings)) warnings.push(`Join: ${NO_EMBEDDING_MODEL_WARNING}`);
+  }
   if (!gen?._skillId) {
     // Standard path — drop any earlier skill binding (see assembleTransformerConfig).
     config.skillId = null;
@@ -5405,6 +5451,9 @@ async function buildOutputConfig({ stepPrompt, upstreamNode, helpers, warnings, 
   const sourceColumnNames = (source.sourceTableSchema?.columns || []).map((c) => c?.name).filter(Boolean);
   const sourceHasVectors = (source.sourceTableSchema?.columns || [])
     .some((c) => /^(vector|values|embedding)$/i.test(c?.name || '') || String(c?.type || '').toLowerCase() === 'vector');
+  const embeddingDefaultLine = helpers.embeddingDefault?.provider
+    ? `Text is embedded with the user's embedding model (${helpers.embeddingDefault.provider} / ${helpers.embeddingDefault.model}${helpers.embeddingDefault.dimensions ? `, ${helpers.embeddingDefault.dimensions} dimensions` : ''}), set in Settings — you do not choose one.`
+    : 'No embedding model is set yet (Settings → AI Provider) — still pick the column; the run will ask for one.';
   const prompt = `Pick output settings for a workflow Output node.
 
 User intent: "${stepPrompt}"
@@ -5438,14 +5487,12 @@ For a database connection output:
 VECTOR DESTINATIONS — a connection whose dbCategory is "Vector" (Pinecone, a
 saved LanceDB connection) or a local "lancedb" file. Add these fields:
   "embedColumn": "<source column whose text is embedded>" | null,
-  "embeddingModel": "text-embedding-3-small" | "text-embedding-3-large",
   "idColumn": "<source column that is the row's primary key>" | null
 - tableName for Pinecone is "index-name" or "index-name/namespace".
 - embedColumn: REQUIRED when the source rows do NOT already carry vectors — the
-  column whose text is embedded (OpenAI). null when they already carry vectors
+  column whose text is embedded. null when they already carry vectors
   (they are copied as they are, nothing is re-embedded).
-- embeddingModel: text-embedding-3-small (1536 dimensions) unless the user
-  names another; a Pinecone index's dimension must match the model.
+  ${embeddingDefaultLine} A Pinecone index's dimension must match it.
 - Records are written with "writeMode" like any table: "append" UPSERTS (a
   record with the same id is replaced, new ones are added, nothing else is
   touched), "truncate" empties the index/namespace/table first and loads this
@@ -5527,13 +5574,23 @@ Return ONLY the JSON object.`;
     };
     if (vectorConn || vectorFile) {
       osv.embedColumn = sourceHasVectors ? null : knownColumn(osv.embedColumn, 'embedColumn');
-      osv.embeddingModel = osv.embeddingModel === 'text-embedding-3-large' ? 'text-embedding-3-large' : 'text-embedding-3-small';
+      // Always the user's Default Embedding Model, recorded on the node.
+      if (osv.embedColumn) {
+        const pinned = defaultEmbeddingFields(helpers);
+        osv.embeddingProvider = pinned?.embeddingProvider || null;
+        osv.embeddingModel = pinned?.embeddingModel || null;
+        if (!pinned) warnings.push(`Output: ${NO_EMBEDDING_MODEL_WARNING}`);
+      } else {
+        delete osv.embeddingProvider;
+        delete osv.embeddingModel;
+      }
       osv.idColumn = osv.writeMode === 'append' ? knownColumn(osv.idColumn, 'idColumn') : null;
       if (!sourceHasVectors && !osv.embedColumn) {
         warnings.push('Output: the source rows carry no vectors and no column to embed was chosen — pick "Column to embed" on the node, or the run will fail.');
       }
     } else {
       delete osv.embedColumn;
+      delete osv.embeddingProvider;
       delete osv.embeddingModel;
       delete osv.idColumn;
     }
@@ -5588,7 +5645,7 @@ Return ONLY the JSON object.`;
 
   const os = config.outputSettings;
   const vectorNote = os.embedColumn
-    ? ` Embeds "${os.embedColumn}" (${os.embeddingModel})${os.idColumn ? `, upserted by "${os.idColumn}"` : ''}.`
+    ? ` Embeds "${os.embedColumn}" (${[os.embeddingProvider, os.embeddingModel].filter(Boolean).join(' / ') || 'default embedding model'})${os.idColumn ? `, upserted by "${os.idColumn}"` : ''}.`
     : (os.idColumn ? ` Upserted by "${os.idColumn}".` : '');
   const outputSummary = os.outputType === 'connection'
     ? `Configured output → connection "${os.connectionId}" / table "${os.tableName || '(none)'}" (${os.writeMode}).${vectorNote}`

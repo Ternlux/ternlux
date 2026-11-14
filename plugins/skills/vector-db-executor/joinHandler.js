@@ -139,20 +139,14 @@ async function fetchVectorSourceRecords({
 
   // Embed the search text if requested.
   let queryVector = null;
-  if (useEmbeddingSearch && searchQuery && op.embeddingProvider && op.embeddingModel) {
-    // OpenAI is the only embedding provider; its key is stored under 'chatgpt'
-    // (or 'openai' on some installs).
-    // Anything else has no key to resolve and fails in generateEmbeddings,
-    // naming the provider rather than silently embedding with the wrong one.
-    const apiKey = op.embeddingProvider === 'openai'
-      ? (helpers?.apiKeys?.chatgpt || helpers?.apiKeys?.openai)
-      : null;
+  if (useEmbeddingSearch && searchQuery) {
+    // helpers.embeddings resolves the key / base URL for the provider, and
+    // fills a missing provider or model from the user's embedding default.
     const embedded = await helpers.embeddings.generateEmbeddings({
       data: [{ query: searchQuery }],
       columnToEmbed: 'query',
       provider: op.embeddingProvider,
       model: op.embeddingModel,
-      apiKey
     });
     queryVector = embedded[0]?.vector || null;
   }
@@ -251,8 +245,8 @@ async function clearVectorNamespace({ connector, fullConfig, connectionId, index
  *   columnToEmbed      - field name to embed
  *   vectorDbType       - 'lancedb' | 'pinecone' | …
  *   targetTable        - table/index name
- *   embeddingProvider  - 'openai'
- *   embeddingModel     - provider-specific model id
+ *   embeddingProvider, embeddingModel - recorded on the node when it was
+ *     built (always the user's Settings default); absent → the current default
  *
  * For cloud vector DBs (non-lancedb), also: targetConnectionId, indexName,
  * namespace.
@@ -290,15 +284,8 @@ async function embedAndUpsertJoinedRows({
     return { success: true, message: 'No rows to embed', recordCount: 0 };
   }
   if (!columnToEmbed) throw new Error('columnToEmbed is required');
-  if (!embeddingProvider || !embeddingModel) {
-    throw new Error('embeddingProvider and embeddingModel are required');
-  }
-
-  const apiKey = embeddingApiKey
-    || (embeddingProvider === 'openai' ? (helpers?.apiKeys?.chatgpt || helpers?.apiKeys?.openai) : null);
-  if (!apiKey) {
-    throw new Error(`No API key configured for embedding provider: ${embeddingProvider}`);
-  }
+  // A missing provider/model falls back to the user's embedding default inside
+  // helpers.embeddings, which also resolves the provider's key and base URL.
 
   const dbPath = vectorDbType === 'lancedb'
     ? (targetLocalPath || path.join(require('electron').app.getPath('userData'), 'data', 'lancedb'))
@@ -341,7 +328,7 @@ async function embedAndUpsertJoinedRows({
     columnToEmbed,
     provider: embeddingProvider,
     model: embeddingModel,
-    apiKey
+    apiKey: embeddingApiKey || undefined,
   });
   const counts = (plan.skipped || plan.metadataUpdated)
     ? ` (${plan.skipped} unchanged skipped, ${plan.metadataUpdated} metadata-only updated)` : '';

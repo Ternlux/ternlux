@@ -506,8 +506,11 @@ async function executeOutput(
     const embedding = outputSettings.embedColumn
       ? {
         columnToEmbed: outputSettings.embedColumn,
-        embeddingProvider: outputSettings.embeddingProvider || 'openai',
-        embeddingModel: outputSettings.embeddingModel || 'text-embedding-3-small',
+        // Unset on nodes saved before provider choice: the model name still
+        // implies its provider (text-embedding-3-* → OpenAI), and with neither
+        // the user's default embedding model from Settings is used.
+        embeddingProvider: outputSettings.embeddingProvider || null,
+        embeddingModel: outputSettings.embeddingModel || null,
       }
       : null;
     // The row's primary key for a vector destination — optional, picked on the

@@ -522,6 +522,48 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /** Persist the user's Max Tokens (used by every AI call). */
     setMaxTokens: (maxTokens) =>
       ipcRenderer.invoke('ai:setMaxTokens', { maxTokens }),
+
+    /** Configured providers that list embedding models, discovered live: [{ id, label, models }]. */
+    listEmbeddingProviders: () =>
+      ipcRenderer.invoke('ai:listEmbeddingProviders'),
+
+    /** Embedding models (only) a provider offers: [{ value, label }]. */
+    listEmbeddingModels: (provider) =>
+      ipcRenderer.invoke('ai:listEmbeddingModels', { provider }),
+
+    /** The saved default embedding { provider, model, dimensions }. */
+    getEmbeddingDefault: () =>
+      ipcRenderer.invoke('ai:getEmbeddingDefault'),
+
+    /** Save the default embedding model. Refused unless the model returns a vector. */
+    setEmbeddingDefault: (provider, model) =>
+      ipcRenderer.invoke('ai:setEmbeddingDefault', { provider, model }),
+  },
+
+  /**
+   * Local models run by the bundled llama-server. Downloads report progress
+   * through onProgress; nothing runs until a local model is used.
+   */
+  localModels: {
+    /** { available, installed, downloads, chatModel, chatIsDefault, embeddingModel, totalMemory, … } */
+    status: () => ipcRenderer.invoke('local:status'),
+    /** Ternlux's recommended models for 'chat' | 'embedding', resolved live. */
+    recommended: (role) => ipcRenderer.invoke('local:recommended', { role }),
+    /** Popular Hugging Face GGUF models that fit this machine. */
+    search: (role, query) => ipcRenderer.invoke('local:search', { role, query }),
+    /** Resolve a pasted Hugging Face repo ("owner/name" or URL). */
+    resolveRepo: (repo, role) => ipcRenderer.invoke('local:resolveRepo', { repo, role }),
+    download: (model) => ipcRenderer.invoke('local:download', model),
+    cancel: (id) => ipcRenderer.invoke('local:cancel', { id }),
+    remove: (id) => ipcRenderer.invoke('local:delete', { id }),
+    /** Make an installed model the default chat or embedding model. */
+    use: (id) => ipcRenderer.invoke('local:use', { id }),
+    /** Subscribe to download progress; returns an unsubscribe function. */
+    onProgress: (cb) => {
+      const listener = (_event, p) => cb(p);
+      ipcRenderer.on('local:progress', listener);
+      return () => ipcRenderer.removeListener('local:progress', listener);
+    },
   },
 
   /**

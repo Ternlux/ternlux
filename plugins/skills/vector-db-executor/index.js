@@ -18,7 +18,7 @@ const fs = require('fs');
 // Vector libs (embeddings + lancedb) live at host level (public/lib) and
 // arrive via params.helpers. They're bound to module-locals once at the
 // start of each lifecycle method so internal call sites stay unchanged.
-let generateEmbeddings, estimateOpenAICost, getEmbeddingDimension;
+let generateEmbeddings, estimateOpenAICost;
 let executeLanceDBOperation, listLanceTables, getLanceDBConnection, toPlainRows, normalizeRecordsForArrow;
 
 // Cooperative stop, injected by the host alongside the vector libs above (see
@@ -41,7 +41,7 @@ function bindLibs(helpers) {
   if (!helpers || !helpers.embeddings || !helpers.lancedb) {
     throw new Error('vector-db-executor requires helpers.embeddings and helpers.lancedb (electron must inject helpers).');
   }
-  ({ generateEmbeddings, estimateOpenAICost, getEmbeddingDimension } = helpers.embeddings);
+  ({ generateEmbeddings, estimateOpenAICost } = helpers.embeddings);
   ({ executeLanceDBOperation, listTables: listLanceTables, getLanceDBConnection, toPlainRows, normalizeRecordsForArrow } = helpers.lancedb);
   ({
     throwIfCancelled = () => {},
@@ -487,8 +487,8 @@ module.exports = {
     name: 'Vector Database Executor',
     description: 'Perform embedding or vector operations with automatic embedding generation',
     capabilities: [
-      'Generate embeddings using OpenAI',
-      'Embed column using OpenAI',
+      'Generate embeddings with the embedding model chosen in Settings (any OpenAI-compatible provider that offers one)',
+      'Embed a column with that model',
       'Upsert vectors to LanceDB (local) or Pinecone (cloud)',
       'Query similar vectors with semantic search',
       'Delete vectors by ID or filter',
@@ -499,12 +499,9 @@ module.exports = {
     outputFormat: 'Array of vector records with metadata and similarity scores',
     executionEnvironment: 'local with external API calls for embeddings',
     providers: {
-      embedding: ['OpenAI'],
+      embedding: ['The Default Embedding Model in Settings → AI Provider'],
       vectorDB: ['LanceDB (local)', 'Pinecone (cloud)']
     },
-    models: {
-      openai: ['text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002']
-    }
   }),
 
   /**
@@ -535,8 +532,9 @@ module.exports = {
         - LanceDB: Local vector database (default, no setup required)
         - Pinecone: Cloud vector database (requires API key and existing index)
 
-        **Embedding Providers:**
-        - OpenAI: text-embedding-3-small (1536 dim), text-embedding-3-large (3072 dim)
+        **Embedding model:**
+        - Always the user's Default Embedding Model from Settings → AI Provider, applied automatically.
+          Never set embeddingProvider / embeddingModel.
       `,
 
       responseFormat: `
@@ -547,8 +545,6 @@ module.exports = {
           "skillParams": {
             "vectorDbType": "lancedb" | "pinecone",
             "operation": "upsert" | "query" | "delete" | "update",
-            "embeddingProvider": "openai",
-            "embeddingModel": "text-embedding-3-small",
             "columnToEmbed": "column_name",
             "targetTable": "table_name"
           },
@@ -597,38 +593,26 @@ module.exports = {
     const metadataFieldList = columns.filter((c) => metadataFieldNames.includes(c.name))
       .map((c) => `${c.name} (${c.type})`).join(', ');
 
-    // Check if we have any embedding API keys
-    // OpenAI embeddings use the 'chatgpt' key (same as ChatGPT API); some
-    // installs store it as 'openai'. Same lookup as the helpers bundle.
-    const hasOpenAI = apiKeys && (apiKeys.chatgpt || apiKeys.openai);
-    const hasAnyEmbeddingKey = hasOpenAI;
+    // The one embedding model every embedding step uses: the user's Default
+    // Embedding Model from Settings (supplied by the host). The AI never picks
+    // a provider or model. An older host passes only apiKeys: OpenAI, which was
+    // then the only provider, with the model every embedding used before.
+    const embeddingDefault = params.embeddingDefault
+      || ((apiKeys && (apiKeys.chatgpt || apiKeys.openai))
+        ? { provider: 'openai', model: 'text-embedding-3-small' }
+        : null);
 
-    // If no embedding keys, return error
-    if (!hasAnyEmbeddingKey) {
+    if (!embeddingDefault?.provider || !embeddingDefault?.model) {
       return {
-        prompt: `Error: No embedding API keys configured.
+        prompt: `Error: No embedding model is set.
 
-To use vector operations, you need to set up an embedding provider API key:
-- OpenAI API key (for OpenAI embeddings)
-
-Please configure an embedding API key in settings before proceeding.`,
+To use vector operations, choose a Default Embedding Model in
+Settings → AI Provider (any configured provider that offers embedding models).`,
         context: { error: true, missingKeys: true }
       };
     }
-
-    // Determine available embedding providers
-    const availableProviders = [];
-    if (hasOpenAI) {
-      availableProviders.push({
-        name: 'OpenAI',
-        id: 'openai',
-        models: [
-          'text-embedding-3-small (1536 dim, $0.02/1M tokens)',
-          'text-embedding-3-large (3072 dim, $0.13/1M tokens)',
-          'text-embedding-ada-002 (1536 dim, $0.10/1M tokens)'
-        ]
-      });
-    }
+    const embeddingModelLine = `${embeddingDefault.provider} / ${embeddingDefault.model}`
+      + `${embeddingDefault.dimensions ? ` (${embeddingDefault.dimensions} dimensions)` : ''}`;
 
     // Determine available vector databases and their connections
     const vectorDbConnections = []; // Map dbType -> array of connections
@@ -882,12 +866,8 @@ subset of the data, explain that filtering is not supported here and that
 they should filter the data upstream (e.g. with a transformer) before it
 reaches this step.
 
-**Available Embedding Providers (you have API keys for):**
-${availableProviders.map((p, idx) => `
-${idx + 1}. **${p.name}** (${p.id})
-   Models:
-${p.models.map(m => `   - ${m}`).join('\n')}
-`).join('\n')}
+**Embedding model:** ${embeddingModelLine} — set by the user in Settings. It is
+applied automatically; do not choose or ask about an embedding provider or model.
 
 **Available Vector Connections:**
 ${vectorDbConnections.map((value) =>  `\n- connectionName: "${value.name}", connectionId: "${value.id}", "dbType: "${value.dbType}"`
@@ -897,15 +877,11 @@ ${vectorDbConnections.map((value) =>  `\n- connectionName: "${value.name}", conn
 **Your Task:**
 Determine the configuration for embedding this data based on chat history and users input:
 1. Which column contains the text to embed (REQUIRED)
-2. Which embedding provider to use (based on available keys above)
-3. Which embedding model to use
-4. Which vector database to store in (based on available databases above)
-5. For cloud vector databases: which connection to use (if multiple available)
-6. Target table/index name
+2. Which vector database to store in (based on available databases above)
+3. For cloud vector databases: which connection to use (if multiple available)
+4. Target table/index name
 
 **Important Decision Rules:**
-- Only use embedding providers that have API keys configured (listed above)
-- If only one embedding provider is available, use it by default
 - If no vector database plugins are installed, default to LanceDB
 - For cloud vector databases (non-LanceDB):
   - If only ONE connection exists for that database type, use it automatically
@@ -929,7 +905,6 @@ If you need to ask questions:
   "action": "ask_questions",
   "questionsNeeded": {
     "columnToEmbed": "Which column should be embedded? (only if not specified by user)",
-    "embeddingProvider": "Which embedding provider? (only if multiple available and user didn't specify)",
     "vectorDbType": "Which vector database? (only if multiple available and user didn't specify)",
     "targetConnectionName": "Which connection should be used? Options: [connection names] (only if cloud vector DB with multiple connections)",
     "targetTable": "What should the target table/index be named? (only if user didn't specify)",
@@ -942,8 +917,6 @@ If ready to execute:
   "action": "execute",
   "vectorDbType": "lancedb" | "pinecone" | "other_vector_db",
   "operation": "upsert",
-  "embeddingProvider": "${availableProviders.map(p => p.id).join('" | "')}",
-  "embeddingModel": "model_name",
   "columnToEmbed": "column_name",
   "targetTable": "vectors_table_name",
   "targetConnectionName": "connection_name",  // REQUIRED for cloud vector DBs, omit for LanceDB
@@ -1070,14 +1043,13 @@ IMPORTANT:
 
           // For upsert/query operations, embeddings are usually needed
           if (['upsert', 'query'].includes(parsed.operation)) {
-            if (!parsed.embeddingProvider || !parsed.columnToEmbed) {
+            // The provider/model may be omitted — the user's default embedding
+            // model from Settings fills them in when the node is assembled.
+            if (!parsed.columnToEmbed) {
               return {
                 action: 'ask_questions',
                 message: 'Missing embedding configuration',
-                questionsNeeded: {
-                  embeddingProvider: !parsed.embeddingProvider,
-                  columnToEmbed: !parsed.columnToEmbed
-                }
+                questionsNeeded: { columnToEmbed: true }
               };
             }
           }
@@ -2095,24 +2067,21 @@ IMPORTANT:
  * Output fed from an embedding step must not pay for a second embedding.
  * Returns { rows, embedded } where `embedded` is how many rows were embedded.
  */
-async function embedRowsForOutput(rows,{ columnToEmbed, embeddingProvider = 'openai', embeddingModel = 'text-embedding-3-small', embeddingApiKey = null } = {}, helpers = null) {
+async function embedRowsForOutput(rows,{ columnToEmbed, embeddingProvider = null, embeddingModel = null, embeddingApiKey = null } = {}, helpers = null) {
   const hasVectors = rows.some((row) => row && (row.vector || row.values || row.embedding));
   if (hasVectors || !columnToEmbed) return { rows, embedded: 0 };
   if (!rows.some((row) => row && Object.prototype.hasOwnProperty.call(row, columnToEmbed))) {
     throw new Error(`Column "${columnToEmbed}" to embed is not in the data. Available columns: ${Object.keys(rows[0] || {}).join(', ')}.`);
   }
-  const apiKey = embeddingApiKey
-    || (embeddingProvider === 'openai' ? (helpers?.apiKeys?.chatgpt || helpers?.apiKeys?.openai) : null);
-  if (!apiKey) {
-    throw new Error(`No API key configured for embedding provider "${embeddingProvider}". Add one in Settings → AI Provider.`);
-  }
-  console.log(`[Vector Output] Embedding "${columnToEmbed}" for ${rows.length} rows with ${embeddingProvider} ${embeddingModel}`);
+  // Provider/model default to the user's embedding model in Settings; the key
+  // and base URL are resolved per provider inside helpers.embeddings.
+  console.log(`[Vector Output] Embedding "${columnToEmbed}" for ${rows.length} rows with ${embeddingProvider || '(default provider)'} ${embeddingModel || '(default model)'}`);
   const embedded = await generateEmbeddings({
     data: rows,
     columnToEmbed,
-    provider: embeddingProvider,
-    model: embeddingModel,
-    apiKey,
+    provider: embeddingProvider || undefined,
+    model: embeddingModel || undefined,
+    apiKey: embeddingApiKey || undefined,
   });
   return { rows: embedded, embedded: embedded.length };
 }
@@ -2254,13 +2223,10 @@ async function executeVectorSourceTransformation({
       // carries _embedding_provider / _embedding_model), then default.
       const sample = (sourceTableSchema?.sampleData || [])[0] || {};
       const stored = sample.metadata && typeof sample.metadata === 'object' ? sample.metadata : sample;
-      const provider = embeddingProvider || stored._embedding_provider || 'openai';
-      const model = embeddingModel || stored._embedding_model || 'text-embedding-3-small';
-      const apiKey = embeddingApiKey
-        || (provider === 'openai' ? (helpers?.apiKeys?.chatgpt || helpers?.apiKeys?.openai) : null);
-      if (!apiKey) {
-        throw new Error(`No API key configured for embedding provider "${provider}" — needed to embed the search text. Add one in Settings → AI Provider.`);
-      }
+      // The records' own model wins over anything on the node; with neither,
+      // the user's Default Embedding Model from Settings is used.
+      const provider = stored._embedding_model ? stored._embedding_provider : (embeddingModel ? embeddingProvider : undefined);
+      const model = stored._embedding_model || embeddingModel || undefined;
 
       // Generate embedding for the search query
       const embeddedQuery = await generateEmbeddings({
@@ -2268,7 +2234,7 @@ async function executeVectorSourceTransformation({
         columnToEmbed: 'query',
         provider,
         model,
-        apiKey
+        apiKey: embeddingApiKey || undefined,
       });
 
       queryVector = embeddedQuery[0].vector;

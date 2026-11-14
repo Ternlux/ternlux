@@ -629,7 +629,7 @@ const CTX_HELPERS_SECTION = `# ctx helpers (all simple, single-call)
 - await ctx.getColumns(connection, table, schema?, dbPath?)
 - await ctx.askAi(prompt, { provider?, model?, systemPrompt?, maxTokens? })
     Returns the model's text response.
-- await ctx.vectorize(['text', ...], { provider?, model? })
+- await ctx.vectorize(['text', ...])   (always the user's Default Embedding Model from Settings)
     Returns an array of vectors aligned with the input texts.
 - ctx.axios                                     -> axios module for arbitrary HTTP
 - await ctx.apiCredentials(connection)

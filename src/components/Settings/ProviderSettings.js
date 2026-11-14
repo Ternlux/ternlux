@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Form, Select, AutoComplete, Card, Button, message, Divider, Typography, Space, Alert } from 'antd';
+import { Form, Select, AutoComplete, Card, Button, message, Typography, Space, Alert, Tabs, Collapse } from 'antd';
 import { RobotOutlined, CheckCircleOutlined, SaveOutlined, EditOutlined } from '@ant-design/icons';
 import ProviderKeyForm from '../ApiKeySetup/ProviderKeyForm';
 import OthersProviderForm from '../ApiKeySetup/OthersProviderForm';
+import EmbeddingSettings from './EmbeddingSettings';
+import LocalModelManager from '../LocalModels/LocalModelManager';
 import { hasApiKeyForProvider } from '../../utils/apiKeyStorage';
 import {
   OPENAI_COMPAT_PROVIDERS,
@@ -42,6 +44,8 @@ const ProviderSettings = () => {
   const [providerHasKey, setProviderHasKey] = useState(true); // Track if selected provider has key
   const [changingKey, setChangingKey] = useState(false); // Replace-key form for a provider that already has one
   const [configuredProviders, setConfiguredProviders] = useState([]); // Providers that have an API key
+  // Models (default provider + embedding model) | API keys (Configure Provider).
+  const [activeTab, setActiveTab] = useState('models');
   // Shared with onboarding (ApiKeySetup) so both screens resolve models and the
   // Max Tokens ladder the same way — see utils/useProviderModels.
   const {
@@ -61,7 +65,9 @@ const ProviderSettings = () => {
       const defaultId = await loadSettings();
       initSelectedProvider(defaultId);
       checkApiKey();
-      refreshConfiguredProviders();
+      const configured = await refreshConfiguredProviders();
+      // Nothing to pick a model for yet: open where keys are added.
+      if (Array.isArray(configured) && configured.length === 0) setActiveTab('keys');
     })();
   }, []);
 
@@ -169,8 +175,10 @@ const ProviderSettings = () => {
       if (configured.length > 0 && !form.getFieldValue('defaultProvider')) {
         applyDefaultProvider(configured[0]);
       }
+      return configured;
     } catch (error) {
       console.error('Error checking configured providers:', error);
+      return null;
     }
   };
 
@@ -300,6 +308,328 @@ const ProviderSettings = () => {
   const isCompatDefault = !!defaultProvider && COMPAT_IDS.includes(defaultProvider);
 
 
+  // Default AI Provider form fields. Kept in one function so the Models tab
+  // stays readable; Advanced Settings is its own collapsed panel inside it.
+  const renderDefaultProvider = () => (
+    <>
+      <Form.Item
+        name="defaultProvider"
+        help={
+          configuredProviders.length > 1
+            ? 'You have multiple providers configured. AI features (chat, workflow build, transforms) will use this one.'
+            : 'AI features will use this provider. Add more providers on the API Keys tab to switch between them.'
+        }
+        style={{ marginBottom: 16 }}
+      >
+        <Select
+          size="large"
+          placeholder="Select default provider"
+          getPopupContainer={(trigger) => trigger.parentNode}
+          onChange={applyDefaultProvider}
+        >
+          {configuredProviders.map((id) => (
+            <Option key={id} value={id}>
+              <Space>
+                <span style={{ color: getProviderInfo(id).color, fontWeight: 600 }}>●</span>
+                {getProviderInfo(id).name}
+              </Space>
+            </Option>
+          ))}
+        </Select>
+      </Form.Item>
+
+      {/* Model for the default provider. The list is refetched from that
+          provider whenever it changes, and a model that isn't in the new list
+          is replaced — a Claude model can't survive a switch to OpenAI.
+          OpenAI-compatible endpoints get a free-text field with their /models
+          list as suggestions: they accept ids they don't always enumerate, and
+          local servers list none. */}
+      {defaultProvider === 'local' ? (
+        <Form.Item
+          label="Model"
+          name="model"
+          rules={[{ required: true, message: 'Select a downloaded model' }]}
+          help={models.length
+            ? 'Chat models downloaded to this computer. Download more on the Local Models tab.'
+            : 'No chat model is downloaded yet — get one on the Local Models tab.'}
+          style={{ marginBottom: 16 }}
+        >
+          <Select
+            size="large"
+            placeholder="Select model"
+            loading={modelsLoading}
+            getPopupContainer={(trigger) => trigger.parentNode}
+            options={models.map((m) => ({ value: m.value, label: m.label }))}
+          />
+        </Form.Item>
+      ) : isCompatDefault ? (
+        <Form.Item
+          label="Model"
+          name="model"
+          rules={[{ required: true, message: 'Enter the model id to use' }]}
+          help={`The exact model id ${getProviderInfo(defaultProvider).name} expects. Suggestions are its published models — you can type any id it accepts.`}
+          style={{ marginBottom: 16 }}
+        >
+          <AutoComplete
+            size="large"
+            placeholder={OPENAI_COMPAT_PROVIDERS[defaultProvider]?.placeholderModel || 'model-id'}
+            options={models.map((m) => ({ value: m.value }))}
+            filterOption={(input, option) =>
+              String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())
+            }
+            getPopupContainer={(trigger) => trigger.parentNode}
+            notFoundContent={modelsLoading ? 'Loading models…' : null}
+          />
+        </Form.Item>
+      ) : defaultProvider ? (
+        <Form.Item
+          label="Model"
+          name="model"
+          rules={[{ required: true, message: 'Please select a model' }]}
+          style={{ marginBottom: 16 }}
+        >
+          <Select
+            size="large"
+            placeholder="Select model"
+            getPopupContainer={(trigger) => trigger.parentNode}
+            optionLabelProp="label"
+            loading={modelsLoading}
+            notFoundContent={modelsLoading ? 'Loading models…' : 'No models found'}
+          >
+            {models.map((model) => (
+              <Option
+                key={model.value}
+                value={model.value}
+                label={
+                  <>
+                    {model.label}
+                    {model.description.includes('Recommended') && (
+                      <CheckCircleOutlined style={{ marginLeft: 8, color: '#52c41a' }} />
+                    )}
+                  </>
+                }
+              >
+                <div>
+                  <div style={{ fontWeight: 500 }}>
+                    {model.label}
+                    {model.description.includes('Recommended') && (
+                      <CheckCircleOutlined style={{ marginLeft: 8, color: '#52c41a' }} />
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#8c8c8c' }}>
+                    {model.description}
+                  </div>
+                </div>
+              </Option>
+            ))}
+          </Select>
+        </Form.Item>
+      ) : null}
+
+      {/* Advanced Settings — collapsed by default. forceRender keeps Max
+          Tokens registered with the form while closed, so saving never falls
+          back to the default value just because the panel wasn't opened. */}
+      <Collapse
+        size="small"
+        style={{ marginBottom: 16 }}
+        items={[{
+          key: 'advanced',
+          label: 'Advanced Settings',
+          forceRender: true,
+          children: (
+            <>
+              <Paragraph type="secondary" style={{ fontSize: 13 }}>
+                Configure maximum response length for AI outputs.
+              </Paragraph>
+              {/* Bounded by the selected model's published output limit, read
+                  from the same provider models endpoint that fills the model
+                  dropdown. Providers that don't publish limits get the full
+                  ladder. */}
+              <Form.Item noStyle shouldUpdate={(prev, cur) => prev.model !== cur.model}>
+                {({ getFieldValue }) => {
+                  const model = getFieldValue('model');
+                  const selected = models.find((m) => m.value === model);
+                  const cap = capFor(model);
+                  const ctx = contextFor(model);
+                  return (
+                    <Form.Item
+                      label="Max Tokens"
+                      name="maxTokens"
+                      help={
+                        cap
+                          ? `Maximum length of AI responses. ${selected.label} accepts up to ${cap.toLocaleString()} output tokens${ctx ? ` and a ${ctx.toLocaleString()}-token context window` : ''}. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.`
+                          : 'Maximum length of AI responses. This provider does not publish per-model limits, so an unsupported value is rejected at request time. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.'
+                      }
+                      style={{ marginBottom: 8 }}
+                    >
+                      <Select getPopupContainer={(trigger) => trigger.parentNode}>
+                        {tokenOptions(model).map((o) => (
+                          <Option key={o.value} value={o.value}>{o.label}</Option>
+                        ))}
+                      </Select>
+                    </Form.Item>
+                  );
+                }}
+              </Form.Item>
+            </>
+          ),
+        }]}
+      />
+
+      <Button
+        type="primary"
+        icon={<SaveOutlined />}
+        loading={savingDefault}
+        onClick={handleSaveDefault}
+      >
+        Save Default Provider
+      </Button>
+    </>
+  );
+
+  // API Keys tab — add or replace a provider's key. Which provider the app
+  // actually uses, and with which model, is set on the Models tab.
+  const renderConfigureProvider = () => (
+    <>
+      <Form.Item
+        label="Configure Provider"
+        name="provider"
+        help="Add or replace the API key for a provider. Which provider the app actually uses — and with which model — is set on the Models tab."
+        rules={[{ required: true, message: 'Please select a provider' }]}
+      >
+        <Select
+          size="large"
+          onChange={handleProviderChange}
+          placeholder="Select AI provider"
+          getPopupContainer={(trigger) => trigger.parentNode}
+        >
+          <Option value="gemini">
+            <Space>
+              <span style={{ color: PROVIDER_INFO.gemini.color, fontWeight: 600 }}>●</span>
+              Google Gemini
+            </Space>
+          </Option>
+          <Option value="claude">
+            <Space>
+              <span style={{ color: PROVIDER_INFO.claude.color, fontWeight: 600 }}>●</span>
+              Anthropic Claude
+            </Space>
+          </Option>
+          <Option value="openai">
+            <Space>
+              <span style={{ color: PROVIDER_INFO.openai.color, fontWeight: 600 }}>●</span>
+              OpenAI ChatGPT
+            </Space>
+          </Option>
+          <Option value="others">
+            <Space>
+              <span style={{ color: '#8c8c8c', fontWeight: 600 }}>●</span>
+              Others (OpenAI-compatible)
+            </Space>
+          </Option>
+        </Select>
+      </Form.Item>
+
+      {/* "Others" = OpenAI-compatible providers (own dropdown + URL/key/model form).
+          Otherwise: no key → show the key form; key present → offer to replace it. */}
+      {selectedProvider === 'others' ? (
+        <div>
+          <Card
+            size="small"
+            style={{ marginBottom: 24, borderLeft: '4px solid #8c8c8c', background: '#fafafa' }}
+          >
+            <Text strong>Others (OpenAI-compatible)</Text>
+            <br />
+            <Text type="secondary" style={{ fontSize: 13 }}>
+              Connect OpenRouter, Groq, Together AI, Mistral, Ollama, LM Studio, or any
+              OpenAI-compatible endpoint. Pick a type to prefill its URL, or choose Custom to set your own.
+            </Text>
+          </Card>
+          <OthersProviderForm onComplete={handleOthersComplete} />
+        </div>
+      ) : !providerHasKey ? (
+        <Space direction="vertical" size="large" style={{ width: '100%' }}>
+          <Alert
+            message={`No API Key for ${PROVIDER_INFO[selectedProvider]?.name || selectedProvider}`}
+            description={`You need to configure an API key for ${PROVIDER_INFO[selectedProvider]?.name || selectedProvider} before you can select models and configure settings for this provider.`}
+            type="info"
+            showIcon
+          />
+          <ProviderKeyForm
+            providerId={selectedProvider}
+            onComplete={handleKeySetupComplete}
+            compact={true}
+          />
+        </Space>
+      ) : (
+        <div>
+          {currentProviderInfo && (
+            <Card
+              size="small"
+              style={{
+                marginBottom: 24,
+                borderLeft: `4px solid ${currentProviderInfo.color}`,
+                background: '#fafafa'
+              }}
+            >
+              <Text strong>{currentProviderInfo.name}</Text>
+              <br />
+              <Text type="secondary" style={{ fontSize: 13 }}>
+                {currentProviderInfo.description}
+              </Text>
+            </Card>
+          )}
+
+          {!changingKey ? (
+            <Alert
+              type="success"
+              showIcon
+              icon={<CheckCircleOutlined />}
+              message={`API key configured for ${currentProviderInfo?.name || selectedProvider}`}
+              description="The key is encrypted and stored on this device."
+              action={
+                <Button size="small" icon={<EditOutlined />} onClick={() => setChangingKey(true)}>
+                  Change Key
+                </Button>
+              }
+              style={{ marginBottom: 24 }}
+            />
+          ) : (
+            <Card
+              size="small"
+              title={`Change ${currentProviderInfo?.name || selectedProvider} API key`}
+              extra={
+                <Button size="small" type="text" onClick={() => setChangingKey(false)}>
+                  Cancel
+                </Button>
+              }
+              style={{ marginBottom: 24 }}
+            >
+              <Alert
+                type="warning"
+                showIcon
+                message="Saving a new key replaces the current one immediately."
+                style={{ marginBottom: 16 }}
+              />
+              <ProviderKeyForm
+                providerId={selectedProvider}
+                onComplete={handleKeyChanged}
+                compact={true}
+              />
+            </Card>
+          )}
+
+          {defaultProvider !== selectedProvider && (
+            <Text type="secondary" style={{ fontSize: 13 }}>
+              To use {currentProviderInfo?.name || selectedProvider} for AI features,
+              select it as the default provider on the Models tab and pick its model.
+            </Text>
+          )}
+        </div>
+      )}
+    </>
+  );
+
   return (
     <div style={{ maxWidth: 800, margin: '0 auto' }}>
       <Space direction="vertical" size="large" style={{ width: '100%' }}>
@@ -314,358 +644,87 @@ const ProviderSettings = () => {
           </Paragraph>
         </div>
 
-
-
-        {/* Provider Selection Card */}
-        <Card>
-          <Form
-            form={form}
-            layout="vertical"
-          >
-            {/* Default provider — provider + its model + its Max Tokens, saved
-                together by one button. This is what every AI feature uses; the
-                "Configure Provider" section below only manages API keys. */}
-            {configuredProviders.length > 0 && (
-              <Card
-                size="small"
-                type="inner"
-                title="Default AI Provider"
-                style={{ marginBottom: 24, background: '#fafafa' }}
-              >
-                <Form.Item
-                  name="defaultProvider"
-                  help={
-                    configuredProviders.length > 1
-                      ? 'You have multiple providers configured. AI features (chat, workflow build, transforms) will use this one.'
-                      : 'AI features will use this provider. Configure more providers below to switch between them.'
-                  }
-                  style={{ marginBottom: 16 }}
-                >
-                  <Select
-                    size="large"
-                    placeholder="Select default provider"
-                    getPopupContainer={(trigger) => trigger.parentNode}
-                    onChange={applyDefaultProvider}
-                  >
-                    {configuredProviders.map((id) => (
-                      <Option key={id} value={id}>
-                        <Space>
-                          <span style={{ color: getProviderInfo(id).color, fontWeight: 600 }}>●</span>
-                          {getProviderInfo(id).name}
-                        </Space>
-                      </Option>
-                    ))}
-                  </Select>
-                </Form.Item>
-
-                {/* Model for the default provider. The list is refetched from
-                    that provider whenever it changes, and a model that isn't in
-                    the new list is replaced — a Claude model can't survive a
-                    switch to OpenAI. OpenAI-compatible endpoints get a free-text
-                    field with their /models list as suggestions: they accept ids
-                    they don't always enumerate, and local servers list none. */}
-                {isCompatDefault ? (
-                  <Form.Item
-                    label="Model"
-                    name="model"
-                    rules={[{ required: true, message: 'Enter the model id to use' }]}
-                    help={`The exact model id ${getProviderInfo(defaultProvider).name} expects. Suggestions are its published models — you can type any id it accepts.`}
-                    style={{ marginBottom: 16 }}
-                  >
-                    <AutoComplete
-                      size="large"
-                      placeholder={OPENAI_COMPAT_PROVIDERS[defaultProvider]?.placeholderModel || 'model-id'}
-                      options={models.map((m) => ({ value: m.value }))}
-                      filterOption={(input, option) =>
-                        String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())
-                      }
-                      getPopupContainer={(trigger) => trigger.parentNode}
-                      notFoundContent={modelsLoading ? 'Loading models…' : null}
-                    />
-                  </Form.Item>
-                ) : defaultProvider ? (
-                  <Form.Item
-                    label="Model"
-                    name="model"
-                    rules={[{ required: true, message: 'Please select a model' }]}
-                    style={{ marginBottom: 16 }}
-                  >
-                    <Select
-                      size="large"
-                      placeholder="Select model"
-                      getPopupContainer={(trigger) => trigger.parentNode}
-                      optionLabelProp="label"
-                      loading={modelsLoading}
-                      notFoundContent={modelsLoading ? 'Loading models…' : 'No models found'}
-                    >
-                      {models.map((model) => (
-                        <Option
-                          key={model.value}
-                          value={model.value}
-                          label={
-                            <>
-                              {model.label}
-                              {model.description.includes('Recommended') && (
-                                <CheckCircleOutlined
-                                  style={{ marginLeft: 8, color: '#52c41a' }}
-                                />
-                              )}
-                            </>
-                          }
-                        >
-                          <div>
-                            <div style={{ fontWeight: 500 }}>
-                              {model.label}
-                              {model.description.includes('Recommended') && (
-                                <CheckCircleOutlined
-                                  style={{ marginLeft: 8, color: '#52c41a' }}
-                                />
-                              )}
-                            </div>
-                            <div style={{ fontSize: 12, color: '#8c8c8c' }}>
-                              {model.description}
-                            </div>
-                          </div>
-                        </Option>
-                      ))}
-                    </Select>
-                  </Form.Item>
-                ) : null}
-
-                <Divider style={{ marginTop: 8 }} />
-
-                {/* Advanced Settings */}
-                <Title level={5}>Advanced Settings</Title>
-                <Paragraph type="secondary" style={{ fontSize: 13 }}>
-                  Configure maximum response length for AI outputs.
-                </Paragraph>
-
-                {/* Bounded by the selected model's published output limit, read
-                    from the same provider models endpoint that fills the model
-                    dropdown. Providers that don't publish limits get the full
-                    ladder. */}
-                <Form.Item noStyle shouldUpdate={(prev, cur) => prev.model !== cur.model}>
-                  {({ getFieldValue }) => {
-                    const model = getFieldValue('model');
-                    const selected = models.find((m) => m.value === model);
-                    const cap = capFor(model);
-                    const ctx = contextFor(model);
-                    return (
-                      <Form.Item
-                        label="Max Tokens"
-                        name="maxTokens"
-                        help={
-                          cap
-                            ? `Maximum length of AI responses. ${selected.label} accepts up to ${cap.toLocaleString()} output tokens${ctx ? ` and a ${ctx.toLocaleString()}-token context window` : ''}. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.`
-                            : 'Maximum length of AI responses. This provider does not publish per-model limits, so an unsupported value is rejected at request time. Reasoning models spend part of this budget thinking before they answer, so low values can cut a reply short.'
-                        }
-                        style={{ marginBottom: 20 }}
-                      >
-                        <Select getPopupContainer={(trigger) => trigger.parentNode}>
-                          {tokenOptions(model).map((o) => (
-                            <Option key={o.value} value={o.value}>{o.label}</Option>
-                          ))}
-                        </Select>
-                      </Form.Item>
-                    );
-                  }}
-                </Form.Item>
-
-                <Button
-                  type="primary"
-                  icon={<SaveOutlined />}
-                  loading={savingDefault}
-                  onClick={handleSaveDefault}
-                >
-                  Save Default Provider
-                </Button>
-              </Card>
-            )}
-
-            {/* Provider Selection — API keys only. The model and Max Tokens
-                live with the default provider above. */}
-            <Form.Item
-              label="Configure Provider"
-              name="provider"
-              help="Add or replace the API key for a provider. Which provider the app actually uses — and with which model — is set above."
-              rules={[{ required: true, message: 'Please select a provider' }]}
-            >
-              <Select
-                size="large"
-                onChange={handleProviderChange}
-                placeholder="Select AI provider"
-                getPopupContainer={(trigger) => trigger.parentNode}
-              >
-                <Option value="gemini">
-                  <Space>
-                    <span style={{ color: PROVIDER_INFO.gemini.color, fontWeight: 600 }}>●</span>
-                    Google Gemini
-                  </Space>
-                </Option>
-                <Option value="claude">
-                  <Space>
-                    <span style={{ color: PROVIDER_INFO.claude.color, fontWeight: 600 }}>●</span>
-                    Anthropic Claude
-                  </Space>
-                </Option>
-                <Option value="openai">
-                  <Space>
-                    <span style={{ color: PROVIDER_INFO.openai.color, fontWeight: 600 }}>●</span>
-                    OpenAI ChatGPT
-                  </Space>
-                </Option>
-                <Option value="others">
-                  <Space>
-                    <span style={{ color: '#8c8c8c', fontWeight: 600 }}>●</span>
-                    Others (OpenAI-compatible)
-                  </Space>
-                </Option>
-              </Select>
-            </Form.Item>
-
-            {// "Others" = OpenAI-compatible providers (own dropdown + URL/key/model form).
-             // Otherwise: no key → show the key form; key present → offer to replace it.
-            }
-  {selectedProvider === 'others' ? (
-    <div>
-      <Card
-        size="small"
-        style={{ marginBottom: 24, borderLeft: '4px solid #8c8c8c', background: '#fafafa' }}
-      >
-        <Text strong>Others (OpenAI-compatible)</Text>
-        <br />
-        <Text type="secondary" style={{ fontSize: 13 }}>
-          Connect OpenRouter, Groq, Together AI, Mistral, Ollama, LM Studio, or any
-          OpenAI-compatible endpoint. Pick a type to prefill its URL, or choose Custom to set your own.
-        </Text>
-      </Card>
-      <OthersProviderForm onComplete={handleOthersComplete} />
-    </div>
-  ) : (!providerHasKey) ?
-
-      <div style={{ maxWidth: 800, margin: '0 auto' }}>
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
-          {/* Header */}
-          <div>
-            <Title level={3}>
-              <RobotOutlined style={{ marginRight: 12, color: '#1890ff' }} />
-              Configure {PROVIDER_INFO[selectedProvider]?.name || selectedProvider}
-            </Title>
-            <Paragraph type="secondary">
-              Set up your API key for {PROVIDER_INFO[selectedProvider]?.name || selectedProvider} to use this provider.
-            </Paragraph>
-          </div>
-
-          {/* Alert explaining the situation */}
-          <Alert
-            message={`No API Key for ${PROVIDER_INFO[selectedProvider]?.name || selectedProvider}`}
-            description={`You need to configure an API key for ${PROVIDER_INFO[selectedProvider]?.name || selectedProvider} before you can select models and configure settings for this provider.`}
-            type="info"
-            showIcon
+        {/* One form across both tabs (the provider panels share its fields);
+            forceRender keeps both tabs' fields registered. */}
+        <Form form={form} layout="vertical">
+          <Tabs
+            activeKey={activeTab}
+            tabBarGutter={24}
+            onChange={async (key) => {
+              setActiveTab(key);
+              // A local model may have just been made the default on the
+              // Local Models tab — re-read what the Models tab shows.
+              if (key === 'models') {
+                await loadSettings();
+                await refreshConfiguredProviders();
+              }
+            }}
+            items={[
+              {
+                key: 'models',
+                label: 'Models',
+                forceRender: true,
+                children: configuredProviders.length > 0 ? (
+                  <Collapse
+                    defaultActiveKey={['default']}
+                    items={[{
+                      key: 'default',
+                      label: 'Default AI Provider',
+                      forceRender: true,
+                      children: renderDefaultProvider(),
+                    }]}
+                  />
+                ) : (
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="No AI provider configured yet"
+                    description="Add an API key for a provider first, then choose its model here."
+                    action={<Button size="small" type="primary" onClick={() => setActiveTab('keys')}>Add API key</Button>}
+                  />
+                ),
+              },
+              {
+                key: 'keys',
+                label: 'API Keys',
+                forceRender: true,
+                children: <Card>{renderConfigureProvider()}</Card>,
+              },
+              {
+                // Not force-rendered: it fetches catalogs from Hugging Face,
+                // which should only happen when someone opens it.
+                key: 'local',
+                label: 'Local Models',
+                children: <LocalModelManager mode="settings" />,
+              },
+            ]}
           />
+        </Form>
 
-          {/* Provider Key Form - embedded */}
-          <div style={{ marginTop: 16 }}>
-            <ProviderKeyForm
-              providerId={selectedProvider}
-              onComplete={handleKeySetupComplete}
-              compact={true}
-            />
-          </div>
-        </Space>
-      </div> :
-  
-            <div>
-            {/* Provider Info */}
-            {currentProviderInfo && (
-              <Card
-                size="small"
-                style={{
-                  marginBottom: 24,
-                  borderLeft: `4px solid ${currentProviderInfo.color}`,
-                  background: '#fafafa'
-                }}
-              >
-                <Text strong>{currentProviderInfo.name}</Text>
-                <br />
-                <Text type="secondary" style={{ fontSize: 13 }}>
-                  {currentProviderInfo.description}
-                </Text>
-              </Card>
-            )}
-
-            {/* API key management — the key exists; allow replacing it */}
-            {!changingKey ? (
-              <Alert
-                type="success"
-                showIcon
-                icon={<CheckCircleOutlined />}
-                message={`API key configured for ${currentProviderInfo?.name || selectedProvider}`}
-                description="The key is encrypted and stored on this device."
-                action={
-                  <Button
-                    size="small"
-                    icon={<EditOutlined />}
-                    onClick={() => setChangingKey(true)}
-                  >
-                    Change Key
-                  </Button>
-                }
-                style={{ marginBottom: 24 }}
-              />
-            ) : (
-              <Card
-                size="small"
-                title={`Change ${currentProviderInfo?.name || selectedProvider} API key`}
-                extra={
-                  <Button size="small" type="text" onClick={() => setChangingKey(false)}>
-                    Cancel
-                  </Button>
-                }
-                style={{ marginBottom: 24 }}
-              >
-                <Alert
-                  type="warning"
-                  showIcon
-                  message="Saving a new key replaces the current one immediately."
-                  style={{ marginBottom: 16 }}
-                />
-                <ProviderKeyForm
-                  providerId={selectedProvider}
-                  onComplete={handleKeyChanged}
-                  compact={true}
-                />
-              </Card>
-            )}
-
-            {/* Nothing else to configure here: the model and Max Tokens for
-                the provider the app uses live in "Default AI Provider" above. */}
-            {defaultProvider !== selectedProvider && (
-              <Text type="secondary" style={{ fontSize: 13 }}>
-                To use {currentProviderInfo?.name || selectedProvider} for AI features,
-                select it as the default provider above and pick its model.
-              </Text>
-            )}
-            </div>}
-          </Form>
-        </Card>
+        {/* Embedding model — its own form (forms can't nest), refreshed when a
+            provider key is added or removed. Only on the Models tab. */}
+        {activeTab === 'models' && (
+          <EmbeddingSettings refreshKey={configuredProviders.join(',')} />
+        )}
 
         {/* Info Card */}
-        <Card size="small" style={{ background: '#f0f5ff', borderColor: '#adc6ff' }}>
-          <Text strong style={{ color: '#1890ff' }}>
-            💡 How it works
-          </Text>
-          <br />
-          <Text type="secondary" style={{ fontSize: 13 }}>
-            The default provider and its model are used for all AI-powered features including:
-            <ul style={{ marginTop: 8, marginBottom: 0 }}>
-              <li>Workflow node configuration assistance</li>
-              <li>SQL query generation from natural language</li>
-              <li>Data transformation suggestions</li>
-              <li>Business intelligence chat responses</li>
-            </ul>
-          </Text>
-        </Card>
+        {activeTab === 'models' && (
+          <Card size="small" style={{ background: '#f0f5ff', borderColor: '#adc6ff' }}>
+            <Text strong style={{ color: '#1890ff' }}>
+              💡 How it works
+            </Text>
+            <br />
+            <Text type="secondary" style={{ fontSize: 13 }}>
+              The default provider and its model are used for all AI-powered features including:
+              <ul style={{ marginTop: 8, marginBottom: 0 }}>
+                <li>Workflow node configuration assistance</li>
+                <li>SQL query generation from natural language</li>
+                <li>Data transformation suggestions</li>
+                <li>Business intelligence chat responses</li>
+              </ul>
+            </Text>
+          </Card>
+        )}
       </Space>
     </div>
   );

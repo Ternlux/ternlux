@@ -42,20 +42,21 @@
     "eject": "react-scripts eject",
     "electron-dev": "concurrently \"cross-env PORT=3100 BROWSER=none DANGEROUSLY_DISABLE_HOST_CHECK=true react-scripts start\" \"wait-on http://localhost:3100 && cross-env ELECTRON_DEV_URL=http://localhost:3100 electron .\"",
     "minify-dist": "node scripts/minify-dist.js",
-    "electron-pack": "node scripts/fetch-duckdb-extensions.js && react-scripts build && node scripts/minify-dist.js && electron-builder",
-    "dist:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
-    "dist:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { electron-builder --linux -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
-    "dist:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win; s=$?; electron-builder install-app-deps; exit $s; }",
-    "dist:all": "node scripts/fetch-duckdb-extensions.js --all && react-scripts build && node scripts/minify-dist.js && electron-builder --mac --linux --win",
-    "pack:mac": "node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
-    "pack:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { electron-builder --linux -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
-    "pack:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win; }",
-    "release:mac": "node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac --publish always -c.directories.output=$HOME/Ternlux-dist; }",
-    "release:win": "node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win --publish always; s=$?; electron-builder install-app-deps; exit $s; }",
-    "release:linux": "node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --linux --publish always -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
+    "electron-pack": "node scripts/fetch-llama-server.js && node scripts/fetch-duckdb-extensions.js && react-scripts build && node scripts/minify-dist.js && electron-builder",
+    "dist:mac": "node scripts/fetch-llama-server.js --mac && node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "dist:linux": "node scripts/fetch-llama-server.js linux-x64 && node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { electron-builder --linux -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
+    "dist:win": "node scripts/fetch-llama-server.js win32-x64 && node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win; s=$?; electron-builder install-app-deps; exit $s; }",
+    "dist:all": "node scripts/fetch-llama-server.js --all && node scripts/fetch-duckdb-extensions.js --all && react-scripts build && node scripts/minify-dist.js && electron-builder --mac --linux --win",
+    "pack:mac": "node scripts/fetch-llama-server.js --mac && node scripts/ensure-mac-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac -c.directories.output=$HOME/Ternlux-dist; }",
+    "pack:linux": "node scripts/fetch-llama-server.js linux-x64 && node scripts/fetch-duckdb-extensions.js linux_amd64 && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { electron-builder --linux -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
+    "pack:win": "node scripts/fetch-llama-server.js win32-x64 && node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win; }",
+    "release:mac": "node scripts/fetch-llama-server.js --mac && node scripts/ensure-mac-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --mac --publish always -c.directories.output=$HOME/Ternlux-dist; }",
+    "release:win": "node scripts/fetch-llama-server.js win32-x64 && node scripts/fetch-duckdb-extensions.js windows_amd64 && node scripts/ensure-win-prebuilts.js && react-scripts build && node scripts/minify-dist.js && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --win --publish always; s=$?; electron-builder install-app-deps; exit $s; }",
+    "release:linux": "node scripts/fetch-llama-server.js linux-x64 && node scripts/fetch-duckdb-extensions.js linux_amd64 && react-scripts build && node scripts/minify-dist.js && node scripts/ensure-linux-prebuilts.js stage && { set -a; [ -f .env ] && . ./.env; set +a; electron-builder --linux --publish always -c.npmRebuild=false; s=$?; node scripts/ensure-linux-prebuilts.js restore; exit $s; }",
     "esigner": "set -a; [ -f .env ] && . ./.env; set +a; node scripts/esigner-sign.js",
     "fetch-duckdb-extensions": "node scripts/fetch-duckdb-extensions.js",
-    "postinstall": "node scripts/fetch-duckdb-extensions.js --optional"
+    "postinstall": "node scripts/fetch-duckdb-extensions.js --optional && node scripts/fetch-llama-server.js --optional",
+    "fetch-llama-server": "node scripts/fetch-llama-server.js"
   },
   "build": {
     "appId": "com.ternlux.app",
@@ -138,7 +139,13 @@
       "gatekeeperAssess": false,
       "entitlements": "assets/entitlements.mac.plist",
       "entitlementsInherit": "assets/entitlements.mac.plist",
-      "notarize": true
+      "notarize": true,
+      "extraResources": [
+        {
+          "from": "resources/llama-server/darwin-${arch}",
+          "to": "llama-server"
+        }
+      ]
     },
     "win": {
       "target": [
@@ -161,6 +168,10 @@
         {
           "from": "resources/duckdb-extensions",
           "to": "duckdb-extensions"
+        },
+        {
+          "from": "resources/llama-server/win32-x64",
+          "to": "llama-server"
         }
       ]
     },
@@ -191,6 +202,10 @@
         {
           "from": "resources/duckdb-extensions",
           "to": "duckdb-extensions"
+        },
+        {
+          "from": "resources/llama-server/linux-x64",
+          "to": "llama-server"
         }
       ]
     }

@@ -40,6 +40,7 @@ import { saveApiKey } from '../../utils/apiKeyStorage';
 import { DEFAULT_MAX_TOKENS, loadDefaultAiSettings, saveDefaultAiSettings } from '../../utils/aiProviders';
 import useProviderModels from '../../utils/useProviderModels';
 import OthersProviderForm from './OthersProviderForm';
+import LocalModelManager from '../LocalModels/LocalModelManager';
 import CommunityLink from '../ui_components/CommunityLink';
 import {
   register as registerAccount,
@@ -212,6 +213,24 @@ const OTHERS_TILE = {
       <circle cx="10" cy="16" r="2" fill={selected ? '#595959' : '#fff'} />
       <circle cx="16" cy="16" r="2" fill={selected ? '#595959' : '#fff'} />
       <circle cx="22" cy="16" r="2" fill={selected ? '#595959' : '#fff'} />
+    </svg>
+  ),
+};
+
+// "On this computer" tile — download a model and run it with the bundled
+// llama-server instead of using an API key. Listed first: it is the one choice
+// that needs no account anywhere.
+const LOCAL_TILE = {
+  id: 'local',
+  name: 'On this computer',
+  company: 'No API key needed',
+  bgColor: '#f3e8ff',
+  borderColor: '#7c3aed',
+  logo: (selected) => (
+    <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+      <rect width="32" height="32" rx="8" fill={selected ? '#f3e8ff' : '#7c3aed'} />
+      <rect x="8" y="9" width="16" height="11" rx="1.5" stroke={selected ? '#5b21b6' : '#fff'} strokeWidth="2" />
+      <path d="M12 24h8" stroke={selected ? '#5b21b6' : '#fff'} strokeWidth="2" strokeLinecap="round" />
     </svg>
   ),
 };
@@ -1204,7 +1223,7 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
             CHOOSE YOUR PROVIDER
           </Typography>
         )}
-        {[...PROVIDERS, OTHERS_TILE].map((p) => {
+        {[LOCAL_TILE, ...PROVIDERS, OTHERS_TILE].map((p) => {
           const isSelected = selectedProvider === p.id;
           return (
             <Box
@@ -1253,9 +1272,13 @@ const BringYourOwnKey = ({ onComplete, isSettingsMode = false }) => {
             <KeyOutlined sx={{ fontSize: 56, opacity: 0.3 }} />
             <Typography variant="h6" fontWeight={500}>Select a provider to continue</Typography>
             <Typography variant="body2" textAlign="center" maxWidth={380}>
-              Choose Claude, Gemini, ChatGPT, or Others (any OpenAI-compatible provider) and we'll
-              show you exactly how to get set up.
+              Run a model on this computer with no API key, or choose Claude, Gemini, ChatGPT, or
+              Others (any OpenAI-compatible provider) and we'll show you exactly how to get set up.
             </Typography>
+          </Box>
+        ) : selectedProvider === 'local' ? (
+          <Box sx={{ p: 4, maxWidth: 760 }}>
+            <LocalModelManager mode={isSettingsMode ? 'settings' : 'onboarding'} onComplete={onComplete} />
           </Box>
         ) : selectedProvider === 'others' ? (
           <Box sx={{ p: 4, maxWidth: 660 }}>
@@ -1541,7 +1564,7 @@ const ApiKeySetup = ({ onComplete, isSettingsMode = false }) => {
                 Ternlux — Get Started
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                Connect your LLM provider with your own API key
+                Run a model on this computer, or connect a provider with your own API key
               </Typography>
             </Box>
           </Box>

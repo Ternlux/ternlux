@@ -801,10 +801,12 @@ async function handleExecuteJoin({
         const javascriptFunction = joinConfig.transformFunction || joinConfig.javascriptFunction;
 
         const vectorDest = joinConfig.vectorDestination || {};
-        if (!vectorDest.columnToEmbed || !vectorDest.embeddingProvider || !vectorDest.embeddingModel) {
+        // Provider/model are optional: a join built before they were pinned (or
+        // with none named) embeds with the user's default embedding model.
+        if (!vectorDest.columnToEmbed) {
           return {
             success: false,
-            message: 'Vector destination missing required fields: columnToEmbed, embeddingProvider, embeddingModel'
+            message: 'Vector destination missing required field: columnToEmbed'
           };
         }
 

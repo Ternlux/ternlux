@@ -27,10 +27,11 @@ import {
   FormScope, FormBody, FormFooter, Card, Fields, Field,
   Segmented, SelectInput, TextInput, PathPicker, Note, Handoff, HandoffBody,
   Picked, CloudButton, EmptyState, ConnList, ConnGroupToggle, ConnRow, IconFolder,
-  SearchSelect, IconChat,
+  SearchSelect, IconChat, StaticValue,
 } from './_formShared';
 import { presetForConnection, endpointKey } from '../connections/apiPresets';
 import { apiAcceptsRows } from '../joinDestinations';
+import useEmbeddingDefault, { inferEmbeddingProvider } from '../../../utils/useEmbeddingModels';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output Node configuration form
@@ -59,12 +60,6 @@ const FORMAT_OPTIONS = [
  * is one dataset per file, where the path alone identifies the destination.
  */
 const TABLE_FORMATS = new Set(['sqlite', 'duckdb', 'lancedb']);
-
-// What an Output can embed with — the dimension is what a Pinecone index must match.
-const EMBEDDING_MODEL_OPTIONS = [
-  { label: 'text-embedding-3-small (1536 dimensions)', value: 'text-embedding-3-small' },
-  { label: 'text-embedding-3-large (3072 dimensions)', value: 'text-embedding-3-large' },
-];
 
 /** Where the file extension differs from the format's name. Only Excel does. */
 const EXTENSION_BY_FORMAT = { excel: 'xlsx' };
@@ -240,7 +235,10 @@ const OutputNodeChat = ({
     // connection): the column embedded on the way out when the input is plain
     // rows. Empty means the input already carries vectors.
     embedColumn: saved?.embedColumn || null,
-    embeddingModel: saved?.embeddingModel || 'text-embedding-3-small',
+    // Empty = the default embedding model from Settings → AI Provider. A
+    // model saved before providers were stored still implies its provider.
+    embeddingProvider: saved?.embeddingProvider || inferEmbeddingProvider(saved?.embeddingModel) || null,
+    embeddingModel: saved?.embeddingModel || null,
     // Vector destination in Append mode only, optional: the column that is the
     // row's primary key. Records are upserted under it, so a re-run replaces
     // them. Empty: ids are a hash of the whole row.
@@ -499,6 +497,10 @@ const OutputNodeChat = ({
   // Where the rows become vectors: a LanceDB file, or a vector connection.
   const writesVectors = (outputSettings.outputType === 'local' && outputSettings.format === 'lancedb')
     || (outputSettings.outputType === 'connection' && destKind === 'vector');
+  // The embedding model is the user's Settings default, recorded on the node
+  // when a column to embed is first picked (see the embedColumn onChange).
+  const embed = useEmbeddingDefault();
+  const providerLabelOf = (id) => embed.labels[id] || id;
   const embedColumnOptions = useMemo(() => [
     { label: 'None — the data already has vectors', value: '' },
     ...((sourceTableSchema?.columns || [])
@@ -1034,19 +1036,54 @@ const OutputNodeChat = ({
                 <SelectInput
                   value={outputSettings.embedColumn ?? ''}
                   options={embedColumnOptions}
-                  onChange={(v) => patch({ embedColumn: v || null })}
+                  onChange={(v) => patch({
+                    embedColumn: v || null,
+                    // Record the default the first time this node embeds, so
+                    // later changes to the default don't split its vectors.
+                    ...(v && !outputSettings.embeddingModel && embed.defaults.model
+                      ? { embeddingProvider: embed.defaults.provider, embeddingModel: embed.defaults.model }
+                      : {}),
+                  })}
                 />
               </Field>
               {outputSettings.embedColumn && (
                 <Field
                   label="Embedding model"
-                  hint="OpenAI, using the key in Settings → AI Provider. A Pinecone index must have the same dimension as the model."
+                  hint={(() => {
+                    const def = embed.defaults;
+                    if (!outputSettings.embeddingModel) {
+                      return def.model
+                        ? 'Your Default Embedding Model from Settings → AI Provider.'
+                        : 'No embedding model is set. Choose a Default Embedding Model in Settings → AI Provider.';
+                    }
+                    const differs = def.model && (def.model !== outputSettings.embeddingModel
+                      || def.provider !== outputSettings.embeddingProvider);
+                    return (
+                      <>
+                        This step keeps the model it was built with, so its stored vectors stay comparable.
+                        {differs && (
+                          <>
+                            {' '}Your current default is {providerLabelOf(def.provider)} / {def.model}.{' '}
+                            <button
+                              type="button"
+                              className="tlx-linkbtn"
+                              style={{ background: 'none', border: 0, padding: 0, color: '#2196f3', cursor: 'pointer' }}
+                              onClick={() => patch({ embeddingProvider: def.provider, embeddingModel: def.model })}
+                            >
+                              Switch to the default
+                            </button>
+                            {' '}(already-stored vectors will no longer match — re-load with Truncate &amp; insert).
+                          </>
+                        )}
+                      </>
+                    );
+                  })()}
                 >
-                  <SelectInput
-                    value={outputSettings.embeddingModel || 'text-embedding-3-small'}
-                    options={EMBEDDING_MODEL_OPTIONS}
-                    onChange={(v) => patch({ embeddingModel: v })}
-                  />
+                  <StaticValue>
+                    {outputSettings.embeddingModel
+                      ? `${providerLabelOf(outputSettings.embeddingProvider || 'openai')} / ${outputSettings.embeddingModel}`
+                      : (embed.defaults.model ? `${providerLabelOf(embed.defaults.provider)} / ${embed.defaults.model}` : 'Not set')}
+                  </StaticValue>
                 </Field>
               )}
             </Fields>

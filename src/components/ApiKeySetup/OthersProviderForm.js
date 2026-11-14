@@ -15,7 +15,8 @@ import SecretStorageWarning from '../SecretStorageWarning/SecretStorageWarning';
 import { saveProviderConfig, loadProviderMeta } from '../../utils/apiKeyStorage';
 import { OPENAI_COMPAT_PROVIDERS } from '../../utils/aiProviders';
 
-const TYPE_IDS = Object.keys(OPENAI_COMPAT_PROVIDERS);
+// `local` is configured on the Local Models screen, not as an endpoint.
+const TYPE_IDS = Object.keys(OPENAI_COMPAT_PROVIDERS).filter((id) => id !== 'local');
 
 /**
  * Configure an OpenAI-compatible provider ("Others"): pick a type, then supply

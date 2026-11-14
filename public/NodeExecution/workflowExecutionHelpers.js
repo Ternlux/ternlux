@@ -758,15 +758,9 @@ async function executeTransformerNode(node, nodeMap, edges, helpers) {
         ? await helpers.buildSkillHelpers()
         : null;
 
-      // Mirror the `skills:execute` IPC shim: vector-db-executor still reads
-      // embeddingApiKey from top-level params, but stored configs don't carry
-      // the key. Resolve it from the same apiKeys bundle the chat path uses.
-      let resolvedEmbeddingKey = config.embeddingApiKey;
-      if (config.skillId === 'vector-db-executor' && !resolvedEmbeddingKey && config.embeddingProvider && skillHelpers?.apiKeys) {
-        if (config.embeddingProvider === 'openai') {
-          resolvedEmbeddingKey = skillHelpers.apiKeys.chatgpt || skillHelpers.apiKeys.openai;
-        }
-      }
+      // Embedding keys are resolved per provider inside skillHelpers.embeddings;
+      // a key saved on an old config is still passed through.
+      const resolvedEmbeddingKey = config.embeddingApiKey;
 
       // Execute the skill
       const skillResult = await helpers.pluginManager.executeSkill(config.skillId, {
