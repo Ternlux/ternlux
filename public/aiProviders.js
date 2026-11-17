@@ -145,6 +145,66 @@ function setLocalBaseURL(url) {
   localBaseURL = url || null;
 }
 
+// Reports what the local chat model server is doing (lib/localModels/runtime.js
+// chatActivity), set at start-up next to setLocalBaseURL. Used only to explain
+// a failed local call to the user.
+let localActivitySource = null;
+function setLocalActivitySource(fn) {
+  localActivitySource = typeof fn === 'function' ? fn : null;
+}
+
+const isLocalProvider = (provider, baseURL) =>
+  String(provider || '').toLowerCase() === 'local' || isLocalBaseURL(baseURL);
+
+const formatCount = (n) => Number(n).toLocaleString('en-US');
+const formatDuration = (s) => (s >= 120 ? `${Math.round(s / 60)} minutes` : `${s} seconds`);
+
+/**
+ * Plain-language reason a local model call failed, built from what the model
+ * server was doing when it did (see runtime.chatActivity). Null when there is
+ * nothing more specific to say than the generic message.
+ */
+function explainLocalFailure(err, activity) {
+  if (!err || !activity) return null;
+  const raw = String(err.message || err);
+  const timedOut = err.code === 'AI_TIMEOUT' || /timed? ?out|timeout/i.test(raw);
+  const unreachable = !timedOut
+    && /econnrefused|econnreset|socket hang up|fetch failed|connection error|network/i.test(raw);
+  const next = 'Try again later, or switch to a cloud provider in Settings → AI Provider.';
+
+  if (timedOut && activity.busy) {
+    const waited = activity.busySeconds ? ` after ${formatDuration(activity.busySeconds)}` : '';
+    const size = activity.promptTokens
+      ? `${formatCount(activity.promptTokens)} tokens: the conversation plus the instructions and tools the assistant uses`
+      : 'the conversation plus the instructions and tools the assistant uses';
+    const what = activity.writtenTokens > 0
+      ? `It had read your request (${size}) and written ${formatCount(activity.writtenTokens)} tokens of its answer${waited}, and was still writing.`
+      : `It was still reading your request (${size})${waited} and hadn't started writing its answer.`;
+    const others = activity.requests > 1
+      ? ` It works on one request at a time, and ${activity.requests - 1} other request${activity.requests > 2 ? 's were' : ' was'} waiting.`
+      : '';
+    return `The local model didn't answer in time. ${what}${others} `
+      + `Local models are slow on a computer's processor (this one has ${activity.cpuCores} cores): a request this size can take many minutes without a fast graphics card or Apple Silicon. `
+      + `It may keep working on this request in the background, which can delay your next message. ${next}`;
+  }
+  if (unreachable && !activity.running) {
+    const why = activity.lastError ? ` Its last error was: ${activity.lastError}` : '';
+    return `The local model server on this computer isn't running: it stopped before answering.${why} `
+      + 'Ternlux starts it again with your next message, so try once more. If it keeps stopping, '
+      + 're-download the model in Settings → AI Provider → Local Models, or switch to another provider.';
+  }
+  return null;
+}
+
+/** Look up the local server's activity and attach the explanation to `err`. */
+async function attachLocalExplanation(err) {
+  if (!err || !localActivitySource || err.code === 'MAX_TOKENS') return;
+  try {
+    const text = explainLocalFailure(err, await localActivitySource());
+    if (text) err.localExplanation = text;
+  } catch (_) { /* fall back to the generic message */ }
+}
+
 // Built-in providers first (preferred when several are configured), then any
 // configured OpenAI-compatible provider as a fallback.
 const PROVIDER_PRIORITY = ['openai', 'claude', 'gemini', ...Object.keys(OPENAI_COMPAT_PROVIDERS)];
@@ -869,6 +929,15 @@ function humanizeAIError(err, provider, model) {
   const status = statusMatch ? Number(statusMatch[1]) : null;
 
   let friendly;
+  if (err && err.localExplanation) {
+    // Built from what the local model server was doing (explainLocalFailure).
+    const e = new Error(err.localExplanation);
+    e.userFacing = true;
+    if (err.code) e.code = err.code;
+    e.provider = provider || null;
+    e.originalMessage = raw;
+    return e;
+  }
   if (err && err.code === 'AI_TIMEOUT') {
     // withTimeout already wrote this for a person, naming the provider and the
     // limit it passed. Kept as-is so the number stays in the message.
@@ -905,6 +974,10 @@ function humanizeAIError(err, provider, model) {
     friendly = `${label} rejected your API key. Open Settings → AI Provider and check the key is correct and still active.`;
   } else if (status === 404 || /no longer available|is not found|not found|does not exist|unknown model|model_not_found/i.test(lower)) {
     friendly = `The selected ${label} model${model ? ` (${model})` : ''} isn't available. Pick a different model in Settings → AI Provider.`;
+  } else if (String(provider || '').toLowerCase() === 'local'
+    && /enotfound|econnrefused|etimedout|econnreset|network|fetch failed|failed to fetch|connection error|socket hang up/i.test(lower)) {
+    // The local model runs on this computer: the internet has nothing to do with it.
+    friendly = `Couldn't connect to the local model server on this computer. Try again: Ternlux starts it again if it stopped. If it keeps failing, check the model in Settings → AI Provider → Local Models.`;
   } else if (/enotfound|econnrefused|etimedout|econnreset|network|fetch failed|failed to fetch|getaddrinfo|socket hang up|dns/i.test(lower)) {
     friendly = `Couldn't reach ${label}. Check your internet connection${provider && OPENAI_COMPAT_PROVIDERS[String(provider).toLowerCase()] ? ' and the provider base URL in Settings' : ''}, then try again.`;
   } else if (status === 500 || status === 502 || status === 503 || status === 504 || /overloaded|unavailable|server error|internal error|try again later/i.test(lower)) {
@@ -1042,6 +1115,7 @@ async function callAI(prompt, options = {}) {
   // Surface a plain-language error to the user; the raw provider message was
   // already written to the prompt log above for debugging.
   if (callError) {
+    if (isLocalProvider(provider, baseURL)) await attachLocalExplanation(callError);
     const e = humanizeAIError(callError, provider, model);
     // A cut-off answer is resumable: hand back everything needed to ask the
     // model for the rest (see continueAI / the chat UI's Continue button).
@@ -1752,7 +1826,10 @@ async function callAITools(options = {}) {
         }),
   });
 
-  if (callError) throw humanizeAIError(callError, provider, model);
+  if (callError) {
+    if (isLocalProvider(provider, baseURL)) await attachLocalExplanation(callError);
+    throw humanizeAIError(callError, provider, model);
+  }
   return result;
 }
 
@@ -1777,6 +1854,8 @@ module.exports = {
   humanizeAIError,
   providerLabel,
   setLocalBaseURL,
+  setLocalActivitySource,
+  explainLocalFailure,
   // Exported to be testable on its own, and so a caller can report the same
   // limit it will be held to.
   withTimeout,

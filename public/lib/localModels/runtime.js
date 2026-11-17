@@ -35,8 +35,8 @@ let binary = null;        // { path, dir } once resolved
 let proxy = null;         // http.Server
 let proxyPort = null;
 const roles = {
-  chat: { proc: null, model: null, port: null, starting: null, inflight: 0, idleTimer: null, lastError: null },
-  embedding: { proc: null, model: null, port: null, starting: null, inflight: 0, idleTimer: null, lastError: null },
+  chat: { proc: null, model: null, port: null, starting: null, inflight: 0, idleTimer: null, lastError: null, busySince: null },
+  embedding: { proc: null, model: null, port: null, starting: null, inflight: 0, idleTimer: null, lastError: null, busySince: null },
 };
 
 /**
@@ -280,9 +280,14 @@ async function handle(req, res) {
     }
   }
 
+  if (state.inflight === 0) state.busySince = Date.now();
   state.inflight += 1;
   clearTimeout(state.idleTimer);
-  const done = () => { state.inflight = Math.max(0, state.inflight - 1); touch(role); };
+  const done = () => {
+    state.inflight = Math.max(0, state.inflight - 1);
+    if (state.inflight === 0) state.busySince = null;
+    touch(role);
+  };
   const upstream = http.request({
     host: '127.0.0.1', port, method: 'POST', path: `/v1${p.replace(/^\/v1/, '')}`,
     headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length },
@@ -351,4 +356,40 @@ function status() {
   };
 }
 
-module.exports = { start, shutdown, release, status, baseURL };
+/**
+ * What the chat model server is doing right now, so a slow or failed request
+ * can be explained to the user. Asks llama-server's /slots for the request in
+ * progress: its size and how much of the answer is written. Never throws; a
+ * field it couldn't learn is null.
+ */
+async function chatActivity() {
+  const state = roles.chat;
+  const activity = {
+    running: !!(state.proc && state.port && state.proc.exitCode == null),
+    model: state.model,
+    requests: state.inflight,
+    busySeconds: state.busySince ? Math.round((Date.now() - state.busySince) / 1000) : null,
+    cpuCores: os.cpus().length,
+    lastError: state.lastError,
+    busy: null,
+    promptTokens: null,
+    writtenTokens: null,
+  };
+  if (!activity.running) return activity;
+  try {
+    const res = await fetch(`http://127.0.0.1:${state.port}/slots`, { signal: AbortSignal.timeout(3000) });
+    const slots = res.ok ? await res.json() : null;
+    if (Array.isArray(slots)) {
+      const slot = slots.find((s) => s && s.is_processing) || null;
+      activity.busy = !!slot;
+      if (slot) {
+        const next = Array.isArray(slot.next_token) ? slot.next_token[0] : slot.next_token;
+        activity.promptTokens = Number(slot.n_prompt_tokens) || null;
+        activity.writtenTokens = Number(next && next.n_decoded) || 0;
+      }
+    }
+  } catch (_) { /* a server this busy may not answer in time */ }
+  return activity;
+}
+
+module.exports = { start, shutdown, release, status, baseURL, chatActivity };

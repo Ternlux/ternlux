@@ -5804,6 +5804,8 @@ app.whenReady().then(async () => {
       getDefaultChatModel: () => (loadApiKeys() || {}).local?.model || null,
     });
     aiProviders.setLocalBaseURL(localURL);
+    // Lets a failed local call tell the user what the model server was doing.
+    aiProviders.setLocalActivitySource(() => localModelRuntime.chatActivity());
   } catch (err) {
     console.warn('[local-models] not started:', err.message);
   }
