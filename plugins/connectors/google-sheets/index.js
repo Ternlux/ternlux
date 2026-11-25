@@ -798,6 +798,25 @@ module.exports = {
   },
 
   /**
+   * A spreadsheet's id, name and last-edited time — one Drive call, no cell
+   * data. Ternlux checks this before reading a local copy of a tab and
+   * downloads the tab again only when the sheet changed (imports/sheetCopies.js).
+   */
+  getSpreadsheetInfo: async (config, connectionId, containerName) => {
+    try {
+      const oauth2Client = getOAuthClient(config, connectionId);
+      await refreshAccessTokenIfNeeded(oauth2Client, connectionId);
+      const sheets = sheetsApi({ version: 'v4', auth: oauth2Client });
+      const drive = driveApi({ version: 'v3', auth: oauth2Client });
+      const spreadsheetId = await resolveSpreadsheetId(drive, sheets, containerName);
+      const file = await drive.files.get({ fileId: spreadsheetId, fields: 'id,name,modifiedTime', supportsAllDrives: true });
+      return { success: true, spreadsheetId, name: file.data.name || spreadsheetId, modifiedTime: file.data.modifiedTime || null };
+    } catch (error) {
+      return { success: false, message: error.message };
+    }
+  },
+
+  /**
    * One tab, as CSV bytes.
    *
    * Returning a file rather than rows is what lets Sheets reuse the whole
